@@ -10,12 +10,29 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fuzz_lcnf_conformance as fuzzer
 
-# Pin the repo toolchain for every child this module spawns (lean, lake, leanc,
-# lean-native): a source file in a temp dir outside the repo otherwise resolves
-# elan's DEFAULT toolchain (measured: `incompatible header ... Init.olean`).
-_TOOLCHAIN_PIN = fuzzer.repo_pinned_toolchain()
-if _TOOLCHAIN_PIN:
-    os.environ["ELAN_TOOLCHAIN"] = _TOOLCHAIN_PIN
+_SAVED_ELAN_TOOLCHAIN = None
+_HAD_ELAN_TOOLCHAIN = False
+
+
+def setUpModule():
+    # Pin the repo toolchain for every child this module spawns (lean, lake,
+    # leanc, lean-native): a source file in a temp dir outside the repo
+    # otherwise resolves elan's DEFAULT toolchain (measured: `incompatible
+    # header ... Init.olean`). Saved here and restored in tearDownModule.
+    global _SAVED_ELAN_TOOLCHAIN, _HAD_ELAN_TOOLCHAIN
+    _HAD_ELAN_TOOLCHAIN = "ELAN_TOOLCHAIN" in os.environ
+    _SAVED_ELAN_TOOLCHAIN = os.environ.get("ELAN_TOOLCHAIN")
+    pin = fuzzer.repo_pinned_toolchain()
+    if pin:
+        os.environ["ELAN_TOOLCHAIN"] = pin
+
+
+def tearDownModule():
+    if _HAD_ELAN_TOOLCHAIN:
+        os.environ["ELAN_TOOLCHAIN"] = _SAVED_ELAN_TOOLCHAIN
+    else:
+        os.environ.pop("ELAN_TOOLCHAIN", None)
+
 
 SPEC_LEAN = fuzzer.ROOT / "lean" / "LeanNative" / "Spec.lean"
 

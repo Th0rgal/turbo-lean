@@ -511,13 +511,7 @@ def tree_to_lean_expr(node: dict[str, Any]) -> str:
 
 
 def find_lean_binary() -> str | None:
-    for cand in [
-        shutil.which("lean"),
-        str(Path.home() / ".elan/toolchains/leanprover--lean4---v4.35.0/bin/lean"),
-        "/root/.elan/toolchains/leanprover--lean4---v4.35.0/bin/lean",
-        "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin/lean",
-        "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/lean",
-    ]:
+    for cand in [shutil.which("lean"), *toolchain_bin_candidates("lean")]:
         if cand and Path(cand).is_file() and os.access(cand, os.X_OK):
             try:
                 prefix = subprocess.run([cand, "--print-prefix"], cwd=ROOT / "lean",
@@ -563,6 +557,7 @@ def elan_homes() -> list[Path]:
         Path("/root/.elan"),
         Path("/var/lib/sandboxed-node/.elan"),
         Path("/var/lib/sandboxed-node/caches/elan"),
+        Path("/opt/orb/elan"),
     ]
     seen: set[str] = set()
     out: list[Path] = []
@@ -573,13 +568,25 @@ def elan_homes() -> list[Path]:
     return out
 
 
-def pinned_toolchain_clang_candidates() -> list[str]:
-    """`bin/clang` of the repo-pinned toolchain under every candidate elan home."""
-    pin = repo_pinned_toolchain()
+def toolchain_bin_candidates(binary: str, toolchain: str | None = None) -> list[str]:
+    """`bin/<binary>` of a toolchain (default: the repo pin) under every elan home."""
+    pin = toolchain if toolchain is not None else repo_pinned_toolchain()
     if not pin:
         return []
     name = elan_toolchain_dir_name(pin)
-    return [str(home / "toolchains" / name / "bin" / "clang") for home in elan_homes()]
+    return [str(home / "toolchains" / name / "bin" / binary) for home in elan_homes()]
+
+
+def pinned_toolchain_clang_candidates() -> list[str]:
+    """`bin/clang` of the repo-pinned toolchain under every candidate elan home."""
+    return toolchain_bin_candidates("clang")
+
+
+def toolchain_version_token(toolchain: str | None) -> str:
+    """`leanprover/lean4:v4.35.0` -> `4.35.0` (the token `lean --version` prints)."""
+    if not toolchain:
+        return ""
+    return toolchain.rsplit(":", 1)[-1].lstrip("v")
 
 
 def clang_version_major(clang_bin: str) -> int | None:
@@ -593,38 +600,77 @@ def clang_version_major(clang_bin: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def pinned_toolchain_env(base: dict[str, str] | None = None) -> dict[str, str]:
-    """Subprocess env with ELAN_TOOLCHAIN pinned to the repo toolchain.
+def pinned_toolchain_env(
+    base: dict[str, str] | None = None, toolchain: str | None = None
+) -> dict[str, str]:
+    """Subprocess env with ELAN_TOOLCHAIN pinned to a toolchain (default: repo pin).
 
     An elan-shimmed binary (`lean`, `lake`, `leanc`) invoked on files in a temp
     dir outside the repo resolves elan's DEFAULT toolchain, not the repo pin
     (measured as `incompatible header ... Init.olean` from a newer default).
     ELAN_TOOLCHAIN overrides elan's directory-based resolution, so every
-    subprocess that may run a shimmed binary gets this env. The repo pin also
-    wins over an ambient ELAN_TOOLCHAIN: these scripts measure the repo."""
+    subprocess that may run a shimmed binary gets this env. The pin also wins
+    over an ambient ELAN_TOOLCHAIN: these scripts measure the repo. A caller
+    that measures against a different pinned toolchain (the conformance suite's
+    con-leche C2/C3 stages) names it with `toolchain=`."""
     env = dict(os.environ if base is None else base)
-    pin = repo_pinned_toolchain()
+    pin = toolchain if toolchain is not None else repo_pinned_toolchain()
     if pin:
         env["ELAN_TOOLCHAIN"] = pin
     return env
+
+
+_CLANG_IR_PROBE = (
+    "define void @turbo_lean_clang_probe() #0 {\n"
+    "entry:\n"
+    "  ret void\n"
+    "}\n"
+    "attributes #0 = { memory(none) }\n"
+)
+_clang_ir_probe_cache: dict[str, bool] = {}
+
+
+def clang_can_lower_pinned_ir(clang_bin: str) -> bool:
+    """Functional decider: compile a one-function `.ll` carrying a
+    `memory(none)` attribute group (what the pinned toolchain emits; LLVM 16+
+    syntax) to an object. Covers Apple clang (its banner major is not the LLVM
+    major) and ccache wrappers whose banner the version parse cannot read.
+    Cached per clang path in-process."""
+    cached = _clang_ir_probe_cache.get(clang_bin)
+    if cached is not None:
+        return cached
+    ok = False
+    try:
+        with tempfile.TemporaryDirectory(prefix="turbo_clang_ir_probe_") as tmp:
+            ll = Path(tmp) / "probe.ll"
+            ll.write_text(_CLANG_IR_PROBE, encoding="utf-8")
+            res = subprocess.run(
+                [clang_bin, "-Wno-override-module", "-c", str(ll), "-o", os.devnull],
+                capture_output=True,
+                text=True,
+            )
+            ok = res.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        ok = False
+    _clang_ir_probe_cache[clang_bin] = ok
+    return ok
 
 
 def find_clang_binary() -> str | None:
     """Resolve a clang able to lower the pinned toolchain's LLVM IR.
 
     Precedence: a `TURBO_LEAN_CLANG` override (used as given; a broken override
-    fails closed instead of silently falling through to another clang), then the
-    pinned toolchain's bundled clang (derived from `lean/lean-toolchain`,
-    honoring `ELAN_HOME`), then a system clang only when its major version is at
-    least `MIN_SYSTEM_CLANG_MAJOR`."""
+    fails closed instead of silently falling through to another clang), then a
+    system clang that can parse the pinned toolchain's IR (a banner major >=
+    `MIN_SYSTEM_CLANG_MAJOR` is the fast path; otherwise the functional
+    `memory(none)` probe decides), then the pinned toolchain's bundled clang as
+    the fallback (its bare driver is unproven for C drivers and for Mach-O
+    cross targets, so a usable system clang wins)."""
     override = os.environ.get("TURBO_LEAN_CLANG")
     if override:
         if Path(override).is_file() and os.access(override, os.X_OK):
             return override
         return None
-    for cand in pinned_toolchain_clang_candidates():
-        if Path(cand).is_file() and os.access(cand, os.X_OK):
-            return cand
     for cand in [
         "/usr/bin/clang",
         "/usr/bin/clang-16",
@@ -638,6 +684,11 @@ def find_clang_binary() -> str | None:
             continue
         major = clang_version_major(cand)
         if major is not None and major >= MIN_SYSTEM_CLANG_MAJOR:
+            return cand
+        if clang_can_lower_pinned_ir(cand):
+            return cand
+    for cand in pinned_toolchain_clang_candidates():
+        if Path(cand).is_file() and os.access(cand, os.X_OK):
             return cand
     return None
 

@@ -35,9 +35,13 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fuzz_lcnf_conformance as fuzz
 
 ROOT = Path(__file__).resolve().parent.parent
 SPEC_PATH = Path(__file__).resolve().parent / "emitter_mutants.json"
@@ -214,20 +218,21 @@ def prepare_env(root: Path, turbo_home: Path) -> dict[str, str]:
     env["CARGO_TARGET_DIR"] = str(root / "target")
     turbo_home.mkdir(parents=True, exist_ok=True)
     env["TURBO_LEAN_HOME"] = str(turbo_home)
-    # Pin elan-shimmed children (lean / lake) to the repo toolchain so a child
-    # running outside the repo never resolves elan's default toolchain.
-    try:
-        toolchain_pin = (root / "lean" / "lean-toolchain").read_text(encoding="utf-8").strip()
-    except OSError:
-        toolchain_pin = ""
+    # Pin elan-shimmed children (lean / lake) to this root's toolchain so a
+    # child running outside the repo never resolves elan's default toolchain.
+    toolchain_pin = fuzz.repo_pinned_toolchain(root / "lean" / "lean-toolchain")
     if toolchain_pin:
         env["ELAN_TOOLCHAIN"] = toolchain_pin
     prefix = [
         str(root / "lean/.lake/build/bin"),
         str(root / "target/release"),
         str(Path.home() / ".elan/bin"),
-        "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin",
-        "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin",
+        # The pinned toolchain's bin dirs under every elan home, derived from
+        # this root's lean/lean-toolchain instead of hardcoded version strings.
+        *(
+            str(Path(cand).parent)
+            for cand in fuzz.toolchain_bin_candidates("lean", toolchain_pin or None)
+        ),
         str(Path.home() / ".cargo/bin"),
     ]
     env["PATH"] = os.pathsep.join([*prefix, env.get("PATH", "")])

@@ -232,40 +232,114 @@ class ClangResolutionOrder(unittest.TestCase):
             with mock.patch.dict(os.environ, {"TURBO_LEAN_CLANG": str(fake)}):
                 self.assertEqual(fuzzer.find_clang_binary(), str(fake))
 
-    def test_pinned_toolchain_clang_preferred_over_system_clang(self):
+    @staticmethod
+    def _system_clang_present():
+        import shutil as _shutil
+
+        return any(
+            c and Path(c).is_file() for c in ("/usr/bin/clang", _shutil.which("clang"))
+        )
+
+    def test_system_clang_preferred_over_bundled_when_banner_is_new_enough(self):
+        if not self._system_clang_present():
+            self.skipTest("no system clang on this node")
         with tempfile.TemporaryDirectory(prefix="tl-elan-home-") as tmp:
             pin = fuzzer.repo_pinned_toolchain()
             bindir = Path(tmp) / "toolchains" / fuzzer.elan_toolchain_dir_name(pin) / "bin"
             bindir.mkdir(parents=True)
-            fake = self._fake_clang(bindir)
+            fake_bundled = self._fake_clang(bindir)
             with mock.patch.dict(os.environ, {"ELAN_HOME": tmp}):
                 os.environ.pop("TURBO_LEAN_CLANG", None)
-                self.assertEqual(fuzzer.find_clang_binary(), str(fake))
+                with mock.patch.object(fuzzer, "clang_version_major", return_value=16):
+                    got = fuzzer.find_clang_binary()
+        self.assertIsNotNone(got)
+        self.assertNotEqual(
+            got, str(fake_bundled), "a usable system clang must win over the bundled clang"
+        )
 
-    def test_system_clang_below_llvm16_is_rejected(self):
-        with mock.patch.dict(os.environ, {}):
-            os.environ.pop("TURBO_LEAN_CLANG", None)
-            with mock.patch.object(
-                fuzzer, "pinned_toolchain_clang_candidates", return_value=[]
-            ), mock.patch.object(fuzzer, "clang_version_major", return_value=15):
-                self.assertIsNone(fuzzer.find_clang_binary())
+    def test_bundled_toolchain_clang_is_the_fallback_when_system_unusable(self):
+        with tempfile.TemporaryDirectory(prefix="tl-elan-home-") as tmp:
+            pin = fuzzer.repo_pinned_toolchain()
+            bindir = Path(tmp) / "toolchains" / fuzzer.elan_toolchain_dir_name(pin) / "bin"
+            bindir.mkdir(parents=True)
+            fake_bundled = self._fake_clang(bindir)
+            with mock.patch.dict(os.environ, {"ELAN_HOME": tmp}):
+                os.environ.pop("TURBO_LEAN_CLANG", None)
+                with mock.patch.object(
+                    fuzzer, "clang_version_major", return_value=15
+                ), mock.patch.object(
+                    fuzzer, "clang_can_lower_pinned_ir", return_value=False
+                ):
+                    self.assertEqual(fuzzer.find_clang_binary(), str(fake_bundled))
 
-    def test_system_clang_at_llvm16_or_newer_is_accepted(self):
-        import shutil as _shutil
-
-        if not any(
-            c and Path(c).is_file()
-            for c in ("/usr/bin/clang", _shutil.which("clang"))
-        ):
+    def test_old_banner_system_clang_accepted_when_the_ir_probe_passes(self):
+        # Apple clang 15 is LLVM 16 and a ccache wrapper may print no parsable
+        # banner: the functional probe, not the banner, decides.
+        if not self._system_clang_present():
             self.skipTest("no system clang on this node")
         with mock.patch.dict(os.environ, {}):
             os.environ.pop("TURBO_LEAN_CLANG", None)
             with mock.patch.object(
                 fuzzer, "pinned_toolchain_clang_candidates", return_value=[]
-            ), mock.patch.object(fuzzer, "clang_version_major", return_value=16):
-                got = fuzzer.find_clang_binary()
-        self.assertIsNotNone(got)
-        self.assertTrue(Path(got).is_file())
+            ), mock.patch.object(
+                fuzzer, "clang_version_major", return_value=15
+            ), mock.patch.object(
+                fuzzer, "clang_can_lower_pinned_ir", return_value=True
+            ):
+                self.assertIsNotNone(fuzzer.find_clang_binary())
+
+    def test_unparsable_banner_system_clang_decided_by_the_ir_probe(self):
+        if not self._system_clang_present():
+            self.skipTest("no system clang on this node")
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop("TURBO_LEAN_CLANG", None)
+            with mock.patch.object(
+                fuzzer, "pinned_toolchain_clang_candidates", return_value=[]
+            ), mock.patch.object(
+                fuzzer, "clang_version_major", return_value=None
+            ), mock.patch.object(
+                fuzzer, "clang_can_lower_pinned_ir", return_value=True
+            ):
+                self.assertIsNotNone(fuzzer.find_clang_binary())
+
+    def test_system_clang_rejected_when_banner_old_and_probe_fails(self):
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop("TURBO_LEAN_CLANG", None)
+            with mock.patch.object(
+                fuzzer, "pinned_toolchain_clang_candidates", return_value=[]
+            ), mock.patch.object(
+                fuzzer, "clang_version_major", return_value=15
+            ), mock.patch.object(
+                fuzzer, "clang_can_lower_pinned_ir", return_value=False
+            ):
+                self.assertIsNone(fuzzer.find_clang_binary())
+
+    def test_ir_probe_result_is_cached_per_path(self):
+        calls = []
+
+        class _Res:
+            returncode = 1
+            stdout = ""
+            stderr = ""
+
+        def fake_run(cmd, **kw):
+            calls.append([str(a) for a in cmd])
+            return _Res()
+
+        fuzzer._clang_ir_probe_cache.clear()
+        try:
+            with mock.patch.object(fuzzer.subprocess, "run", side_effect=fake_run):
+                self.assertFalse(fuzzer.clang_can_lower_pinned_ir("/usr/bin/clang"))
+                self.assertFalse(fuzzer.clang_can_lower_pinned_ir("/usr/bin/clang"))
+        finally:
+            fuzzer._clang_ir_probe_cache.clear()
+        self.assertEqual(len(calls), 1, "the IR probe must run once per clang path")
+
+    def test_toolchain_version_token(self):
+        self.assertEqual(
+            fuzzer.toolchain_version_token("leanprover/lean4:v4.35.0"), "4.35.0"
+        )
+        self.assertEqual(fuzzer.toolchain_version_token(None), "")
 
 
 class PinnedToolchainEnv(unittest.TestCase):
@@ -297,6 +371,12 @@ class PinnedToolchainEnv(unittest.TestCase):
             env = fuzzer.pinned_toolchain_env({"A": "b"})
         self.assertEqual(env, {"A": "b"})
 
+    def test_explicit_toolchain_parameter_overrides_repo_pin(self):
+        # C2/C3 of the conformance suite pin to the con-leche toolchain, which
+        # must not silently become the repo pin the day lean/lean-toolchain bumps.
+        env = fuzzer.pinned_toolchain_env({}, toolchain="leanprover/lean4:v9.9.9")
+        self.assertEqual(env["ELAN_TOOLCHAIN"], "leanprover/lean4:v9.9.9")
+
 
 class _EmitLnirReached(Exception):
     pass
@@ -307,12 +387,15 @@ class PinnedEnvReachesToolchainSubprocesses(unittest.TestCase):
     `lean-native emit-lnir` on a temp-dir batch file was the measured C1
     failure (incompatible Init.olean header from the default toolchain)."""
 
-    def test_run_three_way_batch_toolchain_calls_carry_the_pin(self):
+    @staticmethod
+    def _drive_until_emit(batch_fn, programs):
         calls = []
 
         class _Res:
             returncode = 0
-            stdout = "[]"
+            # Three stock values: enough for one scalar program, and exactly
+            # the ret/old_read/new_read triple one alias program expects.
+            stdout = '["1","1","1"]'
             stderr = ""
 
         def fake_run(cmd, **kw):
@@ -322,7 +405,6 @@ class PinnedEnvReachesToolchainSubprocesses(unittest.TestCase):
                 raise _EmitLnirReached()
             return _Res()
 
-        programs = [fuzzer.build_program(1)]
         engines = {
             "lean_bin": "/fake/lean",
             "core_bin": "/fake/lean-native-core",
@@ -334,8 +416,13 @@ class PinnedEnvReachesToolchainSubprocesses(unittest.TestCase):
             os.environ.pop("TURBO_CONFORMANCE_ASAN", None)
             os.environ.pop("TURBO_CONFORMANCE_UBSAN", None)
             with mock.patch.object(fuzzer.subprocess, "run", side_effect=fake_run):
-                with self.assertRaises(_EmitLnirReached):
-                    fuzzer.run_three_way_batch(programs, engines)
+                try:
+                    batch_fn(programs, engines)
+                except _EmitLnirReached:
+                    return calls
+        raise AssertionError("the emit-lnir call site was never reached")
+
+    def _assert_toolchain_calls_pinned(self, calls):
         pin = fuzzer.repo_pinned_toolchain()
         toolchain_calls = [
             (argv, env)
@@ -343,36 +430,60 @@ class PinnedEnvReachesToolchainSubprocesses(unittest.TestCase):
             if argv[0] in ("/fake/lean", "/fake/lean-native") or argv[0].endswith("leanc")
         ]
         self.assertTrue(toolchain_calls, "no lean/leanc/lean-native subprocess was recorded")
-        emit_calls = [(argv, env) for argv, env in calls if any("emit-lnir" in a for a in argv)]
-        self.assertTrue(emit_calls, "the emit-lnir call site was never reached")
         for argv, env in toolchain_calls:
             self.assertIsNotNone(env, f"{argv} ran without an explicit env (pin lost)")
             self.assertEqual(
                 env.get("ELAN_TOOLCHAIN"), pin, f"{argv} env lacks the repo toolchain pin"
             )
 
-    def test_test_modules_pin_the_toolchain_at_import(self):
+    def test_run_three_way_batch_toolchain_calls_carry_the_pin(self):
+        calls = self._drive_until_emit(fuzzer.run_three_way_batch, [fuzzer.build_program(1)])
+        self._assert_toolchain_calls_pinned(calls)
+
+    def test_run_alias_batch_toolchain_calls_carry_the_pin(self):
+        program = fuzzer.build_program(6)
+        self.assertTrue(fuzzer.program_contains_alias(program), "seed 6 must be an alias program")
+        calls = self._drive_until_emit(fuzzer.run_alias_batch, [program])
+        self._assert_toolchain_calls_pinned(calls)
+
+    def test_test_modules_pin_in_setup_module_and_restore_in_teardown(self):
         import importlib
 
-        with mock.patch.dict(os.environ, {}):
-            os.environ.pop("ELAN_TOOLCHAIN", None)
-            import test_scalar_frontend as tsf
+        import test_p0_trust_boundary as tp0
+        import test_scalar_frontend as tsf
 
-            importlib.reload(tsf)
-            self.assertEqual(
-                os.environ.get("ELAN_TOOLCHAIN"),
-                fuzzer.repo_pinned_toolchain(),
-                "importing test_scalar_frontend must pin ELAN_TOOLCHAIN for its subprocesses",
-            )
-            os.environ.pop("ELAN_TOOLCHAIN", None)
-            import test_p0_trust_boundary as tp0
+        for mod in (tsf, tp0):
+            with mock.patch.dict(os.environ, {}):
+                os.environ.pop("ELAN_TOOLCHAIN", None)
+                importlib.reload(mod)
+                self.assertIsNone(
+                    os.environ.get("ELAN_TOOLCHAIN"),
+                    f"importing {mod.__name__} must not mutate os.environ",
+                )
+                mod.setUpModule()
+                self.assertEqual(
+                    os.environ.get("ELAN_TOOLCHAIN"),
+                    fuzzer.repo_pinned_toolchain(),
+                    f"{mod.__name__}.setUpModule must pin ELAN_TOOLCHAIN",
+                )
+                mod.tearDownModule()
+                self.assertIsNone(
+                    os.environ.get("ELAN_TOOLCHAIN"),
+                    f"{mod.__name__}.tearDownModule must restore the saved env",
+                )
 
-            importlib.reload(tp0)
-            self.assertEqual(
-                os.environ.get("ELAN_TOOLCHAIN"),
-                fuzzer.repo_pinned_toolchain(),
-                "importing test_p0_trust_boundary must pin ELAN_TOOLCHAIN for its subprocesses",
-            )
+
+class ConLecheToolchainPinConsistency(unittest.TestCase):
+    def test_suite_startup_fails_loudly_on_pin_mismatch(self):
+        import run_conformance_suite as suite
+
+        # Equal pins today: must not raise.
+        suite.assert_toolchain_pins_consistent()
+        with mock.patch.object(
+            suite.fuzz, "repo_pinned_toolchain", return_value="leanprover/lean4:v9.9.9"
+        ):
+            with self.assertRaises(SystemExit):
+                suite.assert_toolchain_pins_consistent()
 
 
 if __name__ == "__main__":
