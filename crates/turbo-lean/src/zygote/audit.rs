@@ -1156,7 +1156,20 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
             is_untrusted,
             pinned_dir_raw_fd,
         )
-        .context("Failed to execute independent kernel replay")?;
+        .map_err(|e| {
+            // #437: a timeout names the knob.
+            if e.downcast_ref::<crate::module_builder::CommandTimedOut>()
+                .is_some()
+            {
+                e.context(format!(
+                    "independent kernel replay of {} module(s) exceeded its {}s budget (raise `[replay] timeout_secs` in turbo-lean.toml or `TURBO_LEAN_REPLAY_TIMEOUT_SECS`)",
+                    slice.len(),
+                    timeout.as_secs()
+                ))
+            } else {
+                e.context("Failed to execute independent kernel replay")
+            }
+        })?;
         if out.status.success() {
             return Ok(());
         }
@@ -1166,7 +1179,11 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
                 slice[0],
                 out.status,
                 String::from_utf8_lossy(&out.stderr).trim(),
-                WorkerBudget::memory_kill_note(&out.status, per_worker_rlimit_mb)
+                WorkerBudget::memory_kill_note(
+                    &out.status,
+                    &String::from_utf8_lossy(&out.stderr),
+                    per_worker_rlimit_mb
+                )
             );
         }
         for m in slice {
@@ -1187,14 +1204,32 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
                 is_untrusted,
                 pinned_dir_raw_fd,
             )
-            .context("Failed to execute independent kernel replay (`--kernel-replay-module`)")?;
+            .map_err(|e| {
+                if e.downcast_ref::<crate::module_builder::CommandTimedOut>()
+                    .is_some()
+                {
+                    e.context(format!(
+                        "independent kernel replay of `{}` exceeded its {}s budget (raise `[replay] timeout_secs` in turbo-lean.toml or `TURBO_LEAN_REPLAY_TIMEOUT_SECS`)",
+                        m,
+                        replay_timeout.as_secs()
+                    ))
+                } else {
+                    e.context(
+                        "Failed to execute independent kernel replay (`--kernel-replay-module`)",
+                    )
+                }
+            })?;
             anyhow::ensure!(
                 single_out.status.success(),
                 "[TurboLean.KernelReplay] independent kernel re-check of `{}` failed (exit={}):\n{}{}",
                 m,
                 single_out.status,
                 String::from_utf8_lossy(&single_out.stderr).trim(),
-                WorkerBudget::memory_kill_note(&single_out.status, per_worker_rlimit_mb)
+                WorkerBudget::memory_kill_note(
+                    &single_out.status,
+                    &String::from_utf8_lossy(&single_out.stderr),
+                    per_worker_rlimit_mb
+                )
             );
         }
         Ok(())
@@ -2064,13 +2099,36 @@ pub(crate) fn run_audited_lean_shard_at_with_full_report(
     if let Some(dir) = cwd {
         auditor.current_dir(dir);
     }
-    let mut audit_timeout = std::time::Duration::from_millis(audit_timeout_ms(false));
+    // #443: an explicitly unbounded request lifts the DEFAULT audit cap too, so
+    // `--timeout-ms 0` truly means no artificial timeout; an explicitly configured
+    // TURBO_LEAN_AUDIT_TIMEOUT_SECS still binds.
+    let mut audit_timeout = if timeout_ms == Some(UNBOUNDED_TIMEOUT_MS)
+        && std::env::var_os("TURBO_LEAN_AUDIT_TIMEOUT_SECS").is_none()
+    {
+        std::time::Duration::from_millis(UNBOUNDED_TIMEOUT_MS)
+    } else {
+        std::time::Duration::from_millis(audit_timeout_ms(false))
+    };
     if let Some(left) = budget_left("the shard audit")? {
         audit_timeout = audit_timeout.min(left);
     }
     let audit_out =
         crate::module_builder::run_command_with_timeout(&mut auditor, audit_timeout, false)
-            .context("Failed to execute in-kernel shard auditor (`--audit-modules --shard`)")?;
+            .map_err(|e| {
+                // #437: a timeout names the knob.
+                if e.downcast_ref::<crate::module_builder::CommandTimedOut>()
+                    .is_some()
+                {
+                    e.context(format!(
+                        "shard audit exceeded its {}s budget (raise `[audit] timeout_secs` in turbo-lean.toml or `TURBO_LEAN_AUDIT_TIMEOUT_SECS`)",
+                        audit_timeout.as_secs()
+                    ))
+                } else {
+                    e.context(
+                        "Failed to execute in-kernel shard auditor (`--audit-modules --shard`)",
+                    )
+                }
+            })?;
     let parsed_reply = parse_audit_modules_reply(&audit_out, std::slice::from_ref(&mod_name))?;
     let decls = parsed_reply.decls.unwrap_or_default();
     let missing: Vec<&String> = audit

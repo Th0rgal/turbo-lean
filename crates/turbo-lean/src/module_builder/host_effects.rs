@@ -217,6 +217,25 @@ impl Drop for TempDirGuard {
     }
 }
 
+/// Typed timeout marker for `run_command_with_timeout*` so call sites can attribute a
+/// timeout to the right knob by downcast instead of string matching (#437).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CommandTimedOut {
+    pub(crate) timeout: std::time::Duration,
+}
+
+impl std::fmt::Display for CommandTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`lean` command timed out after {}ms",
+            self.timeout.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for CommandTimedOut {}
+
 pub(crate) fn run_command_with_timeout(
     cmd: &mut Command,
     timeout: std::time::Duration,
@@ -369,7 +388,7 @@ pub(crate) fn run_command_with_timeout_pinned_fd(
             let _ = child.wait();
             let _ = out_handle.join();
             let _ = err_handle.join();
-            anyhow::bail!("`lean` command timed out after {}ms", timeout.as_millis());
+            return Err(anyhow::Error::new(CommandTimedOut { timeout }));
         }
         let sleep_dur = if poll_iter < 25 {
             std::time::Duration::from_micros(200)
@@ -887,9 +906,12 @@ pub(super) type StagedModuleCompileOutput = (i64, String, TempDirGuard);
 /// environment key), clamped in untrusted mode to `[15, 600]` so heavy proof modules do not
 /// spuriously fail on shared 4-vCPU CI runners while untrusted builds remain bounded.
 ///
-/// With no explicit setting the trusted default is adaptive (#437): `max(300 s, 3 × the
-/// last recorded compile duration)` when the caller knows one, else 1800 s — a flat 300 s
-/// killed legitimate proof-heavy modules that take over 400 s.
+/// With no explicit setting the trusted default is 1800 s — a flat 300 s killed legitimate
+/// proof-heavy modules that take over 400 s. The `last_duration_ms` parameter implements
+/// the adaptive `max(300 s, 3 × the last recorded compile duration)` policy (#437) for a
+/// caller that knows one; no production call site passes a duration yet (they all route
+/// through `module_compile_timeout_secs_from` with `None`) — the scheduler's cached action
+/// durations (`get_cached_action_duration_ms`) are the intended source.
 pub(crate) fn module_compile_timeout_secs_with_history(
     raw_env: Option<&str>,
     is_untrusted: bool,
@@ -986,7 +1008,7 @@ pub(super) fn compile_single_module_staged(
     )
     .map_err(|e| {
         // #437: a timeout names the knob instead of a bare "timed out after Nms".
-        if e.to_string().contains("timed out") {
+        if e.downcast_ref::<CommandTimedOut>().is_some() {
             e.context(format!(
                 "module `{}` exceeded its {}s compile timeout (raise `[build] module_timeout_secs` in turbo-lean.toml or `TURBO_LEAN_MODULE_TIMEOUT_SECS`)",
                 node.module_name, timeout_secs
