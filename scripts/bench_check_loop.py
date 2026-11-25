@@ -80,8 +80,10 @@ DEFAULT_TRIALS = 5
 DEFAULT_WARMUP = 1
 # Per-check wall budget. 900 s is the default; a loaded host can push a cold
 # Batteries warm-setup past it (measured 2026-11-25), so a run may widen the
-# budget through the environment. The value is recorded with the results.
-CHECK_TIMEOUT_S = int(os.environ.get("TURBO_LEAN_BENCH_CHECK_TIMEOUT_S", "900"))
+# budget through TURBO_LEAN_BENCH_CHECK_TIMEOUT_S. The override is validated in
+# validate_environment() so a malformed value is an environment error (exit 4),
+# never a bare crash; the value is recorded with the results.
+CHECK_TIMEOUT_S = 900
 
 PINNED_REVS = {
     "batteries": "66e469188fe07963e5cf666c7d4433f45b8131c5",  # tag v4.35.0
@@ -1172,7 +1174,31 @@ def install_signal_restore(runner: Runner):
                 pass  # not the main thread (tests)
 
 
+def _apply_check_timeout_override():
+    """Fold in TURBO_LEAN_BENCH_CHECK_TIMEOUT_S, validated.
+
+    A junk or non-positive value raises BenchEnvError so the run exits 4
+    (environment error) per the exit-code contract, instead of an uncaught
+    ValueError exiting 1 (reserved for a regression verdict).
+    """
+    global CHECK_TIMEOUT_S
+    raw = os.environ.get("TURBO_LEAN_BENCH_CHECK_TIMEOUT_S")
+    if raw is None:
+        return
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise BenchEnvError(
+            f"TURBO_LEAN_BENCH_CHECK_TIMEOUT_S must be an integer number of "
+            f"seconds, got {raw!r}") from e
+    if value <= 0:
+        raise BenchEnvError(
+            f"TURBO_LEAN_BENCH_CHECK_TIMEOUT_S must be positive, got {raw!r}")
+    CHECK_TIMEOUT_S = value
+
+
 def validate_environment(args):
+    _apply_check_timeout_override()
     for var, expected in REQUIRED_ENV.items():
         got = os.environ.get(var)
         if got != expected:
@@ -1308,7 +1334,14 @@ def main(argv=None):
                  "the environment needs TURBO_LEAN_GIT (git >= 2.46) and "
                  "TURBO_LEAN_ALLOWED_{CSIMP,UNSAFE,IMPLEMENTED_BY}='*'")
 
-    git_bin, git_human = validate_environment(args)
+    # Environment validation failures are environment errors (exit 4) like every
+    # other BenchEnvError; an uncaught raise here used to exit 1, the code reserved
+    # for a regression verdict.
+    try:
+        git_bin, git_human = validate_environment(args)
+    except BenchEnvError as e:
+        print(f"ENVIRONMENT ERROR (exit 4): {e}", file=sys.stderr)
+        return 4
     runner = Runner(args)
     install_signal_restore(runner)
     t_start = time.monotonic()
