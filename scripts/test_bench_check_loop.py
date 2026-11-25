@@ -1389,5 +1389,56 @@ class ComparabilityAndProvenance(unittest.TestCase):
             self.assertIn("same binary", r.stdout)
 
 
+class CliFlags(unittest.TestCase):
+    """--check-timeout-s and --only-workloads (G2a measurement plumbing)."""
+
+    @staticmethod
+    def _runner_args(**extra):
+        attrs = {"turbo_lean_bin": "t", "batteries_dir": "b", "pfr_dir": "p",
+                 "trials": 1, "warmup": 0}
+        attrs.update(extra)
+        return type("A", (), attrs)()
+
+    def _make_runner(self, mod, args):
+        old_git = os.environ.get("TURBO_LEAN_GIT")
+        os.environ["TURBO_LEAN_GIT"] = old_git or "/usr/bin/git"
+        runner = mod.Runner(args)
+        self.addCleanup(__import__("shutil").rmtree, runner.scratch,
+                        ignore_errors=True)
+        if old_git is None:
+            self.addCleanup(os.environ.pop, "TURBO_LEAN_GIT", None)
+        return runner
+
+    def test_check_timeout_flag_reaches_check_argv(self):
+        mod = load_script()
+        runner = self._make_runner(mod, self._runner_args(check_timeout_s=1234))
+        with tempfile.TemporaryDirectory() as td:
+            argv = runner.check_argv(mod.WORKLOADS[0], Path(td), Path(td) / "f.lean")
+        self.assertEqual(argv[argv.index("--timeout") + 1], "1234")
+
+    def test_check_timeout_defaults_when_args_lack_attr(self):
+        mod = load_script()
+        runner = self._make_runner(mod, self._runner_args())
+        with tempfile.TemporaryDirectory() as td:
+            argv = runner.check_argv(mod.WORKLOADS[0], Path(td), Path(td) / "f.lean")
+        self.assertEqual(argv[argv.index("--timeout") + 1], str(mod.CHECK_TIMEOUT_S))
+
+    def test_only_workloads_unknown_name_exits_2(self):
+        mod = load_script()
+        with self.assertRaises(SystemExit) as cm:
+            mod.main(["--only-workloads", "not_a_workload",
+                      "--batteries-dir", "b", "--pfr-dir", "p"])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_only_workloads_filters_measurement_selection_in_order(self):
+        mod = load_script()
+        picked = type("A", (), {"only_workloads":
+                                "batteries_unionfind_top,batteries_list_lemmas_top"})()
+        ids = [w["id"] for w in mod.selected_workloads(picked)]
+        self.assertEqual(ids, ["batteries_list_lemmas_top", "batteries_unionfind_top"])
+        everything = type("A", (), {"only_workloads": None})()
+        self.assertEqual(len(mod.selected_workloads(everything)), len(mod.WORKLOADS))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -199,6 +199,22 @@ def empty_workload_result(w):
     }
 
 
+def selected_workloads(args):
+    """WORKLOADS filtered by --only-workloads, in table order.
+
+    The filter applies only to the measurement loop: validate_baseline and
+    compare_run keep seeing the full table so baseline files stay complete, and
+    unselected workloads keep the same "pending" entry an unreached workload
+    has today. Name validation (exit 2 on an unknown id) happens in main's
+    argparse stage; this helper assumes the names are valid.
+    """
+    raw = getattr(args, "only_workloads", None)
+    if not raw:
+        return list(WORKLOADS)
+    names = {n.strip() for n in raw.split(",") if n.strip()}
+    return [w for w in WORKLOADS if w["id"] in names]
+
+
 def empty_run_result(workloads, trials):
     return {
         "schema_version": SCHEMA_VERSION, "kind": "results", "created_utc": utc_now_iso(),
@@ -912,6 +928,8 @@ class Runner:
         self.git_bin = os.environ["TURBO_LEAN_GIT"]
         self.trials = args.trials
         self.warmups = args.warmup
+        # --check-timeout-s; getattr keeps stub args objects in tests working.
+        self.check_timeout_s = getattr(args, "check_timeout_s", None) or CHECK_TIMEOUT_S
         self.scratch = Path(tempfile.mkdtemp(prefix="m1-bench-")).resolve()
         self.revs = {}
         self.oleans_guard_violated = False
@@ -968,11 +986,13 @@ class Runner:
     def check_argv(self, w, cache: Path, file_path: Path):
         argv = [str(self.bin), "--cache-dir", str(cache), "--json", "--no-telemetry",
                 "check", "--project-dir", str(self.proj_dir(w)),
-                "--decl", w["decl"], "--timeout", str(CHECK_TIMEOUT_S), str(file_path)]
+                "--decl", w["decl"], "--timeout", str(self.check_timeout_s), str(file_path)]
         return argv + list(w.get("extra_args", []))
 
     def run_check(self, w, cache: Path, home: Path, staging: Path, no_daemon: bool,
-                  timeout_s=CHECK_TIMEOUT_S):
+                  timeout_s=None):
+        if timeout_s is None:
+            timeout_s = self.check_timeout_s
         env = self.trial_env(cache, home, staging, no_daemon)
         argv = self.check_argv(w, cache, self.source_path(w))
         psi_before = sample_psi()
@@ -1345,6 +1365,13 @@ def main(argv=None):
     ap.add_argument("--trials", type=int, default=DEFAULT_TRIALS)
     ap.add_argument("--warmup", type=int, default=DEFAULT_WARMUP,
                     help="discarded settling runs before measured trials (default 1)")
+    ap.add_argument("--check-timeout-s", type=int, default=CHECK_TIMEOUT_S,
+                    help="per-check budget in seconds, passed to `check --timeout` and "
+                         f"used as the subprocess timeout (default {CHECK_TIMEOUT_S})")
+    ap.add_argument("--only-workloads",
+                    help="comma-separated workload ids; only these are measured, the "
+                         "rest stay pending. For targeted re-measurement; normally "
+                         "used with --no-baseline.")
     ap.add_argument("--out", help="write the full results JSON here")
     ap.add_argument("--baseline", help="baseline or prior results JSON to compare against "
                                        "(default: scripts/bench_check_loop_baseline.json "
@@ -1369,6 +1396,17 @@ def main(argv=None):
         ap.error(f"--trials must be >= 1, got {args.trials}")
     if args.warmup < 0:
         ap.error(f"--warmup must be >= 0, got {args.warmup}")
+    if args.check_timeout_s <= 0:
+        ap.error(f"--check-timeout-s must be >= 1, got {args.check_timeout_s}")
+    if args.only_workloads is not None:
+        names = [n.strip() for n in args.only_workloads.split(",") if n.strip()]
+        if not names:
+            ap.error("--only-workloads needs at least one workload id")
+        valid = {w["id"] for w in WORKLOADS}
+        unknown = sorted(set(names) - valid)
+        if unknown:
+            ap.error(f"unknown workload id(s): {', '.join(unknown)}; valid ids: "
+                     + ", ".join(w["id"] for w in WORKLOADS))
 
     if args.validate_only:
         try:
@@ -1420,9 +1458,11 @@ def main(argv=None):
                      "load1_at_end": None,
                      "busy_allowed": args.allow_busy_node},
             "args": {"trials": args.trials, "warmup": args.warmup,
-                     "skip_rev_check": args.skip_rev_check},
+                     "skip_rev_check": args.skip_rev_check,
+                     "check_timeout_s": args.check_timeout_s,
+                     "only_workloads": args.only_workloads},
         })
-        for w in WORKLOADS:
+        for w in selected_workloads(args):
             entry = runner.run_workload(w)
             results["workloads"][w["id"]] = entry
         results["cas_replay"] = summarize_cas_replay(results)
