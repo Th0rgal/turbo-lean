@@ -26,9 +26,10 @@ Methodology & Honesty Rules:
   its conclusion is vacuous for any declaration that calls a local helper (`lowered_vacuous_local_call`,
   classified under `lowered_unproved` until rung **L2** adds a function environment to both semantics).
 - A call to a user function OUTSIDE the measured corpus is refused by the real lowerer and
-  counted `rejected`, never `proved` (pinned by `test_out_of_corpus_callee_is_rejected_never_proved`):
-  `proved` is reachable only by declarations the pipeline fully lowers whose remaining calls are
-  intrinsics the semantics evaluates.
+  counted `rejected`, not `proved`, in the one measured counterexample pinned by
+  `test_out_of_corpus_callee_is_rejected_never_proved` (a two-module fixture audited caller-only:
+  1 total / 0 proved / 0 unproved / 1 rejected); no broader claim about out-of-corpus calls is
+  made than that test measures.
 - Compiler-generated auxiliary declarations (`isCompilerGeneratedAuxDecl`) are excluded from every
   corpus denominator — the measurement neither lowers nor expands them — and the number excluded is
   published per corpus and subcorpus as `compiler_aux_decls_excluded`, so the scope of
@@ -566,17 +567,47 @@ def sha256_file(path: Path) -> str:
 def _tracked_bridge_paths(root_dir: Path = ROOT_DIR) -> list[str]:
     """The bridge/semantics/proof sources whose sha256 the committed results pin.
 
-    The static `TRACKED_BRIDGE_FILES` plus every `*.lean` directly under the
-    `TRACKED_BRIDGE_DIRS` directories, so the tracked set follows the S3a
-    BridgeHelpers/ split (and any later split) without hand-editing a list.
+    The static `TRACKED_BRIDGE_FILES` plus every git-tracked `*.lean` directly
+    under the `TRACKED_BRIDGE_DIRS` directories (`git ls-files`, so a scratch
+    or dotfile `.lean` stray never joins the measured set), following the S3a
+    BridgeHelpers/ split without hand-editing a list. Outside a git work tree
+    (test fixture roots), the direct-children filesystem glob is the fallback.
     """
     paths = set(TRACKED_BRIDGE_FILES)
     for rel_dir in TRACKED_BRIDGE_DIRS:
         d = root_dir / rel_dir
-        if d.is_dir():
-            for f in sorted(d.glob("*.lean")):
-                paths.add(f"{rel_dir}/{f.name}")
+        if not d.is_dir():
+            continue
+        names: list[str] = []
+        try:
+            proc = subprocess.run(
+                ["git", "ls-files", "--", rel_dir],
+                cwd=str(root_dir),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except Exception:
+            proc = None
+        if proc is not None and proc.returncode == 0 and proc.stdout.strip():
+            names = [
+                ln
+                for ln in proc.stdout.splitlines()
+                if ln.endswith(".lean") and "/" not in ln[len(rel_dir) + 1 :]
+            ]
+        else:
+            names = [f"{rel_dir}/{f.name}" for f in sorted(d.glob("*.lean"))]
+        paths.update(names)
     return sorted(paths)
+
+
+def _bridge_digests(root_dir: Path = ROOT_DIR) -> dict[str, dict[str, str]]:
+    """Live sha256 of every tracked bridge source (empty string when missing)."""
+    digests: dict[str, dict[str, str]] = {}
+    for rel in _tracked_bridge_paths(root_dir):
+        p = root_dir / rel
+        digests[rel] = {"actual_sha256": sha256_file(p) if p.is_file() else ""}
+    return digests
 
 
 def _is_hex_digest(value: Any, length: int) -> bool:
@@ -745,12 +776,53 @@ def _lean_env() -> dict[str, str]:
     return env
 
 
-def _run_audit_driver(root_dir: Path, driver_src: str, lib_dirs: list[str]) -> tuple[int, int, int, int, int]:
+def _parse_audit_result(
+    stdout: str, stderr: str, *, groups: int
+) -> list[tuple[int, int, int, int, int, int]]:
+    """Parse the last AUDIT_RESULT line fail-closed.
+
+    Requires exactly `groups` `;`-separated groups of exactly 6 integer fields
+    (total, proved, unproved, rejected, rejected_not_lowered,
+    compiler_aux_decls_excluded); a marker-less stdout, a wrong group count, a
+    wrong field arity, or a non-integer field each raise a named error, so a
+    malformed driver run is never converted into counts.
+    """
+    raw_lines = [ln.strip() for ln in stdout.splitlines() if ln.strip().startswith("AUDIT_RESULT:")]
+    if not raw_lines:
+        raise RuntimeError(
+            f"Lean audit driver emitted no AUDIT_RESULT:\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        )
+    payload = raw_lines[-1].split(":", 1)[1]
+    parts = payload.split(";")
+    if len(parts) != groups:
+        raise RuntimeError(
+            f"Lean audit driver AUDIT_RESULT has {len(parts)} group(s), expected {groups}: {payload!r}"
+        )
+    out: list[tuple[int, int, int, int, int, int]] = []
+    for part in parts:
+        fields = part.split(",")
+        if len(fields) != 6:
+            raise RuntimeError(
+                f"Lean audit driver AUDIT_RESULT group has {len(fields)} field(s), expected 6: {part!r}"
+            )
+        try:
+            out.append(tuple(int(x) for x in fields))  # type: ignore[arg-type]
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Lean audit driver AUDIT_RESULT carries a non-integer field: {part!r}"
+            ) from exc
+    return out
+
+
+def _run_audit_driver(
+    root_dir: Path, driver_src: str, lib_dirs: list[str]
+) -> tuple[int, int, int, int, int, int]:
     """Run one audit driver against `lib_dirs`.
 
     Returns (total, proved, unproved, rejected, rejected_not_lowered,
-    compiler_aux_decls_excluded). A driver that exits non-zero or emits no
-    AUDIT_RESULT raises; a failed run is never converted into counts.
+    compiler_aux_decls_excluded). A driver that exits non-zero, emits no
+    AUDIT_RESULT, or emits a malformed one raises; a failed run is never
+    converted into counts.
     """
     lean_dir = root_dir / "lean"
     env = _lean_env()
@@ -766,10 +838,7 @@ def _run_audit_driver(root_dir: Path, driver_src: str, lib_dirs: list[str]) -> t
         )
     if proc.returncode != 0:
         raise RuntimeError(f"Lean audit driver failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
-    raw_lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip().startswith("AUDIT_RESULT:")]
-    if not raw_lines:
-        raise RuntimeError(f"Lean audit driver emitted no AUDIT_RESULT:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
-    return tuple(int(x) for x in raw_lines[-1].split(":", 1)[1].split(","))  # type: ignore[return-value]
+    return _parse_audit_result(proc.stdout, proc.stderr, groups=1)[0]
 
 
 def measure_fixture_corpus(root_dir: Path, lean_body: str, mod_name: str = "FixtureCorpus") -> dict[str, Any]:
@@ -972,11 +1041,10 @@ def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
         )
         if proc.returncode != 0:
             raise RuntimeError(f"Lean audit driver failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
-        raw_lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip().startswith("AUDIT_RESULT:")]
-        parts = raw_lines[-1].split(":", 1)[1].split(";")
-        st, sp, su, sr, sc, sa = (int(x) for x in parts[0].split(","))
-        c2t, c2p, c2u, c2r, c2c, c2a = (int(x) for x in parts[1].split(","))
-        c1t, c1p, c1u, c1r, c1c, c1a = (int(x) for x in parts[2].split(","))
+        audit_groups = _parse_audit_result(proc.stdout, proc.stderr, groups=3)
+        st, sp, su, sr, sc, sa = audit_groups[0]
+        c2t, c2p, c2u, c2r, c2c, c2a = audit_groups[1]
+        c1t, c1p, c1u, c1r, c1c, c1a = audit_groups[2]
 
     result = {
         "executed": True,
@@ -1275,10 +1343,7 @@ def build_live_corpora(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
 
 
 def build_coverage_report(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
-    file_digests: dict[str, dict[str, str]] = {}
-    for rel in _tracked_bridge_paths(root_dir):
-        p = root_dir / rel
-        file_digests[rel] = {"actual_sha256": sha256_file(p) if p.is_file() else ""}
+    file_digests = _bridge_digests(root_dir)
 
     rows = [dict(r) for r in LCNF_CONSTRUCTOR_MATRIX_SPEC]
     proved_cnt = sum(1 for r in rows if r["status"] == "proved")
@@ -1288,7 +1353,7 @@ def build_coverage_report(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     corpora = build_live_corpora(root_dir)
 
     return {
-        "schemaVersion": "turbo-lean-lcnf-coverage-v2-live",
+        "schemaVersion": "turbo-lean-lcnf-coverage-v3-live",
         "leaf_id": "H1.0",
         "toolchain": PINNED_TOOLCHAIN,
         "bridge_source_digests": file_digests,
@@ -1336,6 +1401,24 @@ def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[
         digests[rel] = actual
     if not digests:
         raise RuntimeError("refusing to write results: live report tracks no bridge files")
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--", *sorted(digests)],
+        cwd=str(root_dir),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if status.returncode != 0:
+        raise RuntimeError(
+            "refusing to write results: `git status` failed for the tracked bridge files:\n"
+            f"{status.stderr}"
+        )
+    if status.stdout.strip():
+        dirty = ", ".join(sorted(ln[3:].strip() for ln in status.stdout.splitlines() if ln.strip()))
+        raise RuntimeError(
+            "refusing to write results: tracked bridge files have uncommitted changes "
+            f"({dirty}); the recorded `measured_source_commit` would not match the measured bytes"
+        )
     corpora: dict[str, Any] = {}
     for cname, corp in report.get("corpora", {}).items():
         if corp.get("status") == "unknown" or corp.get("measurement_source") != "live_invocation":
@@ -1562,12 +1645,39 @@ def _live_measured_status_error(cname: str, corp: Any) -> str | None:
     return None
 
 
+def _compare_committed_digests(
+    rep: dict[str, Any], base_digests: dict[str, Any], errors: list[str]
+) -> None:
+    """Compare the live report's tracked-file hashes against the committed pins."""
+    live_digests = rep.get("bridge_source_digests", {})
+    for rel, info in live_digests.items():
+        actual = info.get("actual_sha256", "") if isinstance(info, dict) else ""
+        if rel not in base_digests:
+            errors.append(
+                f"Tracked bridge file `{rel}` is missing from "
+                f"scripts/lcnf_coverage_results.json `bridge_file_sha256`"
+            )
+            continue
+        if base_digests[rel] != actual:
+            errors.append(
+                f"Bridge source digest mismatch for {rel}: "
+                f"committed={base_digests[rel]} actual={actual}"
+            )
+    for rel in sorted(base_digests):
+        if rel not in live_digests:
+            errors.append(
+                f"File `{rel}` is pinned in scripts/lcnf_coverage_results.json "
+                f"`bridge_file_sha256` but is not tracked by the live report"
+            )
+
+
 def check_coverage_report(
     root_dir: Path = ROOT_DIR,
     report: dict[str, Any] | None = None,
     verify_live: bool = False,
     results: dict[str, Any] | None = None,
     require_results: bool = False,
+    compare_results_digests: bool = True,
 ) -> dict[str, Any]:
     errors: list[str] = []
     skipped_corpora: list[str] = []
@@ -1585,6 +1695,10 @@ def check_coverage_report(
                 errors.append(
                     f"Matrix row `{row['id']}` evidence symbol `{row['evidence_symbol']}` not found in {row['evidence_file']}"
                 )
+        else:
+            errors.append(
+                f"Matrix row `{row['id']}` evidence file `{row['evidence_file']}` does not exist"
+            )
 
     c_matrix = rep["lcnf_constructor_matrix"]
     c_sum = c_matrix["summary"]
@@ -1692,29 +1806,10 @@ def check_coverage_report(
 
     if baseline_doc is not None:
         errors.extend(validate_results_document(baseline_doc))
-        live_digests = rep.get("bridge_source_digests", {})
         base_digests = baseline_doc.get("bridge_file_sha256", {}) if isinstance(baseline_doc, dict) else {}
         if not isinstance(base_digests, dict):
             base_digests = {}  # already named by validate_results_document
-        for rel, info in live_digests.items():
-            actual = info.get("actual_sha256", "") if isinstance(info, dict) else ""
-            if rel not in base_digests:
-                errors.append(
-                    f"Tracked bridge file `{rel}` is missing from "
-                    f"scripts/lcnf_coverage_results.json `bridge_file_sha256`"
-                )
-                continue
-            if base_digests[rel] != actual:
-                errors.append(
-                    f"Bridge source digest mismatch for {rel}: "
-                    f"committed={base_digests[rel]} actual={actual}"
-                )
-        for rel in sorted(base_digests):
-            if rel not in live_digests:
-                errors.append(
-                    f"File `{rel}` is pinned in scripts/lcnf_coverage_results.json "
-                    f"`bridge_file_sha256` but is not tracked by the live report"
-                )
+        _compare_committed_digests(rep, base_digests, errors)
         base_corpora = baseline_doc.get("corpora", {}) if isinstance(baseline_doc, dict) else {}
         if not isinstance(base_corpora, dict):
             base_corpora = {}
@@ -1832,6 +1927,29 @@ def check_coverage_report(
                     f"Corpus `{cname}` is measured in scripts/lcnf_coverage_results.json "
                     f"but the live measurement errored; refusing to skip a baseline with counts"
                 )
+    elif compare_results_digests:
+        # H1.0's acceptance command is `--json`: bridge-digest drift must not
+        # pass silently outside `--check` either. When a committed baseline
+        # exists it is loaded for the digest comparison alone (only
+        # `--write-results`, which replaces the baseline, skips this).
+        results_path = root_dir / "scripts" / "lcnf_coverage_results.json"
+        if results_path.is_file():
+            committed: Any = None
+            try:
+                committed = json.loads(results_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                errors.append(f"Committed results file is unreadable: {exc}")
+            if committed is not None and not isinstance(committed, dict):
+                errors.append("Committed results file must be a JSON object")
+            elif isinstance(committed, dict):
+                base_digests = committed.get("bridge_file_sha256")
+                if not isinstance(base_digests, dict) or not base_digests:
+                    errors.append(
+                        "Committed results file carries no `bridge_file_sha256` map "
+                        "to gate bridge-source drift"
+                    )
+                else:
+                    _compare_committed_digests(rep, base_digests, errors)
 
     if verify_live:
         live = execute_live_lean_audit(root_dir)
@@ -1881,7 +1999,7 @@ class TestLcnfCoverage(unittest.TestCase):
         chk = check_coverage_report(ROOT_DIR, require_results=True)
         self.assertTrue(chk["ok"], chk["errors"])
         rep = chk["report"]
-        self.assertEqual(rep["schemaVersion"], "turbo-lean-lcnf-coverage-v2-live")
+        self.assertEqual(rep["schemaVersion"], "turbo-lean-lcnf-coverage-v3-live")
         self.assertEqual(rep["leaf_id"], "H1.0")
         summary = rep["lcnf_constructor_matrix"]["summary"]
         rows = rep["lcnf_constructor_matrix"]["rows"]
@@ -2213,10 +2331,7 @@ class TestLcnfCoverage(unittest.TestCase):
             "reason": "no prebuilt pinned con-leche tree (test fixture)",
         }
         return {
-            "bridge_source_digests": {
-                rel: {"actual_sha256": sha256_file(ROOT_DIR / rel)}
-                for rel in _tracked_bridge_paths(ROOT_DIR)
-            },
+            "bridge_source_digests": _bridge_digests(ROOT_DIR),
             "lcnf_constructor_matrix": {
                 "rows": [],
                 "summary": {"total": 0, "proved": 0, "lowered_unproved": 0, "rejected": 0},
@@ -2655,6 +2770,155 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertIn("c1_corpus", err.getvalue())
         self.assertIn("status", err.getvalue().lower())
 
+    def test_missing_matrix_evidence_file_fails_check(self) -> None:
+        # Review F2: a matrix row whose evidence_file does not exist must fail
+        # `--check` with a named error instead of silently skipping the
+        # evidence-symbol check (the V round retargeted two rows at the split
+        # BridgeHelpers files; a typo there must not pass).
+        baseline = self._v_committed_baseline()
+        rep = self._v_fake_live_report()
+        rep["lcnf_constructor_matrix"]["rows"] = [
+            {
+                "id": "Bogus.row",
+                "category": "Test",
+                "construct": "x",
+                "status": "proved",
+                "evidence_file": "lean/LeanNative/No/Such/File.lean",
+                "evidence_symbol": "nope",
+                "notes": "",
+            }
+        ]
+        rep["lcnf_constructor_matrix"]["summary"] = {
+            "total": 1, "proved": 1, "lowered_unproved": 0, "rejected": 0,
+        }
+        chk = check_coverage_report(ROOT_DIR, rep, results=baseline)
+        self.assertFalse(chk["ok"], "missing evidence_file passed --check")
+        self.assertTrue(
+            any("Bogus.row" in e and "does not exist" in e for e in chk["errors"]),
+            chk["errors"],
+        )
+        # Positive control: a real file + symbol row passes the matrix checks.
+        rep2 = self._v_fake_live_report()
+        rep2["lcnf_constructor_matrix"]["rows"] = [
+            {
+                "id": "Control.row",
+                "category": "Test",
+                "construct": "x",
+                "status": "proved",
+                "evidence_file": "lean/LeanNative/IR/BridgeHelpers/TypesAndSigs.lean",
+                "evidence_symbol": "declUsesSignedScalarTransitively",
+                "notes": "",
+            }
+        ]
+        rep2["lcnf_constructor_matrix"]["summary"] = {
+            "total": 1, "proved": 1, "lowered_unproved": 0, "rejected": 0,
+        }
+        chk2 = check_coverage_report(ROOT_DIR, rep2, results=baseline)
+        self.assertTrue(chk2["ok"], chk2["errors"])
+
+    def test_detects_real_bridge_content_drift_in_json_and_check_modes(self) -> None:
+        # Review F1 + F6: a real content edit to a tracked bridge file must
+        # fail the digest gate through the REAL report builder, both with an
+        # explicit baseline (--check) and in non-check modes (--json / no
+        # flag), where the committed results file is loaded for the digest
+        # comparison. `--json` is the H1.0 acceptance command.
+        import contextlib
+        import io
+        import shutil
+        import unittest.mock as mock
+
+        baseline = self._v_committed_baseline()
+        with tempfile.TemporaryDirectory(prefix="lcnf-realdrift-") as tmp:
+            root = Path(tmp)
+            for rel in _tracked_bridge_paths(ROOT_DIR):
+                dst = root / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT_DIR / rel, dst)
+            (root / "scripts").mkdir()
+            (root / "scripts" / "lcnf_coverage_results.json").write_text(
+                json.dumps(baseline), encoding="utf-8"
+            )
+            target = root / "lean/LeanNative/IR/Bridge.lean"
+            pristine = target.read_text(encoding="utf-8")
+            target.write_text(pristine + "\n-- drift\n", encoding="utf-8")
+
+            def _strip_matrix(r: dict[str, Any]) -> dict[str, Any]:
+                # This test gates DIGESTS; the constructor matrix's evidence
+                # files are deliberately not copied into the sparse tmp root
+                # and would fail the (also new) evidence-file existence check.
+                r = dict(r)
+                r["lcnf_constructor_matrix"] = {
+                    "rows": [],
+                    "summary": {"total": 0, "proved": 0, "lowered_unproved": 0, "rejected": 0},
+                }
+                return r
+
+            rep_drifted = _strip_matrix(build_coverage_report(root))
+            # --check path (explicit baseline).
+            chk = check_coverage_report(root, rep_drifted, results=baseline)
+            self.assertFalse(chk["ok"], "content drift passed --check")
+            self.assertTrue(
+                any("digest mismatch" in e and "Bridge.lean" in e for e in chk["errors"]),
+                chk["errors"],
+            )
+            # Non-check path: no results= and require_results=False, the
+            # committed file in `root` is still consulted for digests.
+            chk_json = check_coverage_report(root, rep_drifted)
+            self.assertFalse(chk_json["ok"], "content drift passed the non-check digest gate")
+            self.assertTrue(
+                any("digest mismatch" in e and "Bridge.lean" in e for e in chk_json["errors"]),
+                chk_json["errors"],
+            )
+            # Control: the undrifted copy is clean on the digest gate. On the
+            # --check path the counted baseline is still (rightly) refused,
+            # because this sparse root measures nothing live — that is the
+            # measured-baseline-cannot-be-skipped guard, not digest drift — so
+            # assert specifically that no digest error remains.
+            target.write_text(pristine, encoding="utf-8")
+            rep_clean = _strip_matrix(build_coverage_report(root))
+            chk_clean = check_coverage_report(root, rep_clean, results=baseline)
+            self.assertFalse(
+                any("digest mismatch" in e for e in chk_clean["errors"]), chk_clean["errors"]
+            )
+            # The non-check path compares digests alone: the clean copy passes.
+            chk_clean_json = check_coverage_report(root, rep_clean)
+            self.assertTrue(chk_clean_json["ok"], chk_clean_json["errors"])
+            # CLI-level: `--json` with a drifted live report exits 1, ok=false.
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(
+                sys.modules[__name__], "build_coverage_report", return_value=rep_drifted
+            ), mock.patch.object(
+                sys, "argv", ["lcnf_coverage.py", "--json"]
+            ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = sys.modules[__name__].main()
+            self.assertEqual(rc, 1, "bridge drift passed CLI --json")
+            self.assertFalse(json.loads(out.getvalue())["ok"])
+
+    def test_write_results_refuses_dirty_tracked_bridge_files(self) -> None:
+        # Review F4: `--write-results` must refuse when a tracked bridge file
+        # has uncommitted changes — the recorded `measured_source_commit`
+        # would not match the measured bytes.
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        rel = "lean/LeanNative/IR/Bridge.lean"
+        report = {"bridge_source_digests": {rel: {"actual_sha256": "0" * 64}}, "corpora": {}}
+        with mock.patch.object(m, "_git_head", return_value="a" * 40), mock.patch.object(
+            m.subprocess, "run"
+        ) as run:
+            run.return_value = mock.Mock(returncode=0, stdout=f" M {rel}\n", stderr="")
+            with self.assertRaises(RuntimeError) as ctx:
+                results_document(report, ROOT_DIR)
+        self.assertIn("uncommitted changes", str(ctx.exception))
+        self.assertIn(rel, str(ctx.exception))
+        # Control: a clean status writes the document.
+        with mock.patch.object(m, "_git_head", return_value="a" * 40), mock.patch.object(
+            m.subprocess, "run"
+        ) as run:
+            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            doc = results_document(report, ROOT_DIR)
+        self.assertEqual(doc["bridge_file_sha256"], {rel: "0" * 64})
+
     def test_results_schema_rejects_unknown_keys_and_bad_provenance(self) -> None:
         # H1.0a-V hardening: each of these mutations passed the pre-hardening
         # gate (measured 2026-11-25). The committed note text is pinned, the
@@ -2847,13 +3111,15 @@ class TestLcnfCoverage(unittest.TestCase):
 
     def test_audit_driver_never_silently_drops_a_module(self) -> None:
         # H1.0a-S acceptance: an EXECUTABLE failure reproduction of the silent
-        # module-IR drop. The pre-fix driver skipped a module missing from the
-        # imported environment (`if let some modIdx := ... then`) and turned a
-        # failed IR conversion into an empty module (`.error _ => return #[]`),
-        # so the published counts silently omitted declarations. The shipped
-        # driver must fail loudly, naming the module; the reconstructed
-        # pre-fix variant is run on the same input and shown to emit exactly
-        # the silent under-count the fix prevents.
+        # module-IR drop, for the MISSING-MODULE branch only. The pre-fix
+        # driver skipped a module missing from the imported environment
+        # (`if let some modIdx := ... then`), so published counts silently
+        # omitted declarations; the shipped driver must fail loudly, naming
+        # the module, and the reconstructed pre-fix variant is run on the same
+        # input and shown to emit exactly that silent under-count. The other
+        # pre-fix drop (`.error _ => return #[]` on a failed IR conversion)
+        # has no known fixture that makes `toImpure` fail deterministically,
+        # so it is guarded TEXTUALLY by the assertNotIn below, not executed.
         self.assertNotIn(".error _ => return #[]", _LEAN_AUDIT_DRIVER_HEAD)
         self.assertIn("not found in the imported environment", _LEAN_AUDIT_DRIVER_HEAD)
         _ensure_lean_build(ROOT_DIR)
@@ -2910,6 +3176,35 @@ unsafe def main (args : List String) : IO Unit := do
                 [],
             )
         self.assertIn("emitted no AUDIT_RESULT", str(ctx2.exception))
+        # Review F3: a malformed AUDIT_RESULT (wrong field arity) through the
+        # real subprocess path is a named error, never counts.
+        with self.assertRaises(RuntimeError) as ctx3:
+            _run_audit_driver(
+                ROOT_DIR,
+                'def main (_ : List String) : IO Unit := IO.println "AUDIT_RESULT:1,2,3"\n',
+                [],
+            )
+        self.assertIn("expected 6", str(ctx3.exception))
+        # The shared parser also guards the three-group main path
+        # (execute_live_lean_audit) fail-closed: wrong group count, wrong
+        # field arity, non-integer fields, and a marker-less stdout each
+        # raise named errors instead of IndexError/garbage counts.
+        with self.assertRaises(RuntimeError) as g1:
+            _parse_audit_result("AUDIT_RESULT:1,2,3,4,5,6", "", groups=3)
+        self.assertIn("expected 3", str(g1.exception))
+        with self.assertRaises(RuntimeError) as g2:
+            _parse_audit_result("AUDIT_RESULT:1,2,3;1,2,3,4,5,6;1,2,3,4,5,6", "", groups=3)
+        self.assertIn("expected 6", str(g2.exception))
+        with self.assertRaises(RuntimeError) as g3:
+            _parse_audit_result("AUDIT_RESULT:1,2,3,4,5,x", "", groups=1)
+        self.assertIn("non-integer", str(g3.exception))
+        with self.assertRaises(RuntimeError) as g4:
+            _parse_audit_result("nothing here", "", groups=3)
+        self.assertIn("emitted no AUDIT_RESULT", str(g4.exception))
+        self.assertEqual(
+            _parse_audit_result("AUDIT_RESULT:1,2,3,4,5,6;7,8,9,10,11,12", "", groups=2),
+            [(1, 2, 3, 4, 5, 6), (7, 8, 9, 10, 11, 12)],
+        )
 
     def test_corpus_scope_does_not_claim_aux_expansion_it_never_performs(self) -> None:
         # The scope text claimed compiler-generated `_closed` helpers were
@@ -2997,6 +3292,36 @@ unsafe def main (args : List String) : IO Unit := do
         self.assertGreater(grown["total_declarations"], base["total_declarations"])
         self.assertGreater(grown["rejected"], base["rejected"])
         self.assertEqual(grown["proved"], base["proved"])
+
+    def test_fixture_corpus_counts_compiler_aux_exclusions(self) -> None:
+        # Review F5: value-assert the aux count once against the live lowerer.
+        # A single authored declaration still compiles with compiler-generated
+        # auxiliary declarations beside it; they are counted in
+        # `compiler_aux_decls_excluded` and are absent from the
+        # `total_declarations` denominator (total == the 1 authored decl).
+        plain = measure_fixture_corpus(
+            ROOT_DIR,
+            "@[export aux_plain]\ndef aux_plain (x : UInt64) : UInt64 := x + 1\n",
+            mod_name="AuxPlainFixture",
+        )
+        self.assertEqual(plain["total_declarations"], 1, plain)
+        self.assertEqual(plain["proved"], 1, plain)
+        self.assertGreaterEqual(plain["compiler_aux_decls_excluded"], 1, plain)
+        # A local closure over a fold lambda-lifts: more aux decls excluded,
+        # and the published sum invariant holds on what IS counted.
+        closure = measure_fixture_corpus(
+            ROOT_DIR,
+            "def helper (x : UInt64) : UInt64 := x + 7\n"
+            "@[export aux_fold]\n"
+            "def aux_fold (x : UInt64) : UInt64 := (List.range 3).foldl (fun a _ => helper a) x\n",
+            mod_name="AuxClosureFixture",
+        )
+        self.assertGreaterEqual(closure["compiler_aux_decls_excluded"], 2, closure)
+        self.assertEqual(
+            closure["total_declarations"],
+            closure["proved"] + closure["lowered_unproved"] + closure["rejected"],
+            closure,
+        )
 
     def test_con_leche_unmapped_pinned_revision_is_named_error(self) -> None:
         # Round-2 Point 1 (case 1): pinned con-leche revision missing from
@@ -3193,7 +3518,11 @@ def main() -> int:
         print("  [ERROR] --write-results and --check are mutually exclusive", file=sys.stderr)
         return 2
 
-    chk = check_coverage_report(ROOT_DIR, require_results=args.check)
+    chk = check_coverage_report(
+        ROOT_DIR,
+        require_results=args.check,
+        compare_results_digests=not args.write_results,
+    )
     if args.write_results:
         RESULTS_FILE.write_text(
             json.dumps(results_document(chk["report"], ROOT_DIR), indent=2, sort_keys=True) + "\n",
