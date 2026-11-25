@@ -100,4 +100,33 @@ open LeanNative.Driver.EvalLCNFCLI
   if driverSrc.contains "CompiledUnsafe" then
     throw <| IO.userError "B1: driver declares `unsafe` compiled-reference wrappers; the hygiene gate refuses `unsafe` declarations in source files"
 
+  -- 7. Review-fix regression: `--json` stdout must parse as JSON even when the user's source
+  --    file elaborates with diagnostics (a `sorry` warning, the unused-variable linter, and
+  --    `#eval` output). `withElaboratedSnippet` forwards all of it to stderr.
+  let tmpDir := (← IO.getEnv "TMPDIR").getD "/tmp"
+  let noisyPath := System.FilePath.mk tmpDir / "eval_lcnf_cli_json_noise_regression.lean"
+  IO.FS.writeFile noisyPath <| String.intercalate "\n" [
+    "def noiseRegressionDouble (x : UInt64) : UInt64 := x + x",
+    "theorem noiseRegressionSorry : 1 + 1 = 2 := by sorry",
+    "#eval IO.println \"ELAB-NOISE-ON-STDOUT\"",
+    "def noiseRegressionUnused (y : UInt64) : UInt64 := 7",
+    ""
+  ]
+  let (jsonOut, jsonRc) ← IO.FS.withIsolatedStreams (isolateStderr := false) <|
+    LeanNative.Driver.EvalLCNFCLI.run ["--json", noisyPath.toString]
+  IO.FS.removeFile noisyPath
+  if (jsonOut.splitOn "ELAB-NOISE-ON-STDOUT").length != 1 then
+    throw <| IO.userError "json regression: user `#eval` output leaked onto --json stdout"
+  match Lean.Json.parse jsonOut with
+  | .error e =>
+    throw <| IO.userError s!"json regression: --json stdout is not valid JSON ({e}); first 200 chars: {jsonOut.take 200}"
+  | .ok j =>
+    match j.getObjValAs? Nat "mismatch_count" with
+    | .error e =>
+      throw <| IO.userError s!"json regression: mismatch_count missing from --json output ({e})"
+    | .ok mc =>
+      if mc != 0 then
+        throw <| IO.userError s!"json regression: expected mismatch_count == 0 on the noisy source file, got {mc}"
+      IO.println s!"[eval-lcnf-json-regression] OK: --json stdout parsed as JSON on a diagnostics-heavy source file (mismatch_count={mc}, rc={jsonRc})"
+
 end LeanNative.Tests.EvalLCNFCLITests

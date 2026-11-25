@@ -723,12 +723,19 @@ def withElaboratedSnippet {α : Type} (snippetName : String) (sourceText : Strin
     if ← p.pathExists then
       extraPaths := extraPaths ++ [p]
   Lean.initSearchPath (← LeanNative.IR.resolveLeanSysroot) extraPaths
-  -- The generated `<CompiledRefProbes>` snippet binds one variable per (vector, canonical
-  -- field) that a given probe may not read, and `Lean.Elab.runFrontend` prints linter
-  -- warnings on stdout — which must stay machine-readable under `--json`. The
-  -- unused-variables linter is therefore off for driver-generated snippets only.
-  let opts : Lean.Options := ({} : Lean.Options).setBool `linter.unusedVariables false
-  let some env ← Lean.Elab.runFrontend sourceText opts snippetName modName
+  let opts : Lean.Options := {}
+  -- `Lean.Elab.runFrontend` prints elaboration diagnostics — linter warnings,
+  -- `declaration uses 'sorry'`, deprecations, and `#eval`/`#print` output of the elaborated
+  -- text (driver-generated snippets and user-supplied source files alike) — on stdout, which
+  -- must stay machine-readable under `--json`. Isolate the call's stdout and forward whatever
+  -- it printed to stderr instead.
+  let (frontendOut, env?) ← IO.FS.withIsolatedStreams (isolateStderr := false) <|
+    Lean.Elab.runFrontend sourceText opts snippetName modName
+  unless frontendOut.isEmpty do
+    let stderr ← IO.getStderr
+    stderr.putStr frontendOut
+    stderr.flush
+  let some env := env?
     | throw <| IO.userError s!"Elaboration failed for {snippetName}"
   let coreCtx : Lean.Core.Context := { fileName := snippetName, fileMap := sourceText.toFileMap, options := opts }
   Prod.fst <$> act.toIO coreCtx { env := env }
