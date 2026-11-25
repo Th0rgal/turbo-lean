@@ -2979,6 +2979,149 @@ fn test_epoch_mismatch_and_same_epoch_locks_sidecars_and_spools() -> Result<()> 
 }
 
 #[test]
+fn test_cli_prefetched_prestage_import_refuses_cross_arch_nonportable() -> Result<()> {
+    // The `turbo-lean import` CLI path: main.rs prefetches a prestage with
+    // `try_read_and_prestage_pack` and run_import_command finishes it through
+    // `finish_import_from_prestaged_shared_cas_inner`, never touching
+    // `import_pack_bytes_with_policy`. The arch guard must hold there too.
+    let dir = std::env::temp_dir().join(format!(
+        "turbo_lean_pack_arch_guard_cli_{}_{}",
+        std::process::id(),
+        next_tmp_id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+
+    let payload = b"cli-prestaged-cross-arch-object".to_vec();
+    let bh = blake3::hash(&payload).to_hex().to_string();
+    let mk_pack = |label: &str, host_arch: &str, kind: &str, rel: &str, portable: bool| -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+        let root = dir.join(label);
+        let manifest = PackManifest {
+            format_version: 3,
+            host_arch: host_arch.to_string(),
+            created_at: 1,
+            actions: vec![ActionRecord {
+                action_key: format!("cli_arch_guard_{label}"),
+                toolchain_githash: "leanprover/lean4:v4.35.0".into(),
+                kind: "module_unit".into(),
+                status: "completed".into(),
+                fencing_token: 1,
+                output_manifest_hash: "00".repeat(32),
+                duration_ms: 1,
+                peak_pss_bytes: 0,
+                heartbeats: 1,
+                trust_domain: "trusted".into(),
+                outputs: vec![BlobEntry {
+                    blob_hash: bh.clone(),
+                    kind: kind.into(),
+                    size_bytes: payload.len() as u64,
+                    rel_path: rel.into(),
+                }],
+            }],
+            blobs: vec![PackedBlob {
+                blob_hash: bh.clone(),
+                kind: kind.into(),
+                size_bytes: payload.len() as u64,
+                portable,
+                data_hex_or_base64: Vec::new(),
+            }],
+            ed25519_pubkey: None,
+            ed25519_signature: None,
+            replayed_oleans: Vec::new(),
+        };
+        // v3 header-only pack: the payload is expected to already sit in CAS.
+        let hdr = serde_json::to_vec(&manifest)?;
+        let mut stream = Vec::with_capacity(16 + hdr.len());
+        stream.extend_from_slice(b"TLPK\x00\x00\x00\x03");
+        stream.extend_from_slice(&(hdr.len() as u64).to_le_bytes());
+        stream.extend_from_slice(&hdr);
+        fs::create_dir_all(&root)?;
+        let pack_path = root.join("pack.tlpack");
+        fs::write(&pack_path, &stream)?;
+        // Pre-place the verified blob in the store-local CAS so the prestage succeeds.
+        let blob_dest = root.join("blobs").join(&bh[..2]).join(&bh);
+        fs::create_dir_all(blob_dest.parent().unwrap())?;
+        fs::write(&blob_dest, &payload)?;
+        Ok((root, pack_path))
+    };
+
+    // Cross-arch pack with a non-portable native object: the prefetched-prestage
+    // CLI import must refuse it.
+    let (root_a, pack_a) = mk_pack("foreign", "sparc64", "o", "build/lib/Foo.o", false)?;
+    let prestage_a = try_read_and_prestage_pack(&root_a, &pack_a);
+    let mut store_a = TurboStore::open(Some(&root_a))?;
+    let err = if prestage_a.is_some() {
+        // Pre-guard shape: the prestage succeeded; the finisher must refuse.
+        run_import_command(
+            &mut store_a,
+            false,
+            pack_a.clone(),
+            Some("trusted".into()),
+            None,
+            true,
+            None,
+            Some(std::thread::spawn(move || prestage_a)),
+        )
+        .expect_err("prefetched-prestage CLI import of a cross-arch non-portable pack must be refused")
+    } else {
+        // Post-guard shape: the prestage itself aborts early (no orphan CAS
+        // writes) and the CLI falls back to the policy path, which must refuse.
+        run_import_command(
+            &mut store_a,
+            false,
+            pack_a.clone(),
+            Some("trusted".into()),
+            None,
+            true,
+            None,
+            Some(std::thread::spawn(move || prestage_a)),
+        )
+        .expect_err("fallback import of a cross-arch non-portable pack must be refused")
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("sparc64") && msg.contains(std::env::consts::ARCH),
+        "arch-guard error must name both architectures: {msg}"
+    );
+
+    // Same-arch control through the same prefetched-prestage branch stays importable.
+    let (root_b, pack_b) = mk_pack("native", std::env::consts::ARCH, "o", "build/lib/Foo.o", false)?;
+    let prestage_b = try_read_and_prestage_pack(&root_b, &pack_b);
+    assert!(
+        prestage_b.is_some(),
+        "same-arch prestage must succeed so the prefetched branch is actually exercised"
+    );
+    let mut store_b = TurboStore::open(Some(&root_b))?;
+    run_import_command(
+        &mut store_b,
+        false,
+        pack_b,
+        Some("trusted".into()),
+        None,
+        true,
+        None,
+        Some(std::thread::spawn(move || prestage_b)),
+    )?;
+
+    // Cross-arch portable-only pack through the prefetched branch stays importable.
+    let (root_c, pack_c) = mk_pack("portable", "sparc64", "olean", "build/lib/Foo.olean", true)?;
+    let prestage_c = try_read_and_prestage_pack(&root_c, &pack_c);
+    let mut store_c = TurboStore::open(Some(&root_c))?;
+    run_import_command(
+        &mut store_c,
+        false,
+        pack_c,
+        Some("trusted".into()),
+        None,
+        true,
+        None,
+        Some(std::thread::spawn(move || prestage_c)),
+    )?;
+
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
 fn test_import_refuses_nonportable_blobs_from_other_arch() -> Result<()> {
     let dir = std::env::temp_dir().join(format!(
         "turbo_lean_pack_arch_guard_{}_{}",
