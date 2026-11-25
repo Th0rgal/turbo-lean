@@ -202,6 +202,19 @@ def find_asan_capable_opt() -> tuple[str | None, list[str]]:
     return None, reasons
 
 
+def fuzz_strict_tools_default() -> bool:
+    """Strict tool handling: forced by TARGET_IR_FUZZ_STRICT_TOOLS=true/false, and
+    on by default under CI / GITHUB_ACTIONS (the sibling of
+    run_heapobj_abi_sanitizers' require_tsan default), so a toolchain or PATH
+    regression in the roadmap job fails instead of skipping."""
+    env = os.environ.get("TARGET_IR_FUZZ_STRICT_TOOLS", "").lower()
+    if env in ("true", "1"):
+        return True
+    if env in ("false", "0"):
+        return False
+    return os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("CI") == "true"
+
+
 def _s8(u: int) -> int:
     u &= MASK8
     return u - 0x100 if (u & 0x80) else u
@@ -1232,6 +1245,7 @@ def execute_suite_payload(
     clangxx_bin: str | None,
     ptxas_bin: str | None,
     tools_cache_dir: Path,
+    strict_tools: bool = False,
 ) -> dict[str, int]:
     want = set(backends) if backends is not None else {"llvm", "ptx", "stablehlo", "metal"}
     counts = {
@@ -1254,12 +1268,17 @@ def execute_suite_payload(
             if trap_opt_bin is None and any(c["kind"] != "valid" for c in llvm_cases):
                 # The trap legs need `opt -passes=asan`; the toolchain does not bundle
                 # opt, so when every installed opt is too old for the emitted IR the
-                # stage reports the missing engine instead of failing on it.
-                print(
-                    "[target-ir-fuzz] SKIPPED llvm trap cases (missing engine): no installed "
-                    "opt has a usable -passes=asan for the emitted IR (install llvm >= 16): "
+                # stage reports the missing engine (and fails under strict mode).
+                msg = (
+                    "no installed opt has a usable -passes=asan for the emitted IR "
+                    "(install llvm >= 16): "
                     + "; ".join(probe_reasons or ["no opt candidates found"])
                 )
+                if strict_tools:
+                    raise RuntimeError(
+                        f"missing engine under strict mode for llvm trap cases: {msg}"
+                    )
+                print(f"[target-ir-fuzz] SKIPPED llvm trap cases (missing engine): {msg}")
         for c in llvm_cases:
             if c["kind"] == "valid":
                 run_llvm_valid_case(lli_bin, opt_bin, c)
@@ -1337,7 +1356,7 @@ class TargetIRFuzzSelfTests(unittest.TestCase):
         self.assertEqual(ctx2.exception.trap_class, "dataRace")
 
     def test_llvm_native_asan_ubsan_trap(self) -> None:
-        strict_tools = os.environ.get("TARGET_IR_FUZZ_STRICT_TOOLS", "").lower() == "true"
+        strict_tools = fuzz_strict_tools_default()
         clang_bin = find_clang_c()
         opt_bin, opt_probe_reasons = find_asan_capable_opt()
         if not clang_bin or not opt_bin:
@@ -1395,7 +1414,7 @@ class TargetIRFuzzSelfTests(unittest.TestCase):
         self.assertIn(f'target datalayout = "{host_datalayout}"', probe_ir)
 
     def test_metal_tsan_and_asan_traps(self) -> None:
-        strict_tools = os.environ.get("TARGET_IR_FUZZ_STRICT_TOOLS", "").lower() == "true"
+        strict_tools = fuzz_strict_tools_default()
         clangxx = gpu_diff.find_clangxx()
         if not clangxx:
             if strict_tools:
@@ -1581,8 +1600,22 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(f"target-ir-fuzz-suite failed:\n{gen.stderr}")
         payload = json.loads(gen.stdout)
 
-    lli_bin = llvm_diff.find_llvm_tool(["lli-18", "lli-19", "lli", "lli-17", "lli-20"])
-    opt_bin = llvm_diff.find_llvm_tool(["opt-18", "opt-19", "opt", "opt-17", "opt-20"])
+    strict_tools = fuzz_strict_tools_default()
+    # The same qualified lli/opt pair (same LLVM install) Stage 2A uses; the
+    # LLVM 15 interpreter it rejects must not run the fuzz valid cases either.
+    engine, engine_rejected = llvm_diff.find_qualified_llvm_engine()
+    lli_bin = engine["lli_bin"] if engine else None
+    opt_bin = engine["opt_bin"] if engine else None
+    if "llvm" in backends and engine is None:
+        reasons = "; ".join(str(q.get("reason")) for q in engine_rejected) or "no lli candidates found"
+        msg = (
+            "no lli/opt pair (same LLVM install) passed qualification for the emitted "
+            f"host-arch IR: {reasons}"
+        )
+        if strict_tools:
+            raise RuntimeError(f"[target-ir-fuzz] missing engine under strict mode: {msg}")
+        print(f"[target-ir-fuzz] SKIPPED llvm cases (missing engine): {msg}")
+        backends = [b for b in backends if b != "llvm"]
     clang_bin = find_clang_c()
     clangxx_bin = gpu_diff.find_clangxx()
     ptxas_bin = gpu_diff.find_ptxas(args.tools_cache_dir)
@@ -1596,6 +1629,7 @@ def main(argv: list[str] | None = None) -> int:
         clangxx_bin=clangxx_bin,
         ptxas_bin=ptxas_bin,
         tools_cache_dir=args.tools_cache_dir,
+        strict_tools=strict_tools,
     )
     print(
         "[target-ir-fuzz] PASSED "
