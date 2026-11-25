@@ -3769,6 +3769,84 @@ lean_lib Smoke where
         Ok(())
     }
 
+    /// L299 fix-forward (#299): a glob-expanded module inherits the fail-closed `unsupported`
+    /// flags of the library module resolution assigns it to, not only its options: an owning
+    /// library turbo-lean cannot build like Lake must stop the build even when the expanding
+    /// library is clean.
+    #[test]
+    fn test_l299_glob_expansion_inherits_owner_unsupported_gate() -> Result<()> {
+        let dir = make_temp_test_dir("l299_owner_unsupported");
+        let proj = dir.join("proj");
+        let dep = proj.join(".lake/packages/dep_pkg");
+        fs::create_dir_all(dep.join("Shared"))?;
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(dep.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            dep.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage dep_pkg\ntarget helperT pkg : Unit := do\n  return .nil\nlean_lib First where\n  globs := #[`Shared.+]\nlean_lib Second where\n  globs := #[`Shared.+]\n  needs := #[helperT]\n",
+        )?;
+        fs::write(dep.join("Shared/M.lean"), "def m : Nat := 1\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep_pkg\"\npath = \".lake/packages/dep_pkg\"\n[[lean_lib]]\nname = \"App\"\n",
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{"version": "1.1.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "scope": "", "name": "dep_pkg", "inherited": false, "dir": ".lake/packages/dep_pkg", "configFile": "lakefile.lean"}]}"#,
+        )?;
+        fs::write(proj.join("App.lean"), "def app : Nat := 2\n")?;
+        let cfg = resolve_project_config(&proj)?;
+        // `Second` (the owner by `findModule?`) carries `unsupported` (a custom-target `needs`);
+        // expanding `First`'s glob must not launder `Shared.M` past the fail-closed gate.
+        let err = build_module_dag(&cfg, &["@dep_pkg/First".to_string()])
+            .expect_err("owner-unsupported module must not build through a clean expander")
+            .to_string();
+        assert!(err.contains("like Lake"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// L299 fix-forward (#299): a module the root package OWNS (a library's globs select it)
+    /// whose source file is missing must fail like Lake, never resolve to a same-named module
+    /// in a dependency package one lookup level further out.
+    #[test]
+    fn test_l299_owned_module_with_missing_source_never_resolves_in_dep_packages() -> Result<()> {
+        let dir = make_temp_test_dir("l299_owned_missing_dep");
+        let proj = dir.join("proj");
+        let dep = proj.join(".lake/packages/dep_pkg");
+        fs::create_dir_all(dep.join("Shared"))?;
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(dep.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"dep_pkg\"\n[[lean_lib]]\nname = \"DepShared\"\nroots = []\nglobs = [\"Shared.+\"]\n",
+        )?;
+        fs::write(dep.join("Shared/M.lean"), "def m : Nat := 1\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep_pkg\"\npath = \".lake/packages/dep_pkg\"\n[[lean_lib]]\nname = \"App\"\n[[lean_lib]]\nname = \"Owner\"\nroots = []\nglobs = [\"Shared.+\"]\n",
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{"version": "1.1.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "scope": "", "name": "dep_pkg", "inherited": false, "dir": ".lake/packages/dep_pkg", "configFile": "lakefile.toml"}]}"#,
+        )?;
+        fs::write(proj.join("App.lean"), "import Shared.M\ndef app : Nat := m\n")?;
+        let cfg = resolve_project_config(&proj)?;
+        // Root `Owner` owns `Shared.M`, but `Shared/M.lean` is missing in the root package.
+        let err = build_module_dag(&cfg, &["App".to_string()])
+            .expect_err("an owned module with a missing source must not resolve in a dependency")
+            .to_string();
+        assert!(err.contains("Shared.M") && err.contains("missing"), "{err}");
+        // Control: once the root file exists, the root library owns and builds it.
+        fs::create_dir_all(proj.join("Shared"))?;
+        fs::write(proj.join("Shared/M.lean"), "def m : Nat := 3\n")?;
+        let cfg2 = resolve_project_config(&proj)?;
+        let dag = build_module_dag(&cfg2, &["App".to_string()])?;
+        assert!(dag.nodes["Shared.M"].is_root_pkg);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     /// L299 (#299, module resolution): a matching target whose source file is missing resolves
     /// to nothing (and the build fails like Lake fails), instead of silently trying an earlier
     /// candidate Lake would never build.

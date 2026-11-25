@@ -7737,6 +7737,31 @@ pub(super) fn resolve_module_in_package_mode(
     mod_name: &str,
     include_exe_roots: bool,
 ) -> Option<DiscoveredModuleSpec> {
+    match resolve_module_in_package_ownership(pkg, is_root_pkg, mod_name, include_exe_roots) {
+        ModuleOwnership::Found(spec) => Some(spec),
+        ModuleOwnership::OwnedMissing { .. } | ModuleOwnership::NotOwned => None,
+    }
+}
+
+/// Three-way module lookup: Lake's `findModule?` / `findTargetModule?` return the owning target
+/// even when its source file is missing (and fail at build time), so a caller that would try
+/// the next package on a plain `None` needs to see the difference (#299).
+pub(super) enum ModuleOwnership {
+    Found(DiscoveredModuleSpec),
+    /// A target of this package owns the module name, but its source file is missing.
+    OwnedMissing {
+        target_name: String,
+        src_path: PathBuf,
+    },
+    NotOwned,
+}
+
+pub(super) fn resolve_module_in_package_ownership(
+    pkg: &PackageConfig,
+    is_root_pkg: bool,
+    mod_name: &str,
+    include_exe_roots: bool,
+) -> ModuleOwnership {
     let rel_slash = module_name_to_rel_slash(mod_name);
     let pkg_src_base = pkg.pkg_root.join(&pkg.src_dir);
     let build_base = pkg.pkg_root.join(&pkg.build_dir);
@@ -7769,7 +7794,7 @@ pub(super) fn resolve_module_in_package_mode(
                         &exe.more_lean_args,
                         &exe.weak_lean_args,
                     );
-                    return Some(DiscoveredModuleSpec {
+                    return ModuleOwnership::Found(DiscoveredModuleSpec {
                         module_name: exe.root.clone(),
                         pkg_name: pkg.name.clone(),
                         pkg_base_name: pkg.base_name.clone(),
@@ -7805,7 +7830,10 @@ pub(super) fn resolve_module_in_package_mode(
                 // #299: Lake's `findTargetModule?` still returns this executable's module when
                 // its source file is missing and fails at build time; trying an earlier
                 // candidate instead would resolve a module Lake would never build.
-                return None;
+                return ModuleOwnership::OwnedMissing {
+                    target_name: exe.name.clone(),
+                    src_path: cand,
+                };
             }
         }
     }
@@ -7838,7 +7866,7 @@ pub(super) fn resolve_module_in_package_mode(
                                 | "LeanLib.sharedFacet"
                         )
                     });
-                return Some(DiscoveredModuleSpec {
+                return ModuleOwnership::Found(DiscoveredModuleSpec {
                     module_name: mod_name.to_string(),
                     pkg_name: pkg.name.clone(),
                     pkg_base_name: pkg.base_name.clone(),
@@ -7874,7 +7902,10 @@ pub(super) fn resolve_module_in_package_mode(
             // #299: Lake's `findModule?` keeps this library as the module's owner even when the
             // source file is missing and fails at build time; trying an earlier library instead
             // would build a module Lake would never build.
-            return None;
+            return ModuleOwnership::OwnedMissing {
+                target_name: lib.name.clone(),
+                src_path: cand,
+            };
         }
     }
     // 3. A package without targets: its source directory (Lake has no target to ask).
@@ -7882,7 +7913,7 @@ pub(super) fn resolve_module_in_package_mode(
     if pkg.libs.is_empty() && pkg.exes.is_empty() && cand.is_file() {
         let (lean_options, strong_args, weak_args) =
             compose_effective_args(pkg, &LeanOptionsMap::new(), &[], &[]);
-        return Some(DiscoveredModuleSpec {
+        return ModuleOwnership::Found(DiscoveredModuleSpec {
             module_name: mod_name.to_string(),
             pkg_name: pkg.name.clone(),
             pkg_base_name: pkg.base_name.clone(),
@@ -7909,7 +7940,7 @@ pub(super) fn resolve_module_in_package_mode(
             link_unsupported: pkg.link_unsupported.clone(),
         });
     }
-    None
+    ModuleOwnership::NotOwned
 }
 pub(crate) fn lean_githash_for_bin(lean_bin: &Path) -> Option<String> {
     let canon_bin = lean_bin.canonicalize().ok()?;
@@ -9409,18 +9440,25 @@ pub(super) fn build_module_dag_inner(
             // #299: Lake attaches a module's build settings through `findModule?` (the LAST
             // library that can build it), even when an earlier library's glob expanded it here.
             // Route `leanOptions` / `moreLeanArgs` / `weakLeanArgs` through that resolution so
-            // overlapping globs cannot hand a module the expanding library's options. The
+            // overlapping globs cannot hand a module the expanding library's options, and OR the
+            // owner's fail-closed `unsupported` flags in below, so a clean expanding library
+            // cannot launder a module of an owner turbo-lean cannot build like Lake. The
             // needs-trace attribution (`target_name`, facets, precompile) stays the expanding
-            // library's, which `lake_needs_trace_entries` documents and pins.
-            let (m_opts, m_strong, m_weak) = match resolve_importable_module_in_package(
-                target_pkg,
-                target_is_root,
-                &m_name,
-            ) {
-                Some(owner) if owner.src_path == m_path && owner.target_name != lib.name => {
-                    (owner.lean_options, owner.strong_args, owner.weak_args)
-                }
-                _ => (
+            // library's, which `lake_needs_trace_entries` documents and pins. With a single
+            // library the owner is the expander by construction, so the lookup is skipped.
+            let owner = if target_pkg.libs.len() > 1 {
+                resolve_importable_module_in_package(target_pkg, target_is_root, &m_name)
+                    .filter(|o| o.src_path == m_path && o.target_name != lib.name)
+            } else {
+                None
+            };
+            let (m_opts, m_strong, m_weak) = match &owner {
+                Some(o) => (
+                    o.lean_options.clone(),
+                    o.strong_args.clone(),
+                    o.weak_args.clone(),
+                ),
+                None => (
                     lean_options.clone(),
                     strong_args.clone(),
                     weak_args.clone(),
@@ -9454,15 +9492,18 @@ pub(super) fn build_module_dag_inner(
                     unsupported: target_pkg
                         .unsupported
                         .clone()
-                        .or_else(|| lib.unsupported.clone()),
+                        .or_else(|| lib.unsupported.clone())
+                        .or_else(|| owner.as_ref().and_then(|o| o.unsupported.clone())),
                     native_unsupported: target_pkg
                         .native_unsupported
                         .clone()
-                        .or_else(|| lib.native_unsupported.clone()),
+                        .or_else(|| lib.native_unsupported.clone())
+                        .or_else(|| owner.as_ref().and_then(|o| o.native_unsupported.clone())),
                     link_unsupported: target_pkg
                         .link_unsupported
                         .clone()
-                        .or_else(|| lib.link_unsupported.clone()),
+                        .or_else(|| lib.link_unsupported.clone())
+                        .or_else(|| owner.as_ref().and_then(|o| o.link_unsupported.clone())),
                 },
                 force_c_for_target || emit_c_default,
             ));
@@ -10180,6 +10221,22 @@ pub(super) fn build_module_dag_inner(
                     worklist.push_back((dep_spec, spec.precompile_modules || propagate_c_to_deps));
                     continue;
                 }
+                // #299: the root package may OWN `imp` (a library's globs select it) while its
+                // source file is missing. Lake fails there; falling through would resolve a
+                // same-named module from a dependency package instead.
+                if let ModuleOwnership::OwnedMissing {
+                    target_name,
+                    src_path,
+                } = resolve_module_in_package_ownership(root_pkg, true, imp, false)
+                {
+                    anyhow::bail!(
+                        "Missing source file for module `{}` (imported by `{}`): library `{}` of the root package owns it at {}, so Lake fails here instead of resolving it in another package",
+                        imp,
+                        spec.module_name,
+                        target_name,
+                        src_path.display()
+                    );
+                }
                 // 2. Check if `imp` resolves in any dependency package (failing closed on ambiguity)
                 let dep_matches = dep_closure_memo.resolve_dep_pkg_matches(cfg, imp);
                 if dep_matches.len() > 1 {
@@ -10246,6 +10303,27 @@ pub(super) fn build_module_dag_inner(
                     direct_dag_deps.push(imp.clone());
                     worklist.push_back((dep_spec.clone(), importer_needs_dep_c));
                     continue;
+                }
+                // #299: the same stop one package out: a dependency that OWNS `imp` with a
+                // missing source file is where Lake fails; never fall through to a prebuilt
+                // `.olean` or the toolchain for it.
+                if let Some((dp, target_name, src_path)) = cfg.dep_pkgs.iter().find_map(|dp| {
+                    match resolve_module_in_package_ownership(dp, false, imp, false) {
+                        ModuleOwnership::OwnedMissing {
+                            target_name,
+                            src_path,
+                        } => Some((dp, target_name, src_path)),
+                        _ => None,
+                    }
+                }) {
+                    anyhow::bail!(
+                        "Missing source file for module `{}` (imported by `{}`): library `{}` of package `{}` owns it at {}, so Lake fails here instead of resolving it elsewhere",
+                        imp,
+                        spec.module_name,
+                        target_name,
+                        dp.name,
+                        src_path.display()
+                    );
                 }
                 // 3. In trusted mode only, check if `imp` exists as a prebuilt `.olean` in `.lake/packages/*/.lake/build/lib/lean` or `LEAN_PATH`
                 // BEFORE checking the toolchain library, matching Lean's actual `LEAN_PATH` search order.
