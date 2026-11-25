@@ -2917,12 +2917,36 @@ FC_DONE:
     )
 }
 
-fn emit_builtin_fastcheck_llvm() -> String {
-    r#"; LeanNative FastCheck SIMD Falsification Module: LeanNative.FastCheck.Sample
-; Declarations (2): evm_add_comm_prop, evm_constrained_buggy_prop
-target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
+/// Builtin CPU fallback `(llvm triple, datalayout)` pair for the FastCheck
+/// SIMD module, mirroring the Lean-side `TargetArch.llvmTriple` /
+/// `TargetArch.dataLayout` constants (lean/LeanNative/IR/Types.lean).
+fn builtin_fastcheck_cpu_target(cpu_arch: &str) -> (&'static str, &'static str) {
+    match cpu_arch.trim() {
+        "arm64" | "aarch64" | "aarch64-unknown-linux-gnu" => (
+            "aarch64-unknown-linux-gnu",
+            "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128",
+        ),
+        _ => (
+            "x86_64-unknown-linux-gnu",
+            "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+        ),
+    }
+}
 
+/// CPU architecture of the build host, in superopt target spelling.
+fn host_cpu_arch() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x86_64"
+    }
+}
+
+fn emit_builtin_fastcheck_llvm(cpu_arch: &str) -> String {
+    let (triple, datalayout) = builtin_fastcheck_cpu_target(cpu_arch);
+    format!(
+        "; LeanNative FastCheck SIMD Falsification Module: LeanNative.FastCheck.Sample\n; Declarations (2): evm_add_comm_prop, evm_constrained_buggy_prop\ntarget datalayout = \"{datalayout}\"\ntarget triple = \"{triple}\"\n"
+    ) + r#"
 @lean_native_fastcheck_boundary_u64 = private unnamed_addr constant [8 x i64] [
   i64 0, i64 1, i64 2, i64 42, i64 255, i64 65535,
   i64 4294967295, i64 -1
@@ -2983,15 +3007,16 @@ attributes #0 = { nofree norecurse nounwind }
 !1 = !{!"llvm.loop.vectorize.enable", i1 true}
 !2 = !{!"llvm.loop.vectorize.width", i32 4}
 "#
-    .to_string()
 }
 
 /// Emit NVIDIA PTX 8.0 or LLVM 18 SIMD FastCheck code in-process with zero subprocess calls.
+/// The PTX path targets `sm_arch`; the LLVM CPU fallback targets the build host's
+/// architecture (x86_64 or aarch64 triple + datalayout).
 pub fn emit_lean_native_fastcheck_code(emit_ptx: bool, sm_arch: &str) -> Result<String> {
     if emit_ptx {
         Ok(emit_builtin_fastcheck_ptx(sm_arch))
     } else {
-        Ok(emit_builtin_fastcheck_llvm())
+        Ok(emit_builtin_fastcheck_llvm(host_cpu_arch()))
     }
 }
 
@@ -3654,8 +3679,29 @@ end TurboLean.FastCheck
                 && ptx_code.contains("lean_native_fastcheck_kernel")
         );
 
-        let llvm_code = emit_lean_native_fastcheck_code(false, "x86_64").unwrap();
+        let llvm_code = emit_lean_native_fastcheck_code(false, "").unwrap();
         assert!(llvm_code.contains("@lean_native_fastcheck_simd"));
+        // The builtin CPU fallback module targets the build host's architecture.
+        let expected_triple = if cfg!(target_arch = "aarch64") {
+            "target triple = \"aarch64-unknown-linux-gnu\""
+        } else {
+            "target triple = \"x86_64-unknown-linux-gnu\""
+        };
+        assert!(llvm_code.contains(expected_triple));
+        let arm_llvm = emit_builtin_fastcheck_llvm("aarch64");
+        assert!(arm_llvm.contains("target triple = \"aarch64-unknown-linux-gnu\""));
+        assert!(arm_llvm
+            .contains("target datalayout = \"e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128\""));
+        assert!(arm_llvm.contains("@lean_native_fastcheck_simd"));
+        // x86_64 emission is byte-identical to the historical hardcoded header.
+        let x86_llvm = emit_builtin_fastcheck_llvm("x86_64");
+        assert!(x86_llvm.starts_with(concat!(
+            "; LeanNative FastCheck SIMD Falsification Module: LeanNative.FastCheck.Sample\n",
+            "; Declarations (2): evm_add_comm_prop, evm_constrained_buggy_prop\n",
+            "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n",
+            "target triple = \"x86_64-unknown-linux-gnu\"\n\n",
+            "@lean_native_fastcheck_boundary_u64"
+        )));
     }
 
     #[test]
