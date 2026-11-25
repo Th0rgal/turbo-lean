@@ -107,6 +107,20 @@ TRACKED_BRIDGE_FILES: tuple[str, ...] = (
 # added or removed changes the tracked set and fails `--check` until the
 # committed results are re-measured.
 TRACKED_BRIDGE_DIRS: tuple[str, ...] = ("lean/LeanNative/IR/BridgeHelpers",)
+# Everything the measurement compiles or executes: the Lean tree (the tracked
+# bridge dirs included, so an untracked `*.lean` stray shows as `??`), this
+# script with its embedded audit driver, the C1 generators, and the C2 lake
+# packages. `--write-results` refuses while any of these is dirty, because
+# `measured_source_commit` claims the measurement came from HEAD's bytes. The
+# committed results file itself is deliberately absent: rewriting it is the
+# point of `--write-results`.
+MEASUREMENT_INPUT_PATHS: tuple[str, ...] = (
+    "lean",
+    "scripts/lcnf_coverage.py",
+    "scripts/test_scalar_frontend.py",
+    "scripts/fuzz_lcnf_conformance.py",
+    "verification/c2-lake-packages",
+)
 RESULTS_SCHEMA_VERSION = "turbo-lean-lcnf-coverage-results-v3"
 MEASURED_SOURCE_COMMIT_NOTE = (
     "`measured_source_commit` is the commit of the tree the measurement was taken from "
@@ -574,30 +588,46 @@ def _tracked_bridge_paths(root_dir: Path = ROOT_DIR) -> list[str]:
     (test fixture roots), the direct-children filesystem glob is the fallback.
     """
     paths = set(TRACKED_BRIDGE_FILES)
+    inside_work_tree: bool | None = None
     for rel_dir in TRACKED_BRIDGE_DIRS:
         d = root_dir / rel_dir
         if not d.is_dir():
             continue
-        names: list[str] = []
-        try:
-            proc = subprocess.run(
-                ["git", "ls-files", "--", rel_dir],
+        if inside_work_tree is None:
+            probe = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
                 cwd=str(root_dir),
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
-        except Exception:
-            proc = None
-        if proc is not None and proc.returncode == 0 and proc.stdout.strip():
-            names = [
-                ln
-                for ln in proc.stdout.splitlines()
-                if ln.endswith(".lean") and "/" not in ln[len(rel_dir) + 1 :]
-            ]
-        else:
-            names = [f"{rel_dir}/{f.name}" for f in sorted(d.glob("*.lean"))]
-        paths.update(names)
+            inside_work_tree = probe.returncode == 0 and probe.stdout.strip() == "true"
+        if not inside_work_tree:
+            # Not a git work tree (test fixture roots): direct-children glob.
+            paths.update(f"{rel_dir}/{f.name}" for f in sorted(d.glob("*.lean")))
+            continue
+        # `-z` gives NUL-separated raw paths, so a quotable (non-ASCII or
+        # special-character) tracked path is never dropped by the filter.
+        # Inside a work tree there is NO glob fallback: an empty tracked set
+        # stays empty, and any other git failure is raised, so an untracked
+        # stray can never silently rejoin the measured set.
+        proc = subprocess.run(
+            ["git", "ls-files", "-z", "--", rel_dir],
+            cwd=str(root_dir),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"`git ls-files` failed for `{rel_dir}`; the tracked bridge set "
+                f"cannot be enumerated:\n{proc.stderr}"
+            )
+        paths.update(
+            p
+            for p in proc.stdout.split("\0")
+            if p.endswith(".lean") and "/" not in p[len(rel_dir) + 1 :]
+        )
     return sorted(paths)
 
 
@@ -608,6 +638,37 @@ def _bridge_digests(root_dir: Path = ROOT_DIR) -> dict[str, dict[str, str]]:
         p = root_dir / rel
         digests[rel] = {"actual_sha256": sha256_file(p) if p.is_file() else ""}
     return digests
+
+
+def _refuse_dirty_measurement_inputs(root_dir: Path = ROOT_DIR) -> None:
+    """Refuse `--write-results` on a dirty measurement tree (fail closed).
+
+    `measured_source_commit` claims the measurement came from HEAD's bytes, so
+    every path in `MEASUREMENT_INPUT_PATHS` must be clean. Untracked files
+    count (`?? ...` rows): an untracked `*.lean` under a tracked bridge dir is
+    an input HEAD does not contain, and it was exactly what the earlier
+    digest-keys pathspec missed. Ignored build outputs (`.lake/`) do not show
+    in porcelain and do not refuse.
+    """
+    proc = subprocess.run(
+        ["git", "status", "--porcelain", "--", *MEASUREMENT_INPUT_PATHS],
+        cwd=str(root_dir),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "refusing to write results: `git status` failed for the measurement "
+            f"inputs:\n{proc.stderr}"
+        )
+    if proc.stdout.strip():
+        dirty = ", ".join(sorted(ln[3:].strip() for ln in proc.stdout.splitlines() if ln.strip()))
+        raise RuntimeError(
+            "refusing to write results: measurement inputs have uncommitted or "
+            f"untracked changes ({dirty}); the recorded `measured_source_commit` "
+            "would not match the measured bytes"
+        )
 
 
 def _is_hex_digest(value: Any, length: int) -> bool:
@@ -1401,24 +1462,9 @@ def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[
         digests[rel] = actual
     if not digests:
         raise RuntimeError("refusing to write results: live report tracks no bridge files")
-    status = subprocess.run(
-        ["git", "status", "--porcelain", "--", *sorted(digests)],
-        cwd=str(root_dir),
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if status.returncode != 0:
-        raise RuntimeError(
-            "refusing to write results: `git status` failed for the tracked bridge files:\n"
-            f"{status.stderr}"
-        )
-    if status.stdout.strip():
-        dirty = ", ".join(sorted(ln[3:].strip() for ln in status.stdout.splitlines() if ln.strip()))
-        raise RuntimeError(
-            "refusing to write results: tracked bridge files have uncommitted changes "
-            f"({dirty}); the recorded `measured_source_commit` would not match the measured bytes"
-        )
+    # Defense in depth: main() runs this before the measurement; a direct
+    # results_document caller gets the same refusal here.
+    _refuse_dirty_measurement_inputs(root_dir)
     corpora: dict[str, Any] = {}
     for cname, corp in report.get("corpora", {}).items():
         if corp.get("status") == "unknown" or corp.get("measurement_source") != "live_invocation":
@@ -1950,6 +1996,11 @@ def check_coverage_report(
                     )
                 else:
                     _compare_committed_digests(rep, base_digests, errors)
+        else:
+            errors.append(
+                "Missing committed results file scripts/lcnf_coverage_results.json: "
+                "bridge-digest drift cannot be gated (run --write-results to create it)"
+            )
 
     if verify_live:
         live = execute_live_lean_audit(root_dir)
@@ -2895,9 +2946,11 @@ class TestLcnfCoverage(unittest.TestCase):
             self.assertFalse(json.loads(out.getvalue())["ok"])
 
     def test_write_results_refuses_dirty_tracked_bridge_files(self) -> None:
-        # Review F4: `--write-results` must refuse when a tracked bridge file
-        # has uncommitted changes — the recorded `measured_source_commit`
-        # would not match the measured bytes.
+        # Round-1 F4 + round-2 F5: `--write-results` must refuse when a
+        # measurement input has uncommitted changes, and the test must pin the
+        # exact git command line, not just the canned outcome: the guard runs
+        # `git status --porcelain --` over MEASUREMENT_INPUT_PATHS (which
+        # covers the bridge dirs, so an edit AND an untracked stray both show).
         import unittest.mock as mock
 
         m = sys.modules[__name__]
@@ -2909,8 +2962,13 @@ class TestLcnfCoverage(unittest.TestCase):
             run.return_value = mock.Mock(returncode=0, stdout=f" M {rel}\n", stderr="")
             with self.assertRaises(RuntimeError) as ctx:
                 results_document(report, ROOT_DIR)
-        self.assertIn("uncommitted changes", str(ctx.exception))
+        self.assertIn("uncommitted", str(ctx.exception))
         self.assertIn(rel, str(ctx.exception))
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:4], ["git", "status", "--porcelain", "--"])
+        for p in MEASUREMENT_INPUT_PATHS:
+            self.assertIn(p, argv[4:], argv)
+        self.assertEqual(run.call_args.kwargs.get("cwd"), str(ROOT_DIR))
         # Control: a clean status writes the document.
         with mock.patch.object(m, "_git_head", return_value="a" * 40), mock.patch.object(
             m.subprocess, "run"
@@ -2918,6 +2976,126 @@ class TestLcnfCoverage(unittest.TestCase):
             run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
             doc = results_document(report, ROOT_DIR)
         self.assertEqual(doc["bridge_file_sha256"], {rel: "0" * 64})
+
+    def test_write_results_refuses_untracked_bridge_stray(self) -> None:
+        # Round-2 F1, real temp git repo: an UNTRACKED `*.lean` directly under
+        # a tracked bridge dir is a measurement input HEAD does not contain;
+        # the dirty guard must refuse (`?? ...` in porcelain), where the
+        # round-1 guard's digest-only pathspec let it through silently.
+        with tempfile.TemporaryDirectory(prefix="lcnf-stray-") as tmp:
+            root = Path(tmp)
+            helpers = root / TRACKED_BRIDGE_DIRS[0]
+            helpers.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True, text=True)
+            (helpers / "Tracked.lean").write_text("-- tracked\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "init"],
+                cwd=root, check=True, capture_output=True, text=True,
+            )
+            _refuse_dirty_measurement_inputs(root)  # clean repo: no refusal
+            (helpers / "StrayScratch.lean").write_text("-- untracked stray\n", encoding="utf-8")
+            with self.assertRaises(RuntimeError) as ctx:
+                _refuse_dirty_measurement_inputs(root)
+            self.assertIn("StrayScratch.lean", str(ctx.exception))
+            # End to end: results_document refuses on the same repo.
+            report = {
+                "bridge_source_digests": {
+                    f"{TRACKED_BRIDGE_DIRS[0]}/Tracked.lean": {"actual_sha256": "0" * 64}
+                },
+                "corpora": {},
+            }
+            with self.assertRaises(RuntimeError) as ctx2:
+                results_document(report, root)
+            self.assertIn("StrayScratch.lean", str(ctx2.exception))
+
+    def test_write_results_dirty_guard_runs_before_measurement(self) -> None:
+        # Round-2 F2 (cheap half): under `--write-results` the dirty guard runs
+        # at the start of main, before the minutes-long audit, and a refusal is
+        # a named [ERROR] + exit 1, not a traceback after the build.
+        import contextlib
+        import io
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            m, "_refuse_dirty_measurement_inputs",
+            side_effect=RuntimeError("refusing to write results: dirty fixture"),
+        ) as guard, mock.patch.object(
+            m, "build_coverage_report",
+            side_effect=AssertionError("measurement ran before the dirty guard"),
+        ) as bcr, mock.patch.object(
+            sys, "argv", ["lcnf_coverage.py", "--write-results"]
+        ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = m.main()
+        self.assertEqual(rc, 1)
+        guard.assert_called_once()
+        bcr.assert_not_called()
+        self.assertIn("refusing to write results", err.getvalue())
+
+    def test_json_mode_errors_when_results_file_missing(self) -> None:
+        # Round-2 F3: outside --check, a MISSING committed results file must be
+        # a named error (ok=false), not a silent skip of the digest gate —
+        # `--json` is the H1.0 acceptance command. `--write-results` is the
+        # bootstrap path and keeps compare_results_digests off.
+        import shutil
+
+        with tempfile.TemporaryDirectory(prefix="lcnf-noresults-") as tmp:
+            root = Path(tmp)
+            for rel in _tracked_bridge_paths(ROOT_DIR):
+                dst = root / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT_DIR / rel, dst)
+            rep = build_coverage_report(root)
+            rep["lcnf_constructor_matrix"] = {
+                "rows": [],
+                "summary": {"total": 0, "proved": 0, "lowered_unproved": 0, "rejected": 0},
+            }
+            chk = check_coverage_report(root, rep)
+            self.assertFalse(chk["ok"], "missing results file passed the non-check digest gate")
+            self.assertTrue(
+                any("Missing committed results file" in e for e in chk["errors"]),
+                chk["errors"],
+            )
+
+    def test_tracked_bridge_paths_git_enumeration_edges(self) -> None:
+        # Round-2 F4, real temp git repos: `-z` keeps a quotable (non-ASCII)
+        # tracked path in the set; an untracked stray never joins it inside a
+        # work tree, even when NOTHING is tracked under the dir (no silent
+        # glob fallback there); the glob fallback applies only outside a git
+        # work tree.
+        rel_dir = TRACKED_BRIDGE_DIRS[0]
+        with tempfile.TemporaryDirectory(prefix="lcnf-lsfiles-") as tmp:
+            root = Path(tmp)
+            helpers = root / rel_dir
+            helpers.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True, text=True)
+            (helpers / "Hélper.lean").write_text("-- unicode-named helper\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "init"],
+                cwd=root, check=True, capture_output=True, text=True,
+            )
+            (helpers / "StrayScratch.lean").write_text("-- untracked stray\n", encoding="utf-8")
+            paths = _tracked_bridge_paths(root)
+            self.assertIn(f"{rel_dir}/Hélper.lean", paths, paths)
+            self.assertNotIn(f"{rel_dir}/StrayScratch.lean", paths, paths)
+        with tempfile.TemporaryDirectory(prefix="lcnf-lsfiles-none-") as tmp:
+            root = Path(tmp)
+            helpers = root / rel_dir
+            helpers.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True, text=True)
+            (helpers / "OnlyStray.lean").write_text("-- untracked stray\n", encoding="utf-8")
+            paths = _tracked_bridge_paths(root)
+            self.assertNotIn(f"{rel_dir}/OnlyStray.lean", paths, paths)
+        with tempfile.TemporaryDirectory(prefix="lcnf-lsfiles-nongit-") as tmp:
+            root = Path(tmp)
+            helpers = root / rel_dir
+            helpers.mkdir(parents=True)
+            (helpers / "PlainGlob.lean").write_text("-- glob fallback outside git\n", encoding="utf-8")
+            paths = _tracked_bridge_paths(root)
+            self.assertIn(f"{rel_dir}/PlainGlob.lean", paths, paths)
 
     def test_results_schema_rejects_unknown_keys_and_bad_provenance(self) -> None:
         # H1.0a-V hardening: each of these mutations passed the pre-hardening
@@ -3306,7 +3484,7 @@ unsafe def main (args : List String) : IO Unit := do
         )
         self.assertEqual(plain["total_declarations"], 1, plain)
         self.assertEqual(plain["proved"], 1, plain)
-        self.assertGreaterEqual(plain["compiler_aux_decls_excluded"], 1, plain)
+        self.assertEqual(plain["compiler_aux_decls_excluded"], 1, plain)
         # A local closure over a fold lambda-lifts: more aux decls excluded,
         # and the published sum invariant holds on what IS counted.
         closure = measure_fixture_corpus(
@@ -3316,10 +3494,22 @@ unsafe def main (args : List String) : IO Unit := do
             "def aux_fold (x : UInt64) : UInt64 := (List.range 3).foldl (fun a _ => helper a) x\n",
             mod_name="AuxClosureFixture",
         )
-        self.assertGreaterEqual(closure["compiler_aux_decls_excluded"], 2, closure)
+        # Round-2 F5: pin the exact measured values on the pinned toolchain
+        # (the sum assertion that stood here was a tautology of auditMods).
+        # total == 4, NOT 2: the 2 authored decls plus 2 compiler-generated
+        # fold specializations that `isCompilerGeneratedAuxDecl` does NOT
+        # class as aux, counted honestly in the denominator (helper proves;
+        # the other 3 are rejected heap/closure shapes). aux == 3 > plain's 1,
+        # so the lambda-lifted closure itself is among the excluded.
         self.assertEqual(
-            closure["total_declarations"],
-            closure["proved"] + closure["lowered_unproved"] + closure["rejected"],
+            (
+                closure["total_declarations"],
+                closure["proved"],
+                closure["lowered_unproved"],
+                closure["rejected"],
+                closure["compiler_aux_decls_excluded"],
+            ),
+            (4, 1, 0, 3, 3),
             closure,
         )
 
@@ -3517,6 +3707,15 @@ def main() -> int:
     if args.write_results and args.check:
         print("  [ERROR] --write-results and --check are mutually exclusive", file=sys.stderr)
         return 2
+
+    if args.write_results:
+        # Fail in seconds on a dirty measurement tree, not minutes into the
+        # audit: the same guard runs again inside results_document.
+        try:
+            _refuse_dirty_measurement_inputs(ROOT_DIR)
+        except RuntimeError as exc:
+            print(f"  [ERROR] {exc}", file=sys.stderr)
+            return 1
 
     chk = check_coverage_report(
         ROOT_DIR,
