@@ -4279,29 +4279,18 @@ pub(super) fn parse_lean_options_expr(expr: &str) -> Result<LeanOptionsMap> {
     }
     let pairs: Vec<String> = pairs.into_iter().filter(|p| !p.is_empty()).collect();
     for p in pairs {
+        // #299 (Fable r9): Lake 4.35 rejects plain `(k, v)` `Prod` tuples and explicit
+        // `LeanOption.mk` applications in `leanOptions` arrays (unknown constants under the
+        // module system); only the anonymous-constructor form `⟨k, v⟩` elaborates there.
         let trimmed = p
             .trim()
             .strip_prefix('⟨')
             .and_then(|r| r.strip_suffix('⟩'))
-            .or_else(|| p.trim().strip_prefix('(').and_then(|r| r.strip_suffix(')')))
             .map(str::trim);
         if let Some(inner_pair) = trimmed {
             let Some((k_raw, v_raw)) = inner_pair.split_once(',') else {
                 anyhow::bail!("Invalid `leanOptions` tuple `{}` in lakefile.lean", p);
             };
-            let k = lean_option_name_literal(k_raw)?;
-            let v = lean_option_literal(v_raw, &k.to_lean_string())?;
-            map.insert(k, v);
-        } else if let Some(rest) = p.trim().strip_prefix("LeanOption.mk ") {
-            let Some((k_raw, v_raw)) = rest.trim().split_once(char::is_whitespace) else {
-                anyhow::bail!("Unsupported `leanOptions` entry `{}` in lakefile.lean", p);
-            };
-            let v_raw = v_raw.trim();
-            let v_raw = v_raw
-                .strip_prefix('(')
-                .and_then(|r| r.strip_suffix(')'))
-                .filter(|inner| lean_scan(inner, "").is_ok_and(|(_, d)| d == 0))
-                .unwrap_or(v_raw);
             let k = lean_option_name_literal(k_raw)?;
             let v = lean_option_literal(v_raw, &k.to_lean_string())?;
             map.insert(k, v);
@@ -4862,9 +4851,10 @@ pub(super) fn lakefile_is_plain_with_policy(clean: &str, is_root_pkg: bool) -> b
             .any(|a| {
                 t.strip_prefix(a).is_some_and(|rest| {
                     let rest = rest.trim();
-                    !is_root_pkg
-                        && rest.ends_with('{')
-                        && (rest.starts_with("lean_lib ") || rest.starts_with("lean_exe "))
+                    // #299: Lake accepts an inline target attribute on any package's `where`,
+                    // bare and `{` target headers alike (`lake init` emits the root inline
+                    // `@[default_target] lean_exe ... where` form).
+                    rest.starts_with("lean_lib ") || rest.starts_with("lean_exe ")
                 })
             });
         let tokens = if inline_attr {
@@ -5031,6 +5021,10 @@ pub(super) fn collect_lakefile_abbrevs_with_policy(clean: &str, is_root_pkg: boo
         }
         out.value_decls.insert(name.clone());
         let header = rest[raw_name.len()..].trim_start();
+        // #299 (Fable r9) flags untyped `abbrev xs := #[⟨...⟩]` as a form newer Lake rejects,
+        // but Mathlib's real lakefile binds `mathlibLeanOptions` exactly that way on its pinned
+        // toolchain (`test_computed_lean_options_mathlib_lakefile`), so the untyped form stays
+        // accepted: rejecting it would refuse valid input, the failure mode #299 asks to avoid.
         let body_start = match header.split_once(":=") {
             Some((ty, body)) if ty.trim().is_empty() || ty.starts_with(':') => Some(body),
             _ => None,
@@ -5905,6 +5899,27 @@ pub(super) fn parse_lakefile_lean_inner(
                                 }
                             }
                             "globs" => {
+                                // #299 (Astra r10): a non-plain lakefile can shadow the `Glob`
+                                // constructor spellings this parser reads literally (e.g.
+                                // `def Glob.submodules ... := .one`), so constructor-named glob
+                                // items fail closed there like `leanOptions` bindings do;
+                                // backtick name-literal globs cannot be shadowed and still parse.
+                                if lean_option_bindings.scoped
+                                    && ["Glob.", ".submodules ", ".andSubmodules ", ".one "]
+                                        .iter()
+                                        .any(|c| val_accum.contains(c))
+                                {
+                                    unsupported_lake_field(
+                                        &mut lib.unsupported,
+                                        is_root_pkg,
+                                        format!(
+                                            "Unsupported `globs` constructor expression `{}` in non-plain {} at line {} (a declaration could shadow `Glob` constructors)",
+                                            val_accum,
+                                            lean_path.display(),
+                                            line_no
+                                        ),
+                                    )?;
+                                }
                                 lib.globs = nonempty(parse_lean_globs_expr(&val_accum)?, "globs")?
                             }
                             "moreLeanArgs" => {
@@ -6258,10 +6273,17 @@ where
             let name_ok = rest.starts_with(char::is_whitespace)
                 && words.next().is_some_and(|n| {
                     // `«name»` or Lake's `"name"` (`lake init` emits `package "demo" where`).
+                    let quoted = n.len() >= 2 && n.starts_with('"') && n.ends_with('"');
                     let n = n
                         .strip_prefix('"')
                         .and_then(|n| n.strip_suffix('"'))
                         .unwrap_or(n);
+                    // #299: a dot inside a quoted header is one atomic `Name.mkSimple` segment
+                    // to Lake (`lean_lib "Foo.Bar"` builds `Foo.Bar.lean`), while this parser
+                    // would split it into `Foo/Bar.lean`: fail closed.
+                    if quoted && n.contains('.') {
+                        return false;
+                    }
                     n.split('.').all(|seg| {
                         let seg = seg
                             .strip_prefix('«')
@@ -6935,6 +6957,22 @@ pub(super) fn finalize_package_config(
     explicit_empty_roots: &BTreeSet<usize>,
     hash_inputs_from_disk: bool,
 ) -> Result<()> {
+    // #299 (Fable r9): Lake rejects a configuration declaring two `lean_lib` targets under one
+    // name (a duplicate Lean declaration in `lakefile.lean`); accepting it would silently build
+    // with whichever of the two configurations module resolution happens to pick.
+    let dup_lib = pkg.libs.iter().enumerate().find_map(|(i, l)| {
+        pkg.libs[..i]
+            .iter()
+            .any(|p| p.name == l.name)
+            .then(|| l.name.clone())
+    });
+    if let Some(dup) = dup_lib {
+        unsupported_lake_field(
+            &mut pkg.unsupported,
+            is_root_pkg,
+            format!("Duplicate `lean_lib` `{}` in {}", dup, config_path.display()),
+        )?;
+    }
     for (i, lib) in pkg.libs.iter_mut().enumerate() {
         // Lake's default `roots` is `#[name]`; an explicit `roots = []` stays empty.
         if lib.roots.is_empty() && !lib.name.is_empty() && !explicit_empty_roots.contains(&i) {
@@ -7764,6 +7802,10 @@ pub(super) fn resolve_module_in_package_mode(
                             .or_else(|| exe.link_unsupported.clone()),
                     });
                 }
+                // #299: Lake's `findTargetModule?` still returns this executable's module when
+                // its source file is missing and fails at build time; trying an earlier
+                // candidate instead would resolve a module Lake would never build.
+                return None;
             }
         }
     }
@@ -7829,6 +7871,10 @@ pub(super) fn resolve_module_in_package_mode(
                         .or_else(|| lib.link_unsupported.clone()),
                 });
             }
+            // #299: Lake's `findModule?` keeps this library as the module's owner even when the
+            // source file is missing and fails at build time; trying an earlier library instead
+            // would build a module Lake would never build.
+            return None;
         }
     }
     // 3. A package without targets: its source directory (Lake has no target to ask).
@@ -9353,6 +9399,26 @@ pub(super) fn build_module_dag_inner(
             if force_dynlib_for_target {
                 dy_mods.insert(m_name.clone());
             }
+            // #299: Lake attaches a module's build settings through `findModule?` (the LAST
+            // library that can build it), even when an earlier library's glob expanded it here.
+            // Route `leanOptions` / `moreLeanArgs` / `weakLeanArgs` through that resolution so
+            // overlapping globs cannot hand a module the expanding library's options. The
+            // needs-trace attribution (`target_name`, facets, precompile) stays the expanding
+            // library's, which `lake_needs_trace_entries` documents and pins.
+            let (m_opts, m_strong, m_weak) = match resolve_importable_module_in_package(
+                target_pkg,
+                target_is_root,
+                &m_name,
+            ) {
+                Some(owner) if owner.src_path == m_path && owner.target_name != lib.name => {
+                    (owner.lean_options, owner.strong_args, owner.weak_args)
+                }
+                _ => (
+                    lean_options.clone(),
+                    strong_args.clone(),
+                    weak_args.clone(),
+                ),
+            };
             specs_out.push((
                 DiscoveredModuleSpec {
                     module_name: m_name,
@@ -9372,9 +9438,9 @@ pub(super) fn build_module_dag_inner(
                     precompile_modules: precompile,
                     emit_c_default,
                     is_exe_target: false,
-                    lean_options: lean_options.clone(),
-                    strong_args: strong_args.clone(),
-                    weak_args: weak_args.clone(),
+                    lean_options: m_opts,
+                    strong_args: m_strong,
+                    weak_args: m_weak,
                     extern_lib_digests: extern_digests.clone(),
                     custom_target_needs: lib.custom_target_needs.clone(),
                     pkg_config_digest: target_pkg.config_digest.clone(),
