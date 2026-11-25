@@ -2625,18 +2625,21 @@ lean_exe «demo-exe» where
             .next(),
             Some(&LeanOptionValue::Bool(false))
         );
-        // Option names must be name literals. #299 (Fable r9): Lake 4.35 rejects explicit
-        // `LeanOption.mk` applications and plain `(k, v)` tuples (unknown constants under the
-        // module system), so they fail closed here too.
+        // Option names must be name literals. #299: Lake 4.35 rejects explicit `LeanOption.mk`
+        // applications and plain `(k, v)` tuples (unknown constants under the module system):
+        // the root fails closed at parse time, a dependency records `unsupported` so only its
+        // own modules fail, never the whole workspace configuration.
+        for e in ["#[⟨optKey, false⟩]", "#[⟨``linter.x, false⟩]"] {
+            assert!(parse(&lib(e, "")).is_err(), "{e}");
+        }
         for e in [
-            "#[⟨optKey, false⟩]",
-            "#[⟨``linter.x, false⟩]",
             "#[LeanOption.mk optKey false]",
             "#[LeanOption.mk ` true]",
             "#[LeanOption.mk `linter.n (.ofNat 1500), LeanOption.mk `linter.s \"a b\"]",
             "#[(`linter.a, false)]",
         ] {
-            assert!(parse(&lib(e, "")).is_err(), "{e}");
+            let dep = parse(&lib(e, "")).unwrap();
+            assert!(dep.libs[0].unsupported.is_some(), "{e}");
         }
         // Every scope form disables resolution; binders, dotted and universe names are rejected.
         for prelude in [
@@ -3679,7 +3682,9 @@ lean_lib Smoke where
             .expect_err("stale pinned out-of-tree dep must not become a DAG build node")
             .to_string();
         assert!(
-            err.contains("outside the project root") && err.contains("lake build DepPin"),
+            err.contains("outside the project root")
+                && err.contains("`lake build +DepPin` from the project root")
+                && !err.contains("adopted read-only"),
             "unexpected error: {err}"
         );
         // 2. The statement path (`allow_prebuilt_dep_pkgs = true`, `check`) keeps today's shape.
@@ -3696,6 +3701,15 @@ lean_lib Smoke where
         let cfg_in = resolve_project_config(&proj)?;
         let dag_in = build_module_dag(&cfg_in, &["App".to_string()])?;
         assert!(dag_in.nodes.contains_key("DepPin"));
+        // 4. Control: a packages dir that is ITSELF a symlink to another volume (a RAM or
+        //    scratch disk) still counts as the project's own: the gate compares against the
+        //    canonicalized packages dir, not only the project root.
+        let ext_pkgs = dir.join("ext_pkgs");
+        fs::rename(proj.join(".lake/packages"), &ext_pkgs)?;
+        std::os::unix::fs::symlink(&ext_pkgs, proj.join(".lake/packages"))?;
+        let cfg_ext = resolve_project_config(&proj)?;
+        let dag_ext = build_module_dag(&cfg_ext, &["App".to_string()])?;
+        assert!(dag_ext.nodes.contains_key("DepPin"));
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
@@ -3754,6 +3768,84 @@ lean_lib Smoke where
             Some(&LeanOptionValue::Bool(true))
         );
         assert!(!node.lean_options.contains_key(&first));
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// L299 fix-forward (#299): a glob-expanded module inherits the fail-closed `unsupported`
+    /// flags of the library module resolution assigns it to, not only its options: an owning
+    /// library turbo-lean cannot build like Lake must stop the build even when the expanding
+    /// library is clean.
+    #[test]
+    fn test_l299_glob_expansion_inherits_owner_unsupported_gate() -> Result<()> {
+        let dir = make_temp_test_dir("l299_owner_unsupported");
+        let proj = dir.join("proj");
+        let dep = proj.join(".lake/packages/dep_pkg");
+        fs::create_dir_all(dep.join("Shared"))?;
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(dep.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            dep.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage dep_pkg\ntarget helperT pkg : Unit := do\n  return .nil\nlean_lib First where\n  globs := #[`Shared.+]\nlean_lib Second where\n  globs := #[`Shared.+]\n  needs := #[helperT]\n",
+        )?;
+        fs::write(dep.join("Shared/M.lean"), "def m : Nat := 1\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep_pkg\"\npath = \".lake/packages/dep_pkg\"\n[[lean_lib]]\nname = \"App\"\n",
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{"version": "1.1.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "scope": "", "name": "dep_pkg", "inherited": false, "dir": ".lake/packages/dep_pkg", "configFile": "lakefile.lean"}]}"#,
+        )?;
+        fs::write(proj.join("App.lean"), "def app : Nat := 2\n")?;
+        let cfg = resolve_project_config(&proj)?;
+        // `Second` (the owner by `findModule?`) carries `unsupported` (a custom-target `needs`);
+        // expanding `First`'s glob must not launder `Shared.M` past the fail-closed gate.
+        let err = build_module_dag(&cfg, &["@dep_pkg/First".to_string()])
+            .expect_err("owner-unsupported module must not build through a clean expander")
+            .to_string();
+        assert!(err.contains("like Lake"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// L299 fix-forward (#299): a module the root package OWNS (a library's globs select it)
+    /// whose source file is missing must fail like Lake, never resolve to a same-named module
+    /// in a dependency package one lookup level further out.
+    #[test]
+    fn test_l299_owned_module_with_missing_source_never_resolves_in_dep_packages() -> Result<()> {
+        let dir = make_temp_test_dir("l299_owned_missing_dep");
+        let proj = dir.join("proj");
+        let dep = proj.join(".lake/packages/dep_pkg");
+        fs::create_dir_all(dep.join("Shared"))?;
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(dep.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"dep_pkg\"\n[[lean_lib]]\nname = \"DepShared\"\nroots = []\nglobs = [\"Shared.+\"]\n",
+        )?;
+        fs::write(dep.join("Shared/M.lean"), "def m : Nat := 1\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep_pkg\"\npath = \".lake/packages/dep_pkg\"\n[[lean_lib]]\nname = \"App\"\n[[lean_lib]]\nname = \"Owner\"\nroots = []\nglobs = [\"Shared.+\"]\n",
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{"version": "1.1.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "scope": "", "name": "dep_pkg", "inherited": false, "dir": ".lake/packages/dep_pkg", "configFile": "lakefile.toml"}]}"#,
+        )?;
+        fs::write(proj.join("App.lean"), "import Shared.M\ndef app : Nat := m\n")?;
+        let cfg = resolve_project_config(&proj)?;
+        // Root `Owner` owns `Shared.M`, but `Shared/M.lean` is missing in the root package.
+        let err = build_module_dag(&cfg, &["App".to_string()])
+            .expect_err("an owned module with a missing source must not resolve in a dependency")
+            .to_string();
+        assert!(err.contains("Shared.M") && err.contains("missing"), "{err}");
+        // Control: once the root file exists, the root library owns and builds it.
+        fs::create_dir_all(proj.join("Shared"))?;
+        fs::write(proj.join("Shared/M.lean"), "def m : Nat := 3\n")?;
+        let cfg2 = resolve_project_config(&proj)?;
+        let dag = build_module_dag(&cfg2, &["App".to_string()])?;
+        assert!(dag.nodes["Shared.M"].is_root_pkg);
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
@@ -3823,6 +3915,25 @@ lean_lib Smoke where
             parse_lakefile_lean(&dir, &lf, true).unwrap().libs[0].name,
             "Demo"
         );
+        // A quoted PACKAGE name with a dot stays accepted (`lake init foo.bar` emits it): a
+        // package name never becomes a source path. Same for input targets, whose name is a
+        // literal path component.
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\npackage \"foo.bar\" where\nlean_lib Demo where\n",
+        )
+        .unwrap();
+        assert_eq!(parse_lakefile_lean(&dir, &lf, true).unwrap().name, "foo.bar");
+        fs::write(dir.join("widget.tar"), "x").unwrap();
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\npackage demo\ninput_file \"widget.tar\" where\n  path := \"widget.tar\"\nlean_lib Demo where\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_lakefile_lean(&dir, &lf, true).unwrap().inputs[0].name,
+            "widget.tar"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3887,23 +3998,27 @@ lean_lib Smoke where
             pkg.libs[0].globs,
             vec![GlobSpec::Submodules("Right".to_string())]
         );
-        // ...and backtick-literal globs survive beside a dotted helper.
-        let literal = "import Lake\nopen Lake DSL\npackage dep\ndef Glob.submodules (n : Lake.Glob) : Lake.Glob := n\nlean_lib Dep where\n  globs := #[`Dep.+]\n";
-        fs::write(&lf, literal).unwrap();
-        let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
-        assert!(pkg.libs[0].unsupported.is_none());
+        // ...and backtick-literal globs survive beside a dotted helper, even when the literal
+        // NAME contains "Glob." as a segment (a name literal is not a constructor reference).
+        for globs in ["#[`Dep.+]", "#[`Dep.Glob.+]"] {
+            let literal = format!("import Lake\nopen Lake DSL\npackage dep\ndef Glob.submodules (n : Lake.Glob) : Lake.Glob := n\nlean_lib Dep where\n  globs := {globs}\n");
+            fs::write(&lf, &literal).unwrap();
+            let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+            assert!(pkg.libs[0].unsupported.is_none(), "{globs}");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
     /// L299 (#299, accepted-but-invalid forms): Lake 4.35 rejects plain `(k, v)` tuples and
-    /// explicit `LeanOption.mk` applications in `leanOptions`; turbo-lean fails closed on both
-    /// and keeps the `⟨k, v⟩` form. The bullet's third form, an untyped
-    /// `abbrev xs := #[⟨...⟩]`, stays accepted: Mathlib's real lakefile binds
-    /// `mathlibLeanOptions` that way on its pinned toolchain
+    /// explicit `LeanOption.mk` applications in `leanOptions`: the root package fails closed at
+    /// parse time, a dependency records `unsupported` so only its own modules fail (a dependency
+    /// must not refuse the whole workspace configuration). The `⟨k, v⟩` form stays. The
+    /// bullet's third form, an untyped `abbrev xs := #[⟨...⟩]`, stays accepted: Mathlib's real
+    /// lakefile binds `mathlibLeanOptions` that way on its pinned toolchain
     /// (`test_computed_lean_options_mathlib_lakefile`), and refusing valid input is the failure
     /// mode #299 asks to avoid.
     #[test]
-    fn test_l299_prod_tuple_lean_option_mk_and_untyped_abbrev_fail_closed() {
+    fn test_l299_prod_tuple_and_lean_option_mk_fail_closed_untyped_abbrev_accepted() {
         let dir = make_temp_test_dir("l299_invalid_forms");
         let lf = dir.join("lakefile.lean");
         let parse = |src: &str| {
@@ -3913,8 +4028,15 @@ lean_lib Smoke where
         let lib = |expr: &str, prelude: &str| {
             format!("import Lake\nopen Lake DSL\n{prelude}package demo\nlean_lib Demo where\n  leanOptions := {expr}\n")
         };
-        assert!(parse(&lib("#[(`autoImplicit, false)]", "")).is_err());
-        assert!(parse(&lib("#[LeanOption.mk `autoImplicit false]", "")).is_err());
+        for e in [
+            "#[(`autoImplicit, false)]",
+            "#[LeanOption.mk `autoImplicit false]",
+        ] {
+            let dep = parse(&lib(e, "")).unwrap();
+            assert!(dep.libs[0].unsupported.is_some(), "{e}");
+            fs::write(&lf, lib(e, "")).unwrap();
+            assert!(parse_lakefile_lean(&dir, &lf, true).is_err(), "{e}");
+        }
         // The untyped Mathlib-shaped binding keeps resolving.
         let untyped = parse(&lib("xs", "abbrev xs := #[⟨`autoImplicit, false⟩]\n")).unwrap();
         assert_eq!(
@@ -3947,6 +4069,16 @@ lean_lib Smoke where
         fs::write(&lf, dup).unwrap();
         let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
         assert!(pkg.unsupported.is_some(), "duplicate lean_lib accepted");
+        assert!(parse_lakefile_lean(&dir, &lf, true).is_err());
+        // Cross-kind collisions are duplicate Lean declarations to Lake too.
+        let dup_kinds =
+            "import Lake\nopen Lake DSL\npackage dep\nlean_lib Demo where\nlean_exe Demo where\n";
+        fs::write(&lf, dup_kinds).unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+        assert!(
+            pkg.unsupported.is_some(),
+            "lib-vs-exe name collision accepted"
+        );
         assert!(parse_lakefile_lean(&dir, &lf, true).is_err());
         let meta_if = "import Lake\nopen Lake DSL\npackage dep\nmeta if true then\nlean_lib A where\nlean_lib B where\n";
         fs::write(&lf, meta_if).unwrap();

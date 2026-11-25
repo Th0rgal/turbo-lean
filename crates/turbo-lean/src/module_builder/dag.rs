@@ -4155,6 +4155,37 @@ pub(super) fn parse_lean_globs_expr(expr: &str) -> Result<Vec<GlobSpec>> {
     }
     Ok(out)
 }
+
+/// Whether a `globs := #[...]` expression refers to `Glob` constructors by name (the spellings
+/// `parse_lean_globs_expr` reads literally and a non-plain lakefile's declarations could
+/// shadow), as opposed to backtick name-literal items, which cannot be shadowed even when a
+/// name segment spells "Glob".
+pub(super) fn glob_expr_names_constructors(expr: &str) -> bool {
+    let mut s = expr.trim();
+    if let Some(rest) = s.strip_prefix('#') {
+        s = rest.trim_start();
+    }
+    let Some(inner) = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')) else {
+        // Not the one-literal shape `parse_lean_globs_expr` accepts; it fails closed there.
+        return false;
+    };
+    let Ok(items) = split_top_level_comma(inner) else {
+        return false;
+    };
+    items.iter().any(|item| {
+        let t = item.trim();
+        [
+            "Glob.submodules ",
+            "Glob.andSubmodules ",
+            "Glob.one ",
+            ".submodules ",
+            ".andSubmodules ",
+            ".one ",
+        ]
+        .iter()
+        .any(|p| t.starts_with(p))
+    })
+}
 /// An option name must be a backtick name literal (`Lean.Parser.identFnAux`). Bare identifiers
 /// (`Name` values Lake would evaluate) and operators are rejected.
 pub(super) fn lean_option_name_literal(raw: &str) -> Result<LeanName> {
@@ -4257,6 +4288,12 @@ pub(super) fn lean_option_literal(raw: &str, key: &str) -> Result<LeanOptionValu
         key
     )
 }
+/// Marker head for `leanOptions` entry forms Lake 4.35 rejects (`LeanOption.mk` applications,
+/// `(k, v)` tuples): the lakefile reader downgrades this class to a dependency's `unsupported`
+/// slot instead of refusing the whole workspace configuration.
+pub(super) const LAKE_REJECTED_LEAN_OPTIONS_ENTRY: &str =
+    "Unsupported `leanOptions` entry form Lake rejects";
+
 pub(super) fn parse_lean_options_expr(expr: &str) -> Result<LeanOptionsMap> {
     let mut s = expr.trim();
     if let Some(rest) = s.strip_prefix('#') {
@@ -4279,9 +4316,9 @@ pub(super) fn parse_lean_options_expr(expr: &str) -> Result<LeanOptionsMap> {
     }
     let pairs: Vec<String> = pairs.into_iter().filter(|p| !p.is_empty()).collect();
     for p in pairs {
-        // #299 (Fable r9): Lake 4.35 rejects plain `(k, v)` `Prod` tuples and explicit
-        // `LeanOption.mk` applications in `leanOptions` arrays (unknown constants under the
-        // module system); only the anonymous-constructor form `⟨k, v⟩` elaborates there.
+        // #299: Lake 4.35 rejects plain `(k, v)` `Prod` tuples and explicit `LeanOption.mk`
+        // applications in `leanOptions` arrays (unknown constants under the module system);
+        // only the anonymous-constructor form `⟨k, v⟩` elaborates there.
         let trimmed = p
             .trim()
             .strip_prefix('⟨')
@@ -4294,6 +4331,16 @@ pub(super) fn parse_lean_options_expr(expr: &str) -> Result<LeanOptionsMap> {
             let k = lean_option_name_literal(k_raw)?;
             let v = lean_option_literal(v_raw, &k.to_lean_string())?;
             map.insert(k, v);
+        } else if p
+            .trim()
+            .strip_prefix("LeanOption.mk")
+            .is_some_and(|r| r.starts_with(char::is_whitespace))
+            || (p.trim().starts_with('(') && p.trim().ends_with(')'))
+        {
+            anyhow::bail!(
+                "{LAKE_REJECTED_LEAN_OPTIONS_ENTRY}: `{}` in lakefile.lean (only the anonymous-constructor form `⟨k, v⟩` elaborates under Lake 4.35's module system)",
+                p
+            );
         } else {
             anyhow::bail!("Unsupported `leanOptions` entry `{}` in lakefile.lean", p);
         }
@@ -5021,10 +5068,6 @@ pub(super) fn collect_lakefile_abbrevs_with_policy(clean: &str, is_root_pkg: boo
         }
         out.value_decls.insert(name.clone());
         let header = rest[raw_name.len()..].trim_start();
-        // #299 (Fable r9) flags untyped `abbrev xs := #[⟨...⟩]` as a form newer Lake rejects,
-        // but Mathlib's real lakefile binds `mathlibLeanOptions` exactly that way on its pinned
-        // toolchain (`test_computed_lean_options_mathlib_lakefile`), so the untyped form stays
-        // accepted: rejecting it would refuse valid input, the failure mode #299 asks to avoid.
         let body_start = match header.split_once(":=") {
             Some((ty, body)) if ty.trim().is_empty() || ty.starts_with(':') => Some(body),
             _ => None,
@@ -5356,6 +5399,36 @@ pub(super) fn parse_lean_path_literal(field: &str, expr: &str) -> Result<PathBuf
     parse_lean_path_literal_with_bindings(field, expr, None)
 }
 /// Parse a static declarative `lakefile.lean` into `PackageConfig`.
+/// Extend `target` with a resolved `leanOptions` expression. The entry forms Lake 4.35 rejects
+/// (`LeanOption.mk` applications, `(k, v)` tuples; `LAKE_REJECTED_LEAN_OPTIONS_ENTRY`) fail the
+/// root package closed at parse time but only record `unsupported` on a dependency, so one
+/// dependency's lakefile cannot refuse the whole workspace configuration; every other
+/// resolution error keeps failing closed for every package.
+pub(super) fn extend_lean_options_or_record(
+    target: &mut LeanOptionsMap,
+    slot: &mut Option<String>,
+    val_accum: &str,
+    bindings: &LakefileBindings,
+    line_no: usize,
+    is_root_pkg: bool,
+    lean_path: &Path,
+) -> Result<()> {
+    match resolve_lean_options_expr(val_accum, bindings, line_no) {
+        Ok(opts) => {
+            target.extend(opts);
+            Ok(())
+        }
+        Err(e) if !is_root_pkg && format!("{e:#}").contains(LAKE_REJECTED_LEAN_OPTIONS_ENTRY) => {
+            unsupported_lake_field(
+                slot,
+                is_root_pkg,
+                format!("{:#} in {} at line {}", e, lean_path.display(), line_no),
+            )
+        }
+        Err(e) => Err(e),
+    }
+}
+
 pub fn parse_lakefile_lean(
     pkg_root: &Path,
     lean_path: &Path,
@@ -5857,11 +5930,15 @@ pub(super) fn parse_lakefile_lean_inner(
                                 parse_lean_option_bool(&val_accum, &location)?;
                         }
                         "leanOptions" => {
-                            pkg.lean_options.extend(resolve_lean_options_expr(
+                            extend_lean_options_or_record(
+                                &mut pkg.lean_options,
+                                &mut pkg.unsupported,
                                 &val_accum,
                                 &lean_option_bindings,
                                 line_no,
-                            )?);
+                                is_root_pkg,
+                                lean_path,
+                            )?;
                         }
                         other => {
                             let (c_why, l_why) = classify_native_unsupported_field(
@@ -5899,15 +5976,13 @@ pub(super) fn parse_lakefile_lean_inner(
                                 }
                             }
                             "globs" => {
-                                // #299 (Astra r10): a non-plain lakefile can shadow the `Glob`
-                                // constructor spellings this parser reads literally (e.g.
+                                // #299: a non-plain lakefile can shadow the `Glob` constructor
+                                // spellings this parser reads literally (e.g.
                                 // `def Glob.submodules ... := .one`), so constructor-named glob
                                 // items fail closed there like `leanOptions` bindings do;
                                 // backtick name-literal globs cannot be shadowed and still parse.
                                 if lean_option_bindings.scoped
-                                    && ["Glob.", ".submodules ", ".andSubmodules ", ".one "]
-                                        .iter()
-                                        .any(|c| val_accum.contains(c))
+                                    && glob_expr_names_constructors(&val_accum)
                                 {
                                     unsupported_lake_field(
                                         &mut lib.unsupported,
@@ -5940,11 +6015,15 @@ pub(super) fn parse_lakefile_lean_inner(
                                 lake_precompile(key, &val_accum, &location)?;
                             }
                             "leanOptions" => {
-                                lib.lean_options.extend(resolve_lean_options_expr(
+                                extend_lean_options_or_record(
+                                    &mut lib.lean_options,
+                                    &mut lib.unsupported,
                                     &val_accum,
                                     &lean_option_bindings,
                                     line_no,
-                                )?);
+                                    is_root_pkg,
+                                    lean_path,
+                                )?;
                             }
                             "needs" => {
                                 let needs = parse_lean_bare_name_array_expr(&val_accum, key)?;
@@ -6067,11 +6146,15 @@ pub(super) fn parse_lakefile_lean_inner(
                                 exe.weak_lean_args = parse_lean_string_array_expr(&val_accum)?;
                             }
                             "leanOptions" => {
-                                exe.lean_options.extend(resolve_lean_options_expr(
+                                extend_lean_options_or_record(
+                                    &mut exe.lean_options,
+                                    &mut exe.unsupported,
                                     &val_accum,
                                     &lean_option_bindings,
                                     line_no,
-                                )?);
+                                    is_root_pkg,
+                                    lean_path,
+                                )?;
                             }
                             "needs" => {
                                 let needs = parse_lean_bare_name_array_expr(&val_accum, key)?;
@@ -6278,10 +6361,12 @@ where
                         .strip_prefix('"')
                         .and_then(|n| n.strip_suffix('"'))
                         .unwrap_or(n);
-                    // #299: a dot inside a quoted header is one atomic `Name.mkSimple` segment
-                    // to Lake (`lean_lib "Foo.Bar"` builds `Foo.Bar.lean`), while this parser
-                    // would split it into `Foo/Bar.lean`: fail closed.
-                    if quoted && n.contains('.') {
+                    // #299: a dot inside a quoted TARGET header is one atomic `Name.mkSimple`
+                    // segment to Lake (`lean_lib "Foo.Bar"` builds `Foo.Bar.lean`), while this
+                    // parser would split it into `Foo/Bar.lean`: fail closed. A quoted package
+                    // name never becomes a source path (`lake init foo.bar` emits one), and an
+                    // input target's name is a literal path component, so both keep parsing.
+                    if quoted && n.contains('.') && matches!(kw, "lean_lib" | "lean_exe") {
                         return false;
                     }
                     n.split('.').all(|seg| {
@@ -6957,20 +7042,47 @@ pub(super) fn finalize_package_config(
     explicit_empty_roots: &BTreeSet<usize>,
     hash_inputs_from_disk: bool,
 ) -> Result<()> {
-    // #299 (Fable r9): Lake rejects a configuration declaring two `lean_lib` targets under one
-    // name (a duplicate Lean declaration in `lakefile.lean`); accepting it would silently build
-    // with whichever of the two configurations module resolution happens to pick.
-    let dup_lib = pkg.libs.iter().enumerate().find_map(|(i, l)| {
-        pkg.libs[..i]
-            .iter()
-            .any(|p| p.name == l.name)
-            .then(|| l.name.clone())
-    });
-    if let Some(dup) = dup_lib {
+    // #299: Lake rejects a configuration declaring two targets under one name (a duplicate Lean
+    // declaration in `lakefile.lean`), across target kinds too; accepting it would silently
+    // build with whichever of the two configurations resolution happens to pick. Duplicate
+    // `input_file` / `input_dir` pairs keep their own gate (and its message) below.
+    let dup_target = {
+        let mut names: Vec<(&str, &str)> = Vec::new();
+        names.extend(pkg.libs.iter().map(|l| ("lean_lib", l.name.as_str())));
+        names.extend(pkg.exes.iter().map(|e| ("lean_exe", e.name.as_str())));
+        names.extend(pkg.custom_targets.iter().map(|c| ("target", c.as_str())));
+        names.extend(
+            pkg.extern_libs
+                .iter()
+                .map(|e| ("extern_lib", e.name.as_str())),
+        );
+        names.extend(pkg.inputs.iter().map(|i| ("input", i.name.as_str())));
+        names.iter().enumerate().find_map(|(i, (kind, name))| {
+            names[..i]
+                .iter()
+                .find(|(prev_kind, prev_name)| {
+                    prev_name == name && !(*prev_kind == "input" && *kind == "input")
+                })
+                .map(|(prev_kind, _)| {
+                    (
+                        (*prev_kind).to_string(),
+                        (*kind).to_string(),
+                        (*name).to_string(),
+                    )
+                })
+        })
+    };
+    if let Some((kind_a, kind_b, name)) = dup_target {
         unsupported_lake_field(
             &mut pkg.unsupported,
             is_root_pkg,
-            format!("Duplicate `lean_lib` `{}` in {}", dup, config_path.display()),
+            format!(
+                "Duplicate Lake target name `{}` (a `{}` and a `{}`) in {}",
+                name,
+                kind_a,
+                kind_b,
+                config_path.display()
+            ),
         )?;
     }
     for (i, lib) in pkg.libs.iter_mut().enumerate() {
@@ -7737,6 +7849,31 @@ pub(super) fn resolve_module_in_package_mode(
     mod_name: &str,
     include_exe_roots: bool,
 ) -> Option<DiscoveredModuleSpec> {
+    match resolve_module_in_package_ownership(pkg, is_root_pkg, mod_name, include_exe_roots) {
+        ModuleOwnership::Found(spec) => Some(spec),
+        ModuleOwnership::OwnedMissing { .. } | ModuleOwnership::NotOwned => None,
+    }
+}
+
+/// Three-way module lookup: Lake's `findModule?` / `findTargetModule?` return the owning target
+/// even when its source file is missing (and fail at build time), so a caller that would try
+/// the next package on a plain `None` needs to see the difference (#299).
+pub(super) enum ModuleOwnership {
+    Found(DiscoveredModuleSpec),
+    /// A target of this package owns the module name, but its source file is missing.
+    OwnedMissing {
+        target_name: String,
+        src_path: PathBuf,
+    },
+    NotOwned,
+}
+
+pub(super) fn resolve_module_in_package_ownership(
+    pkg: &PackageConfig,
+    is_root_pkg: bool,
+    mod_name: &str,
+    include_exe_roots: bool,
+) -> ModuleOwnership {
     let rel_slash = module_name_to_rel_slash(mod_name);
     let pkg_src_base = pkg.pkg_root.join(&pkg.src_dir);
     let build_base = pkg.pkg_root.join(&pkg.build_dir);
@@ -7769,7 +7906,7 @@ pub(super) fn resolve_module_in_package_mode(
                         &exe.more_lean_args,
                         &exe.weak_lean_args,
                     );
-                    return Some(DiscoveredModuleSpec {
+                    return ModuleOwnership::Found(DiscoveredModuleSpec {
                         module_name: exe.root.clone(),
                         pkg_name: pkg.name.clone(),
                         pkg_base_name: pkg.base_name.clone(),
@@ -7805,7 +7942,10 @@ pub(super) fn resolve_module_in_package_mode(
                 // #299: Lake's `findTargetModule?` still returns this executable's module when
                 // its source file is missing and fails at build time; trying an earlier
                 // candidate instead would resolve a module Lake would never build.
-                return None;
+                return ModuleOwnership::OwnedMissing {
+                    target_name: exe.name.clone(),
+                    src_path: cand,
+                };
             }
         }
     }
@@ -7838,7 +7978,7 @@ pub(super) fn resolve_module_in_package_mode(
                                 | "LeanLib.sharedFacet"
                         )
                     });
-                return Some(DiscoveredModuleSpec {
+                return ModuleOwnership::Found(DiscoveredModuleSpec {
                     module_name: mod_name.to_string(),
                     pkg_name: pkg.name.clone(),
                     pkg_base_name: pkg.base_name.clone(),
@@ -7874,7 +8014,10 @@ pub(super) fn resolve_module_in_package_mode(
             // #299: Lake's `findModule?` keeps this library as the module's owner even when the
             // source file is missing and fails at build time; trying an earlier library instead
             // would build a module Lake would never build.
-            return None;
+            return ModuleOwnership::OwnedMissing {
+                target_name: lib.name.clone(),
+                src_path: cand,
+            };
         }
     }
     // 3. A package without targets: its source directory (Lake has no target to ask).
@@ -7882,7 +8025,7 @@ pub(super) fn resolve_module_in_package_mode(
     if pkg.libs.is_empty() && pkg.exes.is_empty() && cand.is_file() {
         let (lean_options, strong_args, weak_args) =
             compose_effective_args(pkg, &LeanOptionsMap::new(), &[], &[]);
-        return Some(DiscoveredModuleSpec {
+        return ModuleOwnership::Found(DiscoveredModuleSpec {
             module_name: mod_name.to_string(),
             pkg_name: pkg.name.clone(),
             pkg_base_name: pkg.base_name.clone(),
@@ -7909,7 +8052,7 @@ pub(super) fn resolve_module_in_package_mode(
             link_unsupported: pkg.link_unsupported.clone(),
         });
     }
-    None
+    ModuleOwnership::NotOwned
 }
 pub(crate) fn lean_githash_for_bin(lean_bin: &Path) -> Option<String> {
     let canon_bin = lean_bin.canonicalize().ok()?;
@@ -9312,10 +9455,17 @@ pub(super) fn build_module_dag_inner(
     let root_pkg = &cfg.root_pkg;
     // For the `build <Lib>` scope gate below (#436): compare canonical paths, so a dependency
     // reached through a symlinked `.lake/packages` entry resolves to the checkout it really is.
+    // The packages dir the manifest populates counts as the project's own even when it (or
+    // `.lake`) is itself a symlink onto another volume (a RAM or scratch disk).
     let root_canon = root_pkg
         .pkg_root
         .canonicalize()
         .unwrap_or_else(|_| root_pkg.pkg_root.clone());
+    let packages_canon = root_pkg
+        .pkg_root
+        .join(&root_pkg.packages_dir)
+        .canonicalize()
+        .ok();
     let mut initial_specs: Vec<(DiscoveredModuleSpec, bool)> = Vec::new();
     // Shared-library identity is `(pkg_root, lib_name)`, never `origName`, so two dependencies
     // whose directories share a name cannot collide.
@@ -9402,18 +9552,25 @@ pub(super) fn build_module_dag_inner(
             // #299: Lake attaches a module's build settings through `findModule?` (the LAST
             // library that can build it), even when an earlier library's glob expanded it here.
             // Route `leanOptions` / `moreLeanArgs` / `weakLeanArgs` through that resolution so
-            // overlapping globs cannot hand a module the expanding library's options. The
+            // overlapping globs cannot hand a module the expanding library's options, and OR the
+            // owner's fail-closed `unsupported` flags in below, so a clean expanding library
+            // cannot launder a module of an owner turbo-lean cannot build like Lake. The
             // needs-trace attribution (`target_name`, facets, precompile) stays the expanding
-            // library's, which `lake_needs_trace_entries` documents and pins.
-            let (m_opts, m_strong, m_weak) = match resolve_importable_module_in_package(
-                target_pkg,
-                target_is_root,
-                &m_name,
-            ) {
-                Some(owner) if owner.src_path == m_path && owner.target_name != lib.name => {
-                    (owner.lean_options, owner.strong_args, owner.weak_args)
-                }
-                _ => (
+            // library's, which `lake_needs_trace_entries` documents and pins. With a single
+            // library the owner is the expander by construction, so the lookup is skipped.
+            let owner = if target_pkg.libs.len() > 1 {
+                resolve_importable_module_in_package(target_pkg, target_is_root, &m_name)
+                    .filter(|o| o.src_path == m_path && o.target_name != lib.name)
+            } else {
+                None
+            };
+            let (m_opts, m_strong, m_weak) = match &owner {
+                Some(o) => (
+                    o.lean_options.clone(),
+                    o.strong_args.clone(),
+                    o.weak_args.clone(),
+                ),
+                None => (
                     lean_options.clone(),
                     strong_args.clone(),
                     weak_args.clone(),
@@ -9447,15 +9604,18 @@ pub(super) fn build_module_dag_inner(
                     unsupported: target_pkg
                         .unsupported
                         .clone()
-                        .or_else(|| lib.unsupported.clone()),
+                        .or_else(|| lib.unsupported.clone())
+                        .or_else(|| owner.as_ref().and_then(|o| o.unsupported.clone())),
                     native_unsupported: target_pkg
                         .native_unsupported
                         .clone()
-                        .or_else(|| lib.native_unsupported.clone()),
+                        .or_else(|| lib.native_unsupported.clone())
+                        .or_else(|| owner.as_ref().and_then(|o| o.native_unsupported.clone())),
                     link_unsupported: target_pkg
                         .link_unsupported
                         .clone()
-                        .or_else(|| lib.link_unsupported.clone()),
+                        .or_else(|| lib.link_unsupported.clone())
+                        .or_else(|| owner.as_ref().and_then(|o| o.link_unsupported.clone())),
                 },
                 force_c_for_target || emit_c_default,
             ));
@@ -10045,31 +10205,37 @@ pub(super) fn build_module_dag_inner(
                 }
                 continue;
             }
-            // `turbo-lean build <Lib>` scope (#436): a git-pinned dependency checkout outside the
-            // project root is another (possibly shared) checkout, reached through a symlinked
-            // `.lake/packages` entry or a relocated packages dir. Compiling its modules natively
-            // would publish `.olean`/`.trace` rewrites and `.turbo_publish.lock` files into that
-            // foreign checkout, so a pinned out-of-tree dependency is adopted read-only (the
-            // fresh or prebuilt closure above) or the build fails naming the Lake command that
-            // refreshes it. Path dependencies and pinned clones under the project root keep
-            // building, like Lake builds them; `check`'s statement path (`allow_prebuilt_dep_pkgs`)
-            // and untrusted builds are unchanged.
+            // `turbo-lean build <Lib>` scope (#436): a git-pinned dependency checkout outside
+            // both the project root and its packages dir is another (possibly shared) checkout,
+            // reached through a symlinked `.lake/packages` entry or a relocated packages dir.
+            // Compiling its modules natively would publish `.olean`/`.trace` rewrites and
+            // `.turbo_publish.lock` files into that foreign checkout, so a pinned out-of-tree
+            // dependency is adopted read-only (the fresh or prebuilt closure during import
+            // resolution) or fails here, naming the Lake command that refreshes it. Path
+            // dependencies and pinned clones under the project root or packages dir keep
+            // building, like Lake builds them. The gate covers every trusted non-statement
+            // caller of `build_module_dag_with_trust` (`build`, `ci-verify`, freshness probes);
+            // `check`'s statement path (`allow_prebuilt_dep_pkgs`) and untrusted builds are
+            // unchanged.
             if !is_untrusted && !allow_prebuilt_dep_pkgs && !spec.is_root_pkg {
                 let pkg_canon = spec
                     .pkg_root
                     .canonicalize()
                     .unwrap_or_else(|_| spec.pkg_root.clone());
                 if !pkg_canon.starts_with(&root_canon)
+                    && !packages_canon
+                        .as_deref()
+                        .is_some_and(|p| pkg_canon.starts_with(p))
                     && is_git_pinned_manifest_package(cfg, &spec)
                 {
                     anyhow::bail!(
-                        "Cannot build module `{}`: package `{}` is a git-pinned dependency checkout outside the project root ({} is not under {}) and its Lake artifacts could not be adopted read-only; turbo-lean never compiles or publishes into it. Run `lake build {}` in {} to refresh it, then retry",
+                        "Cannot build module `{}`: package `{}` is a git-pinned dependency checkout outside the project root ({} is not under {}); turbo-lean never compiles or publishes into it. Refresh its Lake artifacts first (run `lake build +{}` from the project root {}) and retry",
                         spec.module_name,
                         spec.pkg_name,
                         pkg_canon.display(),
                         root_canon.display(),
                         spec.module_name,
-                        spec.pkg_root.display()
+                        root_pkg.pkg_root.display()
                     );
                 }
             }
@@ -10167,6 +10333,22 @@ pub(super) fn build_module_dag_inner(
                     worklist.push_back((dep_spec, spec.precompile_modules || propagate_c_to_deps));
                     continue;
                 }
+                // #299: the root package may OWN `imp` (a library's globs select it) while its
+                // source file is missing. Lake fails there; falling through would resolve a
+                // same-named module from a dependency package instead.
+                if let ModuleOwnership::OwnedMissing {
+                    target_name,
+                    src_path,
+                } = resolve_module_in_package_ownership(root_pkg, true, imp, false)
+                {
+                    anyhow::bail!(
+                        "Missing source file for module `{}` (imported by `{}`): library `{}` of the root package owns it at {}, so Lake fails here instead of resolving it in another package",
+                        imp,
+                        spec.module_name,
+                        target_name,
+                        src_path.display()
+                    );
+                }
                 // 2. Check if `imp` resolves in any dependency package (failing closed on ambiguity)
                 let dep_matches = dep_closure_memo.resolve_dep_pkg_matches(cfg, imp);
                 if dep_matches.len() > 1 {
@@ -10233,6 +10415,27 @@ pub(super) fn build_module_dag_inner(
                     direct_dag_deps.push(imp.clone());
                     worklist.push_back((dep_spec.clone(), importer_needs_dep_c));
                     continue;
+                }
+                // #299: the same stop one package out: a dependency that OWNS `imp` with a
+                // missing source file is where Lake fails; never fall through to a prebuilt
+                // `.olean` or the toolchain for it.
+                if let Some((dp, target_name, src_path)) = cfg.dep_pkgs.iter().find_map(|dp| {
+                    match resolve_module_in_package_ownership(dp, false, imp, false) {
+                        ModuleOwnership::OwnedMissing {
+                            target_name,
+                            src_path,
+                        } => Some((dp, target_name, src_path)),
+                        _ => None,
+                    }
+                }) {
+                    anyhow::bail!(
+                        "Missing source file for module `{}` (imported by `{}`): library `{}` of package `{}` owns it at {}, so Lake fails here instead of resolving it elsewhere",
+                        imp,
+                        spec.module_name,
+                        target_name,
+                        dp.name,
+                        src_path.display()
+                    );
                 }
                 // 3. In trusted mode only, check if `imp` exists as a prebuilt `.olean` in `.lake/packages/*/.lake/build/lib/lean` or `LEAN_PATH`
                 // BEFORE checking the toolchain library, matching Lean's actual `LEAN_PATH` search order.
