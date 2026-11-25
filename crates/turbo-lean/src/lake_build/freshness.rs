@@ -2607,6 +2607,20 @@ pub(super) fn standalone_lean_timeout_from(
     ))
 }
 
+/// Map a path relative to a package's `lib/lean` build dir to its
+/// module-relative base path when it carries a staged-artifact suffix the
+/// standalone re-check tree merges.
+pub(super) fn standalone_merge_rel_base(rel: &str) -> Option<String> {
+    rel.strip_suffix(".olean.server")
+        .or_else(|| rel.strip_suffix(".olean.private"))
+        .or_else(|| rel.strip_suffix(".olean"))
+        .or_else(|| rel.strip_suffix(".ilean"))
+        // Lean 4.31 module-system imports also read `<Module>.ir`; without it
+        // the re-check fails `missing IR data file for module ...` (#442).
+        .or_else(|| rel.strip_suffix(".ir"))
+        .map(String::from)
+}
+
 fn standalone_lean_timeout(is_untrusted: bool) -> std::time::Duration {
     standalone_lean_timeout_from(
         std::env::var("TURBO_LEAN_MODULE_TIMEOUT_SECS")
@@ -2794,12 +2808,7 @@ pub(super) fn check_and_audit_standalone_modules(
                     stack.push((p, dst_p));
                 } else if meta.file_type().is_file() {
                     let base_rel = if let Ok(r) = p.strip_prefix(&src_dir) {
-                        let rs = r.to_string_lossy();
-                        rs.strip_suffix(".olean.server")
-                            .or_else(|| rs.strip_suffix(".olean.private"))
-                            .or_else(|| rs.strip_suffix(".olean"))
-                            .or_else(|| rs.strip_suffix(".ilean"))
-                            .map(String::from)
+                        standalone_merge_rel_base(&r.to_string_lossy())
                     } else {
                         None
                     };

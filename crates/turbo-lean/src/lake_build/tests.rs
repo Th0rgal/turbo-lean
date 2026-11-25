@@ -4697,3 +4697,35 @@ public def api := by
             Duration::from_secs(15)
         );
     }
+
+    /// Regression test for #442: the standalone re-check tree must include
+    /// `.ir` files. Lean 4.31 module-system imports read `<Module>.ir`, so a
+    /// merged tree of only `.olean*`/`.ilean` fails a VERIFIED run with
+    /// `missing IR data file for module ...`.
+    #[test]
+    fn standalone_recheck_merge_includes_ir_files() {
+        use super::freshness::standalone_merge_rel_base;
+        assert_eq!(
+            standalone_merge_rel_base("Aesop/Script/Tactic.ir").as_deref(),
+            Some("Aesop/Script/Tactic")
+        );
+        assert_eq!(
+            standalone_merge_rel_base("TurboLean/Spec.olean").as_deref(),
+            Some("TurboLean/Spec")
+        );
+        assert_eq!(
+            standalone_merge_rel_base("TurboLean/Spec.olean.server").as_deref(),
+            Some("TurboLean/Spec")
+        );
+        assert_eq!(
+            standalone_merge_rel_base("TurboLean/Spec.olean.private").as_deref(),
+            Some("TurboLean/Spec")
+        );
+        assert_eq!(
+            standalone_merge_rel_base("TurboLean/Spec.ilean").as_deref(),
+            Some("TurboLean/Spec")
+        );
+        // Non-artifact files stay out of the merged tree.
+        assert_eq!(standalone_merge_rel_base("TurboLean/Spec.c"), None);
+        assert_eq!(standalone_merge_rel_base("TurboLean/Spec.trace"), None);
+    }
