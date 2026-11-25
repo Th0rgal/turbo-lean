@@ -5710,6 +5710,39 @@ fn stub_identity_span(span: &CmdSpan<'_>) -> String {
     sanitize_stubbed_prefix_options(span.orig_text)
 }
 
+/// Canonical (no line padding) variant of [`stub_identity_span`] for the
+/// single-declaration identity prefix: a stubbed proof collapses to `:= sorry` instead of
+/// carrying the original proof's newline count, so proof edits and the line shifts they
+/// cause above the probed declaration leave the probe input byte-identical and the
+/// content-pinned identity cache keeps hitting (#409 / P4). The batched file probe keeps
+/// the padded [`stub_identity_span`], whose exact line numbers map shards into the
+/// compiled probe's `.olean`.
+fn stub_identity_span_canonical(span: &CmdSpan<'_>) -> String {
+    if let Some((header, inner, footer)) = split_mutual_block_subspans(span) {
+        let inner_texts: Vec<String> = inner.iter().map(stub_identity_span_canonical).collect();
+        return join_mutual_parts(
+            span.start_line,
+            header,
+            &inner,
+            &inner_texts,
+            footer,
+            span.end_line,
+        );
+    }
+    if classify_decl_header(span.clean_text).is_some() {
+        if let Some((sig, proof)) = split_at_top_level_assign(span.clean_text) {
+            let (sig_orig, _) = split_at_top_level_assign(span.orig_text).unwrap_or((sig, proof));
+            return format!("{sig_orig} := sorry");
+        }
+    }
+    sanitize_stubbed_prefix_options(span.orig_text)
+}
+
+/// Build the stubbed prefix preceding `shard` for the single-declaration identity probe,
+/// in canonical form: stubbed proofs carry no newline padding, so the prefix (and with it
+/// the probe source the caller compiles and caches) is insensitive to proof-length and
+/// blank-line churn above the declaration. Line numbers inside the resulting probe are
+/// self-consistent; they do not match the original file.
 pub(crate) fn declaration_identity_prefix(src: &str, shard: &TheoremShard) -> String {
     let clean = strip_lean_comments(src);
     let spans = parse_command_spans(src, &clean);
@@ -5724,7 +5757,7 @@ pub(crate) fn declaration_identity_prefix(src: &str, shard: &TheoremShard) -> St
     let mut prefix = String::new();
     let mut prev_end_line = None;
     let push_span = |prefix: &mut String, prev_end_line: &mut Option<usize>, s: &CmdSpan<'_>| {
-        push_joined_span(prefix, *prev_end_line, s, &stub_identity_span(s));
+        push_joined_span(prefix, *prev_end_line, s, &stub_identity_span_canonical(s));
         *prev_end_line = Some(s.end_line);
     };
     for (s_idx, span) in spans.iter().enumerate() {
@@ -14947,6 +14980,7 @@ public def api := by
         let t0 = std::time::Instant::now();
         let probe = build_decl_identity_probe(&src, shard);
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("decl identity probe on 2000-decl file: {elapsed_ms:.2} ms");
         assert!(!probe.signature.is_empty() && probe.before.contains("probe_thm_1998"));
         let limit_ms = if cfg!(debug_assertions) { 2000.0 } else { 200.0 };
         assert!(elapsed_ms < limit_ms, "identity probe took {elapsed_ms:.2} ms");
