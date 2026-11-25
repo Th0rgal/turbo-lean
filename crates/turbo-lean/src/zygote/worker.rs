@@ -682,6 +682,86 @@ pub(super) static ZYGOTE_MASTERS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<(String, String, String), std::sync::Arc<ZygoteMasterEntry>>>,
 > = std::sync::OnceLock::new();
 
+/// H2.3: what a bounded queue run left one pooled worker as, deciding whether it may go
+/// back to `ZYGOTE_POOL`: `Unused` = never ran a request (exactly as acquired); `Healthy`
+/// = its last request replied and the reply qualifies for pooling; `Dead` = its last
+/// request crashed, timed out, or disqualified the worker (runtime panic, failed import).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QueueWorkerFate {
+    Unused,
+    Healthy,
+    Dead,
+}
+
+/// H2.3 (parallel replay under the RAM budget): run `jobs` indexed requests over the given
+/// workers, at most `workers.len()` concurrently, each worker pulling the next request
+/// index from a shared queue so a slow request never idles the other workers. Results come
+/// back indexed by request — deterministic order whatever the completion order. A result
+/// `is_fatal` stops the queue (requests already running finish; never-started slots stay
+/// `None`), so the caller fails closed exactly as a serial loop would at its first fatal
+/// request; a `Dead` fate retires only that worker, and the rest keep draining the queue.
+/// Workers come back with the fate their last request left them.
+pub(super) fn run_request_queue_over_workers<W, T>(
+    workers: Vec<W>,
+    jobs: usize,
+    is_fatal: impl Fn(&T) -> bool + Sync,
+    run: impl Fn(&mut W, usize) -> (T, QueueWorkerFate) + Sync,
+) -> (Vec<(W, QueueWorkerFate)>, Vec<Option<T>>)
+where
+    W: Send,
+    T: Send,
+{
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let results: Vec<std::sync::Mutex<Option<T>>> =
+        (0..jobs).map(|_| std::sync::Mutex::new(None)).collect();
+    let finished_workers = std::thread::scope(|s| {
+        let (next_idx, stop, results, is_fatal, run) = (&next_idx, &stop, &results, &is_fatal, &run);
+        let handles: Vec<_> = workers
+            .into_iter()
+            .map(|mut w| {
+                s.spawn(move || {
+                    let mut fate = QueueWorkerFate::Unused;
+                    loop {
+                        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if idx >= jobs {
+                            break;
+                        }
+                        let (res, new_fate) = run(&mut w, idx);
+                        fate = new_fate;
+                        let fatal = is_fatal(&res);
+                        if let Ok(mut slot) = results[idx].lock() {
+                            *slot = Some(res);
+                        }
+                        if fatal {
+                            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                            break;
+                        }
+                        if fate == QueueWorkerFate::Dead {
+                            // This worker is unusable (panic / failed import); the other
+                            // workers keep draining the queue.
+                            break;
+                        }
+                    }
+                    (w, fate)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("Zygote request-queue worker thread panicked"))
+            .collect::<Vec<_>>()
+    });
+    let outcomes = results
+        .into_iter()
+        .map(|m| m.into_inner().ok().flatten())
+        .collect();
+    (finished_workers, outcomes)
+}
+
 /// Split a shard body (without imports) into `(prefix_code, decl_code, prefix_key)` if it contains
 /// a non-empty command prefix before the final top-level `theorem` or `lemma` declaration.
 pub fn split_body_into_prefix_and_decl(body_code: &str) -> Option<(String, String, String)> {
@@ -2075,6 +2155,137 @@ mod worker_embed_tests {
                 "1-byte edit in {rel} must change the zygote binary cache key"
             );
         }
+    }
+}
+
+/// H2.3: the bounded request queue the cross-file replay fan-out runs on. These tests use
+/// stub workers (no Lean): the scheduling properties (width bound, deterministic result
+/// order, fail-closed stop) are the queue's own, whatever the requests do.
+#[cfg(test)]
+mod pool_queue_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn queue_runs_workers_concurrently_and_preserves_result_order() {
+        let live = AtomicUsize::new(0);
+        let max_live = AtomicUsize::new(0);
+        let t0 = std::time::Instant::now();
+        let (finished, outcomes) = run_request_queue_over_workers(
+            vec![0usize, 1, 2],
+            9,
+            |_: &usize| false,
+            |_w, idx| {
+                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                max_live.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                live.fetch_sub(1, Ordering::SeqCst);
+                (idx * 10, QueueWorkerFate::Healthy)
+            },
+        );
+        let wall = t0.elapsed();
+        assert_eq!(finished.len(), 3);
+        assert!(finished
+            .iter()
+            .all(|(_, fate)| *fate == QueueWorkerFate::Healthy));
+        let vals: Vec<usize> = outcomes.into_iter().map(|o| o.unwrap()).collect();
+        assert_eq!(
+            vals,
+            (0..9).map(|i| i * 10).collect::<Vec<_>>(),
+            "results must come back in request order whatever the completion order"
+        );
+        assert!(
+            max_live.load(Ordering::SeqCst) <= 3,
+            "more concurrent requests than workers"
+        );
+        assert!(
+            max_live.load(Ordering::SeqCst) >= 2,
+            "9 sleep-shaped requests over 3 workers never overlapped: the queue ran serially"
+        );
+        assert!(
+            wall < std::time::Duration::from_millis(9 * 40),
+            "9 x 40ms requests over 3 workers took {wall:?}: no faster than a serial loop"
+        );
+    }
+
+    #[test]
+    fn queue_width_never_exceeds_the_budgets_effective_parallelism() {
+        // #435 / H2.3: the budget object is the single width authority for the pool
+        // fan-out; a 2-job budget must never see a third concurrent request.
+        let budget = WorkerBudget {
+            jobs: Some(2),
+            max_memory_mb: None,
+        };
+        let parallelism = budget.effective_parallelism(8, REPLAY_WORKER_EST_RSS_MB, || 64);
+        assert_eq!(parallelism, 2);
+        let live = AtomicUsize::new(0);
+        let max_live = AtomicUsize::new(0);
+        let (_, outcomes) = run_request_queue_over_workers(
+            (0..parallelism).collect::<Vec<usize>>(),
+            8,
+            |_: &usize| false,
+            |_w, idx| {
+                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                max_live.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                live.fetch_sub(1, Ordering::SeqCst);
+                (idx, QueueWorkerFate::Healthy)
+            },
+        );
+        assert!(
+            max_live.load(Ordering::SeqCst) <= 2,
+            "budget --jobs 2 exceeded: {} concurrent requests",
+            max_live.load(Ordering::SeqCst)
+        );
+        let vals: Vec<usize> = outcomes.into_iter().map(|o| o.unwrap()).collect();
+        assert_eq!(vals, (0..8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn queue_stops_scheduling_after_a_fatal_result_and_leaves_unrun_slots_none() {
+        let (finished, outcomes) = run_request_queue_over_workers(
+            vec![0usize, 1],
+            12,
+            |v: &usize| *v == 1,
+            |_w, idx| {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                (
+                    idx,
+                    if idx == 1 {
+                        QueueWorkerFate::Dead
+                    } else {
+                        QueueWorkerFate::Healthy
+                    },
+                )
+            },
+        );
+        assert_eq!(outcomes.len(), 12);
+        assert_eq!(outcomes[0], Some(0));
+        assert_eq!(outcomes[1], Some(1), "the fatal request's own result is kept");
+        let ran = outcomes.iter().flatten().count();
+        assert!(
+            ran <= 4,
+            "queue kept scheduling after the fatal result: {ran} of 12 ran"
+        );
+        assert!(
+            outcomes[5..].iter().all(|o| o.is_none()),
+            "slots past the fatal stop must stay None (the caller fails closed on them)"
+        );
+        assert!(finished
+            .iter()
+            .any(|(_, fate)| *fate == QueueWorkerFate::Dead));
+    }
+
+    #[test]
+    fn queue_with_no_workers_leaves_every_slot_none() {
+        let (finished, outcomes) = run_request_queue_over_workers(
+            Vec::<usize>::new(),
+            3,
+            |_: &usize| false,
+            |_w, idx| (idx, QueueWorkerFate::Healthy),
+        );
+        assert!(finished.is_empty());
+        assert!(outcomes.iter().all(|o| o.is_none()));
     }
 }
 
