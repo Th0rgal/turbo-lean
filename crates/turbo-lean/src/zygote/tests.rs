@@ -1887,6 +1887,149 @@ use super::*;
     }
 
     #[test]
+    fn test_eval_default_timeout_zero_is_an_unbounded_budget() {
+        // #443: `eval --timeout-ms 0` is documented as "no artificial timeout", but the
+        // shard-fallback path passed it as `Some(0)`, which `run_lean_command` and
+        // `budget_left` treat as an exhausted budget ("Lean request timed out before
+        // fallback" after ~3 s). The default must map to `None` before it reaches them.
+        assert_eq!(request_timeout_ms(0), None);
+        assert_eq!(request_timeout_ms(1_500), Some(1_500));
+        // The mapped default must reach the fallback spawn: `Some(0)` is rejected before
+        // any process starts, while the mapped budget spawns the command.
+        let out = run_lean_command(&mut Command::new("true"), request_timeout_ms(0))
+            .expect("default --timeout-ms 0 must not be rejected before the shard fallback");
+        assert!(out.status.success());
+    }
+
+    #[test]
+    fn test_worker_budget_object_clamps_parallelism_and_batches() {
+        // #435: one budget object; parallelism, the per-worker cap and the replay batch
+        // cap all derive from it instead of ad hoc env reads at each spawn site.
+        let unbounded = WorkerBudget {
+            jobs: None,
+            max_memory_mb: None,
+        };
+        assert_eq!(unbounded.effective_parallelism(64, 2048, || 7), 7);
+        assert_eq!(unbounded.per_worker_rlimit_mb(4), None);
+        assert_eq!(unbounded.replay_batch_cap(32, 4), 32);
+
+        let jobs_only = WorkerBudget {
+            jobs: Some(3),
+            max_memory_mb: None,
+        };
+        assert_eq!(jobs_only.effective_parallelism(64, 2048, || 99), 3);
+        // Never wider than the work list.
+        assert_eq!(jobs_only.effective_parallelism(2, 2048, || 99), 2);
+
+        // A 4 GiB budget with ~2 GiB replay workers admits two workers, whatever nproc says
+        // (the #435 reproducer ran `nproc` replay workers under `--max-memory-mb 4000`).
+        let capped = WorkerBudget {
+            jobs: None,
+            max_memory_mb: Some(4096),
+        };
+        assert_eq!(capped.effective_parallelism(64, 2048, || 99), 2);
+        assert_eq!(capped.per_worker_rlimit_mb(2), Some(2048));
+        assert_eq!(capped.per_worker_rlimit_mb(64), Some(512)); // floored share
+        assert_eq!(capped.replay_batch_cap(32, 2), 8); // 2 GiB per worker: shrink batches
+        assert_eq!(capped.replay_batch_cap(32, 4), 1); // 1 GiB per worker: single-module slices
+
+        let roomy = WorkerBudget {
+            jobs: Some(2),
+            max_memory_mb: Some(32_768),
+        };
+        assert_eq!(roomy.effective_parallelism(64, 2048, || 99), 2);
+        assert_eq!(roomy.replay_batch_cap(32, 2), 32);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_worker_budget_rlimit_reaches_the_worker_process() {
+        // #435 acceptance: the per-worker memory cap is a real rlimit on the spawned
+        // worker, not an advisory governor hint. `ulimit -v` reports RLIMIT_AS in KiB.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "ulimit -v"]);
+        WorkerBudget::apply_worker_rlimit(&mut cmd, 512);
+        let out = cmd.output().expect("spawn sh under the worker rlimit");
+        assert!(out.status.success(), "{out:?}");
+        let reported = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            reported,
+            (512u64 * 1024).to_string(),
+            "RLIMIT_AS must be the 512 MiB per-worker cap"
+        );
+
+        // A signal death under a cap is named, never an opaque `exit=signal: 9`.
+        use std::os::unix::process::ExitStatusExt;
+        let killed = std::process::ExitStatus::from_raw(libc::SIGKILL);
+        let note = WorkerBudget::memory_kill_note(&killed, Some(512));
+        assert!(note.contains("per-worker memory cap of 512 MiB"), "{note}");
+        assert!(note.contains("--max-memory-mb"), "{note}");
+        assert!(
+            WorkerBudget::memory_kill_note(&killed, None).is_empty(),
+            "no cap, no attribution"
+        );
+    }
+
+    #[test]
+    fn test_replay_timeout_budget_env_and_fallback() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_replay = std::env::var_os("TURBO_LEAN_REPLAY_TIMEOUT_SECS");
+        let prev_audit = std::env::var_os("TURBO_LEAN_AUDIT_TIMEOUT_SECS");
+        std::env::remove_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS");
+        std::env::remove_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS");
+        // #437: the replay budget defaults to the audit budget ...
+        assert_eq!(replay_timeout_ms(false), audit_timeout_ms(false));
+        assert_eq!(replay_timeout_ms(true), audit_timeout_ms(true));
+        // ... and has its own knob (`[replay] timeout_secs` sets this environment key).
+        std::env::set_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS", "3600");
+        assert_eq!(replay_timeout_ms(false), 3_600_000);
+        assert_eq!(replay_timeout_ms(true), 3_600_000);
+        match prev_replay {
+            Some(v) => std::env::set_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS", v),
+            None => std::env::remove_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS"),
+        }
+        match prev_audit {
+            Some(v) => std::env::set_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS", v),
+            None => std::env::remove_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS"),
+        }
+    }
+
+    #[test]
+    fn test_worker_budget_from_env_and_jobs_export() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_jobs = std::env::var_os("TURBO_LEAN_JOBS");
+        let prev_mem = std::env::var_os("TURBO_LEAN_MAX_MEMORY_MB");
+        std::env::remove_var("TURBO_LEAN_JOBS");
+        std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", "4096");
+        assert_eq!(
+            WorkerBudget::from_env(),
+            WorkerBudget {
+                jobs: None,
+                max_memory_mb: Some(4096)
+            }
+        );
+        // #435: `check --jobs` is exported so every later spawn observes it ...
+        WorkerBudget::export_effective_jobs(Some(3));
+        assert_eq!(std::env::var("TURBO_LEAN_JOBS").as_deref(), Ok("3"));
+        assert_eq!(WorkerBudget::from_env().jobs, Some(3));
+        // ... but an explicit environment setting wins.
+        WorkerBudget::export_effective_jobs(Some(7));
+        assert_eq!(std::env::var("TURBO_LEAN_JOBS").as_deref(), Ok("3"));
+        match prev_jobs {
+            Some(v) => std::env::set_var("TURBO_LEAN_JOBS", v),
+            None => std::env::remove_var("TURBO_LEAN_JOBS"),
+        }
+        match prev_mem {
+            Some(v) => std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", v),
+            None => std::env::remove_var("TURBO_LEAN_MAX_MEMORY_MB"),
+        }
+    }
+
+    #[test]
     fn test_zygote_timeout_kills_infinite_eval_and_recovers() {
         let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("timeout") else {
             return;

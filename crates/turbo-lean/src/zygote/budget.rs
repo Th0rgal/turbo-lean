@@ -145,6 +145,133 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
     );
 }
 
+/// Conservative per-process RSS estimate in MiB for a kernel replay/audit worker loading a
+/// bounded `.olean` closure slice; used to clamp parallelism under an explicit memory budget.
+pub(crate) const REPLAY_WORKER_EST_RSS_MB: u64 = 2048;
+
+/// One resource budget that reaches every worker (#435): the effective job count
+/// (`check --jobs`, exported as `TURBO_LEAN_JOBS`) and the memory cap (`--max-memory-mb` /
+/// `TURBO_LEAN_MAX_MEMORY_MB`), carried as one object instead of ad hoc env reads at each
+/// spawn site, so kernel-replay and audit workers observe the limits the CLI was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerBudget {
+    pub jobs: Option<usize>,
+    pub max_memory_mb: Option<u64>,
+}
+
+impl WorkerBudget {
+    pub fn from_env() -> Self {
+        Self {
+            jobs: std::env::var("TURBO_LEAN_JOBS")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .filter(|&n| n > 0),
+            max_memory_mb: std::env::var("TURBO_LEAN_MAX_MEMORY_MB")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|&mb| mb > 0),
+        }
+    }
+
+    /// Export `--jobs` as `TURBO_LEAN_JOBS` for the whole command so replay and audit
+    /// workers spawned downstream observe it (#435). An explicit environment setting wins.
+    pub fn export_effective_jobs(jobs: Option<usize>) {
+        if let Some(j) = jobs.filter(|&j| j > 0) {
+            if std::env::var_os("TURBO_LEAN_JOBS").is_none() {
+                std::env::set_var("TURBO_LEAN_JOBS", j.to_string());
+            }
+        }
+    }
+
+    /// Effective worker parallelism for `work_items` units of work: the explicit job count,
+    /// else `fallback()`; clamped under an explicit memory budget to the governor's
+    /// recommendation at `est_worker_rss_mb` per worker, and always at least one worker.
+    pub fn effective_parallelism(
+        &self,
+        work_items: usize,
+        est_worker_rss_mb: u64,
+        fallback: impl FnOnce() -> usize,
+    ) -> usize {
+        let base = self.jobs.unwrap_or_else(fallback).max(1);
+        let clamped = match self.max_memory_mb {
+            Some(mb) => base.min(
+                crate::shm_cache::MemoryBudgetGovernor::new(mb)
+                    .recommended_parallel_workers(est_worker_rss_mb),
+            ),
+            None => base,
+        };
+        clamped.clamp(1, work_items.max(1))
+    }
+
+    /// Per-worker address-space cap in MiB under an explicit budget: the budget divided
+    /// across the workers, floored at 512 MiB so a wide run cannot starve every worker
+    /// below a workable Lean heap.
+    pub fn per_worker_rlimit_mb(&self, parallelism: usize) -> Option<u64> {
+        self.max_memory_mb
+            .map(|mb| (mb / parallelism.max(1) as u64).max(512))
+    }
+
+    /// Shrink the replay closure batch cap when the per-worker budget is tight: one module
+    /// per replay process below 2 GiB per worker, at most 8 modules below 4 GiB, else
+    /// `base_cap` unchanged.
+    pub fn replay_batch_cap(&self, base_cap: usize, parallelism: usize) -> usize {
+        match self.per_worker_rlimit_mb(parallelism) {
+            Some(mb) if mb < 2048 => 1,
+            Some(mb) if mb < 4096 => base_cap.clamp(1, 8),
+            _ => base_cap.max(1),
+        }
+    }
+
+    /// Apply the per-worker cap as a real `RLIMIT_AS`/`RLIMIT_DATA` on the spawned worker
+    /// (#435): rlimits survive `exec`, so the cap also reaches a bwrap-wrapped worker.
+    /// Fail-open inside the child: a worker that cannot lower its limits still runs, and
+    /// the machine-wide LRU governor remains the backstop.
+    pub fn apply_worker_rlimit(cmd: &mut Command, rlimit_mb: u64) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let bytes = rlimit_mb.saturating_mul(1024 * 1024);
+            unsafe {
+                cmd.pre_exec(move || {
+                    let lim = libc::rlimit {
+                        rlim_cur: bytes as libc::rlim_t,
+                        rlim_max: bytes as libc::rlim_t,
+                    };
+                    let _ = libc::setrlimit(libc::RLIMIT_AS, &lim);
+                    let _ = libc::setrlimit(libc::RLIMIT_DATA, &lim);
+                    Ok(())
+                });
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (cmd, rlimit_mb);
+        }
+    }
+
+    /// A named explanation for a replay worker that died by signal under the per-worker
+    /// memory cap, instead of an opaque `exit=signal: 9` (#435). Empty when no cap was
+    /// applied or the worker exited normally.
+    pub fn memory_kill_note(
+        status: &std::process::ExitStatus,
+        rlimit_mb: Option<u64>,
+    ) -> String {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let (Some(mb), Some(sig)) = (rlimit_mb, status.signal()) {
+                return format!(
+                    "\nworker died with signal {sig} under the per-worker memory cap of {mb} MiB \
+                     (from --max-memory-mb / TURBO_LEAN_MAX_MEMORY_MB); raise the budget or \
+                     lower --jobs / TURBO_LEAN_JOBS to give each worker a larger share"
+                );
+            }
+        }
+        let _ = (status, rlimit_mb);
+        String::new()
+    }
+}
+
 pub(crate) const REQUEST_POLICY_KEYS: [&str; 4] = [
     "TURBO_LEAN_ALLOWED_AXIOMS",
     "TURBO_LEAN_ALLOWED_CSIMP",
@@ -282,6 +409,14 @@ pub(crate) fn request_policy(
         .collect()
 }
 
+/// Map an explicit per-request `--timeout-ms` value to the budget the fallback paths
+/// understand (#443): `0` is documented as "no artificial timeout", but `Some(0)` is an
+/// exhausted budget to `run_lean_command` and the shard-fallback `budget_left`, so it must
+/// become `None` before it reaches them.
+pub(crate) fn request_timeout_ms(timeout_ms: u64) -> Option<u64> {
+    (timeout_ms > 0).then_some(timeout_ms)
+}
+
 pub(crate) fn invocation_timeout_ms() -> Option<u64> {
     MCP_TIMEOUT.with(|slot| slot.get()).or_else(|| {
         std::env::var("TURBO_LEAN_TIMEOUT_MS")
@@ -292,8 +427,9 @@ pub(crate) fn invocation_timeout_ms() -> Option<u64> {
     })
 }
 
-/// Per-audit / `.olean`-reader budget in milliseconds (`TURBO_LEAN_AUDIT_TIMEOUT_SECS`,
-/// defaulting to 120 s in untrusted mode and 300 s in trusted mode).
+/// Per-audit / `.olean`-reader budget in milliseconds (`TURBO_LEAN_AUDIT_TIMEOUT_SECS`, or
+/// `[audit] timeout_secs` in turbo-lean.toml; defaulting to 120 s in untrusted mode and
+/// 300 s in trusted mode).
 pub(crate) fn audit_timeout_ms(is_untrusted: bool) -> u64 {
     std::env::var("TURBO_LEAN_AUDIT_TIMEOUT_SECS")
         .ok()
@@ -301,6 +437,17 @@ pub(crate) fn audit_timeout_ms(is_untrusted: bool) -> u64 {
         .filter(|&v| v > 0)
         .unwrap_or(if is_untrusted { 120 } else { 300 })
         .saturating_mul(1000)
+}
+
+/// Per kernel-replay-worker budget in milliseconds (`TURBO_LEAN_REPLAY_TIMEOUT_SECS`, or
+/// `[replay] timeout_secs` in turbo-lean.toml), defaulting to `audit_timeout_ms` (#437).
+pub(crate) fn replay_timeout_ms(is_untrusted: bool) -> u64 {
+    std::env::var("TURBO_LEAN_REPLAY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .map(|secs| secs.saturating_mul(1000))
+        .unwrap_or_else(|| audit_timeout_ms(is_untrusted))
 }
 
 /// Effective `.olean` declaration-identity reader budget in milliseconds: aligns with

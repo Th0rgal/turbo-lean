@@ -19641,6 +19641,46 @@ end ParityNs
             crate::module_builder::module_compile_timeout_secs_from(Some("1200"), false),
             1200
         );
+        // #437: with no explicit setting, the trusted default is 1800 s, not a flat 300 s
+        // that kills legitimate 400 s proof-heavy modules.
+        assert_eq!(
+            crate::module_builder::module_compile_timeout_secs_from(None, false),
+            1800
+        );
+        // With a recorded duration the trusted default adapts: max(300, 3x last).
+        assert_eq!(
+            crate::module_builder::module_compile_timeout_secs_with_history(
+                None,
+                false,
+                Some(436_000)
+            ),
+            1308
+        );
+        assert_eq!(
+            crate::module_builder::module_compile_timeout_secs_with_history(
+                None,
+                false,
+                Some(10_000)
+            ),
+            300
+        );
+        // An explicit setting always wins, and untrusted mode ignores history.
+        assert_eq!(
+            crate::module_builder::module_compile_timeout_secs_with_history(
+                Some("1200"),
+                false,
+                Some(436_000)
+            ),
+            1200
+        );
+        assert_eq!(
+            crate::module_builder::module_compile_timeout_secs_with_history(
+                None,
+                true,
+                Some(436_000)
+            ),
+            300
+        );
     }
 
     #[test]
