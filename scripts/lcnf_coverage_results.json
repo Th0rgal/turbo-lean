@@ -14,6 +14,7 @@
   },
   "corpora": {
     "c1_corpus": {
+      "compiler_aux_decls_excluded": 925,
       "lowered_unproved": 98,
       "proved": 782,
       "rejected": 22,
@@ -22,6 +23,7 @@
       "total_declarations": 902
     },
     "std_init_and_c2": {
+      "compiler_aux_decls_excluded": 817,
       "lowered_unproved": 84,
       "proved": 29,
       "rejected": 1692,
@@ -29,6 +31,7 @@
       "rejected_not_lowered_reason": "mutual_cycle",
       "subcorpora": {
         "c2_lake_packages": {
+          "compiler_aux_decls_excluded": 61,
           "lowered_unproved": 19,
           "proved": 13,
           "rejected": 0,
@@ -37,6 +40,7 @@
           "total_declarations": 32
         },
         "std_init_data": {
+          "compiler_aux_decls_excluded": 756,
           "lowered_unproved": 65,
           "proved": 16,
           "rejected": 1692,
@@ -48,8 +52,8 @@
       "total_declarations": 1805
     }
   },
-  "measured_source_commit": "8f76741f2394bc06f0a4b9c702969474ddfbeec6",
+  "measured_source_commit": "2d18487bfecacada542884c868953424bfc75161",
   "measured_source_commit_note": "`measured_source_commit` is the commit of the tree the measurement was taken from (recorded when `--write-results` ran, i.e. the parent of the commit that updates this file).",
-  "schemaVersion": "turbo-lean-lcnf-coverage-results-v2",
+  "schemaVersion": "turbo-lean-lcnf-coverage-results-v3",
   "toolchain": "leanprover/lean4:v4.35.0"
 }

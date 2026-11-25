@@ -25,6 +25,14 @@ Methodology & Honesty Rules:
   `lowerRealLCNFDecl_sound` is a forward simulation gated on `evalRealLCNFDecl ... = .ok (v, hst')`,
   its conclusion is vacuous for any declaration that calls a local helper (`lowered_vacuous_local_call`,
   classified under `lowered_unproved` until rung **L2** adds a function environment to both semantics).
+- A call to a user function OUTSIDE the measured corpus is refused by the real lowerer and
+  counted `rejected`, never `proved` (pinned by `test_out_of_corpus_callee_is_rejected_never_proved`):
+  `proved` is reachable only by declarations the pipeline fully lowers whose remaining calls are
+  intrinsics the semantics evaluates.
+- Compiler-generated auxiliary declarations (`isCompilerGeneratedAuxDecl`) are excluded from every
+  corpus denominator — the measurement neither lowers nor expands them — and the number excluded is
+  published per corpus and subcorpus as `compiler_aux_decls_excluded`, so the scope of
+  `total_declarations` is auditable rather than claimed.
 - External `Batteries` modules outside the in-toolchain `Init.Data.*` / `Std.Data.*` and the
   `verification/c2-lake-packages/*` `.olean` artifacts are explicitly reported as `unknown` rather
   than extrapolated; measuring them is a later leaf.
@@ -52,6 +60,12 @@ PINNED_CON_LECHE_REV = "501589f5680d9599dee1bcef30a420bc8924c490"
 CON_LECHE_OLEANS_ENV = "TURBO_CON_LECHE_OLEANS"
 RESULTS_FILE = ROOT_DIR / "scripts" / "lcnf_coverage_results.json"
 RESULT_FIELDS = ("total_declarations", "proved", "lowered_unproved", "rejected", "rejected_not_lowered")
+# Compiler-generated auxiliary declarations (`isCompilerGeneratedAuxDecl`) are
+# excluded from every corpus denominator; the count excluded is measured and
+# published per corpus/subcorpus so the scope of `total_declarations` is
+# auditable instead of claimed. It is outside the proved+unproved+rejected sum.
+AUX_FIELD = "compiler_aux_decls_excluded"
+MEASURED_INT_FIELDS = RESULT_FIELDS + (AUX_FIELD,)
 REJECTED_NOT_LOWERED_REASON = "mutual_cycle"
 CON_LECHE_MODULE_PREFIXES = ("ConLeche.Kernel", "ConLeche.Cached", "ConLeche.Frontend", "ConLeche.Driver")
 CON_LECHE_EXCLUDED_MODULES = frozenset({"ConLeche.Kernel.NatOpPins"})
@@ -92,7 +106,7 @@ TRACKED_BRIDGE_FILES: tuple[str, ...] = (
 # added or removed changes the tracked set and fails `--check` until the
 # committed results are re-measured.
 TRACKED_BRIDGE_DIRS: tuple[str, ...] = ("lean/LeanNative/IR/BridgeHelpers",)
-RESULTS_SCHEMA_VERSION = "turbo-lean-lcnf-coverage-results-v2"
+RESULTS_SCHEMA_VERSION = "turbo-lean-lcnf-coverage-results-v3"
 MEASURED_SOURCE_COMMIT_NOTE = (
     "`measured_source_commit` is the commit of the tree the measurement was taken from "
     "(recorded when `--write-results` ran, i.e. the parent of the commit that updates this file)."
@@ -624,7 +638,7 @@ def toImpureDecls (env : Environment) (decls : Array (Decl .pure)) : IO (Array (
   | .ok d => return d
   | .error e => throw (IO.userError s!"module toImpure conversion failed: {e}")
 
-unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat × Nat × Nat × Nat) := do
+unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat × Nat × Nat × Nat × Nat) := do
   -- Fail closed: a module that cannot be converted to impure IR must fail the
   -- audit loudly, never contribute a silent zero, and a module missing from
   -- the imported environment must be named. The declaration set of this
@@ -634,14 +648,18 @@ unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat ×
   -- user function declared in the same group is classified exactly like a
   -- same-module call (a vacuous local call), matching the eval
   -- `unsupportedCall` vacuity of `lowerRealLCNFDecl_sound` instead of being
-  -- rejected or counted proved.
+  -- rejected or counted proved. Compiler-generated auxiliary declarations are
+  -- excluded from the corpus (never measured, never expanded); the number
+  -- excluded is returned so the published denominator's scope is auditable.
   let mut corpusDecls : Array (Name × Decl .impure) := #[]
+  let mut auxTot := 0
   for modName in mods do
     let some modIdx := env.getModuleIdx? modName
       | throw (IO.userError s!"audit module `{modName}` not found in the imported environment")
     let mdecls := monoExt.getModuleEntries env modIdx
     let impDecls ← toImpureDecls env mdecls
     let impNonAux := impDecls.filter (fun d => !isCompilerGeneratedAuxDecl env d.name)
+    auxTot := auxTot + (impDecls.size - impNonAux.size)
     for d in impNonAux do
       corpusDecls := corpusDecls.push (modName, d)
   let corpusNames := corpusDecls.map (·.2.name)
@@ -665,7 +683,7 @@ unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat ×
         if hasCall then unp := unp + 1 else prv := prv + 1
       | .error _ =>
         rej := rej + 1
-  return (tot, prv, unp, rej, cyc)
+  return (tot, prv, unp, rej, cyc, auxTot)
 """
 
 _LEAN_AUDIT_DRIVER_SRC = _LEAN_AUDIT_DRIVER_HEAD + r"""
@@ -693,10 +711,10 @@ unsafe def main (args : List String) : IO Unit := do
     `C1Neg_signed_int64_transitive, `C1Neg_single_ctor_enum
   ]
   let env ← importModules ((stdMods ++ c2Mods ++ c1Mods).map (fun m => { module := m })) {} (loadExts := true)
-  let (st, sp, su, sr, sc) ← auditMods env stdMods
-  let (c2t, c2p, c2u, c2r, c2c) ← auditMods env c2Mods
-  let (c1t, c1p, c1u, c1r, c1c) ← auditMods env c1Mods
-  IO.println s!"AUDIT_RESULT:{st},{sp},{su},{sr},{sc};{c2t},{c2p},{c2u},{c2r},{c2c};{c1t},{c1p},{c1u},{c1r},{c1c}"
+  let (st, sp, su, sr, sc, sa) ← auditMods env stdMods
+  let (c2t, c2p, c2u, c2r, c2c, c2a) ← auditMods env c2Mods
+  let (c1t, c1p, c1u, c1r, c1c, c1a) ← auditMods env c1Mods
+  IO.println s!"AUDIT_RESULT:{st},{sp},{su},{sr},{sc},{sa};{c2t},{c2p},{c2u},{c2r},{c2c},{c2a};{c1t},{c1p},{c1u},{c1r},{c1c},{c1a}"
 """
 
 
@@ -711,8 +729,8 @@ unsafe def main (args : List String) : IO Unit := do
     {names}
   ]
   let env ← importModules (mods.map (fun m => {{ module := m }})) {{}} (loadExts := true)
-  let (t, p, u, r, c) ← auditMods env mods
-  IO.println s!"AUDIT_RESULT:{{t}},{{p}},{{u}},{{r}},{{c}}"
+  let (t, p, u, r, c, a) ← auditMods env mods
+  IO.println s!"AUDIT_RESULT:{{t}},{{p}},{{u}},{{r}},{{c}},{{a}}"
 """
 
 
@@ -728,7 +746,12 @@ def _lean_env() -> dict[str, str]:
 
 
 def _run_audit_driver(root_dir: Path, driver_src: str, lib_dirs: list[str]) -> tuple[int, int, int, int, int]:
-    """Run one audit driver against `lib_dirs`; return (total, proved, unproved, rejected, rejected_not_lowered)."""
+    """Run one audit driver against `lib_dirs`.
+
+    Returns (total, proved, unproved, rejected, rejected_not_lowered,
+    compiler_aux_decls_excluded). A driver that exits non-zero or emits no
+    AUDIT_RESULT raises; a failed run is never converted into counts.
+    """
     lean_dir = root_dir / "lean"
     env = _lean_env()
     with tempfile.TemporaryDirectory(prefix="lcnf-audit-driver-") as tmp:
@@ -766,7 +789,7 @@ def measure_fixture_corpus(root_dir: Path, lean_body: str, mod_name: str = "Fixt
             capture_output=True,
             text=True,
         )
-        tot, prv, unp, rej, cyc = _run_audit_driver(
+        tot, prv, unp, rej, cyc, aux = _run_audit_driver(
             root_dir, _lean_audit_driver_for_modules([mod_name]), [str(root)]
         )
     return {
@@ -776,6 +799,7 @@ def measure_fixture_corpus(root_dir: Path, lean_body: str, mod_name: str = "Fixt
         "rejected": rej,
         "rejected_not_lowered": cyc,
         "rejected_not_lowered_reason": REJECTED_NOT_LOWERED_REASON,
+        "compiler_aux_decls_excluded": aux,
     }
 
 
@@ -950,9 +974,9 @@ def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
             raise RuntimeError(f"Lean audit driver failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
         raw_lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip().startswith("AUDIT_RESULT:")]
         parts = raw_lines[-1].split(":", 1)[1].split(";")
-        st, sp, su, sr, sc = (int(x) for x in parts[0].split(","))
-        c2t, c2p, c2u, c2r, c2c = (int(x) for x in parts[1].split(","))
-        c1t, c1p, c1u, c1r, c1c = (int(x) for x in parts[2].split(","))
+        st, sp, su, sr, sc, sa = (int(x) for x in parts[0].split(","))
+        c2t, c2p, c2u, c2r, c2c, c2a = (int(x) for x in parts[1].split(","))
+        c1t, c1p, c1u, c1r, c1c, c1a = (int(x) for x in parts[2].split(","))
 
     result = {
         "executed": True,
@@ -964,6 +988,7 @@ def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
             "rejected": sr + c2r,
             "rejected_not_lowered": sc + c2c,
             "rejected_not_lowered_reason": REJECTED_NOT_LOWERED_REASON,
+            "compiler_aux_decls_excluded": sa + c2a,
             "subcorpora": {
                 "std_init_data": {
                     "total_declarations": st,
@@ -972,6 +997,7 @@ def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
                     "rejected": sr,
                     "rejected_not_lowered": sc,
                     "rejected_not_lowered_reason": REJECTED_NOT_LOWERED_REASON,
+                    "compiler_aux_decls_excluded": sa,
                 },
                 "c2_lake_packages": {
                     "total_declarations": c2t,
@@ -980,6 +1006,7 @@ def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
                     "rejected": c2r,
                     "rejected_not_lowered": c2c,
                     "rejected_not_lowered_reason": REJECTED_NOT_LOWERED_REASON,
+                    "compiler_aux_decls_excluded": c2a,
                 },
             },
         },
@@ -990,6 +1017,7 @@ def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
             "rejected": c1r,
             "rejected_not_lowered": c1c,
             "rejected_not_lowered_reason": REJECTED_NOT_LOWERED_REASON,
+            "compiler_aux_decls_excluded": c1a,
         },
     }
     _LIVE_AUDIT_CACHE[cache_key] = result
@@ -1160,7 +1188,7 @@ def measure_con_leche(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
             }
         _CON_LECHE_CACHE[cache_key] = result
         return result
-    total, proved, unproved, rejected, rejected_not_lowered = _run_audit_driver(
+    total, proved, unproved, rejected, rejected_not_lowered, aux_excluded = _run_audit_driver(
         root_dir, _lean_audit_driver_for_modules(modules), [str(olean_root)]
     )
     result = {
@@ -1178,6 +1206,7 @@ def measure_con_leche(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
         "rejected": rejected,
         "rejected_not_lowered": rejected_not_lowered,
         "rejected_not_lowered_reason": REJECTED_NOT_LOWERED_REASON,
+        "compiler_aux_decls_excluded": aux_excluded,
     }
     _CON_LECHE_CACHE[cache_key] = result
     return result
@@ -1220,6 +1249,7 @@ def build_live_corpora(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
             "rejected": bat["rejected"],
             "rejected_not_lowered": bat["rejected_not_lowered"],
             "rejected_not_lowered_reason": bat["rejected_not_lowered_reason"],
+            "compiler_aux_decls_excluded": bat["compiler_aux_decls_excluded"],
             "subcorpora": bat["subcorpora"],
         }
         c1 = live["c1_corpus"]
@@ -1234,6 +1264,7 @@ def build_live_corpora(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
             "rejected": c1["rejected"],
             "rejected_not_lowered": c1["rejected_not_lowered"],
             "rejected_not_lowered_reason": c1["rejected_not_lowered_reason"],
+            "compiler_aux_decls_excluded": c1["compiler_aux_decls_excluded"],
         }
     corpora["external_batteries"] = {
         "status": "unknown",
@@ -1309,13 +1340,13 @@ def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[
     for cname, corp in report.get("corpora", {}).items():
         if corp.get("status") == "unknown" or corp.get("measurement_source") != "live_invocation":
             continue
-        entry: dict[str, Any] = {f: corp[f] for f in RESULT_FIELDS if f in corp}
+        entry: dict[str, Any] = {f: corp[f] for f in MEASURED_INT_FIELDS if f in corp}
         if "rejected_not_lowered_reason" in corp:
             entry["rejected_not_lowered_reason"] = corp["rejected_not_lowered_reason"]
         if "subcorpora" in corp:
             entry["subcorpora"] = {
                 sname: {
-                    **{f: sc[f] for f in RESULT_FIELDS if f in sc},
+                    **{f: sc[f] for f in MEASURED_INT_FIELDS if f in sc},
                     **(
                         {"rejected_not_lowered_reason": sc["rejected_not_lowered_reason"]}
                         if "rejected_not_lowered_reason" in sc
@@ -1344,11 +1375,11 @@ def _validate_measured_entry(path: str, entry: Any, errors: list[str], depth: in
         # An explicit `not_measured` stub is honest only with a reason and no counts.
         if not entry.get("reason"):
             errors.append(f"Results file `{path}` is marked not_measured but gives no reason")
-        if any(k in entry for k in RESULT_FIELDS):
+        if any(k in entry for k in MEASURED_INT_FIELDS):
             errors.append(f"Results file `{path}` is marked not_measured yet carries declaration counts")
         if "subcorpora" in entry:
             errors.append(f"Results file `{path}` is marked not_measured yet carries subcorpora")
-        unknown = sorted(set(entry) - {"measurement_source", "reason"} - set(RESULT_FIELDS) - {"subcorpora"})
+        unknown = sorted(set(entry) - {"measurement_source", "reason"} - set(MEASURED_INT_FIELDS) - {"subcorpora"})
         if unknown:
             errors.append(
                 f"Results file `{path}` not_measured stub carries unknown keys: {', '.join(unknown)}"
@@ -1363,13 +1394,13 @@ def _validate_measured_entry(path: str, entry: Any, errors: list[str], depth: in
             f"(only corpus -> subcorpora is supported)"
         )
         return
-    allowed_keys = set(RESULT_FIELDS) | {"rejected_not_lowered_reason"}
+    allowed_keys = set(MEASURED_INT_FIELDS) | {"rejected_not_lowered_reason"}
     if depth == 0:
         allowed_keys.add("subcorpora")
     unknown = sorted(set(entry) - allowed_keys)
     if unknown:
         errors.append(f"Results file `{path}` carries unknown keys: {', '.join(unknown)}")
-    for f in RESULT_FIELDS:
+    for f in MEASURED_INT_FIELDS:
         if f not in entry:
             errors.append(f"Results file `{path}` is missing measured field `{f}`")
             continue
@@ -1409,15 +1440,15 @@ def _validate_measured_entry(path: str, entry: Any, errors: list[str], depth: in
         _validate_measured_entry(f"{path}.subcorpora.{sname}", sc, errors, depth=depth + 1)
     parent_ints = all(
         f in entry and isinstance(entry[f], int) and not isinstance(entry[f], bool)
-        for f in RESULT_FIELDS
+        for f in MEASURED_INT_FIELDS
     )
     sub_ints = all(
         isinstance(sc, dict)
-        and all(f in sc and isinstance(sc[f], int) and not isinstance(sc[f], bool) for f in RESULT_FIELDS)
+        and all(f in sc and isinstance(sc[f], int) and not isinstance(sc[f], bool) for f in MEASURED_INT_FIELDS)
         for sc in subs.values()
     )
     if parent_ints and sub_ints:
-        for f in RESULT_FIELDS:
+        for f in MEASURED_INT_FIELDS:
             summed = sum(sc[f] for sc in subs.values())
             if summed != entry[f]:
                 errors.append(
@@ -1520,7 +1551,7 @@ def _live_measured_status_error(cname: str, corp: Any) -> str | None:
             f"Corpus `{cname}` is measured in scripts/lcnf_coverage_results.json "
             f"but the live entry measurement_source is {source!r}, not 'live_invocation'"
         )
-    for field in RESULT_FIELDS:
+    for field in MEASURED_INT_FIELDS:
         value = corp.get(field)
         if isinstance(value, bool) or not isinstance(value, int):
             return (
@@ -1568,13 +1599,13 @@ def check_coverage_report(
         if corp.get("status") == "unknown":
             if not corp.get("reason"):
                 errors.append(f"Corpus `{cname}` is unknown but gives no reason")
-            if any(k in corp for k in RESULT_FIELDS):
+            if any(k in corp for k in MEASURED_INT_FIELDS):
                 errors.append(f"Corpus `{cname}` is unknown yet carries declaration counts")
             continue
         if source == "not_measured":
             if not corp.get("reason"):
                 errors.append(f"Corpus `{cname}` is not measured but gives no reason")
-            if any(k in corp for k in RESULT_FIELDS):
+            if any(k in corp for k in MEASURED_INT_FIELDS):
                 errors.append(f"Corpus `{cname}` is not measured yet carries declaration counts")
             continue
         if source == "error":
@@ -1591,7 +1622,7 @@ def check_coverage_report(
             continue
         bad_fields = [
             field
-            for field in RESULT_FIELDS
+            for field in MEASURED_INT_FIELDS
             if isinstance(corp.get(field), bool) or not isinstance(corp.get(field), int)
         ]
         if bad_fields:
@@ -1625,7 +1656,7 @@ def check_coverage_report(
                             f"unsupported depth (only corpus -> subcorpora is supported)"
                         )
                 sub_ints = all(
-                    isinstance(sc, dict) and all(f in sc for f in RESULT_FIELDS)
+                    isinstance(sc, dict) and all(f in sc for f in MEASURED_INT_FIELDS)
                     for sc in subs.values()
                 )
                 if not sub_ints:
@@ -1638,12 +1669,14 @@ def check_coverage_report(
                     sub_unp = sum(s["lowered_unproved"] for s in subs.values())
                     sub_rej = sum(s["rejected"] for s in subs.values())
                     sub_rnl = sum(s.get("rejected_not_lowered", 0) for s in subs.values())
-                    if (sub_tot, sub_prv, sub_unp, sub_rej, sub_rnl) != (
+                    sub_aux = sum(s.get(AUX_FIELD, 0) for s in subs.values())
+                    if (sub_tot, sub_prv, sub_unp, sub_rej, sub_rnl, sub_aux) != (
                         tot,
                         corp["proved"],
                         corp["lowered_unproved"],
                         corp["rejected"],
                         corp.get("rejected_not_lowered", 0),
+                        corp.get(AUX_FIELD, 0),
                     ):
                         errors.append(
                             f"Corpus `{cname}` subcorpora totals do not sum to corpus totals"
@@ -1723,10 +1756,10 @@ def check_coverage_report(
                     f"Corpus `{cname}` is measured live but scripts/lcnf_coverage_results.json marks it not_measured"
                 )
                 continue
-            diffs = [f for f in RESULT_FIELDS if base_c.get(f) != corp.get(f)]
+            diffs = [f for f in MEASURED_INT_FIELDS if base_c.get(f) != corp.get(f)]
             if diffs:
                 side_summary = ", ".join(
-                    f"{f}={base_c.get(f)} vs {corp.get(f)}" for f in RESULT_FIELDS
+                    f"{f}={base_c.get(f)} vs {corp.get(f)}" for f in MEASURED_INT_FIELDS
                 )
                 errors.append(
                     f"Corpus `{cname}` differs from scripts/lcnf_coverage_results.json "
@@ -1754,7 +1787,7 @@ def check_coverage_report(
                 bsc = base_subs[sname]
                 if not isinstance(bsc, dict):
                     continue  # already named by validate_results_document
-                for f in RESULT_FIELDS:
+                for f in MEASURED_INT_FIELDS:
                     if bsc.get(f) != sc.get(f):
                         errors.append(
                             f"Corpus `{cname}` subcorpus `{sname}` field `{f}` differs from "
@@ -1813,7 +1846,7 @@ def check_coverage_report(
                 if c_rep.get("measurement_source") != "live_invocation":
                     errors.append(f"Corpus `{cname}` has no live measurement to compare")
                     continue
-                for field in RESULT_FIELDS:
+                for field in MEASURED_INT_FIELDS:
                     if c_rep[field] != c_live[field]:
                         errors.append(
                             f"Corpus `{cname}` live execution mismatch on `{field}`: "
@@ -1828,7 +1861,7 @@ def check_coverage_report(
                     f"run cannot measure it: {c_fresh.get('reason', 'unknown')}"
                 )
             else:
-                for field in RESULT_FIELDS:
+                for field in MEASURED_INT_FIELDS:
                     if c_rep[field] != c_fresh[field]:
                         errors.append(
                             f"Corpus `con_leche_h3_benchmark` live execution mismatch on `{field}`: "
@@ -1926,7 +1959,7 @@ class TestLcnfCoverage(unittest.TestCase):
             os.environ["TURBO_CON_LECHE_OLEANS"] = str(root / "lib" / "lean")
             try:
                 with mock.patch.object(
-                    sys.modules[__name__], "_run_audit_driver", return_value=(100, 7, 11, 82, 4)
+                    sys.modules[__name__], "_run_audit_driver", return_value=(100, 7, 11, 82, 4, 9)
                 ) as run, mock.patch.object(
                     sys.modules[__name__], "_git_head", return_value=PINNED_CON_LECHE_REV
                 ), mock.patch.dict(
@@ -2168,7 +2201,7 @@ class TestLcnfCoverage(unittest.TestCase):
         corpora: dict[str, Any] = {}
         for cname, entry in baseline["corpora"].items():
             corp: dict[str, Any] = {"measurement_source": "live_invocation"}
-            corp.update({f: entry[f] for f in RESULT_FIELDS if f in entry})
+            corp.update({f: entry[f] for f in MEASURED_INT_FIELDS if f in entry})
             if "rejected_not_lowered_reason" in entry:
                 corp["rejected_not_lowered_reason"] = entry["rejected_not_lowered_reason"]
             if "subcorpora" in entry:
@@ -2741,6 +2774,37 @@ class TestLcnfCoverage(unittest.TestCase):
     # same two paths as H1.0a-V, after V).
     # ------------------------------------------------------------------
 
+    def _compile_xmod_fixture(self, root: Path) -> None:
+        """Compile two modules into `root`: SCaller calls SAux.sa_one across modules."""
+        lean_dir = ROOT_DIR / "lean"
+        env = _lean_env()
+        (root / "SAux.lean").write_text(
+            "namespace SAux\n"
+            "@[export sa_one]\n"
+            "def sa_one (x : UInt64) : UInt64 := x + 1\n"
+            "end SAux\n",
+            encoding="utf-8",
+        )
+        (root / "SCaller.lean").write_text(
+            "import SAux\n"
+            "namespace SCaller\n"
+            "@[export sc_two]\n"
+            "def sc_two (x : UInt64) : UInt64 := SAux.sa_one x + 1\n"
+            "end SCaller\n",
+            encoding="utf-8",
+        )
+        cenv = dict(env)
+        cenv["LEAN_PATH"] = str(root)
+        for name in ("SAux", "SCaller"):
+            subprocess.run(
+                ["lean", f"--root={root}", "-o", str(root / f"{name}.olean"), str(root / f"{name}.lean")],
+                cwd=str(lean_dir),
+                env=cenv,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
     def test_cross_module_user_call_is_vacuous_not_rejected(self) -> None:
         # Counterexample (real lowerer, two compiled modules): a declaration in
         # one measured module calling a user function declared in another
@@ -2750,54 +2814,102 @@ class TestLcnfCoverage(unittest.TestCase):
         # call into a measured corpus declaration is a vacuous local call
         # (`lowered_unproved`) — eval `unsupportedCall` makes the pinned
         # simulation vacuous exactly like the same-module helper case.
-        lean_dir = ROOT_DIR / "lean"
         _ensure_lean_build(ROOT_DIR)
-        env = _lean_env()
         with tempfile.TemporaryDirectory(prefix="lcnf-xmod-") as tmp:
             root = Path(tmp)
-            (root / "SAux.lean").write_text(
-                "namespace SAux\n"
-                "@[export sa_one]\n"
-                "def sa_one (x : UInt64) : UInt64 := x + 1\n"
-                "end SAux\n",
-                encoding="utf-8",
-            )
-            (root / "SCaller.lean").write_text(
-                "import SAux\n"
-                "namespace SCaller\n"
-                "@[export sc_two]\n"
-                "def sc_two (x : UInt64) : UInt64 := SAux.sa_one x + 1\n"
-                "end SCaller\n",
-                encoding="utf-8",
-            )
-            cenv = dict(env)
-            cenv["LEAN_PATH"] = str(root)
-            for name in ("SAux", "SCaller"):
-                subprocess.run(
-                    ["lean", f"--root={root}", "-o", str(root / f"{name}.olean"), str(root / f"{name}.lean")],
-                    cwd=str(lean_dir),
-                    env=cenv,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
+            self._compile_xmod_fixture(root)
             counts = _run_audit_driver(
                 ROOT_DIR, _lean_audit_driver_for_modules(["SAux", "SCaller"]), [str(root)]
             )
-        tot, prv, unp, rej, cyc = counts
+        tot, prv, unp, rej, cyc, _aux = counts
         self.assertEqual(tot, 2, counts)
         self.assertEqual(prv, 1, counts)  # the callee itself lowers and proves
         self.assertEqual(unp, 1, counts)  # the cross-module caller is a vacuous local call
         self.assertEqual(rej, 0, counts)  # a corpus-local call is not an unsupported construct
         self.assertEqual(cyc, 0, counts)
 
+    def test_out_of_corpus_callee_is_rejected_never_proved(self) -> None:
+        # H1.0a-S classification investigation, pinned: a call to a user
+        # function OUTSIDE the measured corpus (SAux is importable but not
+        # audited) is refused by the real lowerer and counted `rejected` —
+        # never `proved`, which would be dishonest because
+        # `RealLCNFSemantics.evalLetValue` errors on the call and the pinned
+        # simulation would be vacuous while the matrix claimed a proof.
+        _ensure_lean_build(ROOT_DIR)
+        with tempfile.TemporaryDirectory(prefix="lcnf-xcorpus-") as tmp:
+            root = Path(tmp)
+            self._compile_xmod_fixture(root)
+            counts = _run_audit_driver(
+                ROOT_DIR, _lean_audit_driver_for_modules(["SCaller"]), [str(root)]
+            )
+        tot, prv, unp, rej, cyc, _aux = counts
+        self.assertEqual((tot, prv, unp, rej, cyc), (1, 0, 0, 1, 0), counts)
+
     def test_audit_driver_never_silently_drops_a_module(self) -> None:
-        # A module whose IR conversion fails must fail the audit loudly (never
-        # `return #[]`), and a module missing from the imported environment
-        # must never contribute a silent zero: both would understate the
-        # published counts as if the declarations had been measured.
+        # H1.0a-S acceptance: an EXECUTABLE failure reproduction of the silent
+        # module-IR drop. The pre-fix driver skipped a module missing from the
+        # imported environment (`if let some modIdx := ... then`) and turned a
+        # failed IR conversion into an empty module (`.error _ => return #[]`),
+        # so the published counts silently omitted declarations. The shipped
+        # driver must fail loudly, naming the module; the reconstructed
+        # pre-fix variant is run on the same input and shown to emit exactly
+        # the silent under-count the fix prevents.
         self.assertNotIn(".error _ => return #[]", _LEAN_AUDIT_DRIVER_HEAD)
         self.assertIn("not found in the imported environment", _LEAN_AUDIT_DRIVER_HEAD)
+        _ensure_lean_build(ROOT_DIR)
+        main_src = """
+unsafe def main (args : List String) : IO Unit := do
+  enableInitializersExecution
+  initSearchPath (← findSysroot) (args.map System.FilePath.mk)
+  let env ← importModules (#[`SAux].map (fun m => { module := m })) {} (loadExts := true)
+  let (t, p, u, r, c, a) ← auditMods env #[`SAux, `SCaller]
+  IO.println s!"AUDIT_RESULT:{t},{p},{u},{r},{c},{a}"
+"""
+        with tempfile.TemporaryDirectory(prefix="lcnf-silent-drop-") as tmp:
+            root = Path(tmp)
+            self._compile_xmod_fixture(root)
+            # AFTER (shipped): SCaller is named for audit but absent from the
+            # imported environment -> the run dies loudly, naming the module.
+            with self.assertRaises(RuntimeError) as ctx:
+                _run_audit_driver(ROOT_DIR, _LEAN_AUDIT_DRIVER_HEAD + main_src, [str(root)])
+            self.assertIn(
+                "audit module `SCaller` not found in the imported environment",
+                str(ctx.exception),
+            )
+            # BEFORE (reconstructed pre-fix silent skip): the same input yields
+            # a quiet AUDIT_RESULT that simply omits SCaller's declaration.
+            before_head = _LEAN_AUDIT_DRIVER_HEAD.replace(
+                '    let some modIdx := env.getModuleIdx? modName\n'
+                '      | throw (IO.userError s!"audit module `{modName}` not found in the imported environment")',
+                "    let some modIdx := env.getModuleIdx? modName\n      | continue",
+            )
+            self.assertNotEqual(before_head, _LEAN_AUDIT_DRIVER_HEAD)
+            tot, prv, _unp, _rej, _cyc, _aux = _run_audit_driver(
+                ROOT_DIR, before_head + main_src, [str(root)]
+            )
+            self.assertEqual(
+                (tot, prv), (1, 1), "pre-fix variant should silently omit SCaller, counting SAux only"
+            )
+
+    def test_driver_failure_never_becomes_counts(self) -> None:
+        # Python-side fail-closed: a driver that exits non-zero, and a driver
+        # that exits 0 without printing AUDIT_RESULT, each raise a named
+        # RuntimeError; neither is ever converted into declaration counts.
+        with self.assertRaises(RuntimeError) as ctx:
+            _run_audit_driver(
+                ROOT_DIR,
+                'def main (_ : List String) : IO Unit := throw (IO.userError "synthetic module IR failure")\n',
+                [],
+            )
+        self.assertIn("Lean audit driver failed", str(ctx.exception))
+        self.assertIn("synthetic module IR failure", str(ctx.exception))
+        with self.assertRaises(RuntimeError) as ctx2:
+            _run_audit_driver(
+                ROOT_DIR,
+                'def main (_ : List String) : IO Unit := IO.println "no audit marker"\n',
+                [],
+            )
+        self.assertIn("emitted no AUDIT_RESULT", str(ctx2.exception))
 
     def test_corpus_scope_does_not_claim_aux_expansion_it_never_performs(self) -> None:
         # The scope text claimed compiler-generated `_closed` helpers were
@@ -2841,7 +2953,7 @@ class TestLcnfCoverage(unittest.TestCase):
             os.environ["TURBO_CON_LECHE_OLEANS"] = str(root / "lib" / "lean")
             try:
                 with mock.patch.object(
-                    sys.modules[__name__], "_run_audit_driver", return_value=(100, 7, 11, 82, 4)
+                    sys.modules[__name__], "_run_audit_driver", return_value=(100, 7, 11, 82, 4, 9)
                 ) as run, mock.patch.object(
                     sys.modules[__name__], "_git_head", return_value=PINNED_CON_LECHE_REV
                 ):
@@ -3116,7 +3228,8 @@ def main() -> int:
                     f"(+{corp['lowered_unproved']} vacuous_local_call, "
                     f"{corp['rejected']} rejected incl. "
                     f"rejected_not_lowered={corp['rejected_not_lowered']} "
-                    f"[{corp['rejected_not_lowered_reason']}])"
+                    f"[{corp['rejected_not_lowered_reason']}], "
+                    f"aux_excluded={corp['compiler_aux_decls_excluded']})"
                 )
             elif corp.get("measurement_source") == "error":
                 parts.append(f"{label}=error ({corp.get('error_code', 'error')})")
