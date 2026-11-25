@@ -3439,7 +3439,9 @@ pub(crate) fn recheck_dependents_if_nonlocal_for_check(
                 }
             }
             for dp in &cfg.dep_pkgs {
-                if !dp.inputs.is_empty() {
+                if !dp.inputs.is_empty()
+                    && crate::module_builder::dep_pkg_lake_targets_owned_by_project(&cfg, dp)
+                {
                     let dp_base = crate::module_builder::pkg_target_base_name(dp);
                     input_libs.extend(
                         dp.libs
@@ -3583,6 +3585,9 @@ pub(crate) fn recheck_dependents_if_nonlocal_for_check(
                                 && fs::read_to_string(&spec.src_path)
                                     .map(|s| crate::module_builder::source_uses_include_str(&s))
                                     .unwrap_or(false)
+                                && crate::module_builder::spec_artifacts_purgeable_from_project_root(
+                                    &cfg, &spec,
+                                )
                             {
                                 remove_spec_build_artifacts_checked(&spec)?;
                                 bypass_lake_cache = true;

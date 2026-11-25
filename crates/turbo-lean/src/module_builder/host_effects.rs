@@ -391,6 +391,50 @@ pub(crate) fn spec_source_has_disallowed_elab_host_effects(
     spec_source_host_effect_taint(cfg, spec, src_raw).is_tainted()
 }
 
+/// #434: the Lake-inputs fallback sweep may delete build artifacts only for modules the
+/// project owns. A clean git-pinned dependency is refreshed from its pinned sources by
+/// its own workspace, and a package root that resolves outside the project root (a
+/// symlinked path dependency) belongs to another checkout; deleting either's artifacts
+/// damaged shared Mathlib checkouts (#434).
+pub(crate) fn spec_artifacts_purgeable_from_project_root(
+    cfg: &ProjectConfig,
+    spec: &DiscoveredModuleSpec,
+) -> bool {
+    if spec.is_root_pkg {
+        return true;
+    }
+    if is_git_pinned_manifest_package(cfg, spec) {
+        return false;
+    }
+    match (
+        fs::canonicalize(&spec.pkg_root),
+        fs::canonicalize(&cfg.root_pkg.pkg_root),
+    ) {
+        (Ok(pkg), Ok(root)) => pkg.starts_with(&root),
+        _ => false,
+    }
+}
+
+/// #434: dependency-package `lake build` targets are driven from the dependency's own
+/// workspace unless the package is project-owned (an in-project path dependency); the
+/// fallback after a successful check used to run uncapped `lake build` on every
+/// input-bearing dependency target, Mathlib included.
+pub(crate) fn dep_pkg_lake_targets_owned_by_project(
+    cfg: &ProjectConfig,
+    dp: &PackageConfig,
+) -> bool {
+    if is_clean_git_pinned_pkg(cfg, false, &dp.name, pkg_target_base_name(dp), &dp.pkg_root) {
+        return false;
+    }
+    match (
+        fs::canonicalize(&dp.pkg_root),
+        fs::canonicalize(&cfg.root_pkg.pkg_root),
+    ) {
+        (Ok(pkg), Ok(root)) => pkg.starts_with(&root),
+        _ => false,
+    }
+}
+
 /// #407: every Lake build the tool runs is announced on stderr and, when
 /// `TURBO_LEAN_LAKE_CMD_LOG` names a file, appended to it, so benchmarks can assert that
 /// a warm hit runs zero Lake invocations and zero `lake --no-cache` rebuilds.
@@ -2333,6 +2377,16 @@ mod host_effect_taint_tests {
         label: &str,
         dep_source: &str,
     ) -> Result<(PathBuf, ProjectConfig, DiscoveredModuleSpec)> {
+        dep_fixture(label, dep_source, true)
+    }
+
+    /// Like [`pinned_dep_fixture`], but `git_pinned: false` records `lintlib` as an
+    /// in-project *path* dependency instead.
+    fn dep_fixture(
+        label: &str,
+        dep_source: &str,
+        git_pinned: bool,
+    ) -> Result<(PathBuf, ProjectConfig, DiscoveredModuleSpec)> {
         let dir = temp_dir(label);
         let proj = dir.join("proj");
         let dep_in_pkgs = proj.join(".lake/packages/lintlib");
@@ -2352,19 +2406,31 @@ mod host_effect_taint_tests {
             "import Lake\nopen Lake DSL\npackage proj where\nrequire lintlib from \".lake/packages/lintlib\"\n@[default_target]\nlean_lib Proj where\n",
         )?;
         fs::write(proj.join("Proj.lean"), "import LintLib\ndef p : Nat := 1\n")?;
+        let pkg_entry = if git_pinned {
+            serde_json::json!({
+                "type": "git",
+                "name": "lintlib",
+                "rev": rev,
+                "url": "https://example.invalid/lintlib",
+                "inherited": false,
+                "configFile": "lakefile.toml"
+            })
+        } else {
+            serde_json::json!({
+                "type": "path",
+                "name": "lintlib",
+                "dir": ".lake/packages/lintlib",
+                "manifestFile": "lake-manifest.json",
+                "inherited": false,
+                "configFile": "lakefile.toml"
+            })
+        };
         fs::write(
             proj.join("lake-manifest.json"),
             serde_json::to_string_pretty(&serde_json::json!({
                 "version": "1.1.0",
                 "packagesDir": ".lake/packages",
-                "packages": [{
-                    "type": "git",
-                    "name": "lintlib",
-                    "rev": rev,
-                    "url": "https://example.invalid/lintlib",
-                    "inherited": false,
-                    "configFile": "lakefile.toml"
-                }]
+                "packages": [pkg_entry]
             }))?,
         )?;
         let canon = fs::canonicalize(&proj)?;
@@ -2377,11 +2443,57 @@ mod host_effect_taint_tests {
             .expect("lintlib dependency resolves");
         let spec = resolve_module_in_package(dep_pkg, false, "LintLib")
             .expect("LintLib module resolves in lintlib");
-        assert!(
+        assert_eq!(
             is_git_pinned_manifest_package(&cfg, &spec),
-            "fixture must read as a clean git-pinned dependency or the assertions prove nothing"
+            git_pinned,
+            "fixture pin kind must match or the assertions prove nothing"
         );
         Ok((dir, cfg, spec))
+    }
+
+    /// #434: the Lake-inputs fallback sweep's deletion policy. Artifacts and lake
+    /// targets of a clean git-pinned dependency are never project-driven; root modules
+    /// and in-project path dependencies stay project-owned.
+    #[test]
+    fn host_effects_issue_434_dep_artifacts_not_purgeable_from_project_root() -> Result<()> {
+        let (dir, cfg, spec) = pinned_dep_fixture("sweep_pinned", LINTER_SHAPE)?;
+        assert!(
+            !spec_artifacts_purgeable_from_project_root(&cfg, &spec),
+            "a clean git-pinned dependency's artifacts must never be purged from the project (#434)"
+        );
+        let root_spec =
+            resolve_module_in_package(&cfg.root_pkg, true, "Proj").expect("root module resolves");
+        assert!(
+            spec_artifacts_purgeable_from_project_root(&cfg, &root_spec),
+            "root-package artifacts stay purgeable"
+        );
+        let dep_pkg = cfg
+            .dep_pkgs
+            .iter()
+            .find(|dp| dp.name == "lintlib")
+            .expect("dep pkg");
+        assert!(
+            !dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
+            "a git-pinned dependency's lake targets are not driven from the project (#434)"
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        let (dir2, cfg2, spec2) = dep_fixture("sweep_path", LINTER_SHAPE, false)?;
+        assert!(
+            spec_artifacts_purgeable_from_project_root(&cfg2, &spec2),
+            "an in-project path dependency stays project-owned"
+        );
+        let dep_pkg2 = cfg2
+            .dep_pkgs
+            .iter()
+            .find(|dp| dp.name == "lintlib")
+            .expect("dep pkg");
+        assert!(
+            dep_pkg_lake_targets_owned_by_project(&cfg2, dep_pkg2),
+            "an in-project path dependency's targets are project-driven"
+        );
+        let _ = fs::remove_dir_all(&dir2);
+        Ok(())
     }
 
     /// #433: a clean git-pinned dependency module that only *defines* host-reading code
