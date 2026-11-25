@@ -2129,6 +2129,7 @@ pub(super) fn lake_build_modules_opts(
             .env("LAKE_ARTIFACT_CACHE", "false")
             .env("LAKE_CACHE_DIR", &scratch.path);
     }
+    crate::module_builder::log_lake_build_invocation(canon_dir, modules, bypass_artifact_cache);
     let out = cmd
         .arg("build")
         .args(modules)

@@ -391,6 +391,37 @@ pub(crate) fn spec_source_has_disallowed_elab_host_effects(
     spec_source_host_effect_taint(cfg, spec, src_raw).is_tainted()
 }
 
+/// #407: every Lake build the tool runs is announced on stderr and, when
+/// `TURBO_LEAN_LAKE_CMD_LOG` names a file, appended to it, so benchmarks can assert that
+/// a warm hit runs zero Lake invocations and zero `lake --no-cache` rebuilds.
+pub(crate) fn log_lake_build_invocation(
+    canon_dir: &Path,
+    modules: &[String],
+    bypass_artifact_cache: bool,
+) {
+    let flag = if bypass_artifact_cache {
+        " --no-cache"
+    } else {
+        ""
+    };
+    let line = format!(
+        "[turbo-lean] running `lake{flag} build {}` in {}",
+        modules.join(" "),
+        canon_dir.display()
+    );
+    eprintln!("{line}");
+    if let Some(log_path) = std::env::var_os("TURBO_LEAN_LAKE_CMD_LOG") {
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            use std::io::Write as _;
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
 pub(crate) fn build_lean_search_path(cfg: &ProjectConfig, is_untrusted: bool) -> (String, String) {
     let mut lp_parts = Vec::new();
     let mut ld_parts = Vec::new();
@@ -2238,7 +2269,7 @@ mod host_effect_taint_tests {
     /// *definition* that reads host state when invoked. Nothing host-reading executes at
     /// elaboration or import time.
     const LINTER_SHAPE: &str =
-        "initialize myExt : Nat ← pure 0\n\ndef checkFile : IO Bool := IO.FS.pathExists \"style.txt\"\n";
+        "initialize myExt : Nat ← pure 0\n\ndef readProbe : IO (Option String) := IO.getEnv \"TURBO_TAINT_PROBE\"\n";
     /// An import-time host read: `initialize` bodies re-run in every importer.
     const IMPORT_TIME_SHAPE: &str =
         "initialize envFlag : Option String ← IO.getEnv \"TURBO_TAINT_TEST\"\n";
@@ -2374,6 +2405,53 @@ mod host_effect_taint_tests {
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())
+    }
+
+    /// #407: a warm hit runs zero `lake --no-cache` invocations, and the tool logs every
+    /// Lake build it runs so a benchmark can assert that. The first freshness pass over a
+    /// linter-shaped pinned dependency may Lake-build the missing artifacts (logged,
+    /// without `--no-cache`); the second pass is a warm hit and must add no Lake
+    /// invocation at all.
+    #[test]
+    fn host_effects_issue_407_warm_hit_runs_zero_lake_no_cache() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (dir, _cfg, _spec) = pinned_dep_fixture("warmhit", LINTER_SHAPE)?;
+        let proj = fs::canonicalize(dir.join("proj"))?;
+        let tc = include_str!("../../../../lean/lean-toolchain").trim().to_string();
+        let lake_log = dir.join("lake-cmd.log");
+        std::env::set_var("TURBO_LEAN_LAKE_CMD_LOG", &lake_log);
+        let run = || -> Result<()> {
+            let target = [proj.join("Proj.lean")];
+            reset_lake_inputs_tag_memo();
+            let rebuilt =
+                crate::lake_build::ensure_project_imports_fresh(&proj, &target, Some(&tc), true)?;
+            assert!(rebuilt >= 1, "first call must Lake-build the missing dep import");
+            let after_first = fs::read_to_string(&lake_log).unwrap_or_default();
+            assert!(
+                after_first.lines().count() >= 1,
+                "every Lake build the tool runs must be logged (#407); got: {after_first:?}"
+            );
+            assert!(
+                !after_first.contains("--no-cache"),
+                "a linter-shaped pinned dependency must not force `lake --no-cache` (#407/#433); got: {after_first:?}"
+            );
+            reset_lake_inputs_tag_memo();
+            let rebuilt2 =
+                crate::lake_build::ensure_project_imports_fresh(&proj, &target, Some(&tc), true)?;
+            assert_eq!(rebuilt2, 0, "warm hit must find nothing stale (#407)");
+            let after_second = fs::read_to_string(&lake_log).unwrap_or_default();
+            assert_eq!(
+                after_second, after_first,
+                "a warm hit must run zero Lake invocations (#407)"
+            );
+            Ok(())
+        };
+        let res = run();
+        std::env::remove_var("TURBO_LEAN_LAKE_CMD_LOG");
+        let _ = fs::remove_dir_all(dir);
+        res
     }
 
     /// #438: `purge_elab_host_effect_artifacts_in_closure` must not delete the whole
