@@ -2593,6 +2593,29 @@ pub(super) fn stage_artifact_link(
     fs::copy(src, dst).map(|_| ())
 }
 
+/// Budgeted timeout for the standalone re-check `lean` invocations (#441):
+/// `TURBO_LEAN_MODULE_TIMEOUT_SECS` (default 300 s, clamped in untrusted
+/// mode), the same budget every other per-module compile honors, instead of
+/// a hard-coded 300 s that killed legitimate long modules after VERIFIED.
+pub(super) fn standalone_lean_timeout_from(
+    raw_env: Option<&str>,
+    is_untrusted: bool,
+) -> std::time::Duration {
+    std::time::Duration::from_secs(crate::module_builder::module_compile_timeout_secs_from(
+        raw_env,
+        is_untrusted,
+    ))
+}
+
+fn standalone_lean_timeout(is_untrusted: bool) -> std::time::Duration {
+    standalone_lean_timeout_from(
+        std::env::var("TURBO_LEAN_MODULE_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+        is_untrusted,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_and_audit_standalone_modules(
     store_opt: Option<&TurboStore>,
@@ -2931,7 +2954,7 @@ pub(super) fn check_and_audit_standalone_modules(
 
             let out = crate::module_builder::run_command_with_timeout(
                 &mut cmd,
-                std::time::Duration::from_secs(300),
+                standalone_lean_timeout(is_untrusted),
                 true,
             )?;
             if !out.status.success() {
@@ -3059,7 +3082,7 @@ pub(super) fn check_and_audit_standalone_modules(
             .arg(&published_olean);
             let out = crate::module_builder::run_command_with_timeout(
                 &mut cmd,
-                std::time::Duration::from_secs(300),
+                standalone_lean_timeout(is_untrusted),
                 false,
             )?;
             if !out.status.success() {

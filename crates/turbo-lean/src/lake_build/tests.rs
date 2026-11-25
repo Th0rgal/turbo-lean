@@ -4670,3 +4670,30 @@ public def api := by
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
+
+    /// Regression test for #441: the standalone re-check `lean` invocations use
+    /// the budgeted per-module timeout (`TURBO_LEAN_MODULE_TIMEOUT_SECS`), not a
+    /// hard-coded 300 s that killed legitimate long modules after a VERIFIED run.
+    #[test]
+    fn standalone_recheck_timeout_is_budgeted_not_hardcoded() {
+        use std::time::Duration;
+        // Unset / default keeps the documented 300 s.
+        assert_eq!(
+            super::freshness::standalone_lean_timeout_from(None, false),
+            Duration::from_secs(300)
+        );
+        // The configured budget reaches the standalone re-check sites.
+        assert_eq!(
+            super::freshness::standalone_lean_timeout_from(Some("1200"), false),
+            Duration::from_secs(1200)
+        );
+        // Untrusted runs keep the [15, 600] clamp.
+        assert_eq!(
+            super::freshness::standalone_lean_timeout_from(Some("1200"), true),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            super::freshness::standalone_lean_timeout_from(Some("7"), true),
+            Duration::from_secs(15)
+        );
+    }
