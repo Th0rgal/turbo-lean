@@ -152,3 +152,112 @@ fn milestone_m2_g1b_con_leche_contract_v4_and_olen_v1_model_disclosure() {
         );
     }
 }
+
+/// G1b real-`.olean` leg: a real artifact compiled by the PINNED toolchain is structurally
+/// disjoint from the in-repo `"OLEN"` v1 model shard format, so the Contract V4 M2 theorems
+/// (stated over `parseOleanShard`) demonstrably say nothing about real `.olean` files, and
+/// `ConLeche.lean` carries kernel-evaluated guards pinning that rejection.
+#[cfg(unix)]
+#[test]
+fn milestone_m2_g1b_real_olean_artifact_disjoint_from_olen_model_shards() {
+    let f = M2ModelContractFixture::new("g1b_real_olean");
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+
+    // Real compiled artifact from the pinned toolchain — never synthesized `.olean` bytes.
+    let toolchain = fs::read_to_string(repo_root.join("lean/lean-toolchain"))
+        .expect("read lean/lean-toolchain")
+        .trim()
+        .to_string();
+    let dir = f.root.join("olean");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("lean-toolchain"), format!("{toolchain}\n")).unwrap();
+    let lean_bin = Command::new("elan")
+        .current_dir(&dir)
+        .args(["which", "lean"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+        .unwrap_or_else(|| PathBuf::from("lean"));
+    let ver = Command::new(&lean_bin)
+        .current_dir(&dir)
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert_ok(&ver, "pinned `lean --version`");
+    let ver_txt = String::from_utf8_lossy(&ver.stdout).into_owned();
+    let githash8: String = ver_txt
+        .split("commit ")
+        .nth(1)
+        .expect("`lean --version` names its commit")
+        .chars()
+        .take(8)
+        .collect();
+
+    fs::write(
+        dir.join("ValidPrelude.lean"),
+        "module\nprelude\npublic section\ninductive Yes : Prop where\n  | intro\ntheorem yes : Yes := Yes.intro\nend\n",
+    )
+    .unwrap();
+    let olean_path = dir.join("ValidPrelude.olean");
+    let comp = Command::new(&lean_bin)
+        .current_dir(&dir)
+        .args([
+            "-R",
+            dir.to_str().unwrap(),
+            "-o",
+            olean_path.to_str().unwrap(),
+            dir.join("ValidPrelude.lean").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_ok(&comp, "compile ValidPrelude.lean with the pinned toolchain");
+
+    let bytes = fs::read(&olean_path).expect("read real ValidPrelude.olean");
+
+    // Real `.olean` header facts under the pinned toolchain: ASCII `olean` magic, the ASCII
+    // compiler version at byte offset 7, the emitting compiler githash at byte offset 40.
+    const OLEN_MODEL_MAGIC: [u8; 4] = [0x4F, 0x4C, 0x45, 0x4E];
+    assert!(
+        bytes.len() > 48,
+        "real .olean larger than its 48-byte header prefix (got {})",
+        bytes.len()
+    );
+    assert_eq!(&bytes[..5], &b"olean"[..], "real Lean 4 `.olean` magic");
+    let version = toolchain
+        .rsplit(":v")
+        .next()
+        .expect("toolchain pins a version");
+    assert_eq!(
+        &bytes[7..7 + version.len()],
+        version.as_bytes(),
+        "artifact embeds the pinned compiler version"
+    );
+    assert_eq!(
+        &bytes[40..48],
+        githash8.as_bytes(),
+        "artifact embeds the pinned compiler githash"
+    );
+    // The disjointness the G1b guards pin in Lean: a real `.olean` never carries the model magic.
+    assert_ne!(
+        &bytes[..4],
+        &OLEN_MODEL_MAGIC[..],
+        "a real `.olean` is not an OLEN v1 model shard"
+    );
+
+    // Planted control: a synthesized OLEN v1 model shard must NOT read as a real artifact.
+    let synthesized_olen_model_shard: [u8; 5] = [0x4F, 0x4C, 0x45, 0x4E, 0x00];
+    assert_eq!(&synthesized_olen_model_shard[..4], &OLEN_MODEL_MAGIC[..]);
+    assert_ne!(&synthesized_olen_model_shard[..5], &b"olean"[..]);
+
+    // ConLeche.lean carries the executable discriminator guards (G1b honesty, kernel-evaluated).
+    let src = fs::read_to_string(repo_root.join("lean/TurboLean/ConLeche.lean"))
+        .expect("read lean/TurboLean/ConLeche.lean");
+    assert!(src.contains("def realLeanOleanHeaderPrefix : ByteArray"));
+    assert!(src.contains("#guard (parseOleanShard realLeanOleanHeaderPrefix).isOk == false"));
+    assert!(src.contains("#guard realLeanOleanHeaderPrefix.get! 0 != 0x4F"));
+}
