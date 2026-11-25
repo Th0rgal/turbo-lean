@@ -864,7 +864,7 @@ pub(super) fn eval_with_zygote_pool_attempt(
     #[cfg(target_os = "linux")]
     let expected_pinned_dir = closure.materialized.as_ref().map(|m| m.dir_dev_ino);
 
-    let spawn_zygote_worker = || -> Result<ZygoteChild> {
+    let spawn_zygote_worker = |spawn_rlimit_mb: Option<u64>| -> Result<ZygoteChild> {
         let tools = crate::module_builder::ToolchainExecutables::from_lean(lean_bin)?;
         let lean_bin = tools.lean.as_path();
         let mut worker_env = env_vars.clone();
@@ -952,6 +952,14 @@ pub(super) fn eval_with_zygote_pool_attempt(
             "TURBO_LEAN_STAGING_DIR",
             crate::shm_cache::staging_shm_dir(),
         );
+        // H2.3: a budgeted parallel replay fan-out caps each fresh worker's share of
+        // `--max-memory-mb` as a real RLIMIT_DATA (#435's mechanism); single-request
+        // paths pass `None` and stay uncapped. A master clone inherits the master's
+        // (uncapped) limits, so the cap is best-effort there; the machine-wide RSS
+        // governor stays the backstop.
+        if let Some(mb) = spawn_rlimit_mb {
+            WorkerBudget::apply_worker_rlimit(&mut cmd, mb);
+        }
         let (owner, lifetime) = std::sync::mpsc::channel();
         let (send_child, receive_child) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
@@ -1033,11 +1041,24 @@ pub(super) fn eval_with_zygote_pool_attempt(
     } else {
         worker_rss_limit_mb.max(2048)
     };
+    let budget = WorkerBudget::from_env();
+    // H2.3: an explicit `--jobs` wider than the governor's idle clamp keeps that many
+    // replay workers poolable between fan-out batches (the memory budget still caps the
+    // width); `TURBO_LEAN_MAX_IDLE_ZYGOTES` stays the explicit override.
+    let budget_pool_width = budget
+        .jobs
+        .map(|j| budget.effective_parallelism(j, REPLAY_WORKER_EST_RSS_MB, || j))
+        .unwrap_or(0);
     let max_global_idle = std::env::var("TURBO_LEAN_MAX_IDLE_ZYGOTES")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or_else(|| governor.recommended_parallel_workers(1024).clamp(4, 8));
+        .unwrap_or_else(|| {
+            governor
+                .recommended_parallel_workers(1024)
+                .clamp(4, 8)
+                .max(budget_pool_width)
+        });
     #[cfg(test)]
     let max_global_idle = max_global_idle.max(64);
     let max_pool_per_key = std::thread::available_parallelism()
@@ -1169,7 +1190,7 @@ pub(super) fn eval_with_zygote_pool_attempt(
             }
         };
 
-    let acquire_worker = || -> Result<ZygoteChild> {
+    let acquire_worker = |spawn_rlimit_mb: Option<u64>| -> Result<ZygoteChild> {
         #[cfg(target_os = "linux")]
         if !lake_inputs_uncacheable && closure.label().is_some() && !daemon_disabled() {
             let masters = ZYGOTE_MASTERS.get_or_init(|| {
@@ -1196,7 +1217,9 @@ pub(super) fn eval_with_zygote_pool_attempt(
                 }
             }
             if entry.is_none() {
-                let mut master = spawn_zygote_worker()?;
+                // Masters are shared across requests and cloned for everyone: never
+                // capped by one fan-out's per-worker share.
+                let mut master = spawn_zygote_worker(None)?;
                 let warm = attach_host_closure_digest(&format!("{}\t\tstrict\n", imports_csv), host_closure_digest);
                 if let WorkerReqOutcome::Reply(rep) = run_worker_req(&mut master, &warm, "warm clone master") {
                     if rep.ok && rep.import_ok && closure.binding() == ClosureBinding::Bound {
@@ -1273,7 +1296,7 @@ pub(super) fn eval_with_zygote_pool_attempt(
                 }
             }
         }
-        spawn_zygote_worker()
+        spawn_zygote_worker(spawn_rlimit_mb)
     };
 
     #[allow(clippy::type_complexity)]
@@ -1359,8 +1382,31 @@ pub(super) fn eval_with_zygote_pool_attempt(
                 }
             })
             .collect();
-        if blocks.len() >= 2 && blocks.len() <= 4 {
-            let needed = blocks.len();
+        if blocks.len() >= 2 {
+            // H2.3: fan the coalesced cross-file replay out over the worker pool under
+            // the budget: at most `effective_parallelism` concurrent workers (an explicit
+            // `--jobs` capped by its memory share; otherwise core count), each request
+            // carrying a bounded group of blocks (`replay_batch_cap`), results combined
+            // in block order whatever the completion order. Before H2.3 this path took at
+            // most 4 blocks, one dedicated worker each regardless of the budget, and a
+            // wider replay fell back to one serial whole-body request.
+            let parallelism =
+                budget.effective_parallelism(blocks.len(), REPLAY_WORKER_EST_RSS_MB, || {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4)
+                });
+            let max_per_slice = budget
+                .replay_batch_cap(replay_closure_batch_size(), parallelism)
+                .max(1);
+            let per_slice = blocks.len().div_ceil(parallelism).clamp(1, max_per_slice);
+            let slices: Vec<String> = blocks.chunks(per_slice).map(|c| c.concat()).collect();
+            let needed = parallelism.min(slices.len());
+            let pool_rlimit_mb = if needed > 1 {
+                budget.per_worker_rlimit_mb(needed)
+            } else {
+                None
+            };
             let mut workers: Vec<ZygoteChild> = Vec::with_capacity(needed);
             {
                 let mut pool = pool_mutex
@@ -1429,10 +1475,10 @@ pub(super) fn eval_with_zygote_pool_attempt(
                 mark_closure_snapshot_used(host_closure_digest);
             }
             while workers.len() < needed {
-                workers.push(acquire_worker()?);
+                workers.push(acquire_worker(pool_rlimit_mb)?);
             }
 
-            let req_lines: Vec<String> = blocks
+            let req_lines: Vec<String> = slices
                 .iter()
                 .map(|blk| -> Result<String> {
                     let hb = hex_encode_bytes(blk.as_bytes());
@@ -1450,62 +1496,88 @@ pub(super) fn eval_with_zygote_pool_attempt(
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            let results: Vec<(ZygoteChild, WorkerReqOutcome)> = std::thread::scope(|s| {
-                let req_id_ref = request_identity.as_str();
-                let handles: Vec<_> = workers
-                    .into_iter()
-                    .zip(req_lines)
-                    .map(|(mut w, rl)| {
-                        s.spawn(move || {
-                            let res = run_worker_req(&mut w, &rl, req_id_ref);
-                            (w, res, rl)
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        let (mut w, mut res, rl) =
-                            h.join().expect("Zygote parallel eval thread panicked");
-                        if matches!(res, WorkerReqOutcome::Crashed(_))
-                            && std::time::Instant::now() < deadline
-                        {
-                            if let Ok(retry) = spawn_zygote_worker() {
-                                w = retry;
-                                res = run_worker_req(&mut w, &rl, req_id_ref);
-                            }
-                        }
-                        (w, res)
-                    })
-                    .collect()
-            });
+            let req_id_ref = request_identity.as_str();
+            // A reply from a worker that panicked or failed its imports retires that
+            // worker; the queue's other workers keep going, and the reply itself still
+            // reaches the fail-closed combine below.
+            let worker_fate = |res: &WorkerReqOutcome| match res {
+                WorkerReqOutcome::Reply(r)
+                    if r.import_ok && !r.errors.iter().any(|e| e == RUNTIME_PANIC_ERR) =>
+                {
+                    QueueWorkerFate::Healthy
+                }
+                _ => QueueWorkerFate::Dead,
+            };
+            let (mut finished_workers, mut outcomes) = {
+                let req_lines_ref = &req_lines;
+                run_request_queue_over_workers(
+                    workers,
+                    req_lines_ref.len(),
+                    // Only a timeout aborts the run; a crashed slice is retried below
+                    // and a sick reply is judged by the combine.
+                    |res: &WorkerReqOutcome| matches!(res, WorkerReqOutcome::TimedOut { .. }),
+                    |w: &mut ZygoteChild, idx: usize| {
+                        let res = run_worker_req(w, &req_lines_ref[idx], req_id_ref);
+                        let fate = worker_fate(&res);
+                        (res, fate)
+                    },
+                )
+            };
+            // Crash retry runs on this thread (`spawn_zygote_worker` holds the non-Sync
+            // store handle), once per crashed or never-scheduled slice, mirroring the
+            // pre-H2.3 per-block path's single retry per crashed block. A timeout skips
+            // it: the combine below returns the timed-out reply at once.
+            let timed_out_any = outcomes
+                .iter()
+                .flatten()
+                .any(|r| matches!(r, WorkerReqOutcome::TimedOut { .. }));
+            if !timed_out_any {
+                for idx in 0..req_lines.len() {
+                    let needs_retry = matches!(
+                        outcomes.get(idx),
+                        Some(Some(WorkerReqOutcome::Crashed(_))) | Some(None)
+                    );
+                    if !needs_retry || std::time::Instant::now() >= deadline {
+                        continue;
+                    }
+                    if let Ok(mut retry_w) = spawn_zygote_worker(pool_rlimit_mb) {
+                        let res = run_worker_req(&mut retry_w, &req_lines[idx], req_id_ref);
+                        let fate = worker_fate(&res);
+                        finished_workers.push((retry_w, fate));
+                        outcomes[idx] = Some(res);
+                    }
+                }
+            }
 
             run_digest_test_hook("after_worker_reply");
             let binding = closure.binding();
-            let mut replies = Vec::with_capacity(needed);
-            let mut first_err: Option<anyhow::Error> = None;
-            for (mut w, res) in results {
-                match res {
-                    WorkerReqOutcome::Reply(r) => {
-                        // A worker whose env is not proven to hold the hashed bytes is killed:
-                        // its in-process env cache is labelled with this digest.
-                        if binding == ClosureBinding::Bound
-                            && r.import_ok
-                            && !r.errors.iter().any(|e| e == RUNTIME_PANIC_ERR)
-                        {
-                            w.warm_imports
-                                .insert(imports_csv.clone(), closure_pool_digest.clone());
-                            return_worker_to_pool(pool_mutex, pool_key.clone(), w);
-                        }
-                        replies.push(r);
+            // A worker whose env is not proven to hold the hashed bytes is killed: its
+            // in-process env cache is labelled with this digest. An `Unused` worker goes
+            // back exactly as it was acquired.
+            for (mut w, fate) in finished_workers {
+                match fate {
+                    QueueWorkerFate::Healthy if binding == ClosureBinding::Bound => {
+                        w.warm_imports
+                            .insert(imports_csv.clone(), closure_pool_digest.clone());
+                        return_worker_to_pool(pool_mutex, pool_key.clone(), w);
                     }
-                    WorkerReqOutcome::TimedOut {
+                    QueueWorkerFate::Unused => {
+                        return_worker_to_pool(pool_mutex, pool_key.clone(), w);
+                    }
+                    _ => drop(w),
+                }
+            }
+            let mut replies = Vec::with_capacity(req_lines.len());
+            let mut first_err: Option<anyhow::Error> = None;
+            for res in outcomes {
+                match res {
+                    Some(WorkerReqOutcome::Reply(r)) => replies.push(r),
+                    Some(WorkerReqOutcome::TimedOut {
                         elapsed_us,
                         peak_rss_mb,
                         stderr_tail,
                         last_request,
-                    } => {
-                        drop(w);
+                    }) => {
                         return Ok((
                             ZygoteEvalReply::timed_out_reply(
                                 eval_mode,
@@ -1519,17 +1591,25 @@ pub(super) fn eval_with_zygote_pool_attempt(
                             executed_identity,
                         ));
                     }
-                    WorkerReqOutcome::Crashed(diag) => {
-                        drop(w);
+                    Some(WorkerReqOutcome::Crashed(diag)) => {
                         if first_err.is_none() {
                             first_err = Some(anyhow::anyhow!("{}", diag.message));
                         }
                     }
+                    // A slot never scheduled after a fatal stop: the fatal outcome above
+                    // already fails the run.
+                    None => {}
                 }
             }
             if let Some(e) = first_err {
                 return Err(e);
             }
+            anyhow::ensure!(
+                replies.len() == req_lines.len(),
+                "cross-file replay fan-out lost {} of {} slice replies (fail-closed)",
+                req_lines.len() - replies.len(),
+                req_lines.len()
+            );
             let import_ok = replies.iter().all(|r| r.import_ok);
             let ok = replies.iter().all(|r| r.ok);
             let kernel_gate_active = replies.iter().all(|r| r.kernel_gate_active);
@@ -1852,7 +1932,7 @@ pub(super) fn eval_with_zygote_pool_attempt(
         ));
     }
     if worker.is_none() {
-        worker = Some(acquire_worker()?);
+        worker = Some(acquire_worker(None)?);
     }
 
     let mut w = worker.unwrap();
@@ -1874,7 +1954,7 @@ pub(super) fn eval_with_zygote_pool_attempt(
                 executed_identity,
             ));
         }
-        match spawn_zygote_worker() {
+        match spawn_zygote_worker(None) {
             Ok(retry_w) => w = retry_w,
             Err(_) => {
                 let mut diag = first_diag;
