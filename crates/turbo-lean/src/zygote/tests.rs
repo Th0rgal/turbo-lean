@@ -2300,6 +2300,107 @@ use super::*;
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #439: a snapshot one run still holds (a shared `flock` lease on its `.last-used` marker)
+    /// must survive another run's `collect_closure_snapshots`, even once its marker is idle far
+    /// past `CLOSURE_SNAPSHOT_MIN_IDLE` -- the marker is refreshed only on take/reuse, never
+    /// while a long replay imports through the snapshot, and an open directory fd does not keep
+    /// a tmpfs directory's files. An unleased sibling of the same age is still collected, and so
+    /// is the held snapshot once the holder's lease drops.
+    #[cfg(unix)]
+    #[test]
+    fn test_closure_snapshot_gc_skips_snapshots_held_by_a_concurrent_run() {
+        use std::os::unix::io::AsRawFd;
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct ResetCacheBase;
+        impl Drop for ResetCacheBase {
+            fn drop(&mut self) {
+                TEST_CLOSURE_SNAPSHOT_CACHE_BASE.with(|c| *c.borrow_mut() = None);
+            }
+        }
+        let _reset = ResetCacheBase;
+        let tmp = std::env::temp_dir().join(format!(
+            "turbo_snapshot_lease_{}_{}",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        TEST_CLOSURE_SNAPSHOT_CACHE_BASE.with(|c| *c.borrow_mut() = Some(tmp.join("cache_base")));
+        let root = ensure_private_dir(&closure_snapshot_root()).unwrap();
+        let usage = root.join(CLOSURE_SNAPSHOT_USAGE_DIR);
+
+        // Run 1 materializes a closure (toolchain-builtin entries make a tiny real snapshot) and
+        // holds it across a long replay: `flock` locks are per open file description, so a second
+        // handle in this process stands for the concurrent run's GC probe exactly as another
+        // process would.
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert("Init".to_string(), None);
+        let held = materialize_closure(&entries, None).expect("materialize");
+        assert!(
+            held.lease.is_some(),
+            "a materialized closure must hold a lease on its last-used marker"
+        );
+        let held_dir = held.dir.clone();
+        let held_label = held.label.clone();
+        let run1_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(usage.join(&held_label))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(run1_lock.as_raw_fd(), libc::LOCK_SH) },
+            0,
+            "run 1 takes its shared lease"
+        );
+
+        // Age every marker far past `CLOSURE_SNAPSHOT_MIN_IDLE` and overfill the root so the held
+        // snapshot and an unleased sibling are the two excess (oldest) purge candidates.
+        let very_old = std::time::SystemTime::now() - CLOSURE_SNAPSHOT_MIN_IDLE * 20;
+        let old = std::time::SystemTime::now() - CLOSURE_SNAPSHOT_MIN_IDLE * 2;
+        let age_marker = |label: &str, t: std::time::SystemTime| {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(usage.join(label))
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        };
+        let mk_snap = |name: &str, t: std::time::SystemTime| {
+            let d = root.join(name);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("Mod.olean"), b"bytes").unwrap();
+            mark_closure_snapshot_used_in(&root, name).unwrap();
+            age_marker(name, t);
+        };
+        for i in 0..CLOSURE_SNAPSHOT_KEEP {
+            mk_snap(&format!("snap-young-{i:02}"), old);
+        }
+        mk_snap("snap-victim", very_old);
+        age_marker(&held_label, very_old);
+
+        // Run 2's GC: the held snapshot survives; the unleased one of the same age is collected.
+        collect_closure_snapshots(&root, "snap-current");
+        assert!(
+            held_dir.is_dir(),
+            "a snapshot held by a concurrent run must survive GC (#439)"
+        );
+        assert!(
+            !root.join("snap-victim").exists(),
+            "an unleased idle snapshot is still collected"
+        );
+
+        // Once run 1 finishes, the snapshot is collectable again.
+        drop(run1_lock);
+        drop(held);
+        collect_closure_snapshots(&root, "snap-current");
+        assert!(
+            !held_dir.exists(),
+            "a released snapshot is collected by the next GC pass"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     /// Compile `src` as module `name` under `lib` (`lean -R lib`) and return the `.olean` bytes.
     fn compile_test_olean(lean_bin: &Path, lib: &Path, name: &str, src: &str) -> Vec<u8> {
         let src_path = lib.join(format!("{name}.lean"));
