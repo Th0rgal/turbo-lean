@@ -189,12 +189,12 @@ class BrokenAliasDetection(unittest.TestCase):
 
 
 class ClangResolutionOrder(unittest.TestCase):
-    """Environment portability: the clang used to lower the pinned toolchain's
-    LLVM IR must resolve the pinned toolchain's bundled clang (derived from
-    lean/lean-toolchain, honoring ELAN_HOME) before any system clang, because a
-    system clang older than LLVM 16 cannot parse the `memory(none)` attribute
-    groups the pinned toolchain emits. A TURBO_LEAN_CLANG override wins over
-    everything. Pure resolution-order tests; no second toolchain required."""
+    """Environment portability: TURBO_LEAN_CLANG wins over everything; a usable
+    system clang (banner >= LLVM 16, or passing the `memory(none)` IR probe)
+    wins next, because it carries the sanitizer runtimes; the pinned toolchain's
+    bundled clang (derived from lean/lean-toolchain, honoring ELAN_HOME) is the
+    fallback for hosts whose system clang predates the IR the toolchain emits.
+    Pure resolution-order tests; no second toolchain required."""
 
     @staticmethod
     def _fake_clang(dirpath):

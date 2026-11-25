@@ -648,6 +648,9 @@ def clang_can_lower_pinned_ir(clang_bin: str) -> bool:
                 [clang_bin, "-Wno-override-module", "-c", str(ll), "-o", os.devnull],
                 capture_output=True,
                 text=True,
+                # A wrapper (ccache, a site shim) that blocks on a lock would
+                # otherwise hang engine probing and the whole suite.
+                timeout=30,
             )
             ok = res.returncode == 0
     except (OSError, subprocess.SubprocessError):

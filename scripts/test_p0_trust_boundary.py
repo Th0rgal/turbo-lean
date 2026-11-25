@@ -76,10 +76,10 @@ CORE_BIN = ROOT / "lean" / ".lake" / "build" / "bin" / "lean-native-core"
 
 
 def find_clang() -> str:
-    # Sibling of fuzz_lcnf_conformance.find_clang_binary: the pinned toolchain's
-    # clang (derived from lean/lean-toolchain, honoring ELAN_HOME) comes first,
-    # a system clang only when it can parse the toolchain's LLVM IR (>= LLVM 16),
-    # TURBO_LEAN_CLANG above everything.
+    # Sibling of fuzz_lcnf_conformance.find_clang_binary: TURBO_LEAN_CLANG above
+    # everything; a usable system clang (>= LLVM 16, or passing the IR probe)
+    # first; the pinned toolchain's bundled clang (derived from
+    # lean/lean-toolchain, honoring ELAN_HOME) as the fallback.
     cand = fuzzer.find_clang_binary()
     if cand:
         return cand
