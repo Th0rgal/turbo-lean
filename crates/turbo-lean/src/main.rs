@@ -2124,7 +2124,7 @@ fn run(cli: Cli) -> Result<()> {
                     &source,
                     &file_audit,
                     &file_lean_args,
-                    Some(timeout_ms),
+                    zygote::request_timeout_ms(timeout_ms),
                 )?;
                 std::io::stdout().write_all(&out.stdout)?;
                 std::io::stderr().write_all(&out.stderr)?;
@@ -2225,7 +2225,7 @@ fn run(cli: Cli) -> Result<()> {
                     &source,
                     &file_audit,
                     &file_lean_args,
-                    Some(timeout_ms),
+                    zygote::request_timeout_ms(timeout_ms),
                 )?;
                 let lean_ok = lean_out.status.success();
                 if reply.ok != lean_ok

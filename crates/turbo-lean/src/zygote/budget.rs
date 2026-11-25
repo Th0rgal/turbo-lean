@@ -282,6 +282,14 @@ pub(crate) fn request_policy(
         .collect()
 }
 
+/// Map an explicit per-request `--timeout-ms` value to the budget the fallback paths
+/// understand (#443): `0` is documented as "no artificial timeout", but `Some(0)` is an
+/// exhausted budget to `run_lean_command` and the shard-fallback `budget_left`, so it must
+/// become `None` before it reaches them.
+pub(crate) fn request_timeout_ms(timeout_ms: u64) -> Option<u64> {
+    (timeout_ms > 0).then_some(timeout_ms)
+}
+
 pub(crate) fn invocation_timeout_ms() -> Option<u64> {
     MCP_TIMEOUT.with(|slot| slot.get()).or_else(|| {
         std::env::var("TURBO_LEAN_TIMEOUT_MS")

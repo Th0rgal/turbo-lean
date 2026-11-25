@@ -1887,6 +1887,21 @@ use super::*;
     }
 
     #[test]
+    fn test_eval_default_timeout_zero_is_an_unbounded_budget() {
+        // #443: `eval --timeout-ms 0` is documented as "no artificial timeout", but the
+        // shard-fallback path passed it as `Some(0)`, which `run_lean_command` and
+        // `budget_left` treat as an exhausted budget ("Lean request timed out before
+        // fallback" after ~3 s). The default must map to `None` before it reaches them.
+        assert_eq!(request_timeout_ms(0), None);
+        assert_eq!(request_timeout_ms(1_500), Some(1_500));
+        // The mapped default must reach the fallback spawn: `Some(0)` is rejected before
+        // any process starts, while the mapped budget spawns the command.
+        let out = run_lean_command(&mut Command::new("true"), request_timeout_ms(0))
+            .expect("default --timeout-ms 0 must not be rejected before the shard fallback");
+        assert!(out.status.success());
+    }
+
+    #[test]
     fn test_zygote_timeout_kills_infinite_eval_and_recovers() {
         let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("timeout") else {
             return;
