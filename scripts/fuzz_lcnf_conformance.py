@@ -530,17 +530,97 @@ def find_lean_binary() -> str | None:
     return None
 
 
+LEAN_TOOLCHAIN_FILE = ROOT / "lean" / "lean-toolchain"
+# clang 15 cannot parse the `memory(none)` attribute groups the pinned toolchain
+# emits in its LLVM IR ("error: unterminated attribute group"), so a system clang
+# is usable only from LLVM 16 on.
+MIN_SYSTEM_CLANG_MAJOR = 16
+
+
+def repo_pinned_toolchain(toolchain_file: Path = LEAN_TOOLCHAIN_FILE) -> str | None:
+    """Read the repo's pinned toolchain name (e.g. `leanprover/lean4:v4.35.0`)."""
+    try:
+        text = toolchain_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text or None
+
+
+def elan_toolchain_dir_name(toolchain: str) -> str:
+    """elan stores `leanprover/lean4:v4.35.0` as `leanprover--lean4---v4.35.0`."""
+    return toolchain.replace("/", "--").replace(":", "---")
+
+
+def elan_homes() -> list[Path]:
+    """Candidate elan homes: `ELAN_HOME` first, then the known host layouts."""
+    homes: list[Path] = []
+    env_home = os.environ.get("ELAN_HOME")
+    if env_home:
+        homes.append(Path(env_home))
+    homes += [
+        Path.home() / ".elan",
+        Path("/root/.elan"),
+        Path("/var/lib/sandboxed-node/.elan"),
+        Path("/var/lib/sandboxed-node/caches/elan"),
+    ]
+    seen: set[str] = set()
+    out: list[Path] = []
+    for h in homes:
+        if str(h) not in seen:
+            seen.add(str(h))
+            out.append(h)
+    return out
+
+
+def pinned_toolchain_clang_candidates() -> list[str]:
+    """`bin/clang` of the repo-pinned toolchain under every candidate elan home."""
+    pin = repo_pinned_toolchain()
+    if not pin:
+        return []
+    name = elan_toolchain_dir_name(pin)
+    return [str(home / "toolchains" / name / "bin" / "clang") for home in elan_homes()]
+
+
+def clang_version_major(clang_bin: str) -> int | None:
+    try:
+        out = subprocess.run(
+            [clang_bin, "--version"], check=True, capture_output=True, text=True
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"clang version (\d+)", out)
+    return int(m.group(1)) if m else None
+
+
 def find_clang_binary() -> str | None:
+    """Resolve a clang able to lower the pinned toolchain's LLVM IR.
+
+    Precedence: a `TURBO_LEAN_CLANG` override (used as given; a broken override
+    fails closed instead of silently falling through to another clang), then the
+    pinned toolchain's bundled clang (derived from `lean/lean-toolchain`,
+    honoring `ELAN_HOME`), then a system clang only when its major version is at
+    least `MIN_SYSTEM_CLANG_MAJOR`."""
+    override = os.environ.get("TURBO_LEAN_CLANG")
+    if override:
+        if Path(override).is_file() and os.access(override, os.X_OK):
+            return override
+        return None
+    for cand in pinned_toolchain_clang_candidates():
+        if Path(cand).is_file() and os.access(cand, os.X_OK):
+            return cand
     for cand in [
         "/usr/bin/clang",
+        "/usr/bin/clang-16",
+        "/usr/bin/clang-17",
         "/usr/bin/clang-18",
-        str(Path.home() / ".elan/toolchains/leanprover--lean4---v4.35.0/bin/clang"),
-        "/root/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang",
-        "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang",
-        "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/clang",
+        "/usr/bin/clang-19",
+        "/usr/bin/clang-20",
         shutil.which("clang"),
     ]:
-        if cand and Path(cand).is_file() and os.access(cand, os.X_OK):
+        if not (cand and Path(cand).is_file() and os.access(cand, os.X_OK)):
+            continue
+        major = clang_version_major(cand)
+        if major is not None and major >= MIN_SYSTEM_CLANG_MAJOR:
             return cand
     return None
 
