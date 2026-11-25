@@ -2250,8 +2250,12 @@ use super::*;
         );
 
         // Unsupported `filter := .text` or missing `input_file` must mark the Zygote context
-        // uncacheable (`lake_inputs_uncacheable == true`) and emit fresh nonces so SHM/pool caches
-        // never replay stale verdicts.
+        // uncacheable (`lake_inputs_uncacheable == true`): that flag is what keeps the SHM / pool
+        // / verified-shard caches from replaying stale verdicts. The tag itself must be
+        // DETERMINISTIC across processes (each `reset_lake_inputs_tag_memo` below stands for a
+        // fresh process): it reaches `olean_digest` and therefore the daemon `/eval`
+        // `execution_identity`, and a per-call nonce here meant the client and the daemon could
+        // never agree (every `/eval` answered HTTP 409, #432).
         fs::write(
             tmp_dir.join("lakefile.lean"),
             "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .text\n@[default_target]\nlean_lib Smoke where\n  globs := #[.submodules `Smoke]\n  needs := #[smokeSources]\n",
@@ -2266,8 +2270,8 @@ use super::*;
             "unsupported filter must mark Zygote context uncacheable"
         );
         assert!(
-            !u1.is_empty() && !u2.is_empty() && u1 != u2,
-            "uncacheable workspaces must receive distinct per-call nonces: {u1} vs {u2}"
+            !u1.is_empty() && u1 == u2,
+            "unresolved workspaces must contribute a deterministic tag, never a per-call nonce: {u1} vs {u2}"
         );
         let cache_dir = tmp_dir.join("isolated_cache");
         let eval_file = tmp_dir.join("SmokeEval.lean");
@@ -2281,6 +2285,263 @@ use super::*;
 
         let _ = fs::remove_dir_all(&other);
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// #432: the daemon `/eval` must answer HTTP 200, never 409 `eval execution identity
+    /// changed`, on a workspace whose Lake inputs cannot be resolved (any dependency declaring
+    /// `target` / `extern_lib`, or an unsupported `input_dir` filter). The client computes
+    /// `execution_identity` in its own process and the daemon recomputes it from the request, so
+    /// every component of the identity must be recomputable across processes; a fresh per-call
+    /// nonce in `compute_lean_path_lake_inputs_digest` meant the two could never agree.
+    ///
+    /// The synthetic toolchain cannot elaborate anything, so the reply's `ok` may be false; the
+    /// acceptance is the status line: 200 (identities agreed), not 409.
+    #[cfg(unix)]
+    #[test]
+    fn test_eval_http_identity_answers_200_on_unresolved_lake_inputs_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_eval_identity_432_{}_{}",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        // A workspace whose Lake inputs fail to resolve (`filter := .text` is unsupported), with
+        // its build directory on LEAN_PATH, exactly the #432 shape.
+        let proj = dir.join("proj");
+        let lib = proj.join(".lake/build/lib/lean");
+        fs::create_dir_all(&lib).unwrap();
+        fs::create_dir_all(proj.join("Data")).unwrap();
+        fs::write(
+            proj.join("lean-toolchain"),
+            include_str!("../../../../lean/lean-toolchain"),
+        )
+        .unwrap();
+        fs::write(
+            proj.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .text\n@[default_target]\nlean_lib Smoke where\n  globs := #[.submodules `Smoke]\n  needs := #[smokeSources]\n",
+        )
+        .unwrap();
+        fs::write(proj.join("Data/a.sol"), "contract A {}").unwrap();
+
+        // A synthetic installed toolchain so `/eval` reaches the identity check: an exact
+        // `$ELAN_HOME/toolchains/<tc>` hit needs a `--githash` answer, executable `lake` /
+        // `leanc` siblings, and a `lib/lean` directory.
+        let tc = "leanprover/lean4:v4.35.0-identity-432";
+        let tc_root = dir.join("elan/toolchains/leanprover--lean4---v4.35.0-identity-432");
+        fs::create_dir_all(tc_root.join("bin")).unwrap();
+        fs::create_dir_all(tc_root.join("lib/lean")).unwrap();
+        let write_tool = |name: &str, script: &str| {
+            let p = tc_root.join("bin").join(name);
+            fs::write(&p, script).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        write_tool(
+            "lean",
+            "#!/bin/sh\nif [ \"${1:-}\" = \"--githash\" ]; then echo 0000000000000000000000000000000000000432; exit 0; fi\nexit 1\n",
+        );
+        write_tool("lake", "#!/bin/sh\nexit 0\n");
+        write_tool("leanc", "#!/bin/sh\nexit 0\n");
+        let prev_elan = std::env::var("ELAN_HOME").ok();
+        let prev_api_tok = std::env::var("TURBO_LEAN_API_TOKEN").ok();
+        let prev_daemon_tok = std::env::var("TURBO_LEAN_DAEMON_TOKEN").ok();
+        struct RestoreEnv(Option<String>, Option<String>, Option<String>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (key, prev) in [
+                    ("ELAN_HOME", &self.0),
+                    ("TURBO_LEAN_API_TOKEN", &self.1),
+                    ("TURBO_LEAN_DAEMON_TOKEN", &self.2),
+                ] {
+                    match prev {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _restore_env = RestoreEnv(prev_elan, prev_api_tok, prev_daemon_tok);
+        std::env::set_var("ELAN_HOME", dir.join("elan"));
+        // The client helper attaches ambient tokens to loopback URLs; the server has none.
+        std::env::remove_var("TURBO_LEAN_API_TOKEN");
+        std::env::remove_var("TURBO_LEAN_DAEMON_TOKEN");
+
+        // The real `/eval` handler, in-process, unauthenticated loopback.
+        let port = {
+            let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let addr = format!("127.0.0.1:{port}");
+        let store_dir = dir.join("store");
+        fs::create_dir_all(&store_dir).unwrap();
+        {
+            let addr = addr.clone();
+            let store_dir = store_dir.clone();
+            std::thread::spawn(move || {
+                let _ =
+                    crate::server::serve_cas_http_with_auth(Some(&store_dir), &addr, false, None, true);
+            });
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::net::TcpStream::connect(addr.as_str()).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test server did not come up on {addr}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // The client-side identity, over the env the handler assembles for an unauthenticated
+        // caller (LEAN_PATH, an empty axiom CSV from `allowed_axioms: []`, empty policy tags).
+        let lean_path = lib.to_string_lossy().to_string();
+        let src = "#eval (0 : Nat)";
+        let store = TurboStore::open(Some(&store_dir)).unwrap();
+        let (mut env_vars, lean_bin) =
+            crate::pack::resolve_server_lean_env_and_bin(&store, tc, &lean_path).unwrap();
+        env_vars.insert("LEAN_PATH".to_string(), lean_path.clone());
+        env_vars.insert(crate::splitter::ALLOWED_AXIOMS_ENV.to_string(), String::new());
+        for key in REQUEST_POLICY_KEYS.into_iter().skip(1) {
+            env_vars.insert(key.to_string(), String::new());
+        }
+        crate::module_builder::reset_lake_inputs_tag_memo();
+        let (imports, _) = split_shard_for_zygote(src);
+        let expected =
+            resolve_zygote_context(tc, &lean_path, &env_vars, &lean_bin, &imports).identity;
+        // The daemon is another process: it cannot share this one's Lake-input memo window.
+        crate::module_builder::reset_lake_inputs_tag_memo();
+
+        let req = serde_json::json!({
+            "toolchain": tc,
+            "lean_path": lean_path,
+            "source": src,
+            "execution_identity": expected,
+            "allowed_axioms": [],
+            "timeout_ms": 60_000,
+        });
+        let reply = crate::pack::http_request_with_timeout_and_token(
+            "POST",
+            &format!("http://{addr}/eval"),
+            "application/json",
+            &serde_json::to_vec(&req).unwrap(),
+            Some(120_000),
+            None,
+            || {},
+        );
+        let body = reply.expect(
+            "daemon /eval must answer HTTP 200 on a Lake-inputs workspace, not 409 identity changed",
+        );
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_ne!(
+            v.get("error").and_then(|e| e.as_str()),
+            Some("eval execution identity changed"),
+            "{v}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #439: a snapshot one run still holds (a shared `flock` lease on its `.last-used` marker)
+    /// must survive another run's `collect_closure_snapshots`, even once its marker is idle far
+    /// past `CLOSURE_SNAPSHOT_MIN_IDLE` -- the marker is refreshed only on take/reuse, never
+    /// while a long replay imports through the snapshot, and an open directory fd does not keep
+    /// a tmpfs directory's files. An unleased sibling of the same age is still collected, and so
+    /// is the held snapshot once the holder's lease drops.
+    #[cfg(unix)]
+    #[test]
+    fn test_closure_snapshot_gc_skips_snapshots_held_by_a_concurrent_run() {
+        use std::os::unix::io::AsRawFd;
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct ResetCacheBase;
+        impl Drop for ResetCacheBase {
+            fn drop(&mut self) {
+                TEST_CLOSURE_SNAPSHOT_CACHE_BASE.with(|c| *c.borrow_mut() = None);
+            }
+        }
+        let _reset = ResetCacheBase;
+        let tmp = std::env::temp_dir().join(format!(
+            "turbo_snapshot_lease_{}_{}",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        TEST_CLOSURE_SNAPSHOT_CACHE_BASE.with(|c| *c.borrow_mut() = Some(tmp.join("cache_base")));
+        let root = ensure_private_dir(&closure_snapshot_root()).unwrap();
+        let usage = root.join(CLOSURE_SNAPSHOT_USAGE_DIR);
+
+        // Run 1 materializes a closure (toolchain-builtin entries make a tiny real snapshot) and
+        // holds it across a long replay: `flock` locks are per open file description, so a second
+        // handle in this process stands for the concurrent run's GC probe exactly as another
+        // process would.
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert("Init".to_string(), None);
+        let held = materialize_closure(&entries, None).expect("materialize");
+        assert!(
+            held.lease.is_some(),
+            "a materialized closure must hold a lease on its last-used marker"
+        );
+        let held_dir = held.dir.clone();
+        let held_label = held.label.clone();
+        let run1_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(usage.join(&held_label))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(run1_lock.as_raw_fd(), libc::LOCK_SH) },
+            0,
+            "run 1 takes its shared lease"
+        );
+
+        // Age every marker far past `CLOSURE_SNAPSHOT_MIN_IDLE` and overfill the root so the held
+        // snapshot and an unleased sibling are the two excess (oldest) purge candidates.
+        let very_old = std::time::SystemTime::now() - CLOSURE_SNAPSHOT_MIN_IDLE * 20;
+        let old = std::time::SystemTime::now() - CLOSURE_SNAPSHOT_MIN_IDLE * 2;
+        let age_marker = |label: &str, t: std::time::SystemTime| {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(usage.join(label))
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        };
+        let mk_snap = |name: &str, t: std::time::SystemTime| {
+            let d = root.join(name);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("Mod.olean"), b"bytes").unwrap();
+            mark_closure_snapshot_used_in(&root, name).unwrap();
+            age_marker(name, t);
+        };
+        for i in 0..CLOSURE_SNAPSHOT_KEEP {
+            mk_snap(&format!("snap-young-{i:02}"), old);
+        }
+        mk_snap("snap-victim", very_old);
+        age_marker(&held_label, very_old);
+
+        // Run 2's GC: the held snapshot survives; the unleased one of the same age is collected.
+        collect_closure_snapshots(&root, "snap-current");
+        assert!(
+            held_dir.is_dir(),
+            "a snapshot held by a concurrent run must survive GC (#439)"
+        );
+        assert!(
+            !root.join("snap-victim").exists(),
+            "an unleased idle snapshot is still collected"
+        );
+
+        // Once run 1 finishes, the snapshot is collectable again.
+        drop(run1_lock);
+        drop(held);
+        collect_closure_snapshots(&root, "snap-current");
+        assert!(
+            !held_dir.exists(),
+            "a released snapshot is collected by the next GC pass"
+        );
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     /// Compile `src` as module `name` under `lib` (`lean -R lib`) and return the `.olean` bytes.

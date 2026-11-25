@@ -573,6 +573,11 @@ pub(crate) struct MaterializedClosure {
     /// `ctime` of a probe created in the snapshot root after verification, strictly newer than
     /// every recorded directory and file `ctime` (`None`: unavailable, so nothing is proven).
     pub(super) fence: Option<i128>,
+    /// Shared-`flock` lease on the `.last-used` marker, held for this handle's lifetime so a
+    /// concurrent run's snapshot GC never purges a snapshot in use (#439). Only dropped.
+    #[cfg(unix)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) lease: Option<fs::File>,
 }
 
 #[cfg(unix)]
@@ -1003,6 +1008,35 @@ pub(super) fn mark_closure_snapshot_used(label: &str) {
     }
 }
 
+/// Shared-`flock` lease on snapshot `label`'s `.last-used` marker, held for as long as the
+/// returned handle lives.
+///
+/// The marker's mtime alone cannot protect a run that holds a snapshot open: it is refreshed
+/// only on take/reuse, never while a long replay imports through the snapshot, and an open
+/// directory fd does not keep a tmpfs directory's files. With several runs sharing
+/// `TURBO_LEAN_HOME`, `collect_closure_snapshots` purged a snapshot mid-replay (#439); it now
+/// skips any snapshot whose marker it cannot lock exclusively. The lock is on the marker's open
+/// file description, so it is released even if the holder dies, and `fs::write` refreshes of the
+/// same inode never disturb it.
+#[cfg(unix)]
+pub(super) fn acquire_closure_snapshot_lease(root: &Path, label: &str) -> Option<fs::File> {
+    use std::os::unix::io::AsRawFd;
+    if label.is_empty() {
+        return None;
+    }
+    let usage = ensure_private_dir(&root.join(CLOSURE_SNAPSHOT_USAGE_DIR)).ok()?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(usage.join(label))
+        .ok()?;
+    // Blocking shared lock: the only exclusive holder is the GC's momentary pre-purge probe, and
+    // a lease acquired right after a purge fails snapshot verification and rebuilds.
+    (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } == 0).then_some(file)
+}
+
 /// Create `dir` (and any missing parent components) with mode `0o700` from birth, require a
 /// real directory owned by us, and enforce `0o700` on `dir` and our `cache_root()` hierarchy.
 pub(super) fn ensure_private_dir(dir: &Path) -> Result<PathBuf, SnapshotError> {
@@ -1360,8 +1394,14 @@ pub(super) fn materialize_closure(
             }
         }
         let fence = fence_after_in(&fence_probe_dir, newest);
+        // #439: hold the lease for the lifetime of this handle, so a concurrent run's
+        // `collect_closure_snapshots` skips this snapshot however stale its marker goes.
+        #[cfg(unix)]
+        let lease = acquire_closure_snapshot_lease(&root, &label);
         Ok(MaterializedClosure {
             fence,
+            #[cfg(unix)]
+            lease,
             label: label.clone(),
             dir: dir.clone(),
             #[cfg(target_os = "linux")]
@@ -1651,7 +1691,8 @@ pub(super) fn fence_after_in(dir: &Path, newest: i128) -> Option<i128> {
 }
 
 /// Keep the `CLOSURE_SNAPSHOT_KEEP` most recently used snapshots (plus `keep`), never
-/// removing one used within `CLOSURE_SNAPSHOT_MIN_IDLE`, and drop abandoned temp dirs.
+/// removing one used within `CLOSURE_SNAPSHOT_MIN_IDLE` or held under a live lease (a shared
+/// `flock` on its `.last-used` marker, #439), and drop abandoned temp dirs.
 pub(super) fn collect_closure_snapshots(root: &Path, keep: &str) {
     let Ok(rd) = fs::read_dir(root) else { return };
     let now = std::time::SystemTime::now();
@@ -1688,6 +1729,25 @@ pub(super) fn collect_closure_snapshots(root: &Path, keep: &str) {
     let excess = snaps.len() - CLOSURE_SNAPSHOT_KEEP;
     for (age, name, path) in snaps.into_iter().take(excess) {
         if age > CLOSURE_SNAPSHOT_MIN_IDLE {
+            // #439: a run holding this snapshot keeps a shared `flock` on its marker for the
+            // whole replay; skip it. The exclusive probe is held across the purge so a new lease
+            // cannot bind to a half-deleted tree -- it blocks until the purge is done, and the
+            // holder's verification then fails and rebuilds the snapshot.
+            #[cfg(unix)]
+            let _probe = {
+                use std::os::unix::io::AsRawFd;
+                match fs::File::open(usage_dir.join(&name)) {
+                    Ok(f) => {
+                        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }
+                            != 0
+                        {
+                            continue;
+                        }
+                        Some(f)
+                    }
+                    Err(_) => None,
+                }
+            };
             purge_snapshot_dir(&path);
             let _ = fs::remove_file(usage_dir.join(name));
         }
@@ -1727,6 +1787,12 @@ pub(super) fn collect_closure_snapshots(root: &Path, keep: &str) {
 ///
 /// Empty -- and free, see `workspace_may_declare_lake_inputs` -- for every workspace that declares
 /// no inputs, including every toolchain entry on the path, which carries no Lake config.
+///
+/// A workspace whose inputs cannot be resolved (an unsupported `input_dir` filter, a dependency
+/// declaring `target` / `extern_lib` that is walked as a root) contributes a deterministic
+/// `lake-inputs-unresolved` tag and flips `uncacheable`. The flag is what disables the caches;
+/// the tag must stay recomputable in another process because it reaches the daemon `/eval`
+/// `execution_identity` (#432).
 pub(super) fn compute_lean_path_lake_inputs_digest(
     effective_lean_path: &str,
     env_vars: &std::collections::HashMap<String, String>,
@@ -1741,9 +1807,20 @@ pub(super) fn compute_lean_path_lake_inputs_digest(
                 }
             }
             Ok(None) => {}
+            // Deterministic, never a per-call nonce: the tag reaches `olean_digest` and
+            // therefore the daemon `/eval` `execution_identity`, which the daemon recomputes in
+            // another process. With `module_builder::project_lake_inputs_tag`'s fresh nonce here
+            // the client and the daemon could never agree, so every `/eval` on a workspace with
+            // unresolvable Lake inputs answered HTTP 409 (#432). Cache safety is carried by
+            // `uncacheable`, which every cache keyed on this digest (SHM, worker pool,
+            // verified-shard memo, warm adoption) consults before storing or replaying.
             Err(_) => {
                 uncacheable = true;
-                if let Some(tag) = crate::module_builder::project_lake_inputs_tag(dir) {
+                let tag = format!(
+                    "\u{0}lake-inputs-unresolved:{}",
+                    blake3::hash(dir.to_string_lossy().as_bytes()).to_hex()
+                );
+                if !tags.contains(&tag) {
                     tags.push(tag);
                 }
             }
