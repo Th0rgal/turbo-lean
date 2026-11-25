@@ -253,6 +253,7 @@ def find_v435_lean_and_init() -> tuple[Path, Path] | None:
                     cwd=ROOT / "verification" / "con-leche-bridge"
                     if (ROOT / "verification" / "con-leche-bridge").is_dir()
                     else ROOT,
+                    env=fuzz.pinned_toolchain_env(),
                     check=True,
                     capture_output=True,
                     text=True,
@@ -273,6 +274,7 @@ def find_v435_lean_and_init() -> tuple[Path, Path] | None:
             ver = subprocess.run(
                 [str(p), "--version"],
                 cwd=ROOT / "lean" if (ROOT / "lean").is_dir() else ROOT,
+                env=fuzz.pinned_toolchain_env(),
                 check=True,
                 capture_output=True,
                 text=True,
@@ -282,6 +284,7 @@ def find_v435_lean_and_init() -> tuple[Path, Path] | None:
             prefix = subprocess.run(
                 [str(p), "--print-prefix"],
                 cwd=ROOT / "lean" if (ROOT / "lean").is_dir() else ROOT,
+                env=fuzz.pinned_toolchain_env(),
                 check=True,
                 capture_output=True,
                 text=True,
@@ -388,7 +391,7 @@ def run_c3_corpus(con_leche_bin_arg: str | None) -> dict[str, Any]:
         adv_dir.mkdir(parents=True, exist_ok=True)
         scratch_tmp.mkdir(parents=True, exist_ok=True)
 
-        sub_env = dict(os.environ)
+        sub_env = fuzz.pinned_toolchain_env()
         sub_env["TMPDIR"] = str(scratch_tmp)
 
         compiled_holdouts: list[dict[str, Any]] = []
@@ -571,7 +574,8 @@ def run_c2_corpus(cli_dir: str | None, asan: bool, ubsan: bool) -> dict[str, Any
     clang_bin = engines["clang_bin"]
     extra_inc = fuzz.clang_extra_flags(clang_bin)
     lean_prefix = Path(
-        subprocess.run([lean_bin, "--print-prefix"], check=True, capture_output=True, text=True).stdout.strip()
+        subprocess.run([lean_bin, "--print-prefix"], env=fuzz.pinned_toolchain_env(),
+                       check=True, capture_output=True, text=True).stdout.strip()
     )
     leanc_bin = str(lean_prefix / "bin" / "leanc")
 
@@ -612,7 +616,7 @@ def run_c2_corpus(cli_dir: str | None, asan: bool, ubsan: bool) -> dict[str, Any
 
             work_pkg = tmp_root / pkg_name
             shutil.copytree(src_pkg, work_pkg)
-            sub_env = dict(os.environ)
+            sub_env = fuzz.pinned_toolchain_env()
             sub_env["LEAN_SYSROOT"] = str(lean_prefix)
             sub_env["LEAN_PATH"] = f"{work_pkg}{os.pathsep}{lean_prefix / 'lib' / 'lean'}"
 

@@ -268,5 +268,35 @@ class ClangResolutionOrder(unittest.TestCase):
         self.assertTrue(Path(got).is_file())
 
 
+class PinnedToolchainEnv(unittest.TestCase):
+    """Environment portability: an elan-shimmed binary (lean / lake / leanc)
+    invoked on files in a temp dir outside the repo resolves elan's DEFAULT
+    toolchain, not the repo pin (measured as `incompatible header ...
+    v4.36.0/lib/lean/Init.olean` against the repo's v4.35.0 pin). Subprocess
+    environments therefore pin ELAN_TOOLCHAIN from lean/lean-toolchain."""
+
+    def test_sets_elan_toolchain_from_repo_pin(self):
+        base = {"PATH": "/usr/bin"}
+        env = fuzzer.pinned_toolchain_env(base)
+        self.assertEqual(env["ELAN_TOOLCHAIN"], fuzzer.repo_pinned_toolchain())
+        self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertNotIn("ELAN_TOOLCHAIN", base)
+
+    def test_repo_pin_overrides_ambient_elan_toolchain(self):
+        env = fuzzer.pinned_toolchain_env({"ELAN_TOOLCHAIN": "leanprover/lean4:v4.99.0"})
+        self.assertEqual(env["ELAN_TOOLCHAIN"], fuzzer.repo_pinned_toolchain())
+
+    def test_defaults_to_current_environ(self):
+        with mock.patch.dict(os.environ, {"TL_SENTINEL_VAR": "1"}):
+            env = fuzzer.pinned_toolchain_env()
+        self.assertEqual(env.get("TL_SENTINEL_VAR"), "1")
+        self.assertEqual(env.get("ELAN_TOOLCHAIN"), fuzzer.repo_pinned_toolchain())
+
+    def test_missing_pin_leaves_env_unchanged(self):
+        with mock.patch.object(fuzzer, "repo_pinned_toolchain", return_value=None):
+            env = fuzzer.pinned_toolchain_env({"A": "b"})
+        self.assertEqual(env, {"A": "b"})
+
+
 if __name__ == "__main__":
     unittest.main()

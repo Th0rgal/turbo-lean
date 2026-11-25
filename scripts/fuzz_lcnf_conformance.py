@@ -521,7 +521,8 @@ def find_lean_binary() -> str | None:
         if cand and Path(cand).is_file() and os.access(cand, os.X_OK):
             try:
                 prefix = subprocess.run([cand, "--print-prefix"], cwd=ROOT / "lean",
-                                        check=True, capture_output=True, text=True).stdout.strip()
+                                        env=pinned_toolchain_env(), check=True,
+                                        capture_output=True, text=True).stdout.strip()
                 pinned = Path(prefix) / "bin" / "lean"
                 if pinned.is_file():
                     return str(pinned)
@@ -590,6 +591,22 @@ def clang_version_major(clang_bin: str) -> int | None:
         return None
     m = re.search(r"clang version (\d+)", out)
     return int(m.group(1)) if m else None
+
+
+def pinned_toolchain_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """Subprocess env with ELAN_TOOLCHAIN pinned to the repo toolchain.
+
+    An elan-shimmed binary (`lean`, `lake`, `leanc`) invoked on files in a temp
+    dir outside the repo resolves elan's DEFAULT toolchain, not the repo pin
+    (measured as `incompatible header ... Init.olean` from a newer default).
+    ELAN_TOOLCHAIN overrides elan's directory-based resolution, so every
+    subprocess that may run a shimmed binary gets this env. The repo pin also
+    wins over an ambient ELAN_TOOLCHAIN: these scripts measure the repo."""
+    env = dict(os.environ if base is None else base)
+    pin = repo_pinned_toolchain()
+    if pin:
+        env["ELAN_TOOLCHAIN"] = pin
+    return env
 
 
 def find_clang_binary() -> str | None:
@@ -989,6 +1006,7 @@ def run_three_way_batch(
         subprocess.run(
             [lean_bin, str(stock_source), "-c", str(lean_c_file)],
             cwd=str(tmpdir),
+            env=pinned_toolchain_env(),
             check=True,
             capture_output=True,
             text=True,
@@ -1003,10 +1021,12 @@ def run_three_way_batch(
             encoding="utf-8",
         )
         extra_inc = clang_extra_flags(clang_bin)
-        lean_prefix = subprocess.run([lean_bin, "--print-prefix"], check=True, capture_output=True, text=True).stdout.strip()
+        lean_prefix = subprocess.run([lean_bin, "--print-prefix"], env=pinned_toolchain_env(),
+                                     check=True, capture_output=True, text=True).stdout.strip()
         leanc = str(Path(lean_prefix) / "bin" / "leanc")
         subprocess.run(
             [leanc, "-O2", str(lean_c_file), "-o", str(stock_bin_path)],
+            env=pinned_toolchain_env(),
             check=True,
             capture_output=True,
             text=True,
@@ -1266,7 +1286,8 @@ def run_alias_batch(
         lean_c_file = tmpdir / "AliasBatch.lean.c"
         subprocess.run(
             [lean_bin, str(stock_source), "-c", str(lean_c_file)],
-            cwd=str(tmpdir), check=True, capture_output=True, text=True,
+            cwd=str(tmpdir), env=pinned_toolchain_env(),
+            check=True, capture_output=True, text=True,
         )
         driver_c_path = tmpdir / "alias_driver.c"
         stock_bin_path = tmpdir / "stock_alias_runner"
@@ -1274,10 +1295,12 @@ def run_alias_batch(
             "\n".join(c_driver_decls) + "\n" + "\n".join(c_driver_calls) + "\n",
             encoding="utf-8",
         )
-        lean_prefix = subprocess.run([lean_bin, "--print-prefix"], check=True, capture_output=True, text=True).stdout.strip()
+        lean_prefix = subprocess.run([lean_bin, "--print-prefix"], env=pinned_toolchain_env(),
+                                     check=True, capture_output=True, text=True).stdout.strip()
         leanc = str(Path(lean_prefix) / "bin" / "leanc")
         subprocess.run(
             [leanc, "-O2", str(lean_c_file), "-o", str(stock_bin_path)],
+            env=pinned_toolchain_env(),
             check=True, capture_output=True, text=True,
         )
         stock_out = subprocess.run([str(stock_bin_path)], check=True, capture_output=True, text=True).stdout
