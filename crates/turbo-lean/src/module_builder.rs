@@ -2625,18 +2625,21 @@ lean_exe «demo-exe» where
             .next(),
             Some(&LeanOptionValue::Bool(false))
         );
-        // Option names must be name literals. #299 (Fable r9): Lake 4.35 rejects explicit
-        // `LeanOption.mk` applications and plain `(k, v)` tuples (unknown constants under the
-        // module system), so they fail closed here too.
+        // Option names must be name literals. #299: Lake 4.35 rejects explicit `LeanOption.mk`
+        // applications and plain `(k, v)` tuples (unknown constants under the module system):
+        // the root fails closed at parse time, a dependency records `unsupported` so only its
+        // own modules fail, never the whole workspace configuration.
+        for e in ["#[⟨optKey, false⟩]", "#[⟨``linter.x, false⟩]"] {
+            assert!(parse(&lib(e, "")).is_err(), "{e}");
+        }
         for e in [
-            "#[⟨optKey, false⟩]",
-            "#[⟨``linter.x, false⟩]",
             "#[LeanOption.mk optKey false]",
             "#[LeanOption.mk ` true]",
             "#[LeanOption.mk `linter.n (.ofNat 1500), LeanOption.mk `linter.s \"a b\"]",
             "#[(`linter.a, false)]",
         ] {
-            assert!(parse(&lib(e, "")).is_err(), "{e}");
+            let dep = parse(&lib(e, "")).unwrap();
+            assert!(dep.libs[0].unsupported.is_some(), "{e}");
         }
         // Every scope form disables resolution; binders, dotted and universe names are rejected.
         for prelude in [
@@ -3912,6 +3915,25 @@ lean_lib Smoke where
             parse_lakefile_lean(&dir, &lf, true).unwrap().libs[0].name,
             "Demo"
         );
+        // A quoted PACKAGE name with a dot stays accepted (`lake init foo.bar` emits it): a
+        // package name never becomes a source path. Same for input targets, whose name is a
+        // literal path component.
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\npackage \"foo.bar\" where\nlean_lib Demo where\n",
+        )
+        .unwrap();
+        assert_eq!(parse_lakefile_lean(&dir, &lf, true).unwrap().name, "foo.bar");
+        fs::write(dir.join("widget.tar"), "x").unwrap();
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\npackage demo\ninput_file \"widget.tar\" where\n  path := \"widget.tar\"\nlean_lib Demo where\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_lakefile_lean(&dir, &lf, true).unwrap().inputs[0].name,
+            "widget.tar"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3976,23 +3998,27 @@ lean_lib Smoke where
             pkg.libs[0].globs,
             vec![GlobSpec::Submodules("Right".to_string())]
         );
-        // ...and backtick-literal globs survive beside a dotted helper.
-        let literal = "import Lake\nopen Lake DSL\npackage dep\ndef Glob.submodules (n : Lake.Glob) : Lake.Glob := n\nlean_lib Dep where\n  globs := #[`Dep.+]\n";
-        fs::write(&lf, literal).unwrap();
-        let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
-        assert!(pkg.libs[0].unsupported.is_none());
+        // ...and backtick-literal globs survive beside a dotted helper, even when the literal
+        // NAME contains "Glob." as a segment (a name literal is not a constructor reference).
+        for globs in ["#[`Dep.+]", "#[`Dep.Glob.+]"] {
+            let literal = format!("import Lake\nopen Lake DSL\npackage dep\ndef Glob.submodules (n : Lake.Glob) : Lake.Glob := n\nlean_lib Dep where\n  globs := {globs}\n");
+            fs::write(&lf, &literal).unwrap();
+            let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+            assert!(pkg.libs[0].unsupported.is_none(), "{globs}");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
     /// L299 (#299, accepted-but-invalid forms): Lake 4.35 rejects plain `(k, v)` tuples and
-    /// explicit `LeanOption.mk` applications in `leanOptions`; turbo-lean fails closed on both
-    /// and keeps the `⟨k, v⟩` form. The bullet's third form, an untyped
-    /// `abbrev xs := #[⟨...⟩]`, stays accepted: Mathlib's real lakefile binds
-    /// `mathlibLeanOptions` that way on its pinned toolchain
+    /// explicit `LeanOption.mk` applications in `leanOptions`: the root package fails closed at
+    /// parse time, a dependency records `unsupported` so only its own modules fail (a dependency
+    /// must not refuse the whole workspace configuration). The `⟨k, v⟩` form stays. The
+    /// bullet's third form, an untyped `abbrev xs := #[⟨...⟩]`, stays accepted: Mathlib's real
+    /// lakefile binds `mathlibLeanOptions` that way on its pinned toolchain
     /// (`test_computed_lean_options_mathlib_lakefile`), and refusing valid input is the failure
     /// mode #299 asks to avoid.
     #[test]
-    fn test_l299_prod_tuple_lean_option_mk_and_untyped_abbrev_fail_closed() {
+    fn test_l299_prod_tuple_and_lean_option_mk_fail_closed_untyped_abbrev_accepted() {
         let dir = make_temp_test_dir("l299_invalid_forms");
         let lf = dir.join("lakefile.lean");
         let parse = |src: &str| {
@@ -4002,8 +4028,15 @@ lean_lib Smoke where
         let lib = |expr: &str, prelude: &str| {
             format!("import Lake\nopen Lake DSL\n{prelude}package demo\nlean_lib Demo where\n  leanOptions := {expr}\n")
         };
-        assert!(parse(&lib("#[(`autoImplicit, false)]", "")).is_err());
-        assert!(parse(&lib("#[LeanOption.mk `autoImplicit false]", "")).is_err());
+        for e in [
+            "#[(`autoImplicit, false)]",
+            "#[LeanOption.mk `autoImplicit false]",
+        ] {
+            let dep = parse(&lib(e, "")).unwrap();
+            assert!(dep.libs[0].unsupported.is_some(), "{e}");
+            fs::write(&lf, lib(e, "")).unwrap();
+            assert!(parse_lakefile_lean(&dir, &lf, true).is_err(), "{e}");
+        }
         // The untyped Mathlib-shaped binding keeps resolving.
         let untyped = parse(&lib("xs", "abbrev xs := #[⟨`autoImplicit, false⟩]\n")).unwrap();
         assert_eq!(
@@ -4036,6 +4069,16 @@ lean_lib Smoke where
         fs::write(&lf, dup).unwrap();
         let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
         assert!(pkg.unsupported.is_some(), "duplicate lean_lib accepted");
+        assert!(parse_lakefile_lean(&dir, &lf, true).is_err());
+        // Cross-kind collisions are duplicate Lean declarations to Lake too.
+        let dup_kinds =
+            "import Lake\nopen Lake DSL\npackage dep\nlean_lib Demo where\nlean_exe Demo where\n";
+        fs::write(&lf, dup_kinds).unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+        assert!(
+            pkg.unsupported.is_some(),
+            "lib-vs-exe name collision accepted"
+        );
         assert!(parse_lakefile_lean(&dir, &lf, true).is_err());
         let meta_if = "import Lake\nopen Lake DSL\npackage dep\nmeta if true then\nlean_lib A where\nlean_lib B where\n";
         fs::write(&lf, meta_if).unwrap();

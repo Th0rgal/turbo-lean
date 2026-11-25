@@ -4155,6 +4155,37 @@ pub(super) fn parse_lean_globs_expr(expr: &str) -> Result<Vec<GlobSpec>> {
     }
     Ok(out)
 }
+
+/// Whether a `globs := #[...]` expression refers to `Glob` constructors by name (the spellings
+/// `parse_lean_globs_expr` reads literally and a non-plain lakefile's declarations could
+/// shadow), as opposed to backtick name-literal items, which cannot be shadowed even when a
+/// name segment spells "Glob".
+pub(super) fn glob_expr_names_constructors(expr: &str) -> bool {
+    let mut s = expr.trim();
+    if let Some(rest) = s.strip_prefix('#') {
+        s = rest.trim_start();
+    }
+    let Some(inner) = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')) else {
+        // Not the one-literal shape `parse_lean_globs_expr` accepts; it fails closed there.
+        return false;
+    };
+    let Ok(items) = split_top_level_comma(inner) else {
+        return false;
+    };
+    items.iter().any(|item| {
+        let t = item.trim();
+        [
+            "Glob.submodules ",
+            "Glob.andSubmodules ",
+            "Glob.one ",
+            ".submodules ",
+            ".andSubmodules ",
+            ".one ",
+        ]
+        .iter()
+        .any(|p| t.starts_with(p))
+    })
+}
 /// An option name must be a backtick name literal (`Lean.Parser.identFnAux`). Bare identifiers
 /// (`Name` values Lake would evaluate) and operators are rejected.
 pub(super) fn lean_option_name_literal(raw: &str) -> Result<LeanName> {
@@ -4257,6 +4288,12 @@ pub(super) fn lean_option_literal(raw: &str, key: &str) -> Result<LeanOptionValu
         key
     )
 }
+/// Marker head for `leanOptions` entry forms Lake 4.35 rejects (`LeanOption.mk` applications,
+/// `(k, v)` tuples): the lakefile reader downgrades this class to a dependency's `unsupported`
+/// slot instead of refusing the whole workspace configuration.
+pub(super) const LAKE_REJECTED_LEAN_OPTIONS_ENTRY: &str =
+    "Unsupported `leanOptions` entry form Lake rejects";
+
 pub(super) fn parse_lean_options_expr(expr: &str) -> Result<LeanOptionsMap> {
     let mut s = expr.trim();
     if let Some(rest) = s.strip_prefix('#') {
@@ -4279,9 +4316,9 @@ pub(super) fn parse_lean_options_expr(expr: &str) -> Result<LeanOptionsMap> {
     }
     let pairs: Vec<String> = pairs.into_iter().filter(|p| !p.is_empty()).collect();
     for p in pairs {
-        // #299 (Fable r9): Lake 4.35 rejects plain `(k, v)` `Prod` tuples and explicit
-        // `LeanOption.mk` applications in `leanOptions` arrays (unknown constants under the
-        // module system); only the anonymous-constructor form `⟨k, v⟩` elaborates there.
+        // #299: Lake 4.35 rejects plain `(k, v)` `Prod` tuples and explicit `LeanOption.mk`
+        // applications in `leanOptions` arrays (unknown constants under the module system);
+        // only the anonymous-constructor form `⟨k, v⟩` elaborates there.
         let trimmed = p
             .trim()
             .strip_prefix('⟨')
@@ -4294,6 +4331,16 @@ pub(super) fn parse_lean_options_expr(expr: &str) -> Result<LeanOptionsMap> {
             let k = lean_option_name_literal(k_raw)?;
             let v = lean_option_literal(v_raw, &k.to_lean_string())?;
             map.insert(k, v);
+        } else if p
+            .trim()
+            .strip_prefix("LeanOption.mk")
+            .is_some_and(|r| r.starts_with(char::is_whitespace))
+            || (p.trim().starts_with('(') && p.trim().ends_with(')'))
+        {
+            anyhow::bail!(
+                "{LAKE_REJECTED_LEAN_OPTIONS_ENTRY}: `{}` in lakefile.lean (only the anonymous-constructor form `⟨k, v⟩` elaborates under Lake 4.35's module system)",
+                p
+            );
         } else {
             anyhow::bail!("Unsupported `leanOptions` entry `{}` in lakefile.lean", p);
         }
@@ -5021,10 +5068,6 @@ pub(super) fn collect_lakefile_abbrevs_with_policy(clean: &str, is_root_pkg: boo
         }
         out.value_decls.insert(name.clone());
         let header = rest[raw_name.len()..].trim_start();
-        // #299 (Fable r9) flags untyped `abbrev xs := #[⟨...⟩]` as a form newer Lake rejects,
-        // but Mathlib's real lakefile binds `mathlibLeanOptions` exactly that way on its pinned
-        // toolchain (`test_computed_lean_options_mathlib_lakefile`), so the untyped form stays
-        // accepted: rejecting it would refuse valid input, the failure mode #299 asks to avoid.
         let body_start = match header.split_once(":=") {
             Some((ty, body)) if ty.trim().is_empty() || ty.starts_with(':') => Some(body),
             _ => None,
@@ -5356,6 +5399,36 @@ pub(super) fn parse_lean_path_literal(field: &str, expr: &str) -> Result<PathBuf
     parse_lean_path_literal_with_bindings(field, expr, None)
 }
 /// Parse a static declarative `lakefile.lean` into `PackageConfig`.
+/// Extend `target` with a resolved `leanOptions` expression. The entry forms Lake 4.35 rejects
+/// (`LeanOption.mk` applications, `(k, v)` tuples; `LAKE_REJECTED_LEAN_OPTIONS_ENTRY`) fail the
+/// root package closed at parse time but only record `unsupported` on a dependency, so one
+/// dependency's lakefile cannot refuse the whole workspace configuration; every other
+/// resolution error keeps failing closed for every package.
+pub(super) fn extend_lean_options_or_record(
+    target: &mut LeanOptionsMap,
+    slot: &mut Option<String>,
+    val_accum: &str,
+    bindings: &LakefileBindings,
+    line_no: usize,
+    is_root_pkg: bool,
+    lean_path: &Path,
+) -> Result<()> {
+    match resolve_lean_options_expr(val_accum, bindings, line_no) {
+        Ok(opts) => {
+            target.extend(opts);
+            Ok(())
+        }
+        Err(e) if !is_root_pkg && format!("{e:#}").contains(LAKE_REJECTED_LEAN_OPTIONS_ENTRY) => {
+            unsupported_lake_field(
+                slot,
+                is_root_pkg,
+                format!("{:#} in {} at line {}", e, lean_path.display(), line_no),
+            )
+        }
+        Err(e) => Err(e),
+    }
+}
+
 pub fn parse_lakefile_lean(
     pkg_root: &Path,
     lean_path: &Path,
@@ -5857,11 +5930,15 @@ pub(super) fn parse_lakefile_lean_inner(
                                 parse_lean_option_bool(&val_accum, &location)?;
                         }
                         "leanOptions" => {
-                            pkg.lean_options.extend(resolve_lean_options_expr(
+                            extend_lean_options_or_record(
+                                &mut pkg.lean_options,
+                                &mut pkg.unsupported,
                                 &val_accum,
                                 &lean_option_bindings,
                                 line_no,
-                            )?);
+                                is_root_pkg,
+                                lean_path,
+                            )?;
                         }
                         other => {
                             let (c_why, l_why) = classify_native_unsupported_field(
@@ -5899,15 +5976,13 @@ pub(super) fn parse_lakefile_lean_inner(
                                 }
                             }
                             "globs" => {
-                                // #299 (Astra r10): a non-plain lakefile can shadow the `Glob`
-                                // constructor spellings this parser reads literally (e.g.
+                                // #299: a non-plain lakefile can shadow the `Glob` constructor
+                                // spellings this parser reads literally (e.g.
                                 // `def Glob.submodules ... := .one`), so constructor-named glob
                                 // items fail closed there like `leanOptions` bindings do;
                                 // backtick name-literal globs cannot be shadowed and still parse.
                                 if lean_option_bindings.scoped
-                                    && ["Glob.", ".submodules ", ".andSubmodules ", ".one "]
-                                        .iter()
-                                        .any(|c| val_accum.contains(c))
+                                    && glob_expr_names_constructors(&val_accum)
                                 {
                                     unsupported_lake_field(
                                         &mut lib.unsupported,
@@ -5940,11 +6015,15 @@ pub(super) fn parse_lakefile_lean_inner(
                                 lake_precompile(key, &val_accum, &location)?;
                             }
                             "leanOptions" => {
-                                lib.lean_options.extend(resolve_lean_options_expr(
+                                extend_lean_options_or_record(
+                                    &mut lib.lean_options,
+                                    &mut lib.unsupported,
                                     &val_accum,
                                     &lean_option_bindings,
                                     line_no,
-                                )?);
+                                    is_root_pkg,
+                                    lean_path,
+                                )?;
                             }
                             "needs" => {
                                 let needs = parse_lean_bare_name_array_expr(&val_accum, key)?;
@@ -6067,11 +6146,15 @@ pub(super) fn parse_lakefile_lean_inner(
                                 exe.weak_lean_args = parse_lean_string_array_expr(&val_accum)?;
                             }
                             "leanOptions" => {
-                                exe.lean_options.extend(resolve_lean_options_expr(
+                                extend_lean_options_or_record(
+                                    &mut exe.lean_options,
+                                    &mut exe.unsupported,
                                     &val_accum,
                                     &lean_option_bindings,
                                     line_no,
-                                )?);
+                                    is_root_pkg,
+                                    lean_path,
+                                )?;
                             }
                             "needs" => {
                                 let needs = parse_lean_bare_name_array_expr(&val_accum, key)?;
@@ -6278,10 +6361,12 @@ where
                         .strip_prefix('"')
                         .and_then(|n| n.strip_suffix('"'))
                         .unwrap_or(n);
-                    // #299: a dot inside a quoted header is one atomic `Name.mkSimple` segment
-                    // to Lake (`lean_lib "Foo.Bar"` builds `Foo.Bar.lean`), while this parser
-                    // would split it into `Foo/Bar.lean`: fail closed.
-                    if quoted && n.contains('.') {
+                    // #299: a dot inside a quoted TARGET header is one atomic `Name.mkSimple`
+                    // segment to Lake (`lean_lib "Foo.Bar"` builds `Foo.Bar.lean`), while this
+                    // parser would split it into `Foo/Bar.lean`: fail closed. A quoted package
+                    // name never becomes a source path (`lake init foo.bar` emits one), and an
+                    // input target's name is a literal path component, so both keep parsing.
+                    if quoted && n.contains('.') && matches!(kw, "lean_lib" | "lean_exe") {
                         return false;
                     }
                     n.split('.').all(|seg| {
@@ -6957,20 +7042,47 @@ pub(super) fn finalize_package_config(
     explicit_empty_roots: &BTreeSet<usize>,
     hash_inputs_from_disk: bool,
 ) -> Result<()> {
-    // #299 (Fable r9): Lake rejects a configuration declaring two `lean_lib` targets under one
-    // name (a duplicate Lean declaration in `lakefile.lean`); accepting it would silently build
-    // with whichever of the two configurations module resolution happens to pick.
-    let dup_lib = pkg.libs.iter().enumerate().find_map(|(i, l)| {
-        pkg.libs[..i]
-            .iter()
-            .any(|p| p.name == l.name)
-            .then(|| l.name.clone())
-    });
-    if let Some(dup) = dup_lib {
+    // #299: Lake rejects a configuration declaring two targets under one name (a duplicate Lean
+    // declaration in `lakefile.lean`), across target kinds too; accepting it would silently
+    // build with whichever of the two configurations resolution happens to pick. Duplicate
+    // `input_file` / `input_dir` pairs keep their own gate (and its message) below.
+    let dup_target = {
+        let mut names: Vec<(&str, &str)> = Vec::new();
+        names.extend(pkg.libs.iter().map(|l| ("lean_lib", l.name.as_str())));
+        names.extend(pkg.exes.iter().map(|e| ("lean_exe", e.name.as_str())));
+        names.extend(pkg.custom_targets.iter().map(|c| ("target", c.as_str())));
+        names.extend(
+            pkg.extern_libs
+                .iter()
+                .map(|e| ("extern_lib", e.name.as_str())),
+        );
+        names.extend(pkg.inputs.iter().map(|i| ("input", i.name.as_str())));
+        names.iter().enumerate().find_map(|(i, (kind, name))| {
+            names[..i]
+                .iter()
+                .find(|(prev_kind, prev_name)| {
+                    prev_name == name && !(*prev_kind == "input" && *kind == "input")
+                })
+                .map(|(prev_kind, _)| {
+                    (
+                        (*prev_kind).to_string(),
+                        (*kind).to_string(),
+                        (*name).to_string(),
+                    )
+                })
+        })
+    };
+    if let Some((kind_a, kind_b, name)) = dup_target {
         unsupported_lake_field(
             &mut pkg.unsupported,
             is_root_pkg,
-            format!("Duplicate `lean_lib` `{}` in {}", dup, config_path.display()),
+            format!(
+                "Duplicate Lake target name `{}` (a `{}` and a `{}`) in {}",
+                name,
+                kind_a,
+                kind_b,
+                config_path.display()
+            ),
         )?;
     }
     for (i, lib) in pkg.libs.iter_mut().enumerate() {
