@@ -566,6 +566,49 @@ fn write_executable_script(path: &Path, body: &str) {
     fs::set_permissions(path, perms).unwrap();
 }
 
+/// G1b: compile `<module>.lean` in `dir` into a REAL `<module>.olean` with the repo's pinned
+/// toolchain, so the con-leche verification path is tested over real compiled artifacts and
+/// never over synthesized `.olean` bytes or an empty search path.
+#[cfg(unix)]
+fn compile_real_olean_module(dir: &Path, module: &str) -> PathBuf {
+    let toolchain = include_str!("../../../lean/lean-toolchain").trim();
+    fs::write(dir.join("lean-toolchain"), format!("{toolchain}\n")).unwrap();
+    // Locate the pinned `lean` cleanly even when no elan default toolchain is configured.
+    let lean_bin = Command::new("elan")
+        .current_dir(dir)
+        .args(["which", "lean"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+        .unwrap_or_else(|| PathBuf::from("lean"));
+    let src = dir.join(format!("{module}.lean"));
+    fs::write(
+        &src,
+        "module\nprelude\npublic section\ninductive Yes : Prop where\n  | intro\ntheorem yes : Yes := Yes.intro\nend\n",
+    )
+    .unwrap();
+    let olean = dir.join(format!("{module}.olean"));
+    let out = Command::new(&lean_bin)
+        .current_dir(dir)
+        .args([
+            "-R",
+            dir.to_str().unwrap(),
+            "-o",
+            olean.to_str().unwrap(),
+            src.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "compile {module}.lean with the pinned `lean` failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    olean
+}
+
 #[cfg(unix)]
 #[test]
 fn con_leche_exit_code_protocol_and_verified_cli_flags() {
@@ -576,6 +619,24 @@ fn con_leche_exit_code_protocol_and_verified_cli_flags() {
     let scratch_dir = f.root.join("scratch-tmp");
     fs::create_dir_all(&sp_dir).unwrap();
     fs::create_dir_all(&scratch_dir).unwrap();
+    compile_real_olean_module(&sp_dir, "DemoMod");
+
+    // G1b: the con-leche verification path is exercised over a REAL compiled `.olean`
+    // artifact produced by the pinned toolchain — never an empty or synthesized search path.
+    let demo_olean = sp_dir.join("DemoMod.olean");
+    let demo_bytes = fs::read(&demo_olean).unwrap_or_else(|e| {
+        panic!(
+            "G1b: expected a real compiled DemoMod.olean on the con-leche search path at {}: {e}",
+            demo_olean.display()
+        )
+    });
+    assert!(demo_bytes.len() > 5, "real DemoMod.olean must be non-empty");
+    assert_eq!(&demo_bytes[..5], &b"olean"[..], "real Lean 4 `.olean` magic");
+    assert_ne!(
+        &demo_bytes[..4],
+        &[0x4Fu8, 0x4C, 0x45, 0x4E][..],
+        "a real `.olean` is not an OLEN v1 model shard"
+    );
 
     write_executable_script(
         &mock_bin,
