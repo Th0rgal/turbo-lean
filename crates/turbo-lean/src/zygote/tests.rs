@@ -9,6 +9,27 @@ use std::process::Command;
 
 use super::*;
 
+    /// H2.3 r1 (finding 7): restore an env var on drop, so a failing assert cannot leak
+    /// the override into later tests (the env lock's poison is ignored via `into_inner`).
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     #[cfg(unix)]
@@ -79,8 +100,7 @@ use super::*;
         let _guard = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_jobs = std::env::var_os("TURBO_LEAN_JOBS");
-        std::env::set_var("TURBO_LEAN_JOBS", "2");
+        let _jobs_guard = EnvVarGuard::set("TURBO_LEAN_JOBS", "2");
         let (dir, store, mut env, lean_bin) = open_test_zygote_env("wide_cross_budget").unwrap();
         let policy_tag = format!("H23Wide{}", next_tmp_id());
         env.insert(
@@ -116,10 +136,6 @@ use super::*;
                     .sum::<usize>()
             })
             .unwrap_or(0);
-        match prev_jobs {
-            Some(v) => std::env::set_var("TURBO_LEAN_JOBS", v),
-            None => std::env::remove_var("TURBO_LEAN_JOBS"),
-        }
         assert!(rep.ok && rep.kernel_gate_active, "{rep:?}");
         for n in names {
             assert!(
@@ -132,6 +148,140 @@ use super::*;
             "a --jobs 2 budget must fan a 6-block replay out over exactly 2 pool workers \
              (the pre-H2.3 path ran one serial whole-body worker past 4 blocks)"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// H2.3 r1 (finding 2): a budgeted fan-out's workers carry a permanent RLIMIT_DATA
+    /// share, so they pool under a cap-suffixed key, invisible to uncapped requests.
+    #[test]
+    #[cfg(unix)]
+    fn budgeted_fan_out_workers_pool_under_a_cap_keyed_entry() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _jobs_guard = EnvVarGuard::set("TURBO_LEAN_JOBS", "2");
+        let _mem_guard = EnvVarGuard::set("TURBO_LEAN_MAX_MEMORY_MB", "8192");
+        let (dir, store, mut env, lean_bin) = open_test_zygote_env("capped_fanout").unwrap();
+        let policy_tag = format!("H23Cap{}", next_tmp_id());
+        env.insert(
+            crate::splitter::ALLOWED_AXIOMS_ENV.into(),
+            policy_tag.clone(),
+        );
+        let mut source = String::from("import Init\n");
+        for i in 0..6 {
+            source.push_str(&format!(
+                "-- namespace _TurboCrossFileShard_{i}\ntheorem cap6_{i} : True := True.intro\n"
+            ));
+        }
+        let rep = eval_with_zygote_pool(
+            &store,
+            "leanprover/lean4:v4.35.0",
+            "",
+            &env,
+            &lean_bin,
+            &source,
+            false,
+        )
+        .unwrap();
+        assert!(rep.ok && rep.kernel_gate_active, "{rep:?}");
+        let pool = ZYGOTE_POOL
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut capped_n = 0usize;
+        let mut uncapped_n = 0usize;
+        for (key, workers) in pool.iter().filter(|(key, _)| key.0.contains(&policy_tag)) {
+            // --max-memory-mb 8192 over a jobs=2 fan-out = 4096 MiB per worker.
+            if key.2.ends_with("#rlimit_mb=4096") {
+                capped_n += workers.len();
+            } else {
+                uncapped_n += workers.len();
+            }
+        }
+        drop(pool);
+        assert_eq!(
+            uncapped_n, 0,
+            "RLIMIT_DATA-capped fan-out workers leaked into an uncapped pool key"
+        );
+        assert!(
+            capped_n >= 1,
+            "a budgeted fan-out pools its capped workers under the cap-keyed entry"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// H2.3 r1 (finding 7): the fan-out's dispatching-thread crash retry at width > 4.
+    /// Poison the pooled workers a wide replay left warm, then replay a fresh wide body
+    /// through them: the queue records crashes, the retry respawns per slice, and the
+    /// combined reply is complete and ok.
+    #[test]
+    #[cfg(unix)]
+    fn wide_cross_file_replay_crash_retry_recovers() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _jobs_guard = EnvVarGuard::set("TURBO_LEAN_JOBS", "2");
+        let (dir, store, mut env, lean_bin) = open_test_zygote_env("wide_crash_retry").unwrap();
+        let policy_tag = format!("H23Crash{}", next_tmp_id());
+        env.insert(
+            crate::splitter::ALLOWED_AXIOMS_ENV.into(),
+            policy_tag.clone(),
+        );
+        let wide_source = |prefix: &str| {
+            let mut s = String::from("import Init\n");
+            for i in 0..6 {
+                s.push_str(&format!(
+                    "-- namespace _TurboCrossFileShard_{i}\ntheorem {prefix}_{i} : True := True.intro\n"
+                ));
+            }
+            s
+        };
+        let eval = |source: &str| {
+            eval_with_zygote_pool(
+                &store,
+                "leanprover/lean4:v4.35.0",
+                "",
+                &env,
+                &lean_bin,
+                source,
+                false,
+            )
+            .unwrap()
+        };
+        let first = eval(&wide_source("cr6_warm"));
+        assert!(first.ok && first.kernel_gate_active, "{first:?}");
+        let mut held_pipes = Vec::new();
+        let mut stale_pids = Vec::new();
+        {
+            let mut pool = ZYGOTE_POOL
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for worker in pool
+                .iter_mut()
+                .filter(|(key, _)| key.0.contains(&policy_tag))
+                .flat_map(|(_, workers)| workers)
+            {
+                stale_pids.push(worker.pid());
+                held_pipes.push(std::mem::replace(
+                    &mut worker.stdin,
+                    fs::File::open("/dev/null").unwrap(),
+                ));
+            }
+        }
+        assert_eq!(stale_pids.len(), 2, "warm wide run must pool exactly 2 workers");
+        let retried = eval(&wide_source("cr6_fresh"));
+        assert!(retried.ok && retried.kernel_gate_active, "{retried:?}");
+        for i in 0..6 {
+            let name = format!("cr6_fresh_{i}");
+            assert!(
+                retried.decl_types.contains_key(&name),
+                "crash-retried block decl {name} missing: {retried:?}"
+            );
+        }
+        drop(held_pipes);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4733,6 +4883,7 @@ use super::*;
                 cold_import_us: None,
                 is_master: false,
                 _master: None,
+                rlimit_mb: None,
             }
         };
 

@@ -954,9 +954,10 @@ pub(super) fn eval_with_zygote_pool_attempt(
         );
         // H2.3: a budgeted parallel replay fan-out caps each fresh worker's share of
         // `--max-memory-mb` as a real RLIMIT_DATA (#435's mechanism); single-request
-        // paths pass `None` and stay uncapped. A master clone inherits the master's
-        // (uncapped) limits, so the cap is best-effort there; the machine-wide RSS
-        // governor stays the backstop.
+        // paths pass `None` and spawn uncapped. A capped worker records its cap and
+        // pools only under a cap-keyed entry (r1 finding 2), so uncapped requests never
+        // reuse it. A master clone inherits the master's (uncapped) limits, so the cap
+        // is best-effort there; the machine-wide RSS governor stays the backstop.
         if let Some(mb) = spawn_rlimit_mb {
             WorkerBudget::apply_worker_rlimit(&mut cmd, mb);
         }
@@ -1025,6 +1026,7 @@ pub(super) fn eval_with_zygote_pool_attempt(
             cold_import_us: None,
             is_master: false,
             _master: None,
+            rlimit_mb: spawn_rlimit_mb,
         })
     };
 
@@ -1042,13 +1044,14 @@ pub(super) fn eval_with_zygote_pool_attempt(
         worker_rss_limit_mb.max(2048)
     };
     let budget = WorkerBudget::from_env();
-    // H2.3: an explicit `--jobs` wider than the governor's idle clamp keeps that many
-    // replay workers poolable between fan-out batches (the memory budget still caps the
-    // width); `TURBO_LEAN_MAX_IDLE_ZYGOTES` stays the explicit override.
-    let budget_pool_width = budget
-        .jobs
-        .map(|j| budget.effective_parallelism(j, REPLAY_WORKER_EST_RSS_MB, || j))
-        .unwrap_or(0);
+    // H2.3 r1 (finding 6): an explicit `--jobs` widens idle-pool residency only under an
+    // explicit memory budget, where `effective_parallelism` caps it by each worker's
+    // share; `--jobs` alone must not override the governor's memory-derived clamp.
+    // `TURBO_LEAN_MAX_IDLE_ZYGOTES` stays the explicit override.
+    let budget_pool_width = match (budget.jobs, budget.max_memory_mb) {
+        (Some(j), Some(_)) => budget.effective_parallelism(j, REPLAY_WORKER_EST_RSS_MB, || j),
+        _ => 0,
+    };
     let max_global_idle = std::env::var("TURBO_LEAN_MAX_IDLE_ZYGOTES")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -1061,10 +1064,14 @@ pub(super) fn eval_with_zygote_pool_attempt(
         });
     #[cfg(test)]
     let max_global_idle = max_global_idle.max(64);
+    // A fan-out batch returns all its workers under ONE pool key, so the per-key cap
+    // must admit the budget width too, or the batch's warm workers are dropped at once
+    // (r1 finding 6: the earlier comment claimed poolability this cap took away).
     let max_pool_per_key = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
         .max(4)
+        .max(budget_pool_width)
         .min(max_global_idle);
 
     #[allow(clippy::large_enum_variant)]
@@ -1309,6 +1316,15 @@ pub(super) fn eval_with_zygote_pool_attempt(
             drop(w);
             return;
         }
+        // H2.3 r1 (finding 2): a permanently RLIMIT_DATA-capped worker may pool only
+        // under a key naming its cap; any other key would hand it to requests that
+        // expect no cap and fail allocations with no `memory_kill_note`.
+        if let Some(mb) = w.rlimit_mb {
+            if !key.2.ends_with(&format!("#rlimit_mb={mb}")) {
+                drop(w);
+                return;
+            }
+        }
         w.request_count += 1;
         if w.request_count >= 256 {
             drop(w);
@@ -1390,11 +1406,18 @@ pub(super) fn eval_with_zygote_pool_attempt(
             // in block order whatever the completion order. Before H2.3 this path took at
             // most 4 blocks, one dedicated worker each regardless of the budget, and a
             // wider replay fell back to one serial whole-body request.
+            // H2.3 r1 (finding 3): with no explicit budget the width is the governor's
+            // memory-derived recommendation (already core-capped), never bare core
+            // count: a 64-block replay must not start 64 cold Lean workers on a 64-core
+            // host whose memory cannot back them. Width bounds compose per CALL, not per
+            // process: N concurrent shard threads each get this width, so the process
+            // product is bounded by this per-call recommendation, by the per-worker
+            // RLIMIT_DATA share under an explicit budget, and by
+            // `govern_machine_wide_zygote_rss`, which retires workers machine-wide as
+            // RSS accumulates.
             let parallelism =
                 budget.effective_parallelism(blocks.len(), REPLAY_WORKER_EST_RSS_MB, || {
-                    std::thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(4)
+                    governor.recommended_parallel_workers(REPLAY_WORKER_EST_RSS_MB)
                 });
             let max_per_slice = budget
                 .replay_batch_cap(replay_closure_batch_size(), parallelism)
@@ -1407,12 +1430,23 @@ pub(super) fn eval_with_zygote_pool_attempt(
             } else {
                 None
             };
+            // H2.3 r1 (finding 2): capped workers live under their own pool key, so an
+            // uncapped request never reuses a permanently RLIMIT_DATA-capped worker and
+            // a later fan-out with the same share gets them back warm.
+            let fanout_pool_key = match pool_rlimit_mb {
+                None => pool_key.clone(),
+                Some(mb) => (
+                    pool_key.0.clone(),
+                    pool_key.1.clone(),
+                    format!("{}#rlimit_mb={mb}", pool_key.2),
+                ),
+            };
             let mut workers: Vec<ZygoteChild> = Vec::with_capacity(needed);
             {
                 let mut pool = pool_mutex
                     .lock()
                     .map_err(|_| anyhow::anyhow!("ZygotePool mutex poisoned"))?;
-                let matching_keys: Vec<(String, String, String)> = vec![pool_key.clone()];
+                let matching_keys: Vec<(String, String, String)> = vec![fanout_pool_key.clone()];
                 for k in &matching_keys {
                     if let Some(vec) = pool.get_mut(k) {
                         vec.retain(|w| {
@@ -1461,7 +1495,7 @@ pub(super) fn eval_with_zygote_pool_attempt(
                         }
                     }
                 }
-                if let Some(vec) = pool.get_mut(&pool_key) {
+                if let Some(vec) = pool.get_mut(&fanout_pool_key) {
                     while workers.len() < needed {
                         if let Some(pos) = vec.iter().rposition(|w| w.warm_imports.is_empty()) {
                             workers.push(vec.swap_remove(pos));
@@ -1475,7 +1509,16 @@ pub(super) fn eval_with_zygote_pool_attempt(
                 mark_closure_snapshot_used(host_closure_digest);
             }
             while workers.len() < needed {
-                workers.push(acquire_worker(pool_rlimit_mb)?);
+                match acquire_worker(pool_rlimit_mb) {
+                    Ok(w) => workers.push(w),
+                    // H2.3 r1 (finding 5): one failed spawn (a process or memory limit)
+                    // does not abort the batch once a worker is held; the queue runs at
+                    // the reduced width and the warm workers already taken stay in use.
+                    // The per-worker share was sized for the full width, so the smaller
+                    // crew is capped tighter than its entitlement, never looser.
+                    Err(_) if !workers.is_empty() => break,
+                    Err(e) => return Err(e),
+                }
             }
 
             let req_lines: Vec<String> = slices
@@ -1497,12 +1540,16 @@ pub(super) fn eval_with_zygote_pool_attempt(
                 .collect::<Result<Vec<_>>>()?;
 
             let req_id_ref = request_identity.as_str();
-            // A reply from a worker that panicked or failed its imports retires that
-            // worker; the queue's other workers keep going, and the reply itself still
-            // reaches the fail-closed combine below.
+            // H2.3 r1 (finding 1): one pool-eligibility predicate for both paths — the
+            // serial arm's `unusable` check (RUNTIME_PANIC_ERR or "importsCsv changed")
+            // retires the worker here too; the reply itself still reaches the combine.
             let worker_fate = |res: &WorkerReqOutcome| match res {
                 WorkerReqOutcome::Reply(r)
-                    if r.import_ok && !r.errors.iter().any(|e| e == RUNTIME_PANIC_ERR) =>
+                    if r.import_ok
+                        && !r
+                            .errors
+                            .iter()
+                            .any(|e| e == RUNTIME_PANIC_ERR || e.contains("importsCsv changed")) =>
                 {
                     QueueWorkerFate::Healthy
                 }
@@ -1513,9 +1560,17 @@ pub(super) fn eval_with_zygote_pool_attempt(
                 run_request_queue_over_workers(
                     workers,
                     req_lines_ref.len(),
-                    // Only a timeout aborts the run; a crashed slice is retried below
-                    // and a sick reply is judged by the combine.
-                    |res: &WorkerReqOutcome| matches!(res, WorkerReqOutcome::TimedOut { .. }),
+                    // H2.3 r1 (finding 4): a timeout aborts the run, and so does a sick
+                    // REPLY (failed import, runtime panic): the run is already a failure
+                    // and scheduling more slices against the same closure would only
+                    // reproduce it. A crash carries no verdict, so it is not fatal: the
+                    // worker retires, the rest drain the queue, and the slice is retried
+                    // once below.
+                    |res: &WorkerReqOutcome| {
+                        matches!(res, WorkerReqOutcome::TimedOut { .. })
+                            || (matches!(res, WorkerReqOutcome::Reply(_))
+                                && worker_fate(res) == QueueWorkerFate::Dead)
+                    },
                     |w: &mut ZygoteChild, idx: usize| {
                         let res = run_worker_req(w, &req_lines_ref[idx], req_id_ref);
                         let fate = worker_fate(&res);
@@ -1526,12 +1581,17 @@ pub(super) fn eval_with_zygote_pool_attempt(
             // Crash retry runs on this thread (`spawn_zygote_worker` holds the non-Sync
             // store handle), once per crashed or never-scheduled slice, mirroring the
             // pre-H2.3 per-block path's single retry per crashed block. A timeout skips
-            // it: the combine below returns the timed-out reply at once.
+            // it (the combine returns the timed-out reply at once), and so does a sick
+            // reply (r1 finding 4): cold respawns of the remaining slices would burn the
+            // deadline reproducing a failure the collected replies already prove.
             let timed_out_any = outcomes
                 .iter()
                 .flatten()
                 .any(|r| matches!(r, WorkerReqOutcome::TimedOut { .. }));
-            if !timed_out_any {
+            let fatal_reply_any = outcomes.iter().flatten().any(|r| {
+                matches!(r, WorkerReqOutcome::Reply(_)) && worker_fate(r) == QueueWorkerFate::Dead
+            });
+            if !timed_out_any && !fatal_reply_any {
                 for idx in 0..req_lines.len() {
                     let needs_retry = matches!(
                         outcomes.get(idx),
@@ -1552,23 +1612,26 @@ pub(super) fn eval_with_zygote_pool_attempt(
             run_digest_test_hook("after_worker_reply");
             let binding = closure.binding();
             // A worker whose env is not proven to hold the hashed bytes is killed: its
-            // in-process env cache is labelled with this digest. An `Unused` worker goes
-            // back exactly as it was acquired.
+            // in-process env cache is labelled with this digest, and uncacheable Lake
+            // inputs pool nothing warmed (r1 finding 1, the serial arm's predicate). An
+            // `Unused` worker goes back exactly as it was acquired.
             for (mut w, fate) in finished_workers {
                 match fate {
-                    QueueWorkerFate::Healthy if binding == ClosureBinding::Bound => {
+                    QueueWorkerFate::Healthy
+                        if binding == ClosureBinding::Bound && !lake_inputs_uncacheable =>
+                    {
                         w.warm_imports
                             .insert(imports_csv.clone(), closure_pool_digest.clone());
-                        return_worker_to_pool(pool_mutex, pool_key.clone(), w);
+                        return_worker_to_pool(pool_mutex, fanout_pool_key.clone(), w);
                     }
                     QueueWorkerFate::Unused => {
-                        return_worker_to_pool(pool_mutex, pool_key.clone(), w);
+                        return_worker_to_pool(pool_mutex, fanout_pool_key.clone(), w);
                     }
                     _ => drop(w),
                 }
             }
             let mut replies = Vec::with_capacity(req_lines.len());
-            let mut first_err: Option<anyhow::Error> = None;
+            let mut first_crash: Option<WorkerCrashDiagnostics> = None;
             for res in outcomes {
                 match res {
                     Some(WorkerReqOutcome::Reply(r)) => replies.push(r),
@@ -1587,13 +1650,13 @@ pub(super) fn eval_with_zygote_pool_attempt(
                                 stderr_tail,
                                 Some(last_request),
                             ),
-                            binding,
+                            ClosureBinding::Unproven,
                             executed_identity,
                         ));
                     }
                     Some(WorkerReqOutcome::Crashed(diag)) => {
-                        if first_err.is_none() {
-                            first_err = Some(anyhow::anyhow!("{}", diag.message));
+                        if first_crash.is_none() {
+                            first_crash = Some(diag);
                         }
                     }
                     // A slot never scheduled after a fatal stop: the fatal outcome above
@@ -1601,11 +1664,42 @@ pub(super) fn eval_with_zygote_pool_attempt(
                     None => {}
                 }
             }
-            if let Some(e) = first_err {
-                return Err(e);
+            // H2.3 r1 (finding 1): a crash reads exactly as the serial arm reports it —
+            // the structured reply keeps `crashed`, `peak_rss_mb` and `stderr_tail`, and
+            // a crash discovered past the deadline reads as the timeout it is.
+            if let Some(diag) = first_crash {
+                if std::time::Instant::now() >= deadline {
+                    return Ok((
+                        ZygoteEvalReply::timed_out_reply(
+                            eval_mode,
+                            request_started.elapsed().as_micros() as u64,
+                            effective_timeout_ms,
+                            diag.peak_rss_mb,
+                            diag.stderr_tail,
+                            diag.last_request,
+                        ),
+                        ClosureBinding::Unproven,
+                        executed_identity,
+                    ));
+                }
+                return Ok((
+                    ZygoteEvalReply::crashed_reply_with_diag(eval_mode, diag),
+                    ClosureBinding::Unproven,
+                    executed_identity,
+                ));
             }
+            // H2.3 r1 (finding 4): a fatal-reply stop leaves unscheduled slots, and the
+            // collected replies already carry the real failure — surface them through
+            // the combine instead of a generic lost-slices error. A shortfall with every
+            // collected reply healthy still fails closed.
+            let has_failing_reply = replies.iter().any(|r| {
+                !r.import_ok
+                    || r.errors
+                        .iter()
+                        .any(|e| e == RUNTIME_PANIC_ERR || e.contains("importsCsv changed"))
+            });
             anyhow::ensure!(
-                replies.len() == req_lines.len(),
+                replies.len() == req_lines.len() || has_failing_reply,
                 "cross-file replay fan-out lost {} of {} slice replies (fail-closed)",
                 req_lines.len() - replies.len(),
                 req_lines.len()
