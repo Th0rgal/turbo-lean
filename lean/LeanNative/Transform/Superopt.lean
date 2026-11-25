@@ -50,20 +50,17 @@ def isGpu : SuperoptTarget → Bool
   | .cuda_ptx | .apple_metal => true
   | .x86_64 | .arm64 => false
 
-/-- The build host's CPU `SuperoptTarget` (aarch64 hosts map to `.arm64`,
-    everything else to `.x86_64`), mirroring `TargetArch.host`. -/
-def host : SuperoptTarget :=
-  if System.Platform.target.startsWith "aarch64" || System.Platform.target.startsWith "arm64" then
-    .arm64
-  else
-    .x86_64
-
 /-- CPU `SuperoptTarget` for a codegen `TargetArch` (aarch64 family maps to
     `.arm64`, GPU-only arches to `.cuda_ptx`, everything else to `.x86_64`). -/
 def ofTargetArch (t : TargetArch) : SuperoptTarget :=
   if t.isAArch64 then .arm64
   else if t == .nvptx64 || t == .hybridCpuGpu then .cuda_ptx
   else .x86_64
+
+/-- The build host's CPU `SuperoptTarget`, derived from `TargetArch.host` so the
+    host detection lives in one place. -/
+def host : SuperoptTarget :=
+  ofTargetArch TargetArch.host
 
 end SuperoptTarget
 

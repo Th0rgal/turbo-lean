@@ -221,6 +221,11 @@ pub fn resolve_pack_import_trust_domain(
     trusted_pubkey: Option<&str>,
     allow_unattested_trusted: bool,
 ) -> Result<&'static str> {
+    // Every import path resolves a trust domain before finishing, so this is
+    // the one place the cross-architecture guard covers them all: the policy
+    // imports, the prefetched-prestage CLI/sync finishers, the server /import
+    // v3 branch, and deferred-pack re-imports.
+    check_pack_arch_import(manifest, std::env::consts::ARCH)?;
     let env_pk = std::env::var("TURBO_LEAN_PACK_TRUSTED_PUBKEY")
         .ok()
         .filter(|s| !s.trim().is_empty());

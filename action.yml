@@ -146,7 +146,7 @@ runs:
         bin_arch_matches() {
           command -v file >/dev/null 2>&1 || return 0
           local info
-          info=$(file -b "$1" 2>/dev/null || true)
+          info=$(file -bL "$1" 2>/dev/null || true)
           case "$(uname -m)" in
             x86_64|amd64) printf '%s' "$info" | grep -Eq 'x86-64|x86_64' ;;
             aarch64|arm64) printf '%s' "$info" | grep -Eiq 'aarch64|arm64' ;;

@@ -411,7 +411,14 @@ fn main() {
     ] {
         println!("cargo:rerun-if-env-changed={key}");
     }
-    for key in ["TARGET_CC", "CC", "TARGET_AR", "AR"] {
+    for tool in ["LD", "STRIP", "NM"] {
+        println!("cargo:rerun-if-env-changed={tool}_{cargo_target}");
+        println!("cargo:rerun-if-env-changed={tool}_{target_underscored}");
+    }
+    for key in [
+        "TARGET_CC", "CC", "TARGET_AR", "AR", "TARGET_LD", "LD", "TARGET_STRIP", "STRIP",
+        "TARGET_NM", "NM",
+    ] {
         println!("cargo:rerun-if-env-changed={key}");
     }
     let mut cc_candidates: Vec<String> = Vec::new();
@@ -492,8 +499,44 @@ fn main() {
         "failed to compile TurboLean/Kernel.c, LeanSys/Spec.c, and LeanNative/Spec.c with cc/clang/gcc"
     );
 
+    // Binutils follow the same env conventions (TOOL_<target>, TARGET_TOOL,
+    // TOOL). When cross-compiling with no override, prefer the
+    // `<arch>-linux-gnu-` prefixed tool on PATH (the binutils naming cc-rs
+    // derives for the gcc family) over the bare host tool.
+    let cargo_host = env::var("HOST").unwrap_or_default();
+    let resolve_tool = |tool: &str| -> String {
+        let upper = tool.to_uppercase();
+        for key in [
+            format!("{upper}_{cargo_target}"),
+            format!("{upper}_{target_underscored}"),
+            format!("TARGET_{upper}"),
+            upper.clone(),
+        ] {
+            if let Ok(v) = env::var(&key) {
+                let v = v.trim().to_string();
+                if !v.is_empty() {
+                    return v;
+                }
+            }
+        }
+        if !cargo_target.is_empty() && cargo_target != cargo_host {
+            let prefixed = format!("{}-{tool}", cargo_target.replace("-unknown-", "-"));
+            let found = env::var("PATH").ok().is_some_and(|path_var| {
+                env::split_paths(&path_var).any(|d| d.join(&prefixed).is_file())
+            });
+            if found {
+                return prefixed;
+            }
+        }
+        tool.to_string()
+    };
+    let ld_tool = resolve_tool("ld");
+    let strip_tool = resolve_tool("strip");
+    let nm_tool = resolve_tool("nm");
+    let ar_tool = resolve_tool("ar");
+
     if cfg!(target_os = "macos") {
-        let ld_status = Command::new("ld")
+        let ld_status = Command::new(&ld_tool)
             .args(["-r"])
             .arg(&raw_obj_path)
             .arg(&leansys_raw_obj_path)
@@ -503,7 +546,7 @@ fn main() {
             .status()
             .unwrap_or_else(|e| panic!("ld -r failed: {e}"));
         assert!(ld_status.success() && gc_obj_path.is_file(), "ld -r failed");
-        let strip_status = Command::new("strip")
+        let strip_status = Command::new(&strip_tool)
             .args(["-x"])
             .arg(&gc_obj_path)
             .status()
@@ -521,7 +564,7 @@ fn main() {
         ld_args.push("-o".to_string());
         ld_args.push(gc_obj_path.display().to_string());
 
-        let ld_status = Command::new("ld")
+        let ld_status = Command::new(&ld_tool)
             .args(&ld_args)
             .status()
             .unwrap_or_else(|e| panic!("ld -r --gc-sections failed: {e}"));
@@ -530,7 +573,7 @@ fn main() {
             "ld -r --gc-sections failed on TurboLean_Kernel_raw.o + LeanSys_Spec_raw.o"
         );
 
-        let strip_status = Command::new("strip")
+        let strip_status = Command::new(&strip_tool)
             .args(["--strip-unneeded"])
             .arg(&gc_obj_path)
             .status()
@@ -538,7 +581,7 @@ fn main() {
         assert!(strip_status.success(), "strip --strip-unneeded failed");
     }
 
-    let nm_undef = Command::new("nm")
+    let nm_undef = Command::new(&nm_tool)
         .args(["-P", "-u"])
         .arg(&gc_obj_path)
         .output()
@@ -550,7 +593,7 @@ fn main() {
         "TurboLean_Kernel_gc.o contains undefined symbols:\n{undef_str}"
     );
 
-    let mut nm_def_cmd = Command::new("nm");
+    let mut nm_def_cmd = Command::new(&nm_tool);
     nm_def_cmd.arg("-P");
     if !cfg!(target_os = "macos") {
         nm_def_cmd.arg("--defined-only");
@@ -579,21 +622,6 @@ fn main() {
     }
 
     let _ = fs::remove_file(&lib_path);
-    // Same cc-rs-style env lookup for the archiver (AR_<target>, TARGET_AR, AR).
-    let ar_tool = [
-        format!("AR_{cargo_target}"),
-        format!("AR_{target_underscored}"),
-        "TARGET_AR".to_string(),
-        "AR".to_string(),
-    ]
-    .iter()
-    .find_map(|k| {
-        env::var(k)
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    })
-    .unwrap_or_else(|| "ar".to_string());
     let ar_status = Command::new(&ar_tool)
         .args(["crs"])
         .arg(&lib_path)

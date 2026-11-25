@@ -475,7 +475,7 @@ def runCompileFastCheck (tag : String) (elaborateHook? : Option (String → Targ
   let (useConstraintProp, jsonFlag) := (!(hasFlag args "--no-constraint-prop"), hasFlag args "--json")
   let mod ← loadInputModule elaborateHook? args true
   if hasFlag args "--c-abi" || hasFlag args "--emit-c-abi" then writeOrPrint outPath (LeanNative.Backend.emitFastCheckCABI mod) (some s!"[{tag}] Wrote FastCheck Zero-Boxing C-ABI SIMD source to {outPath}")
-  else if hasFlag args "--emit-llvm" then writeOrPrint outPath (emitFastCheckLLVM mod) (some s!"[{tag}] Wrote FastCheck SIMD LLVM 18 IR to {outPath}")
+  else if hasFlag args "--emit-llvm" then writeOrPrint outPath (emitFastCheckLLVM mod (← parseTargetArchIO (findFlagValue args "--arch" (findFlagValue args "--target" TargetArch.hostName)))) (some s!"[{tag}] Wrote FastCheck SIMD LLVM 18 IR to {outPath}")
   else if hasFlag args "--emit-ptx" then writeOrPrint outPath (emitFastCheckPTX mod smArch) (some s!"[{tag}] Wrote FastCheck NVIDIA PTX 8.0 ({smArch}) to {outPath}")
   else if hasFlag args "--emit-metal" then writeOrPrint outPath (emitFastCheckMetal mod) (some s!"[{tag}] Wrote FastCheck Apple Metal 3.0 shader to {outPath}")
   else
