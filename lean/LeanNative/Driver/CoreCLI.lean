@@ -81,7 +81,7 @@ def resolveInput (args : List String) : IO InputSel := do
 structure CoreCLIOptions where
   inputPath : String := ""
   outputPath : String := ""
-  arch : TargetArch := .x86_64
+  arch : TargetArch := .host
   emitCABI : Bool := false
   emitLLVM : Bool := false
   emitPTX : Bool := false
@@ -94,7 +94,7 @@ structure CoreCLIOptions where
 def parseCoreCLIOptions (args : List String) : IO CoreCLIOptions := do
   validateValueTakingFlags args
   let sel ← resolveInput args
-  let arch ← parseTargetArchIO (findFlagValue args "--arch" (findFlagValue args "--target" "x86_64"))
+  let arch ← parseTargetArchIO (findFlagValue args "--arch" (findFlagValue args "--target" TargetArch.hostName))
   return {
     inputPath := sel.path, outputPath := findFlagValue args "-o" "", arch := arch,
     emitCABI := hasFlag args "--c-abi" || hasFlag args "--emit-c-abi",
@@ -111,8 +111,8 @@ def loadInputModule (elaborateHook? : Option (String → TargetArch → IO LNIRM
     (defaultFastCheck : Bool := false) (allowUnsupported : Bool := false) (allowRcAdt : Bool := false)
     (sel? : Option InputSel := none) : IO LNIRModule := do
   validateValueTakingFlags args
-  let rawArch := findFlagValue args "--arch" (findFlagValue args "--target" "x86_64")
-  let arch := (parseTargetArch? rawArch).getD .x86_64
+  let rawArch := findFlagValue args "--arch" (findFlagValue args "--target" TargetArch.hostName)
+  let arch := (parseTargetArch? rawArch).getD .host
   let checkSupported (m : LNIRModule) : IO LNIRModule := do
     if !allowUnsupported && m.decls.any (fun d => d.assurance == .unsupported) then
       throw <| IO.userError s!"[lean-native] Module '{m.moduleName}' contains unsupported (A_L0) declarations"
@@ -194,7 +194,7 @@ def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → Targ
   let loadMod : IO LNIRModule := match preloaded? with | some (_, m) => pure m | none => loadInputModule elaborateHook? args (sel? := some sel)
   let enforceFreestanding (m : LNIRModule) : IO Unit := do
     if freestanding then
-      if let some (dName, reason) := checkFreestandingModule m (parsedArch?.getD .x86_64) then
+      if let some (dName, reason) := checkFreestandingModule m (parsedArch?.getD .host) then
         throw <| IO.userError s!"[{tag}] Freestanding verification gate rejected '{dName}': {reason}"
   let (sigs, guards, srcLabel) ←
     if isLean && sigOnly then
@@ -229,7 +229,7 @@ def runCompileMode (tag : String) (elaborateHook? : Option (String → TargetArc
   let baseMod ← loadInputModule elaborateHook? args opts.emitCABI (sel? := some sel)
   if hasTelemetryOptIn args then
     let telCfg ← TelemetryConfig.probe args
-    let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
+    let _ ← emitModuleTelemetryEvents telCfg (SuperoptTarget.ofTargetArch opts.arch) false baseMod
   let (optMod, _) ← if opts.isBaseline then pure (baseMod, []) else runOptPipelineWithArgs args false baseMod
   if !opts.emitCABI && !opts.emitPTX && !opts.emitMetal then
     if let some (dName, callee) := findUnsupportedLLVMCall? optMod opts.arch then
@@ -253,7 +253,7 @@ def runCompileMode (tag : String) (elaborateHook? : Option (String → TargetArc
 
 def runCompileLLVM (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   validateValueTakingFlags args
-  let arch ← parseTargetArchIO (findFlagValue args "--arch" (findFlagValue args "--target" "x86_64"))
+  let arch ← parseTargetArchIO (findFlagValue args "--arch" (findFlagValue args "--target" TargetArch.hostName))
   let isBaseline := hasFlag args "--baseline"
   let wasmSimd128 := hasFlag args "--wasm-simd128"
   let freestanding := hasFlag args "--freestanding" || arch.isFreestandingEmbedded
@@ -261,7 +261,7 @@ def runCompileLLVM (tag : String) (elaborateHook? : Option (String → TargetArc
   let baseMod ← if hasFlag args "--slot-regression" then pure slotTypeRegressionModule else loadInputModule elaborateHook? args
   if hasTelemetryOptIn args then
     let telCfg ← TelemetryConfig.probe args
-    let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
+    let _ ← emitModuleTelemetryEvents telCfg (SuperoptTarget.ofTargetArch arch) false baseMod
   let (modToEmit, _) ← if isBaseline then pure (baseMod, []) else runOptPipelineWithArgs args false baseMod
   if freestanding && !(hasFlag args "--slot-regression") then
     match emitLLVMFreestanding? modToEmit arch (!isBaseline) none wasmSimd128 with
@@ -281,7 +281,7 @@ def runCompileLLVM (tag : String) (elaborateHook? : Option (String → TargetArc
 
 def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   validateValueTakingFlags args
-  let arch ← parseTargetArchIO (findFlagValue args "--arch" (findFlagValue args "--target" "x86_64"))
+  let arch ← parseTargetArchIO (findFlagValue args "--arch" (findFlagValue args "--target" TargetArch.hostName))
   if arch == .nvptx64 || arch == .hybridCpuGpu || arch == .wasm32 then
     throw <| IO.userError s!"[{tag}] Static archive verification unsupported for {arch.triple}"
   let (wasmSimd128, jsonFlag, outPath) := (hasFlag args "--wasm-simd128", hasFlag args "--json", findFlagValue args "-o" "/tmp/liblean_native_kernels.a")
@@ -496,7 +496,7 @@ def runCompileHybrid (tag : String) (elaborateHook? : Option (String → TargetA
     (some s!"[{tag}] Wrote Hybrid CPU/GPU dispatch glue (gpuDecls={plan.gpuDecls.length}, cpuDecls={plan.cpuOnlyDecls.length}, minGpuElements={minGpuElems}) to {outPath}")
 
 def runSuperopt (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
-  let targetStr := findFlagValue args "--target" (findFlagValue args "--arch" "x86_64")
+  let targetStr := findFlagValue args "--target" (findFlagValue args "--arch" TargetArch.hostName)
   let target ← parseSuperoptTargetIO targetStr
   let profilePath := findFlagValue args "--profile" ""
   let outPath := findFlagValue args "-o" ""
@@ -516,7 +516,7 @@ def runSuperopt (elaborateHook? : Option (String → TargetArch → IO LNIRModul
   return 0
 
 def runPlugins (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
-  let targetStr := findFlagValue args "--target" (findFlagValue args "--arch" "x86_64")
+  let targetStr := findFlagValue args "--target" (findFlagValue args "--arch" TargetArch.hostName)
   let target ← parseSuperoptTargetIO targetStr
   let testAdversarial := hasFlag args "--test-adversarial" || !(hasFlag args "--no-adversarial-test")
   let outPath := findFlagValue args "-o" ""
@@ -531,7 +531,7 @@ def runPlugins (elaborateHook? : Option (String → TargetArch → IO LNIRModule
   return if ok then 0 else 1
 
 def runTelemetry (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
-  let targetStr := findFlagValue args "--target" (findFlagValue args "--arch" "x86_64")
+  let targetStr := findFlagValue args "--target" (findFlagValue args "--arch" TargetArch.hostName)
   let target ← parseSuperoptTargetIO targetStr
   let telCfg ← TelemetryConfig.probe args
   let baseMod ← loadInputModule elaborateHook? args
@@ -577,7 +577,7 @@ def runPRVerify (tag : String) (args : List String) : IO UInt32 := do
       if changedFiles.contains "LeanNative/Tests/" then testUnchanged := false
     catch _ => pure ()
   let baseMod := mkCanonicalBenchmarkModule
-  let (optMod, pluginReport) := runSegregatedPluginPipeline .x86_64 true baseMod
+  let (optMod, pluginReport) := runSegregatedPluginPipeline .host true baseMod
   let tvReport := validateTranslationModule baseMod optMod
   let allDeclTvOk := pluginReport.declAudits.all (·.tvVerified)
   let axiomReport := verifiedAxiomAuditReport
@@ -635,11 +635,11 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
   let (optMod, stepCerts) := runDefaultPipeline baseMod
   let certReport := verifyModuleCerts baseMod.moduleName (stepCerts.map toOptimizationCert)
   let tvReport := validateTranslationModule baseMod optMod
-  let (_, soReportX86) := superoptModule .x86_64 baseMod
+  let (_, soReportHost) := superoptModule .host baseMod
   let (_, soReportMetal) := superoptModule .apple_metal baseMod
-  let superoptOk := soReportX86.rewritesApplied > 0 && soReportMetal.rewritesApplied > 0 &&
-    soReportX86.totalCostAfter < soReportX86.totalCostBefore
-  let (_, pluginReport) := runSegregatedPluginPipeline .x86_64 true baseMod
+  let superoptOk := soReportHost.rewritesApplied > 0 && soReportMetal.rewritesApplied > 0 &&
+    soReportHost.totalCostAfter < soReportHost.totalCostBefore
+  let (_, pluginReport) := runSegregatedPluginPipeline .host true baseMod
   let pluginsOk := pluginReport.acceptedCount > 0 && pluginReport.adversarialRejected &&
     pluginReport.declAudits.all (fun a => a.tvVerified)
   let law5Ok := checkPRVerificationGate ⟨42, 42, 99, 99, 0, tvReport.allPassed && pluginsOk⟩ &&
@@ -652,7 +652,7 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
   let fcLlvm := emitFastCheckLLVM fcMod
   let fcPtx := emitFastCheckPTX fcMod "sm_90"
   let fcMetal := emitFastCheckMetal fcMod
-  let llvmX86 := emitLLVMOptimized optMod .x86_64
+  let llvmHost := emitLLVMOptimized optMod .host
   let ptxTxt := emitPTXModule optMod "sm_90"
   let metalTxt := emitMetalModule optMod
   let (metalValid, _) := validateMetalShader metalTxt
@@ -671,7 +671,7 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
     mulDivDownNat twoPow60 twoPow60 3 < mulDivUpNat twoPow60 twoPow60 3 &&
     mulDivDownNat twoPow60 twoPow60 0 == 0 && mulDivUpNat twoPow60 twoPow60 0 == 0
   let telCfg ← TelemetryConfig.probe ["--telemetry"]
-  let telCount ← emitModuleTelemetryEvents telCfg .x86_64 true baseMod
+  let telCount ← emitModuleTelemetryEvents telCfg .host true baseMod
   let telOk := telCount > 0
   let relDecl : LNIRDecl := {
     name := "ssz_monotone_offsets_bug"
@@ -826,7 +826,7 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
   IO.println s!"2. LNIR Wire & JSON Round-Trip     : {status (roundTripWireOk && roundTripJsonOk)}"
   IO.println s!"3. Certificate Chain Verification  : {status certReport.verified} ({certReport.certs.length} certs)"
   IO.println s!"4. Alive2 Symbolic TV Validation   : {status tvReport.allPassed} ({tvReport.passedDecls}/{tvReport.totalDecls} decls)"
-  IO.println s!"5. Enumerative Superoptimizer      : {status superoptOk} ({soReportX86.rewritesApplied} rewrites, cost {soReportX86.totalCostBefore}->{soReportX86.totalCostAfter})"
+  IO.println s!"5. Enumerative Superoptimizer      : {status superoptOk} ({soReportHost.rewritesApplied} rewrites, cost {soReportHost.totalCostBefore}->{soReportHost.totalCostAfter})"
   IO.println s!"6. Segregated Plugins & Law 1/5    : {status (pluginsOk && law5Ok)} (accepted={pluginReport.acceptedCount}, adversarialRejected={pluginReport.rejectedCount})"
   IO.println s!"7. FastCheck ConstraintProp vs Vac : {status (fcPropOk && fcNaiveVacuousOk && relSamplingOk)} (propCex={fcReportProp.counterexamplesFound}, naiveVacuous={fcReportNaive.vacuousPasses}, relPolytope=ok)"
   IO.println s!"8. Unified GPUIR & Apple Metal 3.0 : {status (metalValid && fcMetalValid && gpuHeadroomOk)} ({gpuDescs.length} GPU descriptors, Metal={metalTxt.length}B)"
@@ -842,7 +842,7 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
     metalValid && fcMetalValid && blake3Ok && tpuCodegenOk && mulDivOk && telOk && axiomOk && slotTypeRegressionOk &&
     LeanNative.Backend.GPUEmitVerify.verifyGPUEmitters &&
     LeanNative.Backend.LLVMEmitVerify.verifyLLVMEmitter &&
-    llvmX86.length > 500 && ptxTxt.length > 500 && fcLlvm.length > 200 && fcPtx.length > 200
+    llvmHost.length > 500 && ptxTxt.length > 500 && fcLlvm.length > 200 && fcPtx.length > 200
   if allOk then
     IO.println s!"=== ALL {tag.toUpper} v0.5.0 SELF-TESTS PASSED ==="
     return 0
@@ -872,8 +872,8 @@ def printCoreUsage (tag : String) (hasFrontend : Bool) : IO Unit := do
     "  compile-metal      Emit Apple Metal Shading Language 3.0 (--input <file>, --fastcheck, -o <path>)",
     "  compile-fastcheck  Run Constraint-Propagating FastCheck or emit SIMD/PTX/Metal kernels (--samples N, --json, -o <path>)",
     "  compile-hybrid     Partition module into CPU/GPU and emit hybrid host dispatch glue (--input <file>, -o <path>)",
-    "  superopt           Run cost-guided enumerative superoptimizer (--target x86_64|arm64|cuda_ptx|apple_metal, --json)",
-    "  calibrate-cost     Calibrate hardware cost profile (--target <preset>, --samples-json <path>, --json)",
+    "  superopt           Run cost-guided enumerative superoptimizer (--target x86_64|arm64|cuda_ptx|apple_metal, --profile profiles/<name>.json, --json)",
+    "  calibrate-cost     Calibrate hardware cost profile (--target x86_64|arm64|zen5|neoverse|scaleway|..., e.g. --target arm64 on an aarch64 host; --samples-json <path>, --json)",
     "  plugins            Run segregated optimization plugins under Law 1 TV/Cost Gate (--target <arch>, --test-adversarial, --json)",
     "  pr-verify          Run Law 5 PR & Spec-Pinning Gate (--base <ref>, --disallow-spec-changes, --json)",
     "  turbo-plugin       Run JSONL-stdio external accelerator plugin for turbo-lean",
@@ -897,7 +897,7 @@ def runBenchSnarkKernels (args : List String) : IO UInt32 := do
 
 def runEvalLNIR (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let (declName, argsRaw, casesFile) := (findFlagValue args "--decl" "", findFlagValue args "--args" "", findFlagValue args "--cases-file" "")
-  let arch ← parseTargetArchIO (findFlagValue args "--arch" (findFlagValue args "--target" "x86_64"))
+  let arch ← parseTargetArchIO (findFlagValue args "--arch" (findFlagValue args "--target" TargetArch.hostName))
   let (fuel, useOpt, useVerifiedOnly, batchJson) := ((findFlagValue args "--fuel" "4096").toNat?.getD 4096, hasFlag args "--opt" || hasFlag args "--optimized", hasFlag args "--verified-kernel-only", hasFlag args "--batch-json")
   let baseMod ← loadInputModule elaborateHook? args false false true
   let (mod, _) ← if !useOpt then pure (baseMod, []) else runOptPipelineWithArgs args useVerifiedOnly baseMod

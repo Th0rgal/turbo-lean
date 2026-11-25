@@ -25,7 +25,7 @@ def canonicalCorpusDeclNames : List String :=
   mkCanonicalBenchmarkModule8.decls.map (·.name)
 
 private structure Options where
-  target : String := "x86_64"
+  target : String := TargetArch.hostName
   samplesPath : Option String := none
   corpusPath : Option String := none
   json : Bool := false
