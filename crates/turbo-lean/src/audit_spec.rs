@@ -2113,7 +2113,9 @@ impl AuditSpecPolicyConfig {
             extra_forbid_namespaces,
             extra_forbid_decl_kinds,
         )
-        .unwrap_or_default()
+        .unwrap_or_else(|err| {
+            panic!("audit-spec policy config failed closed (never silently default): {err:#}")
+        })
     }
 
     pub fn try_parse_config_str(text: &str) -> Result<Option<Self>> {
@@ -2196,7 +2198,12 @@ impl AuditSpecPolicyConfig {
     }
 
     pub fn parse_config_str(text: &str) -> Option<Self> {
-        Self::try_parse_config_str(text).ok().flatten()
+        match Self::try_parse_config_str(text) {
+            Ok(cfg) => cfg,
+            Err(err) => panic!(
+                "audit-spec config failed closed (unknown keys are never silently ignored): {err:#}"
+            ),
+        }
     }
 
     pub fn effective_forbidden_for_path(
@@ -4781,6 +4788,83 @@ pub fn run_audit_spec_command_with_options(
 #[cfg(test)]
 mod lexer_tests {
     use super::*;
+
+    #[test]
+    fn audit_spec_toml_typo_key_fails_closed() {
+        let typo_toml = "[audit_spec]\nreject_conjunct_tautologys = true\n";
+        // 1. Strict parse: an unknown/misspelled key must fail closed with an
+        //    error that names the offending key instead of listing the schema.
+        let err = format!(
+            "{:#}",
+            AuditSpecPolicyConfig::try_parse_config_str(typo_toml)
+                .err()
+                .expect("typo key in [audit_spec] must fail closed, not parse")
+        );
+        assert!(
+            err.contains("reject_conjunct_tautologys"),
+            "error must name the unknown key, got: {err}"
+        );
+        assert!(
+            err.to_lowercase().contains("unknown field"),
+            "error must report the unknown field, got: {err}"
+        );
+
+        // 2. The convenience parse wrapper must fail closed on the same config
+        //    instead of silently flattening the error into `None` (fail-open).
+        let wrapper = std::panic::catch_unwind(|| {
+            AuditSpecPolicyConfig::parse_config_str(typo_toml)
+        });
+        match wrapper {
+            Ok(Some(cfg)) => {
+                panic!("typo-key config silently parsed as {cfg:?}")
+            }
+            Ok(None) => {
+                panic!("parse_config_str silently ignored a typo key in [audit_spec]")
+            }
+            Err(payload) => {
+                let msg = panic_message(&payload);
+                assert!(
+                    msg.contains("reject_conjunct_tautologys"),
+                    "fail-closed error must name the typo key, got: {msg}"
+                );
+            }
+        }
+
+        // 3. The file-based convenience loader must not silently degrade a
+        //    project config with a typo key to the default policy.
+        let root = std::env::temp_dir().join(format!(
+            "turbo_a1_audit_spec_typo_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let spec = root.join("Spec.lean");
+        fs::write(&spec, "theorem good_spec (n : Nat) (h : n > 0) : n >= 1 := by omega\n").unwrap();
+        fs::write(root.join("turbo-lean.toml"), typo_toml).unwrap();
+        let loaded = std::panic::catch_unwind(|| {
+            AuditSpecPolicyConfig::load_for_target(&spec, None, None, &[], &[])
+        });
+        match loaded {
+            Ok(cfg) => {
+                let _ = fs::remove_dir_all(&root);
+                panic!(
+                    "load_for_target silently degraded a typo'd turbo-lean.toml to default policy {:?}",
+                    cfg.policy
+                )
+            }
+            Err(_) => {}
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+        payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("")
+            .to_string()
+    }
 
     #[test]
     fn cert_checker_diagnostic_is_not_a_theorem() {
