@@ -1860,5 +1860,142 @@ mod worker_embed_tests {
         assert_eq!(a, on_scratch);
         let _ = fs::remove_dir_all(&scratch);
     }
+
+    /// S3b-E: the zygote binary cache key must cover every hash input the key is
+    /// built from, not only the embedded module sources: the lean binary path and
+    /// the toolchain label both feed `compute_zygote_bin_name`, so a toolchain or
+    /// interpreter swap on one host never reuses a binary compiled for another.
+    /// (`TURBO_LEAN_BUILD_EPOCH` and `std::env::consts::ARCH` are compile-time
+    /// process constants and cannot be varied inside one test process; the module
+    /// sources are covered per-entry by the 1-byte mutation walk above.)
+    #[test]
+    fn zygote_cache_key_hash_inputs_cover_lean_bin_and_toolchain() {
+        let lean_bin = Path::new("/tmp/fake-lean");
+        let base = compute_zygote_bin_name(lean_bin, Some("v4.35.0"), ZYGOTE_EMBEDDED_MODULES);
+        assert!(
+            base.starts_with("turbo_zygote_"),
+            "cache key must keep the turbo_zygote_ prefix: {base}"
+        );
+        let digest = base.strip_prefix("turbo_zygote_").unwrap();
+        assert_eq!(digest.len(), 16, "cache key digest must stay 16 hex chars: {base}");
+        assert!(
+            digest.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "cache key digest must be lowercase hex: {base}"
+        );
+        assert_eq!(
+            base,
+            compute_zygote_bin_name(lean_bin, Some("v4.35.0"), ZYGOTE_EMBEDDED_MODULES),
+            "cache key must be deterministic for identical inputs"
+        );
+        assert_ne!(
+            base,
+            compute_zygote_bin_name(lean_bin, Some("v4.36.0"), ZYGOTE_EMBEDDED_MODULES),
+            "a toolchain label change must change the zygote binary cache key"
+        );
+        assert_ne!(
+            base,
+            compute_zygote_bin_name(lean_bin, None, ZYGOTE_EMBEDDED_MODULES),
+            "dropping the toolchain label must change the zygote binary cache key"
+        );
+        assert_ne!(
+            base,
+            compute_zygote_bin_name(
+                Path::new("/tmp/fake-lean-other"),
+                Some("v4.35.0"),
+                ZYGOTE_EMBEDDED_MODULES
+            ),
+            "a lean binary path change must change the zygote binary cache key"
+        );
+    }
+
+    /// S3b-E: scratch writes must place every `.olean`-emitting module at exactly
+    /// `<scratch>/<Module/Path>.lean` with its `.olean` beside it, because the
+    /// compile loop puts the scratch root on `LEAN_PATH` and Lean resolves
+    /// `import TurboLean.X.Y` to `TurboLean/X/Y.olean` under that root. The
+    /// non-emitting entrypoint must take a tmp_id-salted name instead (it is
+    /// never imported, and two concurrent builds must not collide), and every
+    /// written file must be byte-identical to its embedded source.
+    #[test]
+    fn zygote_scratch_writes_place_embedded_sources_for_lean_path_imports() {
+        for m in ZYGOTE_EMBEDDED_MODULES {
+            let scratch = Path::new("/tmp/zygote-scratch-probe");
+            let lean_a = zygote_scratch_lean_path(scratch, m, "aa");
+            let lean_b = zygote_scratch_lean_path(scratch, m, "bb");
+            let module_rel = m.module.replace('.', "/");
+            if m.emit_olean {
+                assert_eq!(
+                    lean_a,
+                    scratch.join(format!("{module_rel}.lean")),
+                    "{}: imported module source must sit at its module path under the scratch root",
+                    m.module
+                );
+                assert_eq!(lean_a, lean_b, "{}: imported module path must not depend on tmp_id", m.module);
+                assert_eq!(
+                    zygote_scratch_olean_path(scratch, m),
+                    scratch.join(format!("{module_rel}.olean")),
+                    "{}: emitted .olean must be where LEAN_PATH import resolution looks for it",
+                    m.module
+                );
+            } else {
+                assert_ne!(lean_a, lean_b, "{}: entrypoint scratch name must be tmp_id-salted", m.module);
+                let name = lean_a.file_name().unwrap().to_string_lossy().into_owned();
+                assert!(
+                    name.contains("aa"),
+                    "{}: entrypoint scratch name must carry the tmp_id: {name}",
+                    m.module
+                );
+            }
+        }
+
+        let scratch = std::env::temp_dir().join(format!(
+            "zygote_scratch_bytes_{}_{}",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        let written = write_zygote_scratch_sources(&scratch, ZYGOTE_EMBEDDED_MODULES, "7").unwrap();
+        for (m, p) in ZYGOTE_EMBEDDED_MODULES.iter().zip(written.iter()) {
+            let on_disk = fs::read_to_string(p).unwrap();
+            assert_eq!(
+                on_disk, m.src,
+                "{}: scratch write must be byte-identical to the embedded source",
+                m.module
+            );
+        }
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    /// S3b-E: the `lean -c` compile list IS `ZYGOTE_EMBEDDED_MODULES` — the build
+    /// loop zips the manifest with `write_zygote_scratch_sources`' return value, so
+    /// the writer must return paths in manifest order, and the flat `{stem}_{tmp}.c`
+    /// / `.o` intermediates it derives per entry must have unique stems (two modules
+    /// sharing a stem would silently overwrite each other's C/object output).
+    #[test]
+    fn zygote_compile_list_follows_manifest_order_with_unique_object_stems() {
+        let scratch = std::env::temp_dir().join(format!(
+            "zygote_compile_list_{}_{}",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        let written = write_zygote_scratch_sources(&scratch, ZYGOTE_EMBEDDED_MODULES, "9").unwrap();
+        assert_eq!(written.len(), ZYGOTE_EMBEDDED_MODULES.len());
+        for (m, p) in ZYGOTE_EMBEDDED_MODULES.iter().zip(written.iter()) {
+            assert_eq!(
+                p,
+                &zygote_scratch_lean_path(&scratch, m, "9"),
+                "{}: written source list must follow manifest (compile) order",
+                m.module
+            );
+        }
+        let stems: std::collections::HashSet<String> = ZYGOTE_EMBEDDED_MODULES
+            .iter()
+            .map(|m| m.rel_path.trim_end_matches(".lean").replace('/', "_"))
+            .collect();
+        assert_eq!(
+            stems.len(),
+            ZYGOTE_EMBEDDED_MODULES.len(),
+            "compile-list object stems must be unique: {stems:?}"
+        );
+        let _ = fs::remove_dir_all(&scratch);
+    }
 }
 
