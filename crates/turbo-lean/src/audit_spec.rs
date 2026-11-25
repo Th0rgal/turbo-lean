@@ -5291,6 +5291,76 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
         .expect("a dedicated config holding only `[audit_spec]` must keep parsing");
         assert!(cfg.is_some(), "the `[audit_spec]` table must yield a config");
     }
+
+    /// A2 (#367, Contract V3): the per-file report carries a `kernel_witness` summary
+    /// (mode `off` unless kernel replay is requested) and every audited spec an honest
+    /// `witness_provenance` field, so consumers can tell kernel evidence from
+    /// eval-level and heuristic evidence without parsing label prefixes.
+    #[test]
+    fn audit_spec_kernel_witness_report_fields_default_off() {
+        let root = std::env::temp_dir().join(format!(
+            "turbo_a2_kw_unit_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let spec = root.join("KwUnit.lean");
+        fs::write(
+            &spec,
+            "theorem kw_succ_pred (n : Nat) (h : 1 ≤ n) : n - 1 + 1 = n := by omega\n",
+        )
+        .unwrap();
+        let rep = audit_spec_file_or_source(&spec, None, None);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(rep["ok"].as_bool(), Some(true), "{rep}");
+        assert_eq!(
+            rep["kernel_witness"]["mode"].as_str(),
+            Some("off"),
+            "kernel witness replay must default off and the report must say so: {rep}"
+        );
+        assert_eq!(
+            rep["specs"][0]["witness_provenance"].as_str(),
+            Some("eval_concrete"),
+            "concrete two-sided eval witnesses must be labeled eval_concrete: {rep}"
+        );
+        let pos = rep["specs"][0]["pos_witness"].as_str().unwrap_or("");
+        let neg = rep["specs"][0]["neg_witness"].as_str().unwrap_or("");
+        assert!(
+            pos.starts_with("satisfied_states=")
+                && neg.starts_with("eval_refuted_postcondition("),
+            "default-off run must keep eval-level labels untouched: pos={pos} neg={neg}"
+        );
+    }
+
+    /// A2 (#367): heuristic-only specs keep their honest `heuristic` provenance; the
+    /// kernel-witness machinery must never upgrade a label it did not replay.
+    #[test]
+    fn audit_spec_kernel_witness_heuristic_specs_stay_heuristic() {
+        let root = std::env::temp_dir().join(format!(
+            "turbo_a2_kw_heur_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let spec = root.join("KwHeur.lean");
+        fs::write(
+            &spec,
+            "theorem kw_symbolic (p : Prop) (h : p ∧ p) : p ∨ p := Or.inl h.1\n",
+        )
+        .unwrap();
+        let rep = audit_spec_file_or_source(&spec, None, None);
+        let _ = fs::remove_dir_all(&root);
+        let prov = rep["specs"][0]["witness_provenance"].as_str().unwrap_or("");
+        assert!(
+            prov == "heuristic" || prov == "eval_partial",
+            "a non-executable-domain spec must keep heuristic-grade provenance, got `{prov}`: {rep}"
+        );
+        let neg = rep["specs"][0]["neg_witness"].as_str().unwrap_or("");
+        assert!(
+            neg.starts_with("heuristic_unverified_"),
+            "symbolic negative witness label must stay heuristic_unverified_*: {neg}"
+        );
+    }
 }
 
 
