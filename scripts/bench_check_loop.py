@@ -8,6 +8,10 @@ medians against it. Every performance change in this project must show before
 and after numbers from this script; a change that does not move them is
 reverted.
 
+The run JSON also records the G2a number (roadmap/HORIZONS.md): the CAS replay
+hit rate over the recorded warm edit sequences, per mode (`cas_replay` inside
+each measured mode result) and run-wide (top-level `cas_replay`).
+
 Typical before/after on one machine (the only comparison this script trusts),
 with the environment it requires (TURBO_LEAN_GIT must be git >= 2.46) and the
 checkout arguments it needs:
@@ -205,7 +209,8 @@ def empty_run_result(workloads, trials):
 
 
 def mode_result(runs_ms, coverage_ratios, statuses, extra=None, phase_dicts=None,
-                psi_lists=None, failed_trials=0, tool_coverage=None):
+                psi_lists=None, failed_trials=0, tool_coverage=None,
+                fission_dicts=None):
     xs = list(runs_ms)
     out = {
         "runs_ms": [round(x, 1) for x in xs],
@@ -218,6 +223,22 @@ def mode_result(runs_ms, coverage_ratios, statuses, extra=None, phase_dicts=None
         "coverage_ratio_external_min": round(min(coverage_ratios), 4) if coverage_ratios else None,
         "statuses_observed": sorted(set(statuses)),
     }
+    # G2a (roadmap/HORIZONS.md): a `theorem_cache_hit` call replayed the
+    # declaration's proof from the theorem CAS with no elaboration; a
+    # `theorem_verified` call ran elaboration (a CAS miss for its target).
+    # Any other status (a blocked probe's exit_*) counts as neither, so
+    # hits + misses can be below `trials`.
+    hits = sum(1 for s in statuses if s == "theorem_cache_hit")
+    misses = sum(1 for s in statuses if s == "theorem_verified")
+    if hits or misses:
+        replay = {"hits": hits, "misses": misses,
+                  "hit_rate": round(hits / (hits + misses), 4)}
+        if fission_dicts is not None:
+            replay["fission_cached_subshards"] = sum(
+                int(d.get("fission_cached_subshards") or 0) for d in fission_dicts)
+            replay["fission_verified_subshards"] = sum(
+                int(d.get("fission_verified_subshards") or 0) for d in fission_dicts)
+        out["cas_replay"] = replay
     if phase_dicts:
         names = sorted({k for pd in phase_dicts for k in pd})
         out["phases_ms_median"] = {
@@ -266,6 +287,62 @@ def blocked_workload_result(exit_code, error_class, median_ms):
         "error_class": error_class,
         "modes": {"cold_no_daemon": {"trials": 1, "median_ms": median_ms,
                                      "runs_ms": [median_ms], "rel_spread": 0.0}},
+    }
+
+
+# --------------------------------------------------- G2a CAS replay hit rate
+
+REPLAY_SEQUENCE_MODES = ("warm_cache_hit_daemon", "warm_edited_proof_daemon")
+
+
+def summarize_cas_replay(results):
+    """G2a (roadmap/HORIZONS.md): CAS replay hit rate on the recorded edit
+    sequences, computed from the statuses the tool reported.
+
+    The recorded sequence per active workload is the warm daemon loop this
+    script drives: `trials` unedited re-checks of the pinned declaration
+    (`warm_cache_hit_daemon`), then `trials` re-checks each after a distinct
+    proof-body edit (`warm_edited_proof_daemon`); warmup and settling runs
+    are excluded, as everywhere in this script. A check call counts as a CAS
+    replay hit when the tool reported `theorem_cache_hit` (proof replayed
+    from the theorem CAS, no elaboration) and as a miss when it reported
+    `theorem_verified` (elaboration ran). The per-condition rates carry the
+    information; the overall rate also reflects the sequence's own
+    unedited:edited mix (trials:trials), so it is only meaningful next to
+    its call counts, never alone. Blocked workloads and the cold mode are
+    outside the recorded sequence and are not counted.
+    """
+    def bucket(modes):
+        hits = misses = fission_cached = fission_verified = 0
+        workloads = []
+        for wid, w in sorted((results.get("workloads") or {}).items()):
+            if w.get("expected_status") == "blocked":
+                continue
+            for mode in modes:
+                rep = ((w.get("modes") or {}).get(mode) or {}).get("cas_replay")
+                if not rep:
+                    continue
+                hits += rep.get("hits", 0)
+                misses += rep.get("misses", 0)
+                fission_cached += rep.get("fission_cached_subshards") or 0
+                fission_verified += rep.get("fission_verified_subshards") or 0
+                if wid not in workloads:
+                    workloads.append(wid)
+        calls = hits + misses
+        return {"workloads": workloads, "check_calls": calls,
+                "hits": hits, "misses": misses,
+                "hit_rate": round(hits / calls, 4) if calls else None,
+                "fission_cached_subshards": fission_cached,
+                "fission_verified_subshards": fission_verified}
+
+    return {
+        "sequence": ("per active workload: {t} unedited warm re-checks "
+                     "(warm_cache_hit_daemon), then {t} edited re-checks "
+                     "(warm_edited_proof_daemon); warmup and settling runs "
+                     "excluded").format(t=results.get("trials")),
+        "unedited_recheck": bucket(("warm_cache_hit_daemon",)),
+        "edited_recheck": bucket(("warm_edited_proof_daemon",)),
+        "overall": bucket(REPLAY_SEQUENCE_MODES),
     }
 
 
@@ -958,11 +1035,15 @@ class Runner:
         one is a failed measurement even if a time was parsed; it is excluded
         from the median and counted in `failed_trials`.
         """
-        runs, covs, tool_covs, statuses, phases, psis, failed = [], [], [], [], [], [], 0
+        runs, covs, tool_covs, statuses, phases, psis = [], [], [], [], [], []
+        fissions, failed = [], 0
         for r in trial_results:
             if trial_failed(r):
                 failed += 1
                 continue
+            j = r.get("json") or {}
+            fissions.append({k: j.get(k) for k in (
+                "fission_cached_subshards", "fission_verified_subshards")})
             runs.append(r["external_wall_ms"])
             statuses.append(str((r.get("json") or {}).get("status") or f"exit_{r['exit_code']}"))
             pt = (r.get("json") or {}).get("phase_timings") or {}
@@ -973,7 +1054,7 @@ class Runner:
             tool_covs.append(pt.get("coverage_ratio") or 0.0)
             phases.append(pt.get("phases_ms") or {})
             psis.append([r.get("psi_before") or {}, r.get("psi_after") or {}])
-        return runs, covs, tool_covs, statuses, phases, psis, failed
+        return runs, covs, tool_covs, statuses, phases, psis, fissions, failed
 
     def run_cold_mode(self, w):
         trial_results = []
@@ -988,9 +1069,11 @@ class Runner:
             shutil.rmtree(d, ignore_errors=True)
             if i >= self.warmups:
                 trial_results.append(r)
-        runs, covs, tool_covs, statuses, phases, psis, failed = self.split_trials(trial_results)
+        runs, covs, tool_covs, statuses, phases, psis, fissions, failed = \
+            self.split_trials(trial_results)
         return mode_result(runs, covs, statuses, phase_dicts=phases, psi_lists=psis,
-                           failed_trials=failed, tool_coverage=tool_covs)
+                           failed_trials=failed, tool_coverage=tool_covs,
+                           fission_dicts=fissions)
 
     def run_warm_modes(self, w):
         d = self.wl_scratch(w["id"]) / "warm"
@@ -1007,11 +1090,11 @@ class Runner:
             hit_trials = []
             for _ in range(self.trials):
                 hit_trials.append(self.run_check(w, cache, home, staging, no_daemon=False))
-            runs, covs, tool_covs, hit_status, hit_phases, hit_psis, hit_failed = \
-                self.split_trials(hit_trials)
+            runs, covs, tool_covs, hit_status, hit_phases, hit_psis, hit_fissions, \
+                hit_failed = self.split_trials(hit_trials)
             warm_cache = mode_result(runs, covs, hit_status, phase_dicts=hit_phases,
                                      psi_lists=hit_psis, failed_trials=hit_failed,
-                                     tool_coverage=tool_covs)
+                                     tool_coverage=tool_covs, fission_dicts=hit_fissions)
             if not all(s == "theorem_cache_hit" for s in hit_status):
                 warm_cache["cache_hit_assert_failed"] = hit_status
             edit_runs, edit_covs, edit_status, edit_phases, edit_psis = [], [], [], [], []
@@ -1035,11 +1118,11 @@ class Runner:
                     edit_trials.append(r)
             finally:
                 self.clear_edit(src_path, original)
-            runs, covs, tool_covs, edit_status, edit_phases, edit_psis, edit_failed = \
-                self.split_trials(edit_trials)
+            runs, covs, tool_covs, edit_status, edit_phases, edit_psis, edit_fissions, \
+                edit_failed = self.split_trials(edit_trials)
             warm_edit = mode_result(runs, covs, edit_status, phase_dicts=edit_phases,
                                     psi_lists=edit_psis, failed_trials=edit_failed,
-                                    tool_coverage=tool_covs)
+                                    tool_coverage=tool_covs, fission_dicts=edit_fissions)
             if not all(s == "theorem_verified" for s in edit_status):
                 warm_edit["verified_assert_failed"] = edit_status
             return warm_cache, warm_edit
@@ -1342,6 +1425,7 @@ def main(argv=None):
         for w in WORKLOADS:
             entry = runner.run_workload(w)
             results["workloads"][w["id"]] = entry
+        results["cas_replay"] = summarize_cas_replay(results)
         verdict = compare_run(baseline, results)
         results["verdict"] = verdict
         if args.rebaseline:
@@ -1368,6 +1452,14 @@ def main(argv=None):
             print(f"  {cell}: {g['baseline_median_ms']} -> {g['new_median_ms']} ms "
                   f"({g['delta_ms']:+.1f} ms, {g['delta_pct']:+.2f}%) "
                   f"band ±{g['noise_band_ms']} ms: {g['verdict']}")
+        rep = results["cas_replay"]
+        if rep["overall"]["check_calls"]:
+            un, ed, ov = rep["unedited_recheck"], rep["edited_recheck"], rep["overall"]
+            print(f"G2A CAS REPLAY: overall {ov['hits']}/{ov['check_calls']} hits "
+                  f"(hit_rate={ov['hit_rate']}) | unedited re-checks "
+                  f"{un['hits']}/{un['check_calls']} (hit_rate={un['hit_rate']}) | "
+                  f"edited re-checks {ed['hits']}/{ed['check_calls']} "
+                  f"(hit_rate={ed['hit_rate']})", flush=True)
         if verdict.get("summary"):
             print(f"SUMMARY: {verdict['summary']}", flush=True)
         print(f"VERDICT: {verdict['verdict']}"

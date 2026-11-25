@@ -386,6 +386,87 @@ class EditedProof(unittest.TestCase):
         self.assertEqual(norm(mod.remove_bench_have(edited)), norm(src))
 
 
+class CasReplay(unittest.TestCase):
+    """G2a (roadmap/HORIZONS.md): CAS replay hit rate on recorded edit sequences."""
+
+    def test_mode_result_counts_hits_and_misses_from_statuses(self):
+        mod = load_script()
+        m = mod.mode_result([100.0, 110.0, 120.0], [0.99] * 3,
+                            ["theorem_cache_hit", "theorem_cache_hit", "theorem_verified"])
+        self.assertEqual(m["cas_replay"],
+                         {"hits": 2, "misses": 1, "hit_rate": 0.6667})
+
+    def test_mode_result_fission_sums_tolerate_missing_fields(self):
+        mod = load_script()
+        m = mod.mode_result([100.0, 100.0], [0.99, 0.99],
+                            ["theorem_verified", "theorem_verified"],
+                            fission_dicts=[{"fission_cached_subshards": 3,
+                                            "fission_verified_subshards": None},
+                                           {}])
+        self.assertEqual(m["cas_replay"]["fission_cached_subshards"], 3)
+        self.assertEqual(m["cas_replay"]["fission_verified_subshards"], 0)
+        self.assertEqual(m["cas_replay"]["hits"], 0)
+        self.assertEqual(m["cas_replay"]["misses"], 2)
+
+    def test_mode_result_without_theorem_statuses_has_no_replay(self):
+        mod = load_script()
+        m = mod.mode_result([100.0], [], ["exit_1"])
+        self.assertNotIn("cas_replay", m)
+
+    def test_summary_separates_unedited_and_edited_conditions(self):
+        mod = load_script()
+        res = {"trials": 2, "workloads": {
+            "w1": {"expected_status": "active", "modes": {
+                "cold_no_daemon": {"cas_replay": {"hits": 0, "misses": 2,
+                                                  "hit_rate": 0.0}},
+                "warm_cache_hit_daemon": {"cas_replay": {"hits": 2, "misses": 0,
+                                                         "hit_rate": 1.0}},
+                "warm_edited_proof_daemon": {"cas_replay": {"hits": 0, "misses": 2,
+                                                            "hit_rate": 0.0}}}},
+            "pfr": {"expected_status": "blocked",
+                    "modes": {"cold_no_daemon": {}}},
+        }}
+        rep = mod.summarize_cas_replay(res)
+        self.assertEqual(rep["unedited_recheck"]["hits"], 2)
+        self.assertEqual(rep["unedited_recheck"]["hit_rate"], 1.0)
+        self.assertEqual(rep["edited_recheck"]["misses"], 2)
+        self.assertEqual(rep["edited_recheck"]["hit_rate"], 0.0)
+        self.assertEqual(rep["overall"]["check_calls"], 4)
+        self.assertEqual(rep["overall"]["hit_rate"], 0.5)
+        # The cold mode and blocked workloads are outside the recorded sequence.
+        self.assertEqual(rep["overall"]["workloads"], ["w1"])
+        self.assertIn("2 unedited warm re-checks", rep["sequence"])
+
+    def test_summary_with_no_measured_warm_modes_is_empty_not_wrong(self):
+        mod = load_script()
+        rep = mod.summarize_cas_replay({"trials": 2, "workloads": {}})
+        self.assertEqual(rep["overall"]["check_calls"], 0)
+        self.assertIsNone(rep["overall"]["hit_rate"])
+
+    def test_end_to_end_records_cas_replay(self):
+        with tempfile.TemporaryDirectory(prefix="m1-replay-") as td:
+            r = run_bench(Path(td), ["--no-baseline", "--out", str(Path(td) / "o.json")])
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            data = json.loads((Path(td) / "o.json").read_text())
+            rep = data["cas_replay"]
+            # 5 active workloads x trials=2: every unedited warm re-check hits
+            # the CAS; every edited re-check misses (the inserted `have`
+            # changes the proof, so the shard key no longer matches).
+            un, ed, ov = (rep["unedited_recheck"], rep["edited_recheck"],
+                          rep["overall"])
+            self.assertEqual((un["hits"], un["misses"], un["hit_rate"]),
+                             (10, 0, 1.0), un)
+            self.assertEqual((ed["hits"], ed["misses"], ed["hit_rate"]),
+                             (0, 10, 0.0), ed)
+            self.assertEqual((ov["check_calls"], ov["hit_rate"]), (20, 0.5), ov)
+            self.assertEqual(len(ov["workloads"]), 5, ov)
+            self.assertIn("G2A CAS REPLAY:", r.stdout)
+            modes = data["workloads"]["batteries_list_lemmas_top"]["modes"]
+            self.assertEqual(modes["warm_cache_hit_daemon"]["cas_replay"]["hit_rate"], 1.0)
+            self.assertEqual(modes["warm_edited_proof_daemon"]["cas_replay"]["hit_rate"], 0.0)
+            self.assertEqual(modes["cold_no_daemon"]["cas_replay"]["hit_rate"], 0.0)
+
+
 class BaselineStrictness(unittest.TestCase):
     """Group 1: a named baseline is an obligation; skipped is never a pass."""
 
