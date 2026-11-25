@@ -2569,6 +2569,67 @@ pub struct StandaloneOleanOverlay {
     pub(super) _scratch: crate::check::PrivateScratchDir,
 }
 
+/// Stage one package build artifact into the standalone re-check staging tree.
+/// `allow_hardlink` is false when `.lake` link counts and `ctime` must stay
+/// untouched (`--no-auto-worktree-link` worktrees).
+pub(super) fn stage_artifact_link(
+    src: &Path,
+    dst: &Path,
+    allow_hardlink: bool,
+) -> std::io::Result<()> {
+    if allow_hardlink && fs::hard_link(src, dst).is_ok() {
+        return Ok(());
+    }
+    // Never fall back to a byte copy of package artifacts (#440): a staging dir
+    // on another filesystem (tmpfs) failed every hard link and silently copied
+    // the whole dependency `.olean` tree into /dev/shm (6.4 GB of Mathlib,
+    // charged to the cgroup). A symlink costs no bytes and leaves the source's
+    // link count and `ctime` untouched, which also covers the
+    // `.lake`-preserving (`allow_hardlink == false`) case.
+    #[cfg(unix)]
+    if src.is_absolute() {
+        return std::os::unix::fs::symlink(src, dst);
+    }
+    fs::copy(src, dst).map(|_| ())
+}
+
+/// Budgeted timeout for the standalone re-check `lean` invocations (#441):
+/// `TURBO_LEAN_MODULE_TIMEOUT_SECS` (default 300 s, clamped in untrusted
+/// mode), the same budget every other per-module compile honors, instead of
+/// a hard-coded 300 s that killed legitimate long modules after VERIFIED.
+pub(super) fn standalone_lean_timeout_from(
+    raw_env: Option<&str>,
+    is_untrusted: bool,
+) -> std::time::Duration {
+    std::time::Duration::from_secs(crate::module_builder::module_compile_timeout_secs_from(
+        raw_env,
+        is_untrusted,
+    ))
+}
+
+/// Map a path relative to a package's `lib/lean` build dir to its
+/// module-relative base path when it carries a staged-artifact suffix the
+/// standalone re-check tree merges.
+pub(super) fn standalone_merge_rel_base(rel: &str) -> Option<String> {
+    rel.strip_suffix(".olean.server")
+        .or_else(|| rel.strip_suffix(".olean.private"))
+        .or_else(|| rel.strip_suffix(".olean"))
+        .or_else(|| rel.strip_suffix(".ilean"))
+        // Lean 4.31 module-system imports also read `<Module>.ir`; without it
+        // the re-check fails `missing IR data file for module ...` (#442).
+        .or_else(|| rel.strip_suffix(".ir"))
+        .map(String::from)
+}
+
+fn standalone_lean_timeout(is_untrusted: bool) -> std::time::Duration {
+    standalone_lean_timeout_from(
+        std::env::var("TURBO_LEAN_MODULE_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+        is_untrusted,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_and_audit_standalone_modules(
     store_opt: Option<&TurboStore>,
@@ -2747,12 +2808,7 @@ pub(super) fn check_and_audit_standalone_modules(
                     stack.push((p, dst_p));
                 } else if meta.file_type().is_file() {
                     let base_rel = if let Ok(r) = p.strip_prefix(&src_dir) {
-                        let rs = r.to_string_lossy();
-                        rs.strip_suffix(".olean.server")
-                            .or_else(|| rs.strip_suffix(".olean.private"))
-                            .or_else(|| rs.strip_suffix(".olean"))
-                            .or_else(|| rs.strip_suffix(".ilean"))
-                            .map(String::from)
+                        standalone_merge_rel_base(&r.to_string_lossy())
                     } else {
                         None
                     };
@@ -2780,9 +2836,7 @@ pub(super) fn check_and_audit_standalone_modules(
                     if let Some(parent) = dst_p.parent() {
                         fs::create_dir_all(parent)?;
                     }
-                    if pkg_preserve_lake || fs::hard_link(&p, &dst_p).is_err() {
-                        fs::copy(&p, &dst_p)?;
-                    }
+                    stage_artifact_link(&p, &dst_p, !pkg_preserve_lake)?;
                 }
             }
         }
@@ -2909,7 +2963,7 @@ pub(super) fn check_and_audit_standalone_modules(
 
             let out = crate::module_builder::run_command_with_timeout(
                 &mut cmd,
-                std::time::Duration::from_secs(300),
+                standalone_lean_timeout(is_untrusted),
                 true,
             )?;
             if !out.status.success() {
@@ -3037,7 +3091,7 @@ pub(super) fn check_and_audit_standalone_modules(
             .arg(&published_olean);
             let out = crate::module_builder::run_command_with_timeout(
                 &mut cmd,
-                std::time::Duration::from_secs(300),
+                standalone_lean_timeout(is_untrusted),
                 false,
             )?;
             if !out.status.success() {
