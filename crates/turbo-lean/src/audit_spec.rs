@@ -2147,6 +2147,25 @@ impl AuditSpecPolicyConfig {
                 !(has_underscore && has_hyphen),
                 "Config cannot specify both `audit_spec` and `audit-spec`"
             );
+            // A1j: mirror the strict TOML handling for JSON. When the top level
+            // holds the named audit-spec object, a sibling key is never silently
+            // dropped: a near-miss spelling fails closed in every mode, and a
+            // dedicated config admits no sibling at all.
+            if has_underscore || has_hyphen {
+                for key in obj.keys() {
+                    if key == "audit_spec" || key == "audit-spec" {
+                        continue;
+                    }
+                    anyhow::ensure!(
+                        !is_audit_spec_section_near_miss(key),
+                        "near-miss `audit_spec` key `{key}` beside the audit-spec object in JSON config; did you mean `audit_spec` or `audit-spec`? Refusing to silently ignore it"
+                    );
+                    anyhow::ensure!(
+                        !allow_top_level_toml,
+                        "dedicated audit-spec JSON config must not contain top-level entries other than the `audit_spec`/`audit-spec` object, found `{key}`"
+                    );
+                }
+            }
             let target_val = if has_underscore {
                 obj["audit_spec"].clone()
             } else if has_hyphen {
@@ -5290,6 +5309,89 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
         )
         .expect("a dedicated config holding only `[audit_spec]` must keep parsing");
         assert!(cfg.is_some(), "the `[audit_spec]` table must yield a config");
+    }
+
+    // A1j: the JSON mirror of A1's strict TOML handling. A misspelled top-level
+    // key beside the `audit_spec`/`audit-spec` object must fail closed instead of
+    // being silently dropped when the named object is extracted.
+    #[test]
+    fn audit_spec_json_misspelled_key_beside_section_fails_closed() {
+        for (section, sibling) in [
+            ("audit_spec", "audit_specs"),
+            ("audit-spec", "audit_spce"),
+            ("audit_spec", "auditspec"),
+        ] {
+            let text = format!(
+                "{{\"{section}\": {{\"policy\": \"default\"}}, \"{sibling}\": {{\"reject_identity_stubs\": true}}}}"
+            );
+            let err = AuditSpecPolicyConfig::try_parse_config_str(&text).expect_err(
+                "a misspelled top-level key beside the JSON audit-spec object must fail closed, never be silently ignored",
+            );
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(sibling),
+                "clear error must name the near-miss key `{sibling}`: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_spec_json_dedicated_sibling_top_level_keys_fail_closed() {
+        let text = "{\"audit_spec\": {\"policy\": \"default\"}, \"stray\": true}";
+        let err = AuditSpecPolicyConfig::try_parse_config_str_mode(text, true).expect_err(
+            "a dedicated JSON audit-spec config with top-level entries beside the audit-spec object must fail closed",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("stray"),
+            "clear error must name the sibling entry `stray`: {msg}"
+        );
+    }
+
+    #[test]
+    fn audit_spec_json_wrapper_fails_closed_on_misspelled_sibling_key() {
+        // The convenience wrapper must not flatten the near-miss error into a
+        // silently-parsed config (the fail-open shape A1 closed for TOML).
+        let wrapper = std::panic::catch_unwind(|| {
+            AuditSpecPolicyConfig::parse_config_str(
+                "{\"audit-spec\": {\"policy\": \"default\"}, \"audit_specs\": {\"policy\": \"strict-proofs\"}}",
+            )
+        });
+        match wrapper {
+            Ok(cfg) => panic!(
+                "JSON config with a misspelled sibling key silently parsed as {cfg:?}"
+            ),
+            Err(payload) => {
+                let msg = panic_message(&payload);
+                assert!(
+                    msg.contains("audit_specs"),
+                    "fail-closed error must name the misspelled key, got: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn audit_spec_json_section_with_unrelated_sibling_still_accepted_in_project_mode() {
+        // Mirror of the TOML rule: a project-level config may carry unrelated
+        // top-level entries beside the audit-spec object; only near-misses and
+        // dedicated-mode siblings fail closed.
+        let cfg = AuditSpecPolicyConfig::try_parse_config_str(
+            "{\"audit_spec\": {\"policy\": \"default\"}, \"pack\": {\"jobs\": 4}}",
+        )
+        .expect("an unrelated top-level key beside the JSON audit-spec object must stay accepted in project mode")
+        .expect("the `audit_spec` object must yield a config");
+        assert_eq!(cfg.policy, "default");
+    }
+
+    #[test]
+    fn audit_spec_json_dedicated_section_alone_still_accepted() {
+        let cfg = AuditSpecPolicyConfig::try_parse_config_str_mode(
+            "{\"audit_spec\": {\"policy\": \"default\"}}",
+            true,
+        )
+        .expect("a dedicated JSON config holding only the audit-spec object must keep parsing");
+        assert!(cfg.is_some(), "the `audit_spec` object must yield a config");
     }
 }
 

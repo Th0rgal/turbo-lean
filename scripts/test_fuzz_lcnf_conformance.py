@@ -10,7 +10,9 @@ alias must be measured, printed, and held above a stated floor.
 These tests are pure Python (no compiled engine required) except the
 end-to-end mutation test, which skips when engines are unavailable.
 """
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -184,6 +186,116 @@ class BrokenAliasDetection(unittest.TestCase):
         report = fuzzer.run_fuzzer(16, mutate_engine="lnir_eval")
         self.assertFalse(report["ok"])
         self.assertGreater(report["mismatch_count"], 0)
+
+
+class ClangResolutionOrder(unittest.TestCase):
+    """Environment portability: the clang used to lower the pinned toolchain's
+    LLVM IR must resolve the pinned toolchain's bundled clang (derived from
+    lean/lean-toolchain, honoring ELAN_HOME) before any system clang, because a
+    system clang older than LLVM 16 cannot parse the `memory(none)` attribute
+    groups the pinned toolchain emits. A TURBO_LEAN_CLANG override wins over
+    everything. Pure resolution-order tests; no second toolchain required."""
+
+    @staticmethod
+    def _fake_clang(dirpath):
+        p = Path(dirpath) / "clang"
+        p.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        p.chmod(0o755)
+        return p
+
+    def test_repo_pinned_toolchain_reads_lean_toolchain_file(self):
+        pin = fuzzer.repo_pinned_toolchain()
+        on_disk = (fuzzer.ROOT / "lean" / "lean-toolchain").read_text(encoding="utf-8").strip()
+        self.assertEqual(pin, on_disk)
+        self.assertTrue(pin)
+
+    def test_elan_toolchain_dir_name_mangles_slash_and_colon(self):
+        self.assertEqual(
+            fuzzer.elan_toolchain_dir_name("leanprover/lean4:v4.35.0"),
+            "leanprover--lean4---v4.35.0",
+        )
+
+    def test_elan_home_is_first_toolchain_clang_candidate(self):
+        with mock.patch.dict(os.environ, {"ELAN_HOME": "/custom/elan-home"}):
+            cands = fuzzer.pinned_toolchain_clang_candidates()
+        pin_dir = fuzzer.elan_toolchain_dir_name(fuzzer.repo_pinned_toolchain())
+        self.assertEqual(
+            cands[0], str(Path("/custom/elan-home") / "toolchains" / pin_dir / "bin" / "clang")
+        )
+        self.assertIn(
+            str(Path.home() / ".elan" / "toolchains" / pin_dir / "bin" / "clang"), cands
+        )
+
+    def test_turbo_lean_clang_override_has_highest_precedence(self):
+        with tempfile.TemporaryDirectory(prefix="tl-clang-override-") as tmp:
+            fake = self._fake_clang(tmp)
+            with mock.patch.dict(os.environ, {"TURBO_LEAN_CLANG": str(fake)}):
+                self.assertEqual(fuzzer.find_clang_binary(), str(fake))
+
+    def test_pinned_toolchain_clang_preferred_over_system_clang(self):
+        with tempfile.TemporaryDirectory(prefix="tl-elan-home-") as tmp:
+            pin = fuzzer.repo_pinned_toolchain()
+            bindir = Path(tmp) / "toolchains" / fuzzer.elan_toolchain_dir_name(pin) / "bin"
+            bindir.mkdir(parents=True)
+            fake = self._fake_clang(bindir)
+            with mock.patch.dict(os.environ, {"ELAN_HOME": tmp}):
+                os.environ.pop("TURBO_LEAN_CLANG", None)
+                self.assertEqual(fuzzer.find_clang_binary(), str(fake))
+
+    def test_system_clang_below_llvm16_is_rejected(self):
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop("TURBO_LEAN_CLANG", None)
+            with mock.patch.object(
+                fuzzer, "pinned_toolchain_clang_candidates", return_value=[]
+            ), mock.patch.object(fuzzer, "clang_version_major", return_value=15):
+                self.assertIsNone(fuzzer.find_clang_binary())
+
+    def test_system_clang_at_llvm16_or_newer_is_accepted(self):
+        import shutil as _shutil
+
+        if not any(
+            c and Path(c).is_file()
+            for c in ("/usr/bin/clang", _shutil.which("clang"))
+        ):
+            self.skipTest("no system clang on this node")
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop("TURBO_LEAN_CLANG", None)
+            with mock.patch.object(
+                fuzzer, "pinned_toolchain_clang_candidates", return_value=[]
+            ), mock.patch.object(fuzzer, "clang_version_major", return_value=16):
+                got = fuzzer.find_clang_binary()
+        self.assertIsNotNone(got)
+        self.assertTrue(Path(got).is_file())
+
+
+class PinnedToolchainEnv(unittest.TestCase):
+    """Environment portability: an elan-shimmed binary (lean / lake / leanc)
+    invoked on files in a temp dir outside the repo resolves elan's DEFAULT
+    toolchain, not the repo pin (measured as `incompatible header ...
+    v4.36.0/lib/lean/Init.olean` against the repo's v4.35.0 pin). Subprocess
+    environments therefore pin ELAN_TOOLCHAIN from lean/lean-toolchain."""
+
+    def test_sets_elan_toolchain_from_repo_pin(self):
+        base = {"PATH": "/usr/bin"}
+        env = fuzzer.pinned_toolchain_env(base)
+        self.assertEqual(env["ELAN_TOOLCHAIN"], fuzzer.repo_pinned_toolchain())
+        self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertNotIn("ELAN_TOOLCHAIN", base)
+
+    def test_repo_pin_overrides_ambient_elan_toolchain(self):
+        env = fuzzer.pinned_toolchain_env({"ELAN_TOOLCHAIN": "leanprover/lean4:v4.99.0"})
+        self.assertEqual(env["ELAN_TOOLCHAIN"], fuzzer.repo_pinned_toolchain())
+
+    def test_defaults_to_current_environ(self):
+        with mock.patch.dict(os.environ, {"TL_SENTINEL_VAR": "1"}):
+            env = fuzzer.pinned_toolchain_env()
+        self.assertEqual(env.get("TL_SENTINEL_VAR"), "1")
+        self.assertEqual(env.get("ELAN_TOOLCHAIN"), fuzzer.repo_pinned_toolchain())
+
+    def test_missing_pin_leaves_env_unchanged(self):
+        with mock.patch.object(fuzzer, "repo_pinned_toolchain", return_value=None):
+            env = fuzzer.pinned_toolchain_env({"A": "b"})
+        self.assertEqual(env, {"A": "b"})
 
 
 if __name__ == "__main__":

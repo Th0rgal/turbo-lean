@@ -52,15 +52,13 @@ CORE_BIN = ROOT / "lean" / ".lake" / "build" / "bin" / "lean-native-core"
 
 
 def find_clang() -> str:
-    for cand in [
-        "/usr/bin/clang",
-        str(Path.home() / ".elan/toolchains/leanprover--lean4---v4.35.0/bin/clang"),
-        "/root/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang",
-        "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang",
-        shutil.which("clang"),
-    ]:
-        if cand and Path(cand).is_file() and os.access(cand, os.X_OK):
-            return cand
+    # Sibling of fuzz_lcnf_conformance.find_clang_binary: the pinned toolchain's
+    # clang (derived from lean/lean-toolchain, honoring ELAN_HOME) comes first,
+    # a system clang only when it can parse the toolchain's LLVM IR (>= LLVM 16),
+    # TURBO_LEAN_CLANG above everything.
+    cand = fuzzer.find_clang_binary()
+    if cand:
+        return cand
     raise RuntimeError("clang not found")
 
 
