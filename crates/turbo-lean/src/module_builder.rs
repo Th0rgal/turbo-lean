@@ -3603,6 +3603,113 @@ lean_lib Smoke where
         assert!(facet_err.contains("Unsupported target facet `:unknown_facet`"));
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// P7 (#436): `turbo-lean build <Lib>` must not schedule a native compile of a git-pinned
+    /// dependency whose checkout lies outside the project root (a symlinked `.lake/packages`
+    /// entry into another checkout): publishing would rewrite `.olean`/`.trace` files and take
+    /// `.turbo_publish.lock` in that foreign checkout. Such a dependency is adopted read-only or
+    /// the DAG build fails naming the `lake build` command that refreshes it. A pinned clone
+    /// under the project root keeps building, like Lake builds it.
+    #[cfg(unix)]
+    #[test]
+    fn test_dag_build_scope_refuses_stale_git_pinned_dep_outside_project_root() -> Result<()> {
+        let dir = make_temp_test_dir("dag_build_scope_pinned_dep");
+        let origin = dir.join("other_checkout/dep_pin");
+        let proj = dir.join("proj");
+        fs::create_dir_all(&origin)?;
+        fs::create_dir_all(&proj)?;
+        let tc = "leanprover/lean4:v4.35.0\n";
+        fs::write(origin.join("lean-toolchain"), tc)?;
+        fs::write(proj.join("lean-toolchain"), tc)?;
+        fs::write(
+            origin.join("lakefile.toml"),
+            "name = \"dep_pin\"\ndefaultTargets = [\"DepPin\"]\n[[lean_lib]]\nname = \"DepPin\"\n",
+        )?;
+        fs::write(origin.join("DepPin.lean"), "def depPinVal : Nat := 7\n")?;
+        let git_bin = std::env::var_os("TURBO_LEAN_GIT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("git"));
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@e.com"],
+            vec!["config", "user.name", "T"],
+            vec!["add", "."],
+            vec!["commit", "-m", "init"],
+        ] {
+            let st = Command::new(&git_bin)
+                .args(&args)
+                .current_dir(&origin)
+                .status()?;
+            anyhow::ensure!(st.success(), "git {args:?} failed in dep origin");
+        }
+        let rev_out = Command::new(&git_bin)
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&origin)
+            .output()?;
+        anyhow::ensure!(rev_out.status.success());
+        let rev = String::from_utf8(rev_out.stdout)?.trim().to_string();
+        fs::write(
+            proj.join("lakefile.toml"),
+            format!(
+                "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep_pin\"\ngit = {:?}\nrev = {:?}\n[[lean_lib]]\nname = \"App\"\n",
+                origin.to_string_lossy(),
+                rev
+            ),
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [{
+                    "type": "git",
+                    "scope": "",
+                    "name": "dep_pin",
+                    "manifestFile": "lake-manifest.json",
+                    "rev": rev,
+                    "inherited": false,
+                    "configFile": "lakefile.toml",
+                    "inputRev": rev,
+                    "url": origin.to_string_lossy()
+                }]
+            })
+            .to_string(),
+        )?;
+        fs::write(
+            proj.join("App.lean"),
+            "import DepPin\ntheorem app_ok : depPinVal = 7 := rfl\n",
+        )?;
+        fs::create_dir_all(proj.join(".lake/packages"))?;
+        std::os::unix::fs::symlink(&origin, proj.join(".lake/packages/dep_pin"))?;
+
+        let cfg = resolve_project_config(&proj)?;
+        // 1. `build <Lib>` (trusted, no prebuilt adoption) fails closed instead of scheduling a
+        //    native compile that would publish into the other checkout.
+        let err = build_module_dag(&cfg, &["App".to_string()])
+            .expect_err("stale pinned out-of-tree dep must not become a DAG build node")
+            .to_string();
+        assert!(
+            err.contains("outside the project root") && err.contains("lake build DepPin"),
+            "unexpected error: {err}"
+        );
+        // 2. The statement path (`allow_prebuilt_dep_pkgs = true`, `check`) keeps today's shape.
+        let stmt_dag = build_module_dag_for_trusted_statement(&cfg, &["App".to_string()])?;
+        assert!(stmt_dag.nodes.contains_key("DepPin"));
+        // 3. Control: the same pinned clone under the project root keeps building like Lake.
+        fs::remove_file(proj.join(".lake/packages/dep_pin"))?;
+        let clone_st = Command::new(&git_bin)
+            .args(["clone", "--quiet"])
+            .arg(&origin)
+            .arg(proj.join(".lake/packages/dep_pin"))
+            .status()?;
+        anyhow::ensure!(clone_st.success(), "git clone into packages dir failed");
+        let cfg_in = resolve_project_config(&proj)?;
+        let dag_in = build_module_dag(&cfg_in, &["App".to_string()])?;
+        assert!(dag_in.nodes.contains_key("DepPin"));
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_optout_module_cache_hits_preserve_existing_lake_tree() -> Result<()> {

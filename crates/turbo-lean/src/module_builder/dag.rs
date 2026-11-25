@@ -9264,6 +9264,12 @@ pub(super) fn build_module_dag_inner(
     }
     validate_materialized_artifacts(cfg)?;
     let root_pkg = &cfg.root_pkg;
+    // For the `build <Lib>` scope gate below (#436): compare canonical paths, so a dependency
+    // reached through a symlinked `.lake/packages` entry resolves to the checkout it really is.
+    let root_canon = root_pkg
+        .pkg_root
+        .canonicalize()
+        .unwrap_or_else(|_| root_pkg.pkg_root.clone());
     let mut initial_specs: Vec<(DiscoveredModuleSpec, bool)> = Vec::new();
     // Shared-library identity is `(pkg_root, lib_name)`, never `origName`, so two dependencies
     // whose directories share a name cannot collide.
@@ -9972,6 +9978,34 @@ pub(super) fn build_module_dag_inner(
                     }
                 }
                 continue;
+            }
+            // `turbo-lean build <Lib>` scope (#436): a git-pinned dependency checkout outside the
+            // project root is another (possibly shared) checkout, reached through a symlinked
+            // `.lake/packages` entry or a relocated packages dir. Compiling its modules natively
+            // would publish `.olean`/`.trace` rewrites and `.turbo_publish.lock` files into that
+            // foreign checkout, so a pinned out-of-tree dependency is adopted read-only (the
+            // fresh or prebuilt closure above) or the build fails naming the Lake command that
+            // refreshes it. Path dependencies and pinned clones under the project root keep
+            // building, like Lake builds them; `check`'s statement path (`allow_prebuilt_dep_pkgs`)
+            // and untrusted builds are unchanged.
+            if !is_untrusted && !allow_prebuilt_dep_pkgs && !spec.is_root_pkg {
+                let pkg_canon = spec
+                    .pkg_root
+                    .canonicalize()
+                    .unwrap_or_else(|_| spec.pkg_root.clone());
+                if !pkg_canon.starts_with(&root_canon)
+                    && is_git_pinned_manifest_package(cfg, &spec)
+                {
+                    anyhow::bail!(
+                        "Cannot build module `{}`: package `{}` is a git-pinned dependency checkout outside the project root ({} is not under {}) and its Lake artifacts could not be adopted read-only; turbo-lean never compiles or publishes into it. Run `lake build {}` in {} to refresh it, then retry",
+                        spec.module_name,
+                        spec.pkg_name,
+                        pkg_canon.display(),
+                        root_canon.display(),
+                        spec.module_name,
+                        spec.pkg_root.display()
+                    );
+                }
             }
             // Every DAG node is compiled or restored and published with a Lake trace, which must
             // not happen for a module Lake would build differently.
