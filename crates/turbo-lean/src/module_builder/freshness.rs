@@ -2069,16 +2069,14 @@ pub(super) fn lake_closure_export_info_inner(
             false
         };
 
+        // One taint classification feeds both checks (review F4): stamp eligibility
+        // keeps its narrower host-read meaning, and the gated clause below is what
+        // polices pure elaborator / `@[extern]` shapes.
+        let host_taint = spec_source_host_effect_taint(cfg, spec, &src_raw);
         if ((!cache.post_lake_refresh || has_valid_turbo_entry)
-            && source_ineligible_for_stamp_reuse(
-                cfg,
-                &spec.pkg_root,
-                &spec.module_name,
-                &spec.src_path,
-                &src_raw,
-            ))
+            && spec_source_stamp_ineligible_given_taint(cfg, spec, &src_raw, host_taint))
             || (!cache.post_lake_refresh
-                && spec_source_has_disallowed_elab_host_effects(cfg, spec, &src_raw)
+                && host_taint.is_tainted()
                 && (strict_policy
                     || !has_valid_turbo_entry
                     || crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root)))
@@ -2653,16 +2651,13 @@ pub(crate) fn dep_pkg_import_pins_consistent(
         let Ok(src) = fs::read_to_string(&cur.src_path) else {
             return false;
         };
-        if source_ineligible_for_stamp_reuse(
-            cfg,
-            &cur.pkg_root,
-            &cur.module_name,
-            &cur.src_path,
-            &src,
-        ) || (!cache.post_lake_refresh
-            && (strict_policy
-                || crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root))
-            && spec_source_has_disallowed_elab_host_effects(cfg, &cur, &src))
+        // Review F4: one classification per module; see the matching caller above.
+        let host_taint = spec_source_host_effect_taint(cfg, &cur, &src);
+        if spec_source_stamp_ineligible_given_taint(cfg, &cur, &src, host_taint)
+            || (!cache.post_lake_refresh
+                && (strict_policy
+                    || crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root))
+                && host_taint.is_tainted())
         {
             return false;
         }

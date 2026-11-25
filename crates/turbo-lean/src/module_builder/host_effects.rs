@@ -47,20 +47,26 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
             }
         }
     }
-    // #438 / #433: only import-time taint (`initialize` bodies reading host state, plus
-    // every fail-closed shape) walks up to importers; a self-only tainted module (an
-    // elaborator body reading host state, an uncovered `include_str`) is purged alone.
-    // Its importers stay pinned to its artifact digest through the verified-source
-    // stamps and Lake traces, so a rebuilt artifact still invalidates them without
-    // deleting whole import closures up front.
+    // #438 / #433: only spreading taint (import-time host reads and invocable-definer
+    // bodies, plus every fail-closed shape) walks up to importers; a self-only tainted
+    // module (a `run_cmd` reading host state, an uncovered `include_str`) is purged
+    // alone. Its importers stay pinned to its artifact digest through the
+    // verified-source stamps and Lake traces, so a rebuilt artifact still invalidates
+    // them without deleting whole import closures up front. Deletion itself honors the
+    // #434 ownership guard (review F5): spreading still propagates through a module the
+    // project does not own, but that module's artifacts (a shared pinned Mathlib
+    // checkout's) are left for its own workspace to refresh.
     let mut spreading: HashSet<(PathBuf, String)> = HashSet::new();
     let mut purged_any = false;
     for spec in postorder {
         let key = (spec.pkg_root.clone(), spec.module_name.clone());
+        let purgeable = spec_artifacts_purgeable_from_project_root(cfg, &spec);
         let Ok(src_raw) = fs::read_to_string(&spec.src_path) else {
             spreading.insert(key);
-            crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
-            purged_any = true;
+            if purgeable {
+                crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
+                purged_any = true;
+            }
             continue;
         };
         let hdr = parse_header_info(&src_raw);
@@ -80,9 +86,11 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
         let taint = spec_source_host_effect_taint(cfg, &spec, &src_raw);
         if imports_spreading || taint.spreads_to_importers() {
             spreading.insert(key);
-            crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
-            purged_any = true;
-        } else if taint.is_tainted() {
+            if purgeable {
+                crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
+                purged_any = true;
+            }
+        } else if taint.is_tainted() && purgeable {
             crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
             purged_any = true;
         }
@@ -115,11 +123,68 @@ impl HostEffectTaint {
     }
 }
 
+const DECL_MODIFIER_WORDS: &[&str] = &[
+    "private",
+    "protected",
+    "public",
+    "scoped",
+    "local",
+    "noncomputable",
+    "unsafe",
+    "partial",
+    "nonrec",
+    "meta",
+];
+
+/// True for a line holding only attribute groups (`@[...]`) and declaration modifiers,
+/// i.e. a line that cannot be a whole declaration by itself (review F3).
+fn line_is_attr_or_modifier_only(uq_line: &str) -> bool {
+    let mut rest = uq_line.trim();
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        if let Some(tail) = rest.strip_prefix("@[") {
+            let mut depth = 1usize;
+            let mut end = None;
+            for (i, ch) in tail.char_indices() {
+                match ch {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(end) = end else {
+                return false;
+            };
+            rest = tail[end + 1..].trim_start();
+            continue;
+        }
+        let word_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (word, tail) = rest.split_at(word_end);
+        if !DECL_MODIFIER_WORDS.contains(&word) {
+            return false;
+        }
+        rest = tail.trim_start();
+    }
+    true
+}
+
 /// Walks the top-level declaration blocks of a source whose comment-stripped and
 /// string-stripped views are given, calling `hit` with each block's two views prefixed
 /// by the file's top-level `open` / `namespace` lines (so a bare `getEnv` under
 /// `open IO` still counts inside its block). Blocks are split at Lean's column-0
-/// declaration starts; continuation lines of a declaration are indented in valid Lean.
+/// declaration starts; continuation lines of a declaration are indented in valid Lean,
+/// and a column-0 line holding only attribute groups and declaration modifiers
+/// (`@[tactic foo]`, `private`, ...) continues into the next line's block, because Lean
+/// and Mathlib write such attributes on their own line above the definition they apply
+/// to, and splitting there separated the trigger from the body it governs (review F3).
 /// Returns `None` when the two views disagree on line structure (callers fail closed).
 fn scan_top_level_blocks(
     comment_free: &str,
@@ -147,78 +212,191 @@ fn scan_top_level_blocks(
     };
     let mut cf_block = String::new();
     let mut uq_block = String::new();
+    let mut block_attr_only = true;
     for (cf, uq) in cf_lines.iter().zip(uq_lines.iter()) {
-        if uq.chars().next().is_some_and(|c| !c.is_whitespace()) && !uq_block.is_empty() {
+        if uq.chars().next().is_some_and(|c| !c.is_whitespace())
+            && !uq_block.is_empty()
+            && !block_attr_only
+        {
             if block_hit(&cf_block, &uq_block) {
                 return Some(true);
             }
             cf_block.clear();
             uq_block.clear();
+            block_attr_only = true;
         }
         cf_block.push_str(cf);
         cf_block.push('\n');
         uq_block.push_str(uq);
         uq_block.push('\n');
+        if !uq.trim().is_empty() && !line_is_attr_or_modifier_only(uq) {
+            block_attr_only = false;
+        }
     }
     Some(block_hit(&cf_block, &uq_block))
 }
 
-/// True when an `initialize` / `builtin_initialize` declaration and a host-read token
-/// share one top-level block, i.e. the host read executes at *import time* in every
-/// importer. This only ever *narrows* the callers' whole-file co-occurrence test, and the
-/// narrowing is limited to reads that would have to sit in a column-0-continuing
-/// `initialize` body to be missed, which valid Lean does not produce; a structural
-/// disagreement between the stripped views fails closed.
+/// True when an initializer trigger (an `initialize` / `builtin_initialize` declaration,
+/// or the attribute spellings `@[init ...]` / `@[builtin_init ...]`) pairs with a
+/// host-read token, i.e. the host read executes at *import time* in every importer. The
+/// pairing is per top-level block, except that an initializer body may reach host state
+/// through a same-file helper whose read tokens sit in the helper's own block: when the
+/// trigger block itself carries no read token, every same-file `def` / `partial def` /
+/// `unsafe def` block whose defined name the trigger block references is checked for
+/// read tokens, and a hit classifies the source exactly as if the trigger block read
+/// host state itself. That reference check is one level deep: a helper that reaches
+/// host state only through a second helper is not followed. A structural disagreement
+/// between the stripped views fails closed.
 fn initialize_block_reads_host(comment_free: &str, unquoted: &str) -> bool {
     const INIT_WORDS: [&str; 2] = ["initialize", "builtin_initialize"];
-    if !INIT_WORDS
-        .iter()
-        .any(|w| crate::splitter::contains_lean_word(unquoted, w))
-    {
-        return false;
-    }
-    scan_top_level_blocks(comment_free, unquoted, |cf_block, uq_block| {
+    const INIT_ATTRS: [&str; 2] = ["@[init", "@[builtin_init"];
+    let has_init_trigger = |uq: &str| {
         INIT_WORDS
             .iter()
-            .any(|w| crate::splitter::contains_lean_word(uq_block, w))
-            && crate::splitter::unquoted_has_host_read_tokens(cf_block, uq_block)
+            .any(|w| crate::splitter::contains_lean_word(uq, w))
+            || INIT_ATTRS.iter().any(|a| uq.contains(a))
+    };
+    if !has_init_trigger(unquoted) {
+        return false;
+    }
+    let blocks: std::cell::RefCell<Vec<(String, String)>> = std::cell::RefCell::new(Vec::new());
+    let walked = scan_top_level_blocks(comment_free, unquoted, |cf_block, uq_block| {
+        blocks
+            .borrow_mut()
+            .push((cf_block.to_string(), uq_block.to_string()));
+        false
+    });
+    if walked.is_none() {
+        // The stripped views disagree on line structure: fail closed.
+        return true;
+    }
+    let blocks = blocks.into_inner();
+    let block_reads_host = |(cf, uq): &(String, String)| {
+        crate::splitter::unquoted_has_host_read_tokens(cf, uq)
+    };
+    blocks.iter().enumerate().any(|(i, block)| {
+        if !has_init_trigger(&block.1) {
+            return false;
+        }
+        if block_reads_host(block) {
+            return true;
+        }
+        // One level of same-file indirection: a helper definition the trigger block
+        // references, whose own block carries the read token.
+        blocks.iter().enumerate().any(|(j, other)| {
+            j != i
+                && defined_def_names(&other.1)
+                    .iter()
+                    .any(|name| crate::splitter::contains_lean_word(&block.1, name))
+                && block_reads_host(other)
+        })
     })
-    .unwrap_or(true)
 }
 
-/// True when a top-level block both carries an elaboration-exec trigger (`elab`,
-/// `run_cmd`, `#eval`, a simproc, an exec attribute, ...) and reads host state, or holds
-/// a bare `#eval`: that code executes while *this* module elaborates, so its artifacts
-/// may depend on host state. Definition-only IO in plain `def` blocks does not count.
-fn any_block_executes_host_reads(comment_free: &str, unquoted: &str) -> bool {
+/// The identifiers a block's column-0 head lines define via `def <ident>`,
+/// `partial def <ident>`, or `unsafe def <ident>` — the defining-block spellings the
+/// one-level same-file reference check in [`initialize_block_reads_host`] follows.
+fn defined_def_names(uq_block: &str) -> Vec<String> {
+    uq_block
+        .lines()
+        .filter(|l| l.chars().next().is_some_and(|c| !c.is_whitespace()))
+        .filter_map(|l| {
+            let rest = l
+                .strip_prefix("partial def ")
+                .or_else(|| l.strip_prefix("unsafe def "))
+                .or_else(|| l.strip_prefix("def "))?
+                .trim_start();
+            let end = rest
+                .char_indices()
+                .find(|&(_, c)| !crate::splitter::is_lean_id_rest(c))
+                .map_or(rest.len(), |(idx, _)| idx);
+            (end > 0).then(|| rest[..end].to_string())
+        })
+        .collect()
+}
+
+/// Collects the top-level blocks (both stripped views, `open`-prefixed) for the
+/// block-pairing checks below. `None` when the views disagree (callers fail closed).
+fn collect_top_level_blocks(comment_free: &str, unquoted: &str) -> Option<Vec<(String, String)>> {
+    let blocks: std::cell::RefCell<Vec<(String, String)>> = std::cell::RefCell::new(Vec::new());
     scan_top_level_blocks(comment_free, unquoted, |cf_block, uq_block| {
-        ["#eval", "#eval!"]
-            .iter()
-            .any(|w| crate::splitter::contains_lean_word(uq_block, w))
-            || (crate::splitter::unquoted_has_elab_exec_trigger(uq_block)
-                && crate::splitter::unquoted_has_host_read_tokens(cf_block, uq_block))
+        blocks
+            .borrow_mut()
+            .push((cf_block.to_string(), uq_block.to_string()));
+        false
+    })?;
+    Some(blocks.into_inner())
+}
+
+/// True when block `i` reads host state itself, or references (one level of same-file
+/// indirection, exactly as in [`initialize_block_reads_host`]) a `def` block that does.
+fn block_reads_host_directly_or_via_helper(blocks: &[(String, String)], i: usize) -> bool {
+    let reads =
+        |(cf, uq): &(String, String)| crate::splitter::unquoted_has_host_read_tokens(cf, uq);
+    if reads(&blocks[i]) {
+        return true;
+    }
+    blocks.iter().enumerate().any(|(j, other)| {
+        j != i
+            && defined_def_names(&other.1)
+                .iter()
+                .any(|name| crate::splitter::contains_lean_word(&blocks[i].1, name))
+            && reads(other)
     })
-    .unwrap_or(true)
+}
+
+/// Review F1: true when a top-level block *defines* invocable host-reading code (an
+/// `elab` / `elab_rules`, a simproc, a `@[tactic]` / `@[command_elab]` / linter
+/// handler, an attribute or environment-extension registration) whose host reads are
+/// direct or one same-file helper away. Importers execute those bodies when they
+/// elaborate the invoking syntax, and the defining module's `.olean` can come out
+/// byte-identical, so its artifact digest does not protect them: this taint spreads.
+fn any_block_defines_invocable_host_reads(comment_free: &str, unquoted: &str) -> bool {
+    let Some(blocks) = collect_top_level_blocks(comment_free, unquoted) else {
+        return true;
+    };
+    (0..blocks.len()).any(|i| {
+        crate::splitter::unquoted_has_invocable_definer_trigger(&blocks[i].1)
+            && block_reads_host_directly_or_via_helper(&blocks, i)
+    })
+}
+
+/// True when a top-level block executes host reads during *this* module's own build
+/// only: a self-run command (`run_cmd`, `run_elab`, ...) whose reads are direct or one
+/// same-file helper away, or a bare `#eval` (arbitrary code at build time). Definition-
+/// only IO in plain `def` blocks does not count.
+fn any_block_executes_self_run_host_reads(comment_free: &str, unquoted: &str) -> bool {
+    let Some(blocks) = collect_top_level_blocks(comment_free, unquoted) else {
+        return true;
+    };
+    (0..blocks.len()).any(|i| {
+        (crate::splitter::unquoted_has_self_run_only_trigger(&blocks[i].1)
+            && block_reads_host_directly_or_via_helper(&blocks, i))
+            || ["#eval", "#eval!"]
+                .iter()
+                .any(|w| crate::splitter::contains_lean_word(&blocks[i].1, w))
+    })
 }
 
 /// A module of a *clean, git-pinned* dependency package is host-effect tainted only by
 /// code that executes when the module itself elaborates or is imported (#433, #438):
 ///
-/// * `initialize` bodies reading host state are classified by the caller (they spread);
-/// * a block that carries an elaboration-exec trigger *and* a host read (an `elab` whose
-///   body opens files, a `run_cmd`, a `#eval`) taints the module itself, exactly like an
-///   editable module;
+/// * import-time and invocable-definer host reads are classified by the caller through
+///   [`classify_block_execution`] (they spread);
+/// * a host read behind a self-run-only command (`run_cmd`, a `#eval`) taints the
+///   module itself, exactly like an editable module;
 /// * definition-only IO (a linter's `def` bodies) and literal in-tree `include_str`
-///   content are covered by the pin: stock Lake's traces already treat the pinned
-///   sources plus the toolchain as the module's whole input set, and the kernel replay
-///   and soundness-hygiene gates are unaffected. Out-of-tree or non-literal
-///   `include_str` still taints the module itself.
+///   content that git *tracks at the pinned rev* are covered by the pin: stock Lake's
+///   traces already treat the pinned sources plus the toolchain as the module's whole
+///   input set, and the kernel replay and soundness-hygiene gates are unaffected.
+///   Out-of-tree, non-literal, or untracked (gitignored / generated; review F7)
+///   `include_str` targets still taint the module itself, because the pinned rev does
+///   not fix their content.
 fn classify_clean_pinned_dep_source(
     pkg_root: &Path,
     src_path: &Path,
     src_raw: &str,
-    comment_free: &str,
-    unquoted: &str,
+    exec_taint: HostEffectTaint,
 ) -> HostEffectTaint {
     let Ok(canon_pkg_root) = fs::canonicalize(pkg_root) else {
         return HostEffectTaint::SpreadsToImporters;
@@ -233,20 +411,37 @@ fn classify_clean_pinned_dep_source(
         let Some(src_dir) = src_path.parent() else {
             return HostEffectTaint::SelfOnly;
         };
+        let mut rels_in_root: Vec<PathBuf> = Vec::new();
         for rel in &rel_paths {
             let Ok(canon_target) = fs::canonicalize(src_dir.join(rel)) else {
                 return HostEffectTaint::SelfOnly;
             };
-            if !canon_target.starts_with(&canon_pkg_root) {
+            let Ok(rel_in_root) = canon_target.strip_prefix(&canon_pkg_root) else {
                 return HostEffectTaint::SelfOnly;
-            }
+            };
+            rels_in_root.push(rel_in_root.to_path_buf());
+        }
+        if !include_targets_tracked_at_pin(&canon_pkg_root, &rels_in_root) {
+            return HostEffectTaint::SelfOnly;
         }
     }
-    if any_block_executes_host_reads(comment_free, unquoted) {
-        HostEffectTaint::SelfOnly
-    } else {
-        HostEffectTaint::None
+    exec_taint
+}
+
+/// Review F7: inside-the-root is not pinned-by-the-rev. The checkout is clean, so a
+/// *tracked* path's content equals the pinned rev's; a gitignored or generated file
+/// changes without moving the pin. An unanswerable git (missing, refusing) fails closed.
+fn include_targets_tracked_at_pin(canon_pkg_root: &Path, rels: &[PathBuf]) -> bool {
+    let Ok(mut cmd) = crate::trusted_tools::git(canon_pkg_root) else {
+        return false;
+    };
+    cmd.arg("-C")
+        .arg(canon_pkg_root)
+        .args(["ls-files", "--error-unmatch", "--"]);
+    for rel in rels {
+        cmd.arg(rel);
     }
+    cmd.output().is_ok_and(|o| o.status.success())
 }
 
 /// #433 / #438: classify how `src_raw` can taint `module_name`'s compiled artifacts.
@@ -258,11 +453,18 @@ fn classify_clean_pinned_dep_source(
 /// (#433) and made every `check` delete and rebuild whole import closures (#438, #407).
 /// The split:
 ///
-/// * import-time execution (`initialize` bodies that read host state, plus every
-///   fail-closed shape) spreads, because importers re-run those bodies;
-/// * elaboration-time host dependence taints the module alone (`SelfOnly`); importers
-///   are protected by the recorded `.olean` digests, which go stale the moment the
-///   tainted module's artifact changes;
+/// * import-time execution spreads: `initialize` / `builtin_initialize` / `@[init]`
+///   declarations whose host reads are reachable through same-file definitions (review
+///   F2), plus every fail-closed shape, because importers re-run those bodies;
+/// * a block *defining* invocable host-reading code (an `elab`, a simproc, a
+///   `@[tactic]` / `@[command_elab]` handler, a linter) spreads too (review F1):
+///   importers run that body when they elaborate the invoking syntax, and the defining
+///   module's `.olean` can come out byte-identical, so the artifact digest does not
+///   protect them;
+/// * host reads behind commands that run only during this module's own build (`#eval`,
+///   `run_cmd` / `run_elab` / `run_meta`, an uncovered `include_str`) taint the module
+///   alone (`SelfOnly`); importers are protected by the recorded `.olean` digests,
+///   which go stale the moment the tainted module's artifact changes;
 /// * a module of a clean git-pinned dependency package follows
 ///   [`classify_clean_pinned_dep_source`].
 pub(crate) fn classify_source_host_effect_taint(
@@ -280,14 +482,17 @@ pub(crate) fn classify_source_host_effect_taint(
     if initialize_block_reads_host(&comment_free, &unquoted) {
         return HostEffectTaint::SpreadsToImporters;
     }
+    // Review F1: a block that *defines* invocable host-reading code spreads too.
+    if any_block_defines_invocable_host_reads(&comment_free, &unquoted) {
+        return HostEffectTaint::SpreadsToImporters;
+    }
     if is_git_pinned && !is_root_pkg {
-        return classify_clean_pinned_dep_source(
-            pkg_root,
-            src_path,
-            src_raw,
-            &comment_free,
-            &unquoted,
-        );
+        let exec_taint = if any_block_executes_self_run_host_reads(&comment_free, &unquoted) {
+            HostEffectTaint::SelfOnly
+        } else {
+            HostEffectTaint::None
+        };
+        return classify_clean_pinned_dep_source(pkg_root, src_path, src_raw, exec_taint);
     }
     // Editable sources (the root package and path dependencies) keep the conservative
     // whole-file co-occurrence test; what changed is only that the verdict no longer
@@ -357,6 +562,13 @@ pub(crate) fn source_host_effect_taint(
     )
 }
 
+/// Review F4: stamp eligibility keeps its pre-#433 meaning: the module's own `.olean`
+/// may depend on host state (a host read reachable from an elaboration-exec trigger, or
+/// an include not covered by the package's Lake inputs). For a clean git-pinned
+/// dependency the pin already fixes in-tree includes and definition-only IO, so the
+/// narrower #433 taint classification decides instead. Pure `elab` / `simproc` /
+/// `macro` / `@[extern]` shapes without host reads stay stamp-eligible; the callers'
+/// separate gated `is_tainted` clause polices those.
 pub(crate) fn source_ineligible_for_stamp_reuse(
     cfg: &ProjectConfig,
     pkg_root: &Path,
@@ -364,7 +576,57 @@ pub(crate) fn source_ineligible_for_stamp_reuse(
     src_path: &Path,
     src_raw: &str,
 ) -> bool {
-    source_host_effect_taint(cfg, pkg_root, module_name, src_path, src_raw).is_tainted()
+    let taint = source_host_effect_taint(cfg, pkg_root, module_name, src_path, src_raw);
+    source_stamp_ineligible_given_taint(cfg, pkg_root, module_name, src_path, src_raw, taint)
+}
+
+/// [`source_ineligible_for_stamp_reuse`] with the taint already computed, so a caller
+/// that needs both answers classifies the module once (review F4).
+pub(crate) fn source_stamp_ineligible_given_taint(
+    cfg: &ProjectConfig,
+    pkg_root: &Path,
+    module_name: &str,
+    src_path: &Path,
+    src_raw: &str,
+    taint: HostEffectTaint,
+) -> bool {
+    if taint.spreads_to_importers() {
+        // Import-time host reads and every fail-closed shape.
+        return true;
+    }
+    let Ok(canon_pkg_root) = fs::canonicalize(pkg_root) else {
+        return true;
+    };
+    let Some(pkg) = std::iter::once(&cfg.root_pkg)
+        .chain(cfg.dep_pkgs.iter())
+        .find(|pkg| fs::canonicalize(&pkg.pkg_root).is_ok_and(|root| root == canon_pkg_root))
+    else {
+        return true;
+    };
+    let is_root = fs::canonicalize(&cfg.root_pkg.pkg_root).is_ok_and(|root| root == canon_pkg_root);
+    if !is_root
+        && is_clean_git_pinned_pkg(cfg, false, &pkg.name, pkg_target_base_name(pkg), &pkg.pkg_root)
+    {
+        return taint.is_tainted();
+    }
+    crate::splitter::source_may_read_host_state(src_raw)
+        || !module_includes_all_covered_by_lake_inputs(pkg, module_name, src_path, src_raw)
+}
+
+pub(crate) fn spec_source_stamp_ineligible_given_taint(
+    cfg: &ProjectConfig,
+    spec: &DiscoveredModuleSpec,
+    src_raw: &str,
+    taint: HostEffectTaint,
+) -> bool {
+    source_stamp_ineligible_given_taint(
+        cfg,
+        &spec.pkg_root,
+        &spec.module_name,
+        &spec.src_path,
+        src_raw,
+        taint,
+    )
 }
 
 pub(crate) fn spec_source_host_effect_taint(
@@ -391,11 +653,14 @@ pub(crate) fn spec_source_has_disallowed_elab_host_effects(
     spec_source_host_effect_taint(cfg, spec, src_raw).is_tainted()
 }
 
-/// #434: the Lake-inputs fallback sweep may delete build artifacts only for modules the
-/// project owns. A clean git-pinned dependency is refreshed from its pinned sources by
-/// its own workspace, and a package root that resolves outside the project root (a
-/// symlinked path dependency) belongs to another checkout; deleting either's artifacts
-/// damaged shared Mathlib checkouts (#434).
+/// #434 / review F6: the Lake-inputs fallback sweep may delete build artifacts only for
+/// modules the project owns, and ownership comes from the manifest entry type. A `path`
+/// dependency is editable project state wherever its directory resolves (an editable
+/// `require foo from "../foo"` monorepo sibling included); a `git` entry is refreshed
+/// from its pin by its own workspace, and deleting its artifacts damaged shared Mathlib
+/// checkouts (#434). The location check only refuses a package whose canonical root
+/// lies inside another package's `.lake/packages`: that is a nested checkout this
+/// project does not own, whatever the manifest says.
 pub(crate) fn spec_artifacts_purgeable_from_project_root(
     cfg: &ProjectConfig,
     spec: &DiscoveredModuleSpec,
@@ -403,41 +668,84 @@ pub(crate) fn spec_artifacts_purgeable_from_project_root(
     if spec.is_root_pkg {
         return true;
     }
-    if is_git_pinned_manifest_package(cfg, spec) {
-        return false;
-    }
-    match (
-        fs::canonicalize(&spec.pkg_root),
-        fs::canonicalize(&cfg.root_pkg.pkg_root),
-    ) {
-        (Ok(pkg), Ok(root)) => pkg.starts_with(&root),
-        _ => false,
-    }
+    manifest_entry_is_path_dep(cfg, &spec.pkg_name, &spec.pkg_base_name, &spec.pkg_root)
+        && !pkg_root_inside_foreign_lake_packages(cfg, &spec.pkg_root)
 }
 
 /// #434: dependency-package `lake build` targets are driven from the dependency's own
-/// workspace unless the package is project-owned (an in-project path dependency); the
-/// fallback after a successful check used to run uncapped `lake build` on every
-/// input-bearing dependency target, Mathlib included.
+/// workspace unless the project owns the package (a `path` manifest entry outside any
+/// other package's `.lake/packages`; review F6); the fallback after a successful check
+/// used to run uncapped `lake build` on every input-bearing dependency target, Mathlib
+/// included.
 pub(crate) fn dep_pkg_lake_targets_owned_by_project(
     cfg: &ProjectConfig,
     dp: &PackageConfig,
 ) -> bool {
-    if is_clean_git_pinned_pkg(cfg, false, &dp.name, pkg_target_base_name(dp), &dp.pkg_root) {
-        return false;
-    }
-    match (
-        fs::canonicalize(&dp.pkg_root),
-        fs::canonicalize(&cfg.root_pkg.pkg_root),
-    ) {
-        (Ok(pkg), Ok(root)) => pkg.starts_with(&root),
-        _ => false,
-    }
+    manifest_entry_is_path_dep(cfg, &dp.name, pkg_target_base_name(dp), &dp.pkg_root)
+        && !pkg_root_inside_foreign_lake_packages(cfg, &dp.pkg_root)
 }
 
-/// #407: every Lake build the tool runs is announced on stderr and, when
-/// `TURBO_LEAN_LAKE_CMD_LOG` names a file, appended to it, so benchmarks can assert that
-/// a warm hit runs zero Lake invocations and zero `lake --no-cache` rebuilds.
+fn manifest_entry_is_path_dep(
+    cfg: &ProjectConfig,
+    pkg_name: &str,
+    pkg_base_name: &str,
+    pkg_root: &Path,
+) -> bool {
+    let pkg_canon = pkg_root.canonicalize().ok();
+    cfg.manifest_packages.iter().any(|mp| {
+        mp.pkg_type == "path"
+            && (mp.name == pkg_name
+                || (!pkg_base_name.is_empty() && mp.name == pkg_base_name)
+                || mp.dir == pkg_root
+                || mp
+                    .dir
+                    .canonicalize()
+                    .ok()
+                    .zip(pkg_canon.as_ref())
+                    .is_some_and(|(a, b)| a == *b))
+    })
+}
+
+/// A package root inside a *different* package's `.lake/packages` is a nested checkout
+/// (a dependency's own dependency), never project state; the project's own
+/// `packagesDir` is where its dependencies normally live and does not count.
+fn pkg_root_inside_foreign_lake_packages(cfg: &ProjectConfig, pkg_root: &Path) -> bool {
+    let Ok(canon) = fs::canonicalize(pkg_root) else {
+        return true;
+    };
+    let own_packages_dir =
+        fs::canonicalize(cfg.root_pkg.pkg_root.join(&cfg.root_pkg.packages_dir)).ok();
+    std::iter::once(&cfg.root_pkg)
+        .chain(cfg.dep_pkgs.iter())
+        .any(|p| {
+            let Ok(proot) = fs::canonicalize(&p.pkg_root) else {
+                return false;
+            };
+            if proot == canon {
+                return false;
+            }
+            let Ok(pdir) = fs::canonicalize(proot.join(&p.packages_dir)) else {
+                return false;
+            };
+            own_packages_dir.as_ref() != Some(&pdir) && canon.starts_with(&pdir)
+        })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Review F9: tests route the Lake-invocation log here instead of the process-wide
+    /// environment variable, so a concurrently running test cannot write into another
+    /// test's log.
+    pub(crate) static TEST_LAKE_CMD_LOG: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// #407: every Lake build the tool runs (the module build in
+/// `lake_build_modules_opts`, and the `lake query` materialization in the recipe path)
+/// is appended to the file `TURBO_LEAN_LAKE_CMD_LOG` names, so benchmarks can assert
+/// that a warm hit runs zero Lake invocations and zero `lake --no-cache` rebuilds. The
+/// contextual stderr announcements at the call sites already say what is being rebuilt;
+/// this sink is the machine-readable record and prints nothing itself (review F9).
 pub(crate) fn log_lake_build_invocation(
     canon_dir: &Path,
     modules: &[String],
@@ -453,8 +761,7 @@ pub(crate) fn log_lake_build_invocation(
         modules.join(" "),
         canon_dir.display()
     );
-    eprintln!("{line}");
-    if let Some(log_path) = std::env::var_os("TURBO_LEAN_LAKE_CMD_LOG") {
+    let append = |log_path: &std::ffi::OsStr| {
         if let Ok(mut f) = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -463,6 +770,14 @@ pub(crate) fn log_lake_build_invocation(
             use std::io::Write as _;
             let _ = writeln!(f, "{line}");
         }
+    };
+    #[cfg(test)]
+    if let Some(path) = TEST_LAKE_CMD_LOG.with(|p| p.borrow().clone()) {
+        append(path.as_os_str());
+        return;
+    }
+    if let Some(log_path) = std::env::var_os("TURBO_LEAN_LAKE_CMD_LOG") {
+        append(&log_path);
     }
 }
 
@@ -1748,17 +2063,60 @@ pub(super) fn node_source_has_disallowed_elab_host_effects(
     node_source_host_effect_taint(cfg, node, src_raw).is_tainted()
 }
 
+/// Review F8: whether `spec`'s module, or anything below it in its *own* import graph,
+/// carries spreading host-effect taint. External `.olean` dependencies are not dag
+/// nodes, so spreading has to be chased through their source headers; one hop was not
+/// enough (`Dep.B` importing a host-reading `Dep.A` never marked the root). Lean import
+/// graphs are acyclic; a resolver cycle is cut by the in-progress memo entry. An
+/// unreadable source or broken header fails closed, as in the purge walk.
+pub(super) fn spec_spreads_host_effects_transitively(
+    cfg: &ProjectConfig,
+    spec: &DiscoveredModuleSpec,
+    memo: &mut HashMap<(PathBuf, String), bool>,
+) -> bool {
+    let key = (spec.pkg_root.clone(), spec.module_name.clone());
+    if let Some(&v) = memo.get(&key) {
+        return v;
+    }
+    memo.insert(key.clone(), false);
+    let v = match fs::read_to_string(&spec.src_path) {
+        Err(_) => true,
+        Ok(src) => {
+            spec_source_host_effect_taint(cfg, spec, &src).spreads_to_importers() || {
+                let hdr = parse_header_info(&src);
+                hdr.header_error.is_some()
+                    || hdr.imports.iter().any(|sub| {
+                        let site = match resolve_module_in_package(&cfg.root_pkg, true, sub) {
+                            Some(rs) => ImportSite::Module(Box::new(rs)),
+                            None => resolve_import_site(cfg, sub),
+                        };
+                        match site {
+                            ImportSite::Module(sub_spec) => {
+                                spec_spreads_host_effects_transitively(cfg, &sub_spec, memo)
+                            }
+                            _ => false,
+                        }
+                    })
+            }
+        }
+    };
+    memo.insert(key, v);
+    v
+}
+
 /// #433: a module is tainted when its own source is (`SelfOnly` or worse), or when a
-/// module whose `initialize` body reads host state sits anywhere below it in the import
-/// graph (those bodies re-run at import time in every transitive importer). Taint that is
-/// `SelfOnly` no longer spreads: importers are pinned to the tainted module's artifact
-/// digest by the verified-source stamps and Lake traces, so a content change still
-/// invalidates them without disabling their own reuse up front.
+/// spreading module (an import-time initializer, or an invocable host-reading definer;
+/// review F1/F8) sits anywhere below it in the import graph, its external `.olean`
+/// dependencies' own imports included. Taint that is `SelfOnly` no longer spreads:
+/// importers are pinned to the tainted module's artifact digest by the verified-source
+/// stamps and Lake traces, so a content change still invalidates them without disabling
+/// their own reuse up front.
 pub(super) fn compute_tainted_elab_host_effect_modules(
     cfg: &ProjectConfig,
     dag: &ModuleDag,
 ) -> HashSet<String> {
-    let mut ext_taint_memo: HashMap<PathBuf, HostEffectTaint> = HashMap::new();
+    let mut ext_spread_memo: HashMap<(PathBuf, String), bool> = HashMap::new();
+    let mut ext_olean_memo: HashMap<PathBuf, bool> = HashMap::new();
     let mut tainted: HashSet<String> = HashSet::new();
     let mut spreading: HashSet<String> = HashSet::new();
     for mod_name in &dag.topological_order {
@@ -1770,20 +2128,15 @@ pub(super) fn compute_tainted_elab_host_effect_modules(
             .unwrap_or(HostEffectTaint::SpreadsToImporters);
         let dag_dep_spreads = node.direct_dag_deps.iter().any(|d| spreading.contains(d));
         let ext_dep_spreads = node.external_olean_deps.iter().any(|(_, olean_path)| {
-            ext_taint_memo
-                .entry(olean_path.clone())
-                .or_insert_with(|| {
-                    resolve_source_spec_for_prebuilt_olean(cfg, olean_path)
-                        .map(|spec| {
-                            fs::read_to_string(&spec.src_path)
-                                .map(|s| spec_source_host_effect_taint(cfg, &spec, &s))
-                                .unwrap_or(HostEffectTaint::SpreadsToImporters)
-                        })
-                        // An external `.olean` with no resolvable source never counted as
-                        // tainting its importer (toolchain and unrelated prebuilts).
-                        .unwrap_or(HostEffectTaint::None)
-                })
-                .spreads_to_importers()
+            *ext_olean_memo.entry(olean_path.clone()).or_insert_with(|| {
+                resolve_source_spec_for_prebuilt_olean(cfg, olean_path)
+                    .map(|spec| {
+                        spec_spreads_host_effects_transitively(cfg, &spec, &mut ext_spread_memo)
+                    })
+                    // An external `.olean` with no resolvable source never counted as
+                    // tainting its importer (toolchain and unrelated prebuilts).
+                    .unwrap_or(false)
+            })
         });
         if self_taint.spreads_to_importers() || dag_dep_spreads || ext_dep_spreads {
             spreading.insert(mod_name.clone());
@@ -2321,6 +2674,23 @@ mod host_effect_taint_tests {
     /// (or anything invoking the syntax) elaborates, so the module itself stays tainted
     /// even inside a clean git-pinned dependency.
     const ELAB_BLOCK_HOST_READ_SHAPE: &str = "import Lean\nelab \"dep_env_ty\" : term => do\n  let _rows ← IO.FS.lines \"flag.txt\"\n  return Lean.mkConst ``Nat\n";
+    /// Review F1: a host read behind a command that runs only in this module's build.
+    const RUN_CMD_HELPER_SHAPE: &str =
+        "def loadCfg : IO String := IO.FS.readFile \"cfg\"\nrun_cmd do let _ ← loadCfg\n";
+    /// Review F3: Lean and Mathlib write the attribute on its own line above the
+    /// definition it applies to; the two lines are one declaration.
+    const SPLIT_ATTR_TACTIC_SHAPE: &str = "import Lean\n@[tactic fooTac]\ndef evalFoo : IO Nat := do\n  let _rows ← IO.FS.lines \"x\"\n  return 3\n";
+    /// Review F4: a pure elaborator (no host read) is tainted but stamp-eligible.
+    const PURE_ELAB_SHAPE: &str =
+        "import Lean\nelab \"pure_ty\" : term => return Lean.mkConst ``Nat\n";
+    /// An import-time host read reached through a same-file helper: the `initialize`
+    /// body's block holds no read token itself, the helper's block holds no trigger.
+    const INIT_HELPER_INDIRECTION_SHAPE: &str =
+        "def helper : IO (Option String) := IO.getEnv \"TURBO_TAINT_TEST\"\n\ninitialize x : String ← do\n  let v ← helper\n  pure (v.getD \"\")\n";
+    /// The attribute spelling of an initializer: `@[init helper]` registers `helper` to
+    /// run at import time in every importer, exactly like an `initialize` block.
+    const INIT_ATTR_HELPER_SHAPE: &str =
+        "def helper : IO String := do\n  let v ← IO.getEnv \"TURBO_TAINT_TEST\"\n  pure (v.getD \"\")\n\n@[init helper] opaque x : String\n";
 
     fn temp_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -2387,18 +2757,36 @@ mod host_effect_taint_tests {
         dep_source: &str,
         git_pinned: bool,
     ) -> Result<(PathBuf, ProjectConfig, DiscoveredModuleSpec)> {
+        dep_fixture_with(label, dep_source, git_pinned, &[])
+    }
+
+    /// [`dep_fixture`] with extra committed files inside the dependency package.
+    fn dep_fixture_with(
+        label: &str,
+        dep_source: &str,
+        git_pinned: bool,
+        dep_extra_files: &[(&str, &str)],
+    ) -> Result<(PathBuf, ProjectConfig, DiscoveredModuleSpec)> {
         let dir = temp_dir(label);
         let proj = dir.join("proj");
         let dep_in_pkgs = proj.join(".lake/packages/lintlib");
         fs::create_dir_all(&dep_in_pkgs)?;
         let tc = include_str!("../../../../lean/lean-toolchain");
         fs::write(dep_in_pkgs.join("lean-toolchain"), tc)?;
-        fs::write(dep_in_pkgs.join(".gitignore"), "/.lake/\n")?;
+        fs::write(dep_in_pkgs.join(".gitignore"), "/.lake/\ngen.txt\n")?;
+        fs::write(dep_in_pkgs.join("data.txt"), "pinned data\n")?;
         fs::write(
             dep_in_pkgs.join("lakefile.toml"),
             "name = \"lintlib\"\ndefaultTargets = [\"LintLib\"]\n[[lean_lib]]\nname = \"LintLib\"\n",
         )?;
         fs::write(dep_in_pkgs.join("LintLib.lean"), dep_source)?;
+        for (rel, content) in dep_extra_files {
+            let p = dep_in_pkgs.join(rel);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(p, content)?;
+        }
         let rev = git_init_commit(&dep_in_pkgs)?;
         fs::write(proj.join("lean-toolchain"), tc)?;
         fs::write(
@@ -2496,6 +2884,66 @@ mod host_effect_taint_tests {
         Ok(())
     }
 
+    /// Review F6: a `path` dependency outside the project root (an editable monorepo
+    /// sibling) is still project-owned; ownership comes from the manifest entry type,
+    /// not from where the directory resolves.
+    #[test]
+    fn host_effects_review_r1_sibling_path_dep_is_project_owned() -> Result<()> {
+        let dir = temp_dir("sibling_path");
+        let proj = dir.join("proj");
+        let dep = dir.join("lintlib");
+        fs::create_dir_all(&proj)?;
+        fs::create_dir_all(&dep)?;
+        let tc = include_str!("../../../../lean/lean-toolchain");
+        fs::write(dep.join("lean-toolchain"), tc)?;
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"lintlib\"\ndefaultTargets = [\"LintLib\"]\n[[lean_lib]]\nname = \"LintLib\"\n",
+        )?;
+        fs::write(dep.join("LintLib.lean"), LINTER_SHAPE)?;
+        fs::write(proj.join("lean-toolchain"), tc)?;
+        fs::write(
+            proj.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage proj where\nrequire lintlib from \"../lintlib\"\n@[default_target]\nlean_lib Proj where\n",
+        )?;
+        fs::write(proj.join("Proj.lean"), "import LintLib\ndef p : Nat := 1\n")?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [{
+                    "type": "path",
+                    "name": "lintlib",
+                    "dir": "../lintlib",
+                    "manifestFile": "lake-manifest.json",
+                    "inherited": false,
+                    "configFile": "lakefile.toml"
+                }]
+            }))?,
+        )?;
+        let canon = fs::canonicalize(&proj)?;
+        reset_lake_inputs_tag_memo();
+        let cfg = resolve_project_config(&canon)?;
+        let dep_pkg = cfg
+            .dep_pkgs
+            .iter()
+            .find(|dp| dp.name == "lintlib")
+            .expect("sibling lintlib dependency resolves");
+        let spec = resolve_module_in_package(dep_pkg, false, "LintLib")
+            .expect("LintLib module resolves in sibling lintlib");
+        assert!(
+            spec_artifacts_purgeable_from_project_root(&cfg, &spec),
+            "an editable sibling path dependency stays project-owned (review F6)"
+        );
+        assert!(
+            dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
+            "an editable sibling path dependency's lake targets are project-driven (review F6)"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
     /// #433: a clean git-pinned dependency module that only *defines* host-reading code
     /// (a linter: pure `initialize`, IO in a `def` body) must not be host-effect tainted;
     /// an import-time host read in the same position must stay tainted.
@@ -2519,6 +2967,37 @@ mod host_effect_taint_tests {
         Ok(())
     }
 
+    /// Review F1 + F3: an invocable definer whose body (or one-helper-away body) reads
+    /// host state spreads to importers; a column-0 attribute line counts as its
+    /// definition's trigger; self-run-only commands stay on the module.
+    #[test]
+    fn host_effects_review_r1_definer_taint_classification() -> Result<()> {
+        let (dir, cfg, spec) = pinned_dep_fixture("review_r1_classify", LINTER_SHAPE)?;
+        let taint = |src: &str| spec_source_host_effect_taint(&cfg, &spec, src);
+        assert_eq!(
+            taint(ELAB_BLOCK_HOST_READ_SHAPE),
+            HostEffectTaint::SpreadsToImporters,
+            "an elab definer reading host state runs inside importers (review F1)"
+        );
+        assert_eq!(
+            taint(SPLIT_ATTR_TACTIC_SHAPE),
+            HostEffectTaint::SpreadsToImporters,
+            "@[tactic] on its own line governs the definition below it (review F3)"
+        );
+        assert_eq!(
+            taint(RUN_CMD_HELPER_SHAPE),
+            HostEffectTaint::SelfOnly,
+            "a run_cmd reaching host state through a same-file helper runs only here"
+        );
+        assert_eq!(
+            taint(LINTER_SHAPE),
+            HostEffectTaint::None,
+            "the #433 linter shape stays clean"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
     /// #407: a warm hit runs zero `lake --no-cache` invocations, and the tool logs every
     /// Lake build it runs so a benchmark can assert that. The first freshness pass over a
     /// linter-shaped pinned dependency may Lake-build the missing artifacts (logged,
@@ -2533,7 +3012,9 @@ mod host_effect_taint_tests {
         let proj = fs::canonicalize(dir.join("proj"))?;
         let tc = include_str!("../../../../lean/lean-toolchain").trim().to_string();
         let lake_log = dir.join("lake-cmd.log");
-        std::env::set_var("TURBO_LEAN_LAKE_CMD_LOG", &lake_log);
+        // Review F9: the log path is thread-local in tests, so a concurrently running
+        // test that builds with Lake cannot write into this test's log.
+        TEST_LAKE_CMD_LOG.with(|p| *p.borrow_mut() = Some(lake_log.clone()));
         let run = || -> Result<()> {
             let target = [proj.join("Proj.lean")];
             reset_lake_inputs_tag_memo();
@@ -2561,24 +3042,85 @@ mod host_effect_taint_tests {
             Ok(())
         };
         let res = run();
-        std::env::remove_var("TURBO_LEAN_LAKE_CMD_LOG");
+        TEST_LAKE_CMD_LOG.with(|p| *p.borrow_mut() = None);
         let _ = fs::remove_dir_all(dir);
         res
     }
 
-    /// #438: `purge_elab_host_effect_artifacts_in_closure` must not delete the whole
-    /// import closure. A self-only tainted dependency module (an elaborator body reading
-    /// host state) is purged alone and its importers keep their artifacts; an import-time
-    /// host read still purges the importer cone; a definition-only linter module in a
-    /// clean pinned dependency purges nothing.
+    /// Review F7: an `include_str` target inside a pinned package root but not tracked
+    /// at the pinned rev (generated or gitignored) is not covered by the pin.
+    #[test]
+    fn host_effects_review_r1_untracked_pinned_include_taints() -> Result<()> {
+        let tracked_src = "def d := include_str \"data.txt\"\n";
+        let untracked_src = "def g := include_str \"gen.txt\"\n";
+        let (dir, cfg, spec) = pinned_dep_fixture("untracked_include", tracked_src)?;
+        assert_eq!(
+            spec_source_host_effect_taint(&cfg, &spec, tracked_src),
+            HostEffectTaint::None,
+            "a tracked in-tree include target is covered by the pin"
+        );
+        // A gitignored (generated) file inside the package root: present, invisible to
+        // the clean check, but not fixed by the pinned rev (review F7).
+        fs::write(spec.pkg_root.join("gen.txt"), "generated\n")?;
+        assert_eq!(
+            spec_source_host_effect_taint(&cfg, &spec, untracked_src),
+            HostEffectTaint::SelfOnly,
+            "an untracked include target is not covered by the pin"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// Review F4: stamp eligibility keeps its host-read meaning. A path-dependency
+    /// module with a pure elaborator (no host read) stays stamp-eligible; the taint
+    /// stays on the separate gated check. Host-reading editable sources stay ineligible.
+    #[test]
+    fn host_effects_review_r1_stamp_eligibility_is_host_read_only() -> Result<()> {
+        let (dir, cfg, spec) = dep_fixture("stamp_pure_elab", PURE_ELAB_SHAPE, false)?;
+        assert!(
+            !source_ineligible_for_stamp_reuse(
+                &cfg,
+                &spec.pkg_root,
+                &spec.module_name,
+                &spec.src_path,
+                PURE_ELAB_SHAPE,
+            ),
+            "a pure elaborator must stay stamp-eligible (review F4)"
+        );
+        assert!(
+            spec_source_has_disallowed_elab_host_effects(&cfg, &spec, PURE_ELAB_SHAPE),
+            "the gated taint check still covers the pure elaborator"
+        );
+        assert!(
+            source_ineligible_for_stamp_reuse(
+                &cfg,
+                &spec.pkg_root,
+                &spec.module_name,
+                &spec.src_path,
+                LINTER_SHAPE,
+            ),
+            "an editable module whose source may read host state stays stamp-ineligible"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// #438 / review F1+F5: `purge_elab_host_effect_artifacts_in_closure` must not
+    /// delete artifacts the project does not own, and spreading follows execution. A
+    /// definition-only linter module purges nothing; an elaborator body reading host
+    /// state spreads (importers run it when they elaborate its syntax), so the importer
+    /// cone is purged while a clean pinned dependency's own artifacts are left for its
+    /// workspace; a project-owned path dependency is purged in place.
     #[test]
     fn host_effects_issue_438_purge_keeps_importers_of_self_only_tainted_dep() -> Result<()> {
-        for (label, dep_source, expect_dep_purged, expect_importer_purged) in [
-            ("linter", LINTER_SHAPE, false, false),
-            ("elabread", ELAB_BLOCK_HOST_READ_SHAPE, true, false),
-            ("importtime", IMPORT_TIME_SHAPE, true, true),
+        for (label, dep_source, git_pinned, expect_dep_purged, expect_importer_purged) in [
+            ("linter", LINTER_SHAPE, true, false, false),
+            ("elabread", ELAB_BLOCK_HOST_READ_SHAPE, true, false, true),
+            ("importtime", IMPORT_TIME_SHAPE, true, false, true),
+            ("path_elabread", ELAB_BLOCK_HOST_READ_SHAPE, false, true, true),
         ] {
-            let (dir, cfg, spec) = pinned_dep_fixture(&format!("purge_{label}"), dep_source)?;
+            let (dir, cfg, spec) =
+                dep_fixture(&format!("purge_{label}"), dep_source, git_pinned)?;
             let dep_olean = spec.build_lib_lean_dir.join("LintLib.olean");
             fs::create_dir_all(dep_olean.parent().unwrap())?;
             fs::write(&dep_olean, b"fake dep olean")?;
@@ -2612,6 +3154,8 @@ mod host_effect_taint_tests {
         for (label, linter_src, expect_importer_tainted) in [
             ("defonly", LINTER_SHAPE, false),
             ("importtime", IMPORT_TIME_SHAPE, true),
+            // Review F1: an elaborator that reads host state runs inside importers.
+            ("elabdef", ELAB_BLOCK_HOST_READ_SHAPE, true),
         ] {
             let dir = temp_dir(label);
             let proj = dir.join("proj");
@@ -2645,6 +3189,72 @@ mod host_effect_taint_tests {
             );
             let _ = fs::remove_dir_all(dir);
         }
+        Ok(())
+    }
+
+    /// (w-p1 r1): an `initialize` body that reaches host state only through a same-file
+    /// helper `def` must classify like the direct whole-file co-occurrence result
+    /// (`SpreadsToImporters`), not narrower: the body still re-runs in every importer.
+    #[test]
+    fn host_effects_w_p1_initialize_via_same_file_helper_keeps_whole_file_verdict()
+    -> Result<()> {
+        let (dir, cfg, spec) = pinned_dep_fixture("init_helper", INIT_HELPER_INDIRECTION_SHAPE)?;
+        assert_eq!(
+            spec_source_host_effect_taint(&cfg, &spec, INIT_HELPER_INDIRECTION_SHAPE),
+            spec_source_host_effect_taint(&cfg, &spec, IMPORT_TIME_SHAPE),
+            "same-file helper indirection must take the whole-file verdict IMPORT_TIME_SHAPE gets"
+        );
+        assert_eq!(
+            spec_source_host_effect_taint(&cfg, &spec, INIT_HELPER_INDIRECTION_SHAPE),
+            HostEffectTaint::SpreadsToImporters,
+            "an initialize body reading host state through a same-file helper spreads"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// (w-p1 r1): the `@[init f]` / `@[builtin_init f]` attribute spellings are
+    /// initializer triggers like the `initialize` keyword, so an `@[init helper]` whose
+    /// helper reads host state classifies as the whole-file result (`SpreadsToImporters`).
+    #[test]
+    fn host_effects_w_p1_init_attribute_spelling_is_an_initializer_trigger() -> Result<()> {
+        let (dir, cfg, spec) = pinned_dep_fixture("init_attr", INIT_ATTR_HELPER_SHAPE)?;
+        assert_eq!(
+            spec_source_host_effect_taint(&cfg, &spec, INIT_ATTR_HELPER_SHAPE),
+            spec_source_host_effect_taint(&cfg, &spec, IMPORT_TIME_SHAPE),
+            "`@[init helper]` must take the whole-file verdict IMPORT_TIME_SHAPE gets"
+        );
+        assert_eq!(
+            spec_source_host_effect_taint(&cfg, &spec, INIT_ATTR_HELPER_SHAPE),
+            HostEffectTaint::SpreadsToImporters,
+            "`@[init helper]` with a host-reading same-file helper spreads"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// Review F8: spreading taint in an external dependency travels the dependency's
+    /// own import graph, not just one hop.
+    #[test]
+    fn host_effects_review_r1_ext_dep_spread_is_transitive() -> Result<()> {
+        let (dir, cfg, spec) = dep_fixture_with(
+            "ext_transitive",
+            "import LintLib.A\ndef l : Nat := 0\n",
+            true,
+            &[("LintLib/A.lean", IMPORT_TIME_SHAPE)],
+        )?;
+        let own = fs::read_to_string(&spec.src_path)?;
+        assert_eq!(
+            spec_source_host_effect_taint(&cfg, &spec, &own),
+            HostEffectTaint::None,
+            "LintLib's own source carries no taint"
+        );
+        let mut memo = HashMap::new();
+        assert!(
+            spec_spreads_host_effects_transitively(&cfg, &spec, &mut memo),
+            "a spreading initialize below LintLib must reach it through its own imports (review F8)"
+        );
+        let _ = fs::remove_dir_all(dir);
         Ok(())
     }
 }
