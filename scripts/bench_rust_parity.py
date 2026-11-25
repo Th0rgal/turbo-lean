@@ -19,6 +19,15 @@ CORE = ROOT / 'lean/.lake/build/bin/lean-native-core'
 TURBO = ROOT / 'target/release/turbo-lean'
 ENV = {**os.environ, 'TURBO_LEAN_TELEMETRY': 'off', 'LEAN_NATIVE_CORE_BIN': str(CORE)}
 
+# Calibrate the cost profile for the CPU the benches actually ran on
+# (profiles/arm64_*.json ship for the arm64 leg); `calibrate-cost --target`
+# takes the Lean TargetArch spelling, so aarch64 hosts pass `arm64`.
+HOST_TARGET = 'arm64' if platform.machine().lower() in ('aarch64', 'arm64') else 'x86_64'
+# clang rejects `-march=native` on Apple arm64; `-mcpu=native` is the Darwin spelling.
+NATIVE_TUNE_FLAG = ('-mcpu=native'
+                    if platform.system() == 'Darwin' and platform.machine().lower() in ('aarch64', 'arm64')
+                    else '-march=native')
+
 RUST = r'''
 use std::ffi::c_void;
 extern "C" { fn malloc(n: usize) -> *mut c_void; }
@@ -87,7 +96,7 @@ def build(tmp):
     lib = tmp / 'rust.a'
     run(['rustc', '-C', 'opt-level=3', '-C', 'target-cpu=native', '--crate-type=staticlib', rs, '-o', lib])
     exe = tmp / 'bench'
-    run(['clang', '-O3', '-march=native', '-Wno-override-module', tmp / 'harness.c',
+    run(['clang', '-O3', NATIVE_TUNE_FLAG, '-Wno-override-module', tmp / 'harness.c',
          *sorted(tmp.glob('*.ll')), lib, '-ldl', '-lpthread', '-lm', '-o', exe])
     return exe
 
@@ -141,7 +150,7 @@ def main():
               'lean': run(['lean', '--version']).strip(), 'rows': rows,
               'geomean_ratio': {label: math.exp(statistics.mean(math.log(r[label]['ratio']) for r in rows[:8]))
                                 for label in ['baseline', 'optimized']}}
-    result['calibration'] = json.loads(run([CORE, 'calibrate-cost', '--target', 'x86_64', '--json']))
+    result['calibration'] = json.loads(run([CORE, 'calibrate-cost', '--target', HOST_TARGET, '--json']))
     result['evolution'] = json.loads(run([TURBO, 'superopt-evolve',
                                         '--generations', '2', '--seed', '1', '--input', 'canonical',
                                         '--json', '--no-telemetry']))
