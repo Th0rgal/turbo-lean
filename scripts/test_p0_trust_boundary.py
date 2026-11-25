@@ -37,6 +37,7 @@ import shutil
 import signal
 import time
 import subprocess
+import platform
 import sys
 import tempfile
 import unittest
@@ -73,6 +74,13 @@ def tearDownModule():
 
 
 CORE_BIN = ROOT / "lean" / ".lake" / "build" / "bin" / "lean-native-core"
+
+# The primary CPU `--arch` legs run the host's TargetArch spelling; the opposite
+# CPU arch stays covered by explicit cross-emission legs (the Apple arm64 tests
+# below plus test_04b: an arm64 host cross-emits x86_64 IR and vice versa).
+HOST_ARCH = "arm64" if platform.machine().lower() in ("aarch64", "arm64") else "x86_64"
+CROSS_ARCH = "x86_64" if HOST_ARCH == "arm64" else "arm64"
+CPU_ARCH_TRIPLES = {"x86_64": "x86_64-unknown-linux-gnu", "arm64": "aarch64-unknown-linux-gnu"}
 
 
 def find_clang() -> str:
@@ -129,7 +137,7 @@ class TestP0TrustBoundary(unittest.TestCase):
             self.assertNotEqual(res.returncode, 0, "Corrupt wire inside JSON with canonical moduleName must fail closed")
 
         worker_input = (
-            '{"id":1,"method":"compile-llvm","arch":"x86_64","wire":"not-valid-lnir"}\n'
+            '{"id":1,"method":"compile-llvm","arch":"' + HOST_ARCH + '","wire":"not-valid-lnir"}\n'
             '{"id":2,"method":"batch-fastcheck","wire":"not-valid-lnir"}\n'
             '{"id":3,"method":"compile-llvm","arch":"bogus-arch","canonical_benchmark":true}\n'
             '{"id":4,"method":"exit"}\n'
@@ -205,6 +213,19 @@ class TestP0TrustBoundary(unittest.TestCase):
                 self.assertEqual(out_a.read_bytes()[:8], b"!<arch>\n")
                 self.assertGreater(len(out_a.read_bytes()), 68)
 
+    def test_04b_cross_cpu_arch_emission_is_symmetric(self) -> None:
+        # The primary legs run `--arch HOST_ARCH`; the opposite CPU arch stays
+        # covered as a cross-emission leg (an arm64 host cross-emits x86_64 IR,
+        # an x86_64 host cross-emits arm64 IR).
+        host_ir = subprocess.check_output(
+            [str(CORE_BIN), "compile-llvm", "canonical", "--arch", HOST_ARCH], text=True
+        )
+        cross_ir = subprocess.check_output(
+            [str(CORE_BIN), "compile-llvm", "canonical", "--arch", CROSS_ARCH], text=True
+        )
+        self.assertIn(f'target triple = "{CPU_ARCH_TRIPLES[HOST_ARCH]}"', host_ir)
+        self.assertIn(f'target triple = "{CPU_ARCH_TRIPLES[CROSS_ARCH]}"', cross_ir)
+
     def test_05_wasm32_scalar_default_and_explicit_simd128(self) -> None:
         wasm_scalar = subprocess.check_output(
             [str(CORE_BIN), "compile-llvm", "canonical", "--arch", "wasm32"], text=True
@@ -228,7 +249,7 @@ class TestP0TrustBoundary(unittest.TestCase):
                     "compile-static-lib",
                     "canonical",
                     "--arch",
-                    "x86_64",
+                    HOST_ARCH,
                     "--clang-bin",
                     clang_bin,
                     "-o",
@@ -257,7 +278,7 @@ class TestP0TrustBoundary(unittest.TestCase):
                     "compile-static-lib",
                     "canonical",
                     "--arch",
-                    "x86_64",
+                    HOST_ARCH,
                     "--clang-bin",
                     clang_bin,
                     "--ar-bin",
@@ -287,7 +308,7 @@ class TestP0TrustBoundary(unittest.TestCase):
                     "compile-static-lib",
                     "canonical",
                     "--arch",
-                    "x86_64",
+                    HOST_ARCH,
                     "--clang-bin",
                     clang_bin,
                     "--ar-bin",
