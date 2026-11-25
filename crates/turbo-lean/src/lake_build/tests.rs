@@ -4677,10 +4677,11 @@ public def api := by
     #[test]
     fn standalone_recheck_timeout_is_budgeted_not_hardcoded() {
         use std::time::Duration;
-        // Unset / default keeps the documented 300 s.
+        // Unset / default follows the module budget: trusted runs with no
+        // recorded history default to 1800 s (#437), not the old flat 300 s.
         assert_eq!(
             super::freshness::standalone_lean_timeout_from(None, false),
-            Duration::from_secs(300)
+            Duration::from_secs(1800)
         );
         // The configured budget reaches the standalone re-check sites.
         assert_eq!(

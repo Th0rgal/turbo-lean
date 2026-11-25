@@ -2594,9 +2594,10 @@ pub(super) fn stage_artifact_link(
 }
 
 /// Budgeted timeout for the standalone re-check `lean` invocations (#441):
-/// `TURBO_LEAN_MODULE_TIMEOUT_SECS` (default 300 s, clamped in untrusted
-/// mode), the same budget every other per-module compile honors, instead of
-/// a hard-coded 300 s that killed legitimate long modules after VERIFIED.
+/// `TURBO_LEAN_MODULE_TIMEOUT_SECS` (trusted default 1800 s when no compile
+/// history is recorded, per #437; clamped to [15, 600] in untrusted mode),
+/// the same budget every other per-module compile honors, instead of a
+/// hard-coded 300 s that killed legitimate long modules after VERIFIED.
 pub(super) fn standalone_lean_timeout_from(
     raw_env: Option<&str>,
     is_untrusted: bool,
