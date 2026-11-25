@@ -7131,3 +7131,206 @@ pub(super) fn probe_warm_on_disk_module_candidate(
     Some(actual_olean_digest)
 }
 
+#[cfg(test)]
+mod frozen_cone_tests {
+    use super::*;
+
+    fn env_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, val: &str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, val);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(p) => std::env::set_var(self.key, p),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Re-materialize `build_dir` as a hardlinked pack: move it aside to `cas_dir` (the CAS
+    /// `state.db` stand-in) and hardlink every artifact back, backdated to `artifact_mtime`.
+    /// This is the cone shape `import` + `worktree-dedup` mint (#339): byte-identical artifacts
+    /// whose mtimes predate the freshly stamped checkout sources.
+    fn rematerialize_as_hardlinked_pack(
+        build_dir: &Path,
+        cas_dir: &Path,
+        artifact_mtime: std::time::SystemTime,
+    ) -> Result<()> {
+        fs::rename(build_dir, cas_dir)?;
+        for entry in WalkDir::new(cas_dir) {
+            let entry = entry?;
+            let rel = entry.path().strip_prefix(cas_dir)?;
+            let dst = build_dir.join(rel);
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(&dst)?;
+            } else {
+                fs::hard_link(entry.path(), &dst)?;
+                fs::File::options()
+                    .write(true)
+                    .open(&dst)?
+                    .set_modified(artifact_mtime)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rewrite `path` with identical bytes and stamp it strictly newer than any artifact, the way
+    /// a fresh checkout / `git` operation stamps sources newer than a frozen pack's artifacts.
+    fn restamp_checkout_file(path: &Path) -> Result<()> {
+        let bytes = fs::read(path)?;
+        fs::write(path, &bytes)?;
+        fs::File::options()
+            .write(true)
+            .open(path)?
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_frozen_cone_content_hash_freshness_hardlinked_cone_zero_rebuilds() -> Result<()> {
+        let _env_guard = env_test_guard();
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_lean_frozen_cone_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let proj_dir = dir.join("proj");
+        let dep_dir = proj_dir.join(".lake/packages/dep_pkg");
+        fs::create_dir_all(dep_dir.join("Dep"))?;
+        fs::create_dir_all(proj_dir.join("App"))?;
+        let run = (|| -> Result<()> {
+            for d in [&proj_dir, &dep_dir] {
+                fs::write(d.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+            }
+            fs::write(
+                dep_dir.join("lakefile.toml"),
+                "name = \"dep_pkg\"\ndefaultTargets = [\"Dep\"]\n[[lean_lib]]\nname = \"Dep\"\nglobs = [\"Dep.+\"]\n",
+            )?;
+            fs::write(dep_dir.join("Dep/Base.lean"), "def baseVal : Nat := 7\n")?;
+            fs::write(
+                dep_dir.join("Dep/Value.lean"),
+                "import Dep.Base\ndef depVal : Nat := baseVal\n",
+            )?;
+            fs::write(
+                proj_dir.join("lake-manifest.json"),
+                r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep_pkg", "dir": ".lake/packages/dep_pkg", "configFile": "lakefile.toml", "inherited": false}], "name": "app_pkg", "lakeDir": ".lake", "fixedToolchain": false}"#,
+            )?;
+            fs::write(
+                proj_dir.join("lakefile.toml"),
+                "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+            )?;
+            fs::write(
+                proj_dir.join("App/Use.lean"),
+                "import Dep.Value\ntheorem use_ok : depVal = 7 := rfl\n",
+            )?;
+
+            let mut store = TurboStore::open(Some(&dir.join(".turbo_store")))?;
+            let rep0 = crate::module_builder::build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                &[],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )?;
+            assert_eq!(rep0.modules_compiled, 3);
+            assert!(dep_dir
+                .join(".lake/build/.turbo_verified_sources.json")
+                .is_file());
+
+            // Freeze the dependency cone: hardlink its artifacts out of a CAS stand-in with the
+            // pack's original (old) mtimes, then stamp sources and lakefiles newer, as a fresh
+            // checkout does. Content stays byte-identical throughout.
+            let backdate = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+            rematerialize_as_hardlinked_pack(
+                &dep_dir.join(".lake/build"),
+                &dir.join("cas_pack"),
+                backdate,
+            )?;
+            for rel in [
+                "Dep/Base.lean",
+                "Dep/Value.lean",
+                "lakefile.toml",
+                "lean-toolchain",
+            ] {
+                restamp_checkout_file(&dep_dir.join(rel))?;
+            }
+            for rel in ["lakefile.toml", "lean-toolchain", "lake-manifest.json"] {
+                restamp_checkout_file(&proj_dir.join(rel))?;
+            }
+            // Hand-materialized cones run with worktree auto-linking opted out (#339's flow).
+            let _no_link = ScopedEnvVar::set("TURBO_LEAN_NO_WORKTREE_LINK", "1");
+
+            // Control, the preserved default: raw mtime skew classifies the byte-identical
+            // hardlinked cone stale, so its modules are scheduled for rebuild.
+            reset_lake_inputs_tag_memo();
+            let cfg = resolve_project_config(&proj_dir)?;
+            let dag_mtime = build_module_dag_with_trust(&cfg, &["App.Use".to_string()], false)?;
+            assert!(
+                dag_mtime.nodes.contains_key("Dep.Base")
+                    && dag_mtime.nodes.contains_key("Dep.Value"),
+                "without --frozen-cone, mtime-skewed dep cone modules stay scheduled, got {:?}",
+                dag_mtime.nodes.keys().collect::<Vec<_>>()
+            );
+
+            // `--frozen-cone`: freshness is decided by the verified-sources content hashes
+            // (`src_blake3`, `olean_artifact_digest`, per-edge import pins), so the hardlinked
+            // cone is adopted as external `.olean` deps with zero rebuild nodes.
+            let _frozen = ScopedEnvVar::set("TURBO_LEAN_FROZEN_CONE", "1");
+            reset_lake_inputs_tag_memo();
+            let cfg = resolve_project_config(&proj_dir)?;
+            let dag = build_module_dag_with_trust(&cfg, &["App.Use".to_string()], false)?;
+            assert_eq!(
+                dag.nodes.keys().map(|s| s.as_str()).collect::<Vec<_>>(),
+                vec!["App.Use"],
+                "frozen cone must contribute 0 rebuild nodes"
+            );
+            let use_node = dag.nodes.get("App.Use").unwrap();
+            let mut ext: Vec<&str> = use_node
+                .external_olean_deps
+                .iter()
+                .map(|(m, _)| m.as_str())
+                .collect();
+            ext.sort_unstable();
+            assert_eq!(ext, vec!["Dep.Base", "Dep.Value"]);
+
+            let rep = crate::module_builder::build_project_modules_native(
+                &mut store,
+                &proj_dir,
+                &["App.Use".to_string()],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )?;
+            assert_eq!(
+                rep.modules_compiled, 0,
+                "hardlinked cone with equal content must trigger 0 rebuilds"
+            );
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(&dir);
+        run
+    }
+}
+
