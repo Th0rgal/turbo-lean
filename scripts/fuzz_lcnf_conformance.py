@@ -1040,6 +1040,7 @@ def run_three_way_batch(
         wire_path = tmpdir / "batch.lnir"
         subprocess.run(
             [full_bin, "emit-lnir", "--wire", str(lean_file), "-o", str(wire_path)],
+            env=pinned_toolchain_env(),
             check=True,
             capture_output=True,
             text=True,
@@ -1317,6 +1318,7 @@ def run_alias_batch(
         wire_path = tmpdir / "alias_batch.lnir"
         subprocess.run(
             [full_bin, "emit-lnir", "--wire", "--allow-rc-adt", str(lean_file), "-o", str(wire_path)],
+            env=pinned_toolchain_env(),
             check=True, capture_output=True, text=True,
         )
         tv_out = subprocess.run(

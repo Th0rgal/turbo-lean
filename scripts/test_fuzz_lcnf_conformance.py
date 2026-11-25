@@ -298,5 +298,82 @@ class PinnedToolchainEnv(unittest.TestCase):
         self.assertEqual(env, {"A": "b"})
 
 
+class _EmitLnirReached(Exception):
+    pass
+
+
+class PinnedEnvReachesToolchainSubprocesses(unittest.TestCase):
+    """The pin must reach the actual call sites, not only exist as a helper:
+    `lean-native emit-lnir` on a temp-dir batch file was the measured C1
+    failure (incompatible Init.olean header from the default toolchain)."""
+
+    def test_run_three_way_batch_toolchain_calls_carry_the_pin(self):
+        calls = []
+
+        class _Res:
+            returncode = 0
+            stdout = "[]"
+            stderr = ""
+
+        def fake_run(cmd, **kw):
+            argv = [str(a) for a in cmd]
+            calls.append((argv, kw.get("env")))
+            if any("emit-lnir" in a for a in argv):
+                raise _EmitLnirReached()
+            return _Res()
+
+        programs = [fuzzer.build_program(1)]
+        engines = {
+            "lean_bin": "/fake/lean",
+            "core_bin": "/fake/lean-native-core",
+            "full_bin": "/fake/lean-native",
+            "clang_bin": "/fake/clang",
+            "sanitizer_linker": None,
+        }
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop("TURBO_CONFORMANCE_ASAN", None)
+            os.environ.pop("TURBO_CONFORMANCE_UBSAN", None)
+            with mock.patch.object(fuzzer.subprocess, "run", side_effect=fake_run):
+                with self.assertRaises(_EmitLnirReached):
+                    fuzzer.run_three_way_batch(programs, engines)
+        pin = fuzzer.repo_pinned_toolchain()
+        toolchain_calls = [
+            (argv, env)
+            for argv, env in calls
+            if argv[0] in ("/fake/lean", "/fake/lean-native") or argv[0].endswith("leanc")
+        ]
+        self.assertTrue(toolchain_calls, "no lean/leanc/lean-native subprocess was recorded")
+        emit_calls = [(argv, env) for argv, env in calls if any("emit-lnir" in a for a in argv)]
+        self.assertTrue(emit_calls, "the emit-lnir call site was never reached")
+        for argv, env in toolchain_calls:
+            self.assertIsNotNone(env, f"{argv} ran without an explicit env (pin lost)")
+            self.assertEqual(
+                env.get("ELAN_TOOLCHAIN"), pin, f"{argv} env lacks the repo toolchain pin"
+            )
+
+    def test_test_modules_pin_the_toolchain_at_import(self):
+        import importlib
+
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop("ELAN_TOOLCHAIN", None)
+            import test_scalar_frontend as tsf
+
+            importlib.reload(tsf)
+            self.assertEqual(
+                os.environ.get("ELAN_TOOLCHAIN"),
+                fuzzer.repo_pinned_toolchain(),
+                "importing test_scalar_frontend must pin ELAN_TOOLCHAIN for its subprocesses",
+            )
+            os.environ.pop("ELAN_TOOLCHAIN", None)
+            import test_p0_trust_boundary as tp0
+
+            importlib.reload(tp0)
+            self.assertEqual(
+                os.environ.get("ELAN_TOOLCHAIN"),
+                fuzzer.repo_pinned_toolchain(),
+                "importing test_p0_trust_boundary must pin ELAN_TOOLCHAIN for its subprocesses",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

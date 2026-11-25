@@ -83,7 +83,7 @@ def find_lean_prefix(override_lean: str | None = None) -> Path | None:
             cand_pref = p.resolve().parent.parent
             if not ((cand_pref / "include" / "lean" / "lean.h").is_file() and (cand_pref / "lib" / "lean" / "libleanrt.a").is_file()):
                 # Avoid running `~/.elan/bin/lean` proxy shims that resolve to `.elan` root without `lean.h` / `libleanrt.a`
-                env = dict(os.environ)
+                env = fuzz_san.pinned_toolchain_env()
                 ver = subprocess.run([str(p), "--version"], env=env, check=True, capture_output=True, text=True).stdout
                 if "4.35.0" not in ver:
                     continue
@@ -93,7 +93,7 @@ def find_lean_prefix(override_lean: str | None = None) -> Path | None:
                 if (pref / "include" / "lean" / "lean.h").is_file() and (pref / "lib" / "lean" / "libleanrt.a").is_file():
                     return pref
                 continue
-            env = dict(os.environ)
+            env = fuzz_san.pinned_toolchain_env()
             env["LEAN_SYSROOT"] = str(cand_pref)
             ver = subprocess.run([str(p), "--version"], env=env, check=True, capture_output=True, text=True).stdout
             if "4.35.0" in ver:
