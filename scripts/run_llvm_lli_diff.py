@@ -20,20 +20,21 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_arch  # noqa: E402
+
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
-# Host-CPU `(lean --arch spelling, llvm triple, datalayout)` pairs, mirroring the
+# `(llvm triple, datalayout)` per Lean `TargetArch` spelling, mirroring the
 # Rust-side `builtin_fastcheck_cpu_target` (crates/turbo-lean/src/gpu_fastcheck.rs)
 # and the Lean-side `TargetArch.llvmTriple` / `TargetArch.dataLayout` constants
 # (lean/LeanNative/IR/Types.lean).
-HOST_CPU_TARGETS: dict[str, tuple[str, str, str]] = {
+HOST_CPU_TARGETS: dict[str, tuple[str, str]] = {
     "x86_64": (
-        "x86_64",
         "x86_64-unknown-linux-gnu",
         "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
     ),
-    "aarch64": (
-        "arm64",
+    "arm64": (
         "aarch64-unknown-linux-gnu",
         "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128",
     ),
@@ -41,10 +42,11 @@ HOST_CPU_TARGETS: dict[str, tuple[str, str, str]] = {
 
 
 def host_llvm_cpu_target() -> tuple[str, str, str]:
-    """`(lean --arch spelling, llvm triple, datalayout)` for the host CPU."""
-    machine = platform.machine().lower()
-    key = "aarch64" if machine in ("aarch64", "arm64") else "x86_64"
-    return HOST_CPU_TARGETS[key]
+    """`(lean --arch spelling, llvm triple, datalayout)` for the host CPU.
+    Raises on machines with no native-emission support (see host_arch)."""
+    arch = host_arch.host_target_arch()
+    triple, datalayout = HOST_CPU_TARGETS[arch]
+    return arch, triple, datalayout
 
 
 def find_llvm_tool(names: list[str]) -> str | None:
@@ -160,17 +162,35 @@ entry:
 """
 
 
-def classify_ub_probe(outcomes: list[tuple[int, str]]) -> dict[str, Any]:
-    """Classify repeated UB-probe runs. Trap evidence is a signal (`rc < 0`) or an
-    explicit `ERROR` diagnostic on stderr, on EVERY run. A plain exit status proves
-    nothing: `udiv` by zero is UB, and an interpreter that does not trap (measured on
-    LLVM 15 `lli`: rc 80/96/64/48/128/0 for the same input) returns `@main`'s garbage
-    value as the exit code, so even `rc >= 128` is a coin flip, not a trap."""
+def classify_ub_probe(outcomes: list[tuple[int, str]], machine: str | None = None) -> dict[str, Any]:
+    """Classify repeated UB-probe runs against the HOST's expectation.
+
+    Trap evidence is a signal (`rc < 0`) or an explicit `ERROR` diagnostic on
+    stderr, on EVERY run. On x86_64 a plain exit status proves nothing: the
+    interpreter's native division raises SIGFPE, and anything else is `@main`'s
+    garbage value (measured on LLVM 15 `lli`: rc 80/96/64/48/128/0 for one input),
+    so even `rc >= 128` is a coin flip, not a trap. AArch64 DEFINES integer
+    division by zero as 0, so a release-build `lli` there deterministically exits
+    0 without trapping; that outcome conforms on aarch64 hosts, as does a
+    deterministic trap from an assertions-enabled build."""
+    if machine is None:
+        machine = platform.machine().lower()
     rcs = [rc for rc, _ in outcomes]
     trapped_each = [rc < 0 or "ERROR" in stderr for rc, stderr in outcomes]
+    trapped = bool(trapped_each) and all(trapped_each)
+    deterministic = len(set(rcs)) == 1 and len(set(trapped_each)) == 1
+    if machine in ("aarch64", "arm64"):
+        expectation = "a deterministic trap, or the AArch64-defined zero result, on every run"
+        conforming = deterministic and (trapped or all(rc == 0 for rc in rcs))
+    else:
+        expectation = "a deterministic trap (signal or ERROR diagnostics) on every run"
+        conforming = deterministic and trapped
     return {
-        "trapped": bool(trapped_each) and all(trapped_each),
-        "deterministic": len(set(rcs)) == 1 and len(set(trapped_each)) == 1,
+        "trapped": trapped,
+        "deterministic": deterministic,
+        "conforming": conforming,
+        "expectation": expectation,
+        "machine": machine,
         "returncodes": rcs,
         "stderr": outcomes[-1][1].strip()[:240] if outcomes else "",
     }
@@ -272,15 +292,81 @@ def qualify_lli_engine(lli_bin: str, opt_bin: str) -> dict[str, Any]:
         result["reason"] = f"engine probe failed to execute: {exc}"
         return result
     result["ub_div_zero_probe"] = probe
-    if not probe["trapped"]:
+    if not probe["conforming"]:
         result["reason"] = (
-            "udiv-by-zero probe did not trap deterministically "
-            f"(returncodes={probe['returncodes']}); this interpreter reports a garbage "
-            "exit value for UB, so its pass/fail verdicts are unreliable"
+            f"udiv-by-zero probe did not meet the host expectation ({probe['expectation']}): "
+            f"returncodes={probe['returncodes']}, stderr={probe['stderr'] or '<empty>'}"
         )
         return result
     result["usable"] = True
     return result
+
+
+def sibling_opt_for_lli(lli_bin: str) -> str | None:
+    """The `opt` from the SAME LLVM install as `lli_bin`: same directory, same
+    version suffix (`/usr/lib/llvm-18/bin/lli` -> `.../opt`, `/usr/bin/lli-18`
+    -> `/usr/bin/opt-18`). Mixing installs would let an old `opt` verify modules
+    a newer `lli` runs (or the reverse), so the pair is selected together."""
+    p = Path(lli_bin)
+    if not p.name.startswith("lli"):
+        return None
+    cand = p.with_name("opt" + p.name[len("lli"):])
+    if cand.is_file() and os.access(str(cand), os.X_OK):
+        return str(cand)
+    return None
+
+
+def find_qualified_llvm_engine(
+    lli_override: str | None = None,
+    opt_override: str | None = None,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """One selector for every stage that interprets the emitted IR: the first
+    `lli` that passes `qualify_lli_engine` together with the `opt` of the same
+    LLVM install. Returns `(engine, rejected)`. An override pins the candidate
+    set to exactly that pair, so a named binary that fails qualification comes
+    back as `(None, [its qualification record])` for the caller to FAIL on."""
+    if lli_override or opt_override:
+        lli = lli_override or find_llvm_tool(["lli-18", "lli"])
+        opt = opt_override or (sibling_opt_for_lli(lli) if lli else None) or find_llvm_tool(["opt-18", "opt"])
+        if not lli or not opt:
+            return None, [{
+                "lli_bin": lli,
+                "opt_bin": opt,
+                "usable": False,
+                "reason": "explicit engine selection incomplete: lli or opt not found",
+            }]
+        q = qualify_lli_engine(lli, opt)
+        return (q if q["usable"] else None), [q]
+    rejected: list[dict[str, Any]] = []
+    for lli in iter_llvm_tool_candidates(["lli-18", "lli-19", "lli", "lli-17", "lli-20"]):
+        opt = sibling_opt_for_lli(lli)
+        if not opt:
+            rejected.append({
+                "lli_bin": lli,
+                "opt_bin": None,
+                "usable": False,
+                "reason": "no opt in the same LLVM install (same directory, same version suffix)",
+            })
+            continue
+        q = qualify_lli_engine(lli, opt)
+        if q["usable"]:
+            return q, rejected
+        rejected.append(q)
+    return None, rejected
+
+
+def llvm_strict_tools_default() -> bool:
+    """Missing-engine states FAIL instead of skipping under strict mode: forced
+    by TURBO_LLI_DIFF_STRICT_TOOLS=true/false, and on by default under CI /
+    GITHUB_ACTIONS (the sibling of run_heapobj_abi_sanitizers' require_tsan
+    default): the roadmap job installs llvm-18 on purpose, so a toolchain or
+    PATH regression there must not pass silently."""
+    env = os.environ.get("TURBO_LLI_DIFF_STRICT_TOOLS", "").lower()
+    if env in ("true", "1"):
+        return True
+    if env in ("false", "0"):
+        return False
+    return os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("CI") == "true"
 
 
 def run_suite(core_bin: Path, lli_bin: str, opt_bin: str) -> dict[str, Any]:
@@ -354,7 +440,7 @@ def run_suite(core_bin: Path, lli_bin: str, opt_bin: str) -> dict[str, Any]:
         len(mismatches) == 0
         and len(negative_survivors) == 0
         and len(negative_kills) >= 6
-        and bool(ub_probe["trapped"])
+        and bool(ub_probe["conforming"])
     )
     return {
         "ok": ok,
@@ -391,23 +477,43 @@ class SelfTests(unittest.TestCase):
             self.assertIn(f'target datalayout = "{datalayout}"', ir)
 
     def test_ub_probe_classification_requires_deterministic_trap_evidence(self) -> None:
-        # Measured on LLVM 15 lli: udiv-by-zero returned rc 80/96/64/48/128/0 for one
-        # input, so a bare exit status (even >= 128) must never read as a trap.
-        garbage_flip = classify_ub_probe([(128, ""), (0, "")])
+        # Measured on LLVM 15 lli (x86_64): udiv-by-zero returned rc 80/96/64/48/128/0
+        # for one input, so a bare exit status (even >= 128) must never read as a trap.
+        garbage_flip = classify_ub_probe([(128, ""), (0, "")], machine="x86_64")
         self.assertFalse(garbage_flip["trapped"])
         self.assertFalse(garbage_flip["deterministic"])
-        stable_garbage = classify_ub_probe([(160, ""), (160, "")])
+        self.assertFalse(garbage_flip["conforming"])
+        stable_garbage = classify_ub_probe([(160, ""), (160, "")], machine="x86_64")
         self.assertFalse(stable_garbage["trapped"])
         self.assertTrue(stable_garbage["deterministic"])
-        signal_trap = classify_ub_probe([(-6, ""), (-6, "")])
+        self.assertFalse(stable_garbage["conforming"])
+        signal_trap = classify_ub_probe([(-6, ""), (-6, "")], machine="x86_64")
         self.assertTrue(signal_trap["trapped"])
         self.assertTrue(signal_trap["deterministic"])
+        self.assertTrue(signal_trap["conforming"])
         error_trap = classify_ub_probe(
-            [(70, "LLVM ERROR: divide by zero"), (70, "LLVM ERROR: divide by zero")]
+            [(70, "LLVM ERROR: divide by zero"), (70, "LLVM ERROR: divide by zero")],
+            machine="x86_64",
         )
         self.assertTrue(error_trap["trapped"])
-        one_bad_run = classify_ub_probe([(-6, ""), (0, "")])
+        self.assertTrue(error_trap["conforming"])
+        one_bad_run = classify_ub_probe([(-6, ""), (0, "")], machine="x86_64")
         self.assertFalse(one_bad_run["trapped"])
+        self.assertFalse(one_bad_run["conforming"])
+
+    def test_ub_probe_conformance_is_arch_aware_on_aarch64(self) -> None:
+        # AArch64 defines integer division by zero as 0 (no trap), so a release
+        # lli interpreter deterministically exits 0 there; that engine is usable.
+        defined_zero = classify_ub_probe([(0, ""), (0, "")], machine="aarch64")
+        self.assertFalse(defined_zero["trapped"])
+        self.assertTrue(defined_zero["conforming"])
+        # An assertions-enabled aarch64 lli that aborts is also usable.
+        self.assertTrue(classify_ub_probe([(-6, ""), (-6, "")], machine="aarch64")["conforming"])
+        # Nondeterminism, or a stable value other than the defined zero, is not.
+        self.assertFalse(classify_ub_probe([(0, ""), (128, "")], machine="arm64")["conforming"])
+        self.assertFalse(classify_ub_probe([(64, ""), (64, "")], machine="aarch64")["conforming"])
+        # On x86_64 the division traps, so a deterministic zero exit stays rejected.
+        self.assertFalse(classify_ub_probe([(0, ""), (0, "")], machine="x86_64")["conforming"])
 
 
 def main() -> int:
@@ -433,46 +539,41 @@ def main() -> int:
         print(f"[FAIL] Missing lean-native-core binary at {core_bin}", file=sys.stderr)
         return 1
 
-    opt_bin = args.opt_bin or find_llvm_tool(["opt-18", "opt"])
-    if not opt_bin:
-        print("[FAIL] Missing `opt` / `opt-18` binary (install llvm-18)", file=sys.stderr)
-        return 1
-
-    lli_candidates = [args.lli_bin] if args.lli_bin else list(iter_llvm_tool_candidates(["lli-18", "lli"]))
-    if not lli_candidates:
-        print("[FAIL] Missing `lli` / `lli-18` binary (install llvm-18)", file=sys.stderr)
-        return 1
-
-    qualifications: list[dict[str, Any]] = []
-    engine: dict[str, Any] | None = None
-    for cand in lli_candidates:
-        q = qualify_lli_engine(cand, opt_bin)
-        qualifications.append(q)
-        if q["usable"]:
-            engine = q
-            break
+    engine, rejected = find_qualified_llvm_engine(args.lli_bin, args.opt_bin)
 
     if engine is None:
+        if not rejected:
+            print("[FAIL] Missing `lli` / `lli-18` binary (install llvm-18)", file=sys.stderr)
+            return 1
+        explicit = bool(args.lli_bin or args.opt_bin)
+        strict = llvm_strict_tools_default()
+        hard_fail = explicit or strict
         report = {
-            "status": "skipped_missing_engine",
-            "skipped": True,
+            "status": "failed_missing_engine" if hard_fail else "skipped_missing_engine",
+            "skipped": not hard_fail,
+            "strict": strict,
+            "explicit_engine_args": explicit,
             "reason": (
-                "no installed lli interpreter is usable for the emitted host-arch IR "
-                "(the Lean toolchain does not bundle lli/opt; install llvm >= 18)"
+                "no lli/opt pair (same LLVM install) passed qualification for the emitted "
+                "host-arch IR; the measured per-candidate causes follow (the Lean toolchain "
+                "does not bundle lli/opt; the CI jobs install llvm-18)"
             ),
-            "candidates": qualifications,
+            "candidates": rejected,
         }
         if args.json_out:
             Path(args.json_out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-        print("[stage2a-lli-diff] SKIPPED (missing engine): " + report["reason"])
-        for q in qualifications:
-            print(
-                f"  candidate lli={q['lli_bin']} ({q['lli_version'] or 'version unknown'}): {q['reason']}"
-            )
-        return 0
+        head = "FAILED" if hard_fail else "SKIPPED"
+        why = (
+            " for explicitly named engine args" if explicit
+            else (" under strict mode" if strict else "")
+        )
+        print(f"[stage2a-lli-diff] {head} (missing engine{why}): " + report["reason"])
+        for q in rejected:
+            ver = q.get("lli_version") or "version unknown"
+            print(f"  candidate lli={q.get('lli_bin')} opt={q.get('opt_bin')} ({ver}): {q.get('reason')}")
+        return 1 if hard_fail else 0
 
-    lli_bin = engine["lli_bin"]
-    report = run_suite(core_bin, lli_bin, opt_bin)
+    report = run_suite(core_bin, engine["lli_bin"], engine["opt_bin"])
     report["engine_qualification"] = engine
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -481,7 +582,7 @@ def main() -> int:
         f"[stage2a-lli-diff] ok={report['ok']} cases={report['cases_checked']} "
         f"vectors={report['vectors_checked']} mismatches={len(report['mismatches'])} "
         f"neg_mutants_killed={report['negative_mutants_killed']} "
-        f"ub_probe_trapped={report['ub_div_zero_probe']['trapped']}"
+        f"ub_probe_conforming={report['ub_div_zero_probe']['conforming']}"
     )
     if not report["ok"]:
         print(json.dumps(report, indent=2), file=sys.stderr)
