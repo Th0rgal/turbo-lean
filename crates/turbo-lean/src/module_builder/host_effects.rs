@@ -61,11 +61,30 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
     for spec in postorder {
         let key = (spec.pkg_root.clone(), spec.module_name.clone());
         let purgeable = spec_artifacts_purgeable_from_project_root(cfg, &spec);
+        // A refusal must never become a silent skip: the seeds asked for a refresh that
+        // needs these stale artifacts gone. A clean git-pinned dependency is the one
+        // by-design exception (#438/#434): the pin covers its artifacts, so nothing of
+        // its own is stale and its importers are handled through spreading. Every other
+        // refusal fails closed, deleting nothing and naming the reason.
+        let refuse_purge = |spec: &DiscoveredModuleSpec| -> Result<()> {
+            if is_git_pinned_manifest_package(cfg, spec) {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "Failed to purge stale build artifact(s) of {} ({}): the package is not \
+                 purgeable from this project root (a shared or foreign checkout), and \
+                 continuing with stale host-effect artifacts would be unsound",
+                spec.module_name,
+                spec.pkg_root.display()
+            )
+        };
         let Ok(src_raw) = fs::read_to_string(&spec.src_path) else {
             spreading.insert(key);
             if purgeable {
                 crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
                 purged_any = true;
+            } else {
+                refuse_purge(&spec)?;
             }
             continue;
         };
@@ -89,10 +108,16 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
             if purgeable {
                 crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
                 purged_any = true;
+            } else {
+                refuse_purge(&spec)?;
             }
-        } else if taint.is_tainted() && purgeable {
-            crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
-            purged_any = true;
+        } else if taint.is_tainted() {
+            if purgeable {
+                crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
+                purged_any = true;
+            } else {
+                refuse_purge(&spec)?;
+            }
         }
     }
     Ok(purged_any)
@@ -668,21 +693,53 @@ pub(crate) fn spec_artifacts_purgeable_from_project_root(
     if spec.is_root_pkg {
         return true;
     }
-    manifest_entry_is_path_dep(cfg, &spec.pkg_name, &spec.pkg_base_name, &spec.pkg_root)
-        && !pkg_root_inside_foreign_lake_packages(cfg, &spec.pkg_root)
+    pkg_root_owned_by_project(cfg, &spec.pkg_name, &spec.pkg_base_name, &spec.pkg_root)
 }
 
 /// #434: dependency-package `lake build` targets are driven from the dependency's own
-/// workspace unless the project owns the package (a `path` manifest entry outside any
-/// other package's `.lake/packages`; review F6); the fallback after a successful check
-/// used to run uncapped `lake build` on every input-bearing dependency target, Mathlib
-/// included.
+/// workspace unless the project owns the package (review F6); the fallback after a
+/// successful check used to run uncapped `lake build` on every input-bearing dependency
+/// target, Mathlib included.
 pub(crate) fn dep_pkg_lake_targets_owned_by_project(
     cfg: &ProjectConfig,
     dp: &PackageConfig,
 ) -> bool {
-    manifest_entry_is_path_dep(cfg, &dp.name, pkg_target_base_name(dp), &dp.pkg_root)
-        && !pkg_root_inside_foreign_lake_packages(cfg, &dp.pkg_root)
+    pkg_root_owned_by_project(cfg, &dp.name, pkg_target_base_name(dp), &dp.pkg_root)
+}
+
+/// Project ownership of a dependency package root:
+///
+/// * a clean git-pinned package (a manifest `git` entry, clean at its rev) is never
+///   project-owned: its own workspace refreshes it from the pin (#434);
+/// * a root inside another package's `.lake/packages` is a nested checkout, never ours;
+/// * a `path` manifest entry is editable project state wherever its directory resolves
+///   (review F6's editable `../sibling`);
+/// * otherwise (no matching manifest entry — a hand-built or synthesized package — or a
+///   git entry whose checkout is not clean at its pin) ownership falls back to
+///   location: a canonical root inside the project root is ours, and a symlinked
+///   shared checkout canonicalizes outside the root and stays refused.
+fn pkg_root_owned_by_project(
+    cfg: &ProjectConfig,
+    pkg_name: &str,
+    pkg_base_name: &str,
+    pkg_root: &Path,
+) -> bool {
+    if is_clean_git_pinned_pkg(cfg, false, pkg_name, pkg_base_name, pkg_root) {
+        return false;
+    }
+    if pkg_root_inside_foreign_lake_packages(cfg, pkg_root) {
+        return false;
+    }
+    if manifest_entry_is_path_dep(cfg, pkg_name, pkg_base_name, pkg_root) {
+        return true;
+    }
+    match (
+        fs::canonicalize(pkg_root),
+        fs::canonicalize(&cfg.root_pkg.pkg_root),
+    ) {
+        (Ok(pkg), Ok(root)) => pkg.starts_with(&root),
+        _ => false,
+    }
 }
 
 fn manifest_entry_is_path_dep(
