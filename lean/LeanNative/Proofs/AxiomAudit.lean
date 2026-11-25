@@ -52,6 +52,7 @@ import LeanNative.Proofs.CostAutotuneSoundness
 import LeanNative.Proofs.SliceBridgeStandaloneProofs
 import LeanNative.Proofs.TargetIRFuzzProofs
 import LeanNative.Proofs.LedgerEmbedded32Proofs
+import TurboLean.PolicyGates
 
 namespace LeanNative.Proofs
 
@@ -822,9 +823,12 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.LedgerEmbedded32.execFn_modOfFnForTarget_eq
   , ``LeanNative.Proofs.LedgerEmbedded32.lowerModuleForTarget_sound
   , ``LeanNative.Proofs.LedgerEmbedded32.ledgerBip32Varint_e2e_nonvacuous
+  , ``TurboLean.PolicyGates.specAuditWitnessReplay_eq_gate
+  , ``TurboLean.PolicyGates.specAuditWitnessReplay_sound_pos
+  , ``TurboLean.PolicyGates.specAuditWitnessReplay_sound_neg
   ]
 
-#guard auditedTheoremNames.length == 863
+#guard auditedTheoremNames.length == 866
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/
