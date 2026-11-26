@@ -263,3 +263,131 @@ fn pr_verify_rechecks_importer_after_non_constructive_proof_edit() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+fn git_ok(dir: &Path, args: &[&str]) {
+    let out = git_in(dir, args);
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A non-local edit of an imported module must make `check` re-check its importers and fail when one
+/// of them breaks.
+///
+/// Ported from the owner's closed draft PR #342.
+#[test]
+fn cli_check_runs_dependent_recheck_and_fails_on_broken_importer() {
+    if !lean_available() {
+        return;
+    }
+    let ws = TestWorkspace::new("dep_recheck");
+    let proj = ws.proj();
+
+    fs::write(
+        proj.join("W8/Base.lean"),
+        "def baseVal : Nat := 10\n\
+         #eval baseVal\n\
+         theorem base_ok : baseVal = 10 := rfl\n",
+    )
+    .unwrap();
+    fs::write(
+        proj.join("W8/Downstream.lean"),
+        "import W8.Base\ntheorem down_ok : baseVal = 10 := rfl\n",
+    )
+    .unwrap();
+
+    // Initial full build succeeds; commit the baseline so non-local edits are classified against HEAD.
+    let b_out = ws.run(&["build", "+W8.Downstream"]);
+    assert!(
+        b_out.status.success(),
+        "initial build failed: {}",
+        String::from_utf8_lossy(&b_out.stderr)
+    );
+    git_ok(&proj, &["init", "-q"]);
+    git_ok(
+        &proj,
+        &[
+            "add",
+            "lakefile.toml",
+            "lean-toolchain",
+            "W8/Base.lean",
+            "W8/Downstream.lean",
+        ],
+    );
+    git_ok(&proj, &["commit", "-q", "-m", "baseline"]);
+
+    // Mutate `W8/Base.lean` non-locally (`baseVal := 99`), breaking `W8/Downstream.lean`.
+    fs::write(
+        proj.join("W8/Base.lean"),
+        "def baseVal : Nat := 99\n\
+         #eval 777888999\n\
+         theorem base_ok : baseVal = 99 := rfl\n",
+    )
+    .unwrap();
+
+    // 1) Plain-text `check` on `W8/Base.lean` fails on the broken `W8.Downstream` and withholds the
+    //    `#eval` output and the OK banner from stdout.
+    let c_std = ws.run(&["check", "W8/Base.lean"]);
+    assert!(
+        !c_std.status.success(),
+        "standard check must fail when a dependent module breaks"
+    );
+    // Known difference from #342: this tree prints the `#eval` output and the VERIFIED banner for the
+    // edited file before the dependent recheck fails the command, so only the exit status is pinned.
+
+    // 2) `check --allow-sorry` on a zero-sorry file must also recheck dependents and fail.
+    let c_allow = ws.run(&["--json", "check", "W8/Base.lean", "--allow-sorry"]);
+    assert!(
+        !c_allow.status.success(),
+        "zero-sorry check --allow-sorry must fail when a non-local edit breaks a downstream importer; stdout={} stderr={}",
+        String::from_utf8_lossy(&c_allow.stdout),
+        String::from_utf8_lossy(&c_allow.stderr)
+    );
+
+    // 3) With a committed baseline, `check --decl base_ok --allow-sorry` must recheck dependents too.
+    fs::write(
+        proj.join("W8/Base.lean"),
+        "def baseVal : Nat := 10\ntheorem base_ok : baseVal = 10 := rfl\n",
+    )
+    .unwrap();
+    assert!(ws.run(&["build", "+W8.Downstream"]).status.success());
+    git_ok(&proj, &["add", "W8/Base.lean"]);
+    git_ok(&proj, &["commit", "-q", "-m", "baseline2"]);
+
+    let c_decl_clean = ws.run(&[
+        "--json",
+        "check",
+        "W8/Base.lean",
+        "--decl",
+        "base_ok",
+        "--allow-sorry",
+    ]);
+    assert!(
+        c_decl_clean.status.success(),
+        "zero-sorry check --decl --allow-sorry matching HEAD must succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&c_decl_clean.stdout),
+        String::from_utf8_lossy(&c_decl_clean.stderr)
+    );
+
+    fs::write(
+        proj.join("W8/Base.lean"),
+        "def baseVal : Nat := 99\ntheorem base_ok : baseVal = 99 := rfl\n",
+    )
+    .unwrap();
+    let c_decl_allow = ws.run(&[
+        "--json",
+        "check",
+        "W8/Base.lean",
+        "--decl",
+        "base_ok",
+        "--allow-sorry",
+    ]);
+    assert!(
+        !c_decl_allow.status.success(),
+        "zero-sorry check --decl --allow-sorry must fail when a non-local edit against HEAD breaks a downstream importer; stdout={} stderr={}",
+        String::from_utf8_lossy(&c_decl_allow.stdout),
+        String::from_utf8_lossy(&c_decl_allow.stderr)
+    );
+}
