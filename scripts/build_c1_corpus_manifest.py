@@ -165,6 +165,25 @@ _EMPHASIS = {name: re.compile(pat) for name, pat, _q in EMPHASIS_SPEC}
 TARGET_STATUS = {cid: status for cid, status, _p in TARGET_CONSTRUCT_SPEC}
 
 
+def detector_digest() -> str:
+    """F3 (round 2): sha256 over everything that shapes candidate enumeration
+    and selection (both spec tuples, the size bound, the import-free rule,
+    the pile set). Recorded in the manifest and re-checked by the
+    manifest-only gate, so a detector edit without `--write` fails the PR
+    gate instead of only failing at nightly runtime."""
+    payload = json.dumps(
+        {
+            "targetConstructSpec": [list(row) for row in TARGET_CONSTRUCT_SPEC],
+            "emphasisSpec": [list(row) for row in EMPHASIS_SPEC],
+            "maxProgramBytes": MAX_PROGRAM_BYTES,
+            "importRe": _IMPORT_RE.pattern,
+            "corpusPiles": list(CORPUS_PILES),
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def matrix_constructs(text: str) -> list[str]:
     hits = []
     for cid, _status, _pat in TARGET_CONSTRUCT_SPEC:
@@ -283,6 +302,7 @@ def build_manifest(
     }
     return {
         "schemaVersion": SCHEMA_VERSION,
+        "detectorDigest": detector_digest(),
         "pin": {
             "repoUrl": C1_UPSTREAM_REPO_URL,
             "rev": C1_UPSTREAM_REV,
@@ -328,6 +348,11 @@ def verify_manifest(
 
     if manifest.get("schemaVersion") != SCHEMA_VERSION:
         reasons.append(f"schemaVersion != {SCHEMA_VERSION!r}")
+    if manifest.get("detectorDigest") != detector_digest():
+        reasons.append(
+            "detectorDigest does not match the current detector set (TARGET_CONSTRUCT_SPEC, "
+            "EMPHASIS_SPEC, MAX_PROGRAM_BYTES, import-free rule, CORPUS_PILES); regenerate with --write"
+        )
     pin = manifest.get("pin", {})
     for key, want in (
         ("repoUrl", C1_UPSTREAM_REPO_URL),
@@ -383,10 +408,14 @@ def verify_manifest(
         except (FileNotFoundError, OSError) as err:
             reasons.append(f"cannot measure emphasis availability at the pin: {err}")
 
-    for name, _pat, _q in EMPHASIS_SPEC:
+    for name, pat, _q in EMPHASIS_SPEC:
         rec = manifest.get("emphasis", {}).get(name, {})
         actual = sum(1 for p in programs if name in p.get("emphasis", []))
-        if rec.get("count") != actual:
+        if rec.get("pattern") != pat:
+            # F3 (round 2): the recorded pattern is compared with the spec, so
+            # a stale manifest cannot ride its own recorded detector text.
+            reasons.append(f"emphasis {name!r}: recorded pattern differs from EMPHASIS_SPEC")
+        elif rec.get("count") != actual:
             reasons.append(f"emphasis {name!r}: recorded count {rec.get('count')} != rows {actual}")
         elif available is not None:
             # R6: the floor is measured, never trusted from the manifest.
@@ -547,6 +576,23 @@ class C1CorpusManifestSelfTest(unittest.TestCase):
             red = verify_manifest(mp, corpus_root=root, expect_program_count=n)
             self.assertFalse(red["ok"])
             self.assertTrue(any("sha256" in r for r in red["reasons"]), red["reasons"])
+
+            # F3 (round 2): a detector edit without --write must fail the
+            # manifest-only gate through the recorded detectorDigest...
+            bad_digest = json.loads(json.dumps(manifest))
+            bad_digest["detectorDigest"] = "0" * 64
+            mp.write_text(json.dumps(bad_digest), encoding="utf-8")
+            red3 = verify_manifest(mp, expect_program_count=n)
+            self.assertFalse(red3["ok"])
+            self.assertTrue(any("detectorDigest" in r for r in red3["reasons"]), red3["reasons"])
+
+            # ...and through the per-emphasis recorded pattern vs EMPHASIS_SPEC.
+            bad_pat = json.loads(json.dumps(manifest))
+            bad_pat["emphasis"]["closures"]["pattern"] = r"\bfun\b"
+            mp.write_text(json.dumps(bad_pat), encoding="utf-8")
+            red4 = verify_manifest(mp, expect_program_count=n)
+            self.assertFalse(red4["ok"])
+            self.assertTrue(any("pattern" in r for r in red4["reasons"]), red4["reasons"])
 
             bad_cov = json.loads(json.dumps(manifest))
             for row in bad_cov["programs"]:

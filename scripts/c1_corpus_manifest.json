@@ -1,5 +1,6 @@
 {
   "categoriesNote": "matrixConstructs/emphasis are syntactic selection markers (regexes over program source), chosen to exercise the lowered_unproved and rejected rows of the LCNF coverage matrix; they are not executed-lowering measurements. The executed classification is recorded per program by run_conformance_suite.py --tier C1.",
+  "detectorDigest": "1460234bd94b8d035888c4a027700e1d1918b5c9bd090563f2bc36527df617e8",
   "emphasis": {
     "array_bytearray_sharing": {
       "count": 67,

@@ -59,7 +59,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .turbo-cache/c1-upstream
-          key: ${{ runner.os }}-${{ runner.arch }}-c1-upstream-lean4-eb6cafb7290e8bd5f2937522d8d804f58f02bafc-v1
+          key: ${{ runner.os }}-${{ runner.arch }}-c1-upstream-lean4-eb6cafb7290e8bd5f2937522d8d804f58f02bafc-piles-tests-compile+tests-elab-v1
 
       - name: Setup Lean 4 toolchain
         run: |

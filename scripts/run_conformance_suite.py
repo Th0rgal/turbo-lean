@@ -1024,8 +1024,12 @@ def ensure_c1_upstream_corpus() -> dict[str, Any]:
         "tag": c1_corpus.C1_UPSTREAM_TAG,
         "path": str(dep_dir),
     }
+    # F2 (round 2): the stamp records the pile set beside the rev, so a
+    # CORPUS_PILES change re-provisions a warm sparse cache instead of
+    # leaving it stuck without the new pile.
+    want_stamp = rev + "\n" + ",".join(c1_corpus.CORPUS_PILES) + "\n"
     try:
-        if not (stamp.is_file() and stamp.read_text(encoding="utf-8").strip() == rev):
+        if not (stamp.is_file() and stamp.read_text(encoding="utf-8") == want_stamp):
             dep_dir.mkdir(parents=True, exist_ok=True)
             if not (dep_dir / ".git").is_dir():
                 subprocess.run(["git", "init", "-q", str(dep_dir)], check=True, capture_output=True,
@@ -1047,8 +1051,17 @@ def ensure_c1_upstream_corpus() -> dict[str, Any]:
                                   check=True, capture_output=True, text=True, errors="replace").stdout.strip()
             if head != rev:
                 return {**base, "ok": False, "reason": f"checkout is at {head!r}, expected the pinned rev"}
-            stamp.write_text(rev + "\n", encoding="utf-8")
+            stamp.write_text(want_stamp, encoding="utf-8")
         missing_piles = [pile for pile in c1_corpus.CORPUS_PILES if not (dep_dir / pile).is_dir()]
+        if missing_piles:
+            # F2 (round 2): a stamped cache can still lack a pile (an older
+            # sparse cone, a partial cache restore); re-running the sparse
+            # checkout is cheap and self-heals it instead of failing.
+            subprocess.run(["git", "-C", str(dep_dir), "sparse-checkout", "set", *c1_corpus.CORPUS_PILES],
+                           check=True, capture_output=True, text=True, errors="replace")
+            subprocess.run(["git", "-C", str(dep_dir), "checkout", "-q", "--detach", rev],
+                           check=True, capture_output=True, text=True, errors="replace")
+            missing_piles = [pile for pile in c1_corpus.CORPUS_PILES if not (dep_dir / pile).is_dir()]
         if missing_piles:
             return {**base, "ok": False, "reason": f"corpus piles missing at the pin: {missing_piles}"}
         return {**base, "ok": True}
@@ -1076,17 +1089,40 @@ C1_UPSTREAM_REJECTION_MARKERS: tuple[str, ...] = (
     "[lean-native] Failed to extract any LCNF declarations",
     "[lean-native] Module contains no Stage 1B scalar functions",
 )
+# F1 (round 2): fatal shapes that DISQUALIFY a refusal classification even
+# when a refusal marker is also present (Lean can print a panic and keep
+# running, so a fatal line can sit beside per-declaration refusal notes).
+# Spellings read at their sources: "[lean-native] internal bridge error"
+# (lean/LeanNative/IR/RealLCNFBridge.lean:526), "Elaboration failed for"
+# (lean/LeanNative/Driver/BuildExe.lean:99, EvalLCNFCLI.lean:739), and from
+# the pinned lean4 checkout: "PANIC at " (src/Init/Util.lean:51),
+# "INTERNAL PANIC" (src/runtime/object.cpp:93), "uncaught exception: "
+# (src/runtime/io.cpp:66).
+C1_UPSTREAM_FATAL_MARKERS: tuple[str, ...] = (
+    "[lean-native] internal bridge error",
+    "Elaboration failed for",
+    "PANIC at ",
+    "INTERNAL PANIC",
+    "uncaught exception: ",
+)
 # R1: authored scalar-subset canary, manifest-external; the opt-in leg is ok
 # only when the frontend lowers it end to end.
 C1_UPSTREAM_CANARY = ROOT / "scripts" / "fixtures" / "c1_upstream_canary.lean"
 
 
-def classify_c1_upstream_rejection(returncode: int, stderr: str) -> str:
-    """R1: a nonzero `emit-lnir` exit counts as rejected_fail_closed only when
-    stderr carries a deliberate refusal diagnostic; every other nonzero shape
-    (negative returncode = signal death, usage errors, elaboration errors,
-    internal bridge errors) is frontend_error, and any frontend_error makes
-    the leg not ok."""
+def classify_c1_upstream_rejection(returncode: int, stderr: str, stdout: str = "") -> str:
+    """R1 + round-2 F1: a nonzero `emit-lnir` exit counts as
+    rejected_fail_closed only when stderr carries a deliberate refusal
+    diagnostic AND no fatal shape appears in stderr or stdout. A negative
+    returncode, or one >= 128 (a shell-encoded signal death), is
+    frontend_error whatever the output says; so are usage, elaboration,
+    panic and internal-bridge shapes. Any frontend_error makes the leg not
+    ok."""
+    if returncode < 0 or returncode >= 128:
+        return "frontend_error"
+    combined = f"{stderr}\n{stdout}"
+    if any(marker in combined for marker in C1_UPSTREAM_FATAL_MARKERS):
+        return "frontend_error"
     if returncode > 0 and any(marker in stderr for marker in C1_UPSTREAM_REJECTION_MARKERS):
         return "rejected_fail_closed"
     return "frontend_error"
@@ -1116,6 +1152,25 @@ def run_c1_upstream_corpus(enabled: bool) -> dict[str, Any]:
                 "upstream corpus leg opts in via --c1-upstream / TURBO_C1_UPSTREAM=1; it "
                 "provisions the pinned leanprover/lean4 checkout into TURBO_LEAN_HOME/c1-upstream "
                 "(one network fetch per cold cache) and fails closed on a missing dependency"
+            ),
+        }
+    # R2, relocated here by F5 (round 2): the corpus pin consistency check
+    # lives in the opted-in leg, not suite startup, so a lean/lean-toolchain
+    # bump cannot break tiers that never run this corpus. The leg still fails
+    # closed, before any provisioning, with a named status.
+    repo_pin = fuzz.repo_pinned_toolchain()
+    if c1_corpus.C1_UPSTREAM_TOOLCHAIN != repo_pin:
+        return {
+            "executed": False,
+            "optedIn": True,
+            "ok": False,
+            "status": "failed_toolchain_pin_mismatch",
+            "manifestToolchain": c1_corpus.C1_UPSTREAM_TOOLCHAIN,
+            "repoToolchain": repo_pin,
+            "reason": (
+                "scripts/build_c1_corpus_manifest.py C1_UPSTREAM_TOOLCHAIN must equal "
+                "lean/lean-toolchain; update the corpus pin (repoUrl/rev/tag/toolchain) "
+                "and regenerate scripts/c1_corpus_manifest.json together"
             ),
         }
     prov = ensure_c1_upstream_corpus()
@@ -1159,7 +1214,7 @@ def run_c1_upstream_corpus(enabled: bool) -> dict[str, Any]:
             return {"path": prog["path"], "outcome": "infrastructure_timeout",
                     "skippedReason": f"emit-lnir exceeded {C1_UPSTREAM_PROGRAM_TIMEOUT_S}s"}
         if res.returncode != 0:
-            if classify_c1_upstream_rejection(res.returncode, res.stderr or "") != "rejected_fail_closed":
+            if classify_c1_upstream_rejection(res.returncode, res.stderr or "", res.stdout or "") != "rejected_fail_closed":
                 return {
                     "path": prog["path"],
                     "outcome": "frontend_error",
@@ -1349,16 +1404,9 @@ def assert_toolchain_pins_consistent() -> None:
             "PINNED_CON_LECHE_TOOLCHAIN, PINNED_CON_LECHE_REV and the C2 package "
             "fixtures together."
         )
-    # R2: the C1 upstream manifest module must pin the same toolchain the
-    # repo pins, or corpus programs elaborate under a toolchain the suite's
-    # engines were not built with.
-    if c1_corpus.C1_UPSTREAM_TOOLCHAIN != repo_pin:
-        raise SystemExit(
-            f"Toolchain pin mismatch: scripts/build_c1_corpus_manifest.py pins "
-            f"C1_UPSTREAM_TOOLCHAIN {c1_corpus.C1_UPSTREAM_TOOLCHAIN!r} but lean/lean-toolchain "
-            f"pins {repo_pin!r}. Update the C1 upstream corpus pin (repoUrl/rev/tag/toolchain) "
-            "and regenerate scripts/c1_corpus_manifest.json together."
-        )
+    # The R2 check on c1_corpus.C1_UPSTREAM_TOOLCHAIN moved into the opted-in
+    # upstream leg (F5, round 2): a repo toolchain bump must not break tiers
+    # that never run that corpus.
 
 
 def main() -> int:
