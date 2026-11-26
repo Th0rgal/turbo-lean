@@ -28,39 +28,88 @@ L2/L3 contracts extend toward `lowerRealLCNFDecl_soundF` / `lowerRealLCNFDecl_so
 an executable `#guard` catches it (`Tests/*.lean`, this file). H1.4 MEASURES that claim
 instead of asserting it.
 
-### Methodology (`scripts/proof_mutant_matrix.py`)
+### Methodology (`scripts/proof_mutant_matrix.py`, harness r1)
 
 Each mutant is one small semantic edit at a mechanically enumerated site in
 `IR/RealLCNFBridge.lean` (the lowering) or `IR/RealLCNFShared.lean` (the helpers the
 lowering shares with the independent semantics — the differential's shared trusted
 component). 31 explicit operators over the brief's six classes: operand swap, constant
 off-by-one, branch-condition flip, dropped statement, wrong constructor/tag, swapped
-arguments; 60 sites at the pinned file sha256s (the harness fails closed on drift, the
-same honesty rule as `scripts/lcnf_coverage_results.json`). Mutations apply only in a
-throwaway `git worktree` under `.h14-mutants/`, seeded from the local `lean/.lake` cache,
-with a pristine `build` snapshot restored before every mutant; the committed originals are
-never touched. The kill signal is a failed `lake build LeanNative` of the proofs/Tests
-closure; a mutant whose own module fails to elaborate is NOT_APPLICABLE (stillborn), and
-infrastructure signatures are INFRA (unmeasured), never kills. The harness `--self-test`
-drives planted always-survives / always-killed / stillborn / infra controls through the
-real classifier; CI (`.github/workflows/nightly-conformance.yml`, job
-`proof-mutant-sample`) runs that self-test plus a pinned KILLED subset nightly; the full
-matrix runs behind `--full`.
+arguments; 60 sites at the pinned file sha256s (the harness fails closed on drift and on a
+working tree that differs from the measured commit — the same honesty rule as
+`scripts/lcnf_coverage_results.json`). Mutations apply only in a throwaway `git worktree`
+under `.h14-mutants/`, seeded from the local `lean/.lake` cache, with a pristine `build`
+snapshot restored before every mutant; the committed originals are never touched. The kill
+signal is a failed `lake build LeanNative` of the proofs/Tests closure; a mutant whose own
+module fails to elaborate is NOT_APPLICABLE (stillborn); a build timeout is TIMEOUT and an
+OOM / infrastructure failure is INFRA — all three are unmeasured, never kills. Builds run
+in their own process group (SIGKILLed whole on timeout), each scratch gets a private
+TMPDIR, infra signatures are only consulted on failed builds, every finished mutant is
+checkpointed to a progress JSONL (resumable), and a harness exception is an ERROR row.
+The harness `--self-test` drives planted always-survives / always-killed / stillborn /
+timeout / OOM controls through the real two-stage `run_one`; CI
+(`.github/workflows/nightly-conformance.yml`, job `proof-mutant-sample`) runs that
+self-test plus a pinned KILLED subset nightly; the full matrix runs behind `--full`.
 
-### The matrix (full table: `scripts/proof_mutant_matrix_results.json`)
+### Measurement record, including what the pre-r1 harness got wrong
 
-Measured at commit d1c2254d (pass 1, BEFORE this file's guards existed), 60 valid mutants,
-0 stillborn, 0 infra: 58 KILLED / 2 SURVIVED. Kills attribute to both designed signals —
-theorem modules (`Proofs.RealLCNFBridge.{Scalar, JpTag, StepMono, StateInv, UnaryCast,
-CtorIntrinsic, CtorScalarCall, LetValue}`) and executable guards
-(`Tests.{HeapObjContract, EvalLCNFCLITests, ProofRetentionTests, HeapObj5b}`). By
-category: operand-swap 6/6, swapped-args 2/2, const-offby1 7/7, wrong-ctor-tag 11/11,
-branch-flip 20/21, dropped-stmt 12/13.
+Two full 60-mutant passes ran under the pre-r1 classifier (pass 1 at d1c2254d, pass 2 at
+8147df02; both read "58/60" with 0 stillborn / 0 infra) and DISAGREED on which mutants
+survived. The root cause is measured, not guessed: two Tests modules run elaboration-time
+`#eval` IO against SHARED temp paths, so a concurrent build (another matrix worker, or any
+sibling checkout building this library on the same host) fails them for reasons unrelated
+to the mutant. `Tests/EvalLCNFCLITests.lean` writes a fixed-name fixture under `$TMPDIR`
+(the host-shared `/tmp` for every pre-r1 worker): pass 2's artifact records
+`EvalLCNFCLITests.lean:21:0: no such file or directory` as the `first_error` on all three
+of its `EvalLCNFCLITests` "kills", and a 3-repetition re-run reproduced that false kill
+LIVE, alternating between two concurrently built mutants with scheduling.
+`Tests/StochasticEvolveTests.lean` hard-coded the LITERAL path
+`/tmp/stochastic-evolve-integrity.tlpack` for its tamper/no-tamper pack pair, so even
+TMPDIR-isolated workers collided — one worker's tampered pack overwrites another's clean
+pack ("pack integrity regression") or the cleanup removes it mid-read (ENOENT); a
+3-repetition isolated re-run recorded both texts, non-deterministically, on the three
+retTy mutants (1-2 of 3 identical runs each). Every kill attributed to either module in
+the pre-r1 passes is therefore environment, not the mutant; per the non-inflation rule
+("a mutant killed only by flakiness or build nondeterminism is SURVIVED") neither pre-r1
+number is reused. The fixes: the r1 harness gives every scratch a private TMPDIR and
+TURBO_LEAN_HOME, and this leaf's one Tests edit derives the pack fixture path from
+`$TMPDIR` (the same convention `EvalLCNFCLITests` already uses). The number of record
+comes from the r1 harness over the fixed tree and is inlined below by the fold commit
+together with `scripts/proof_mutant_matrix_results.json`.
 
-The two pass-1 survivors, each a real finding (the repo rule: a surviving mutant means
-untested, never defended), and what this file does about them:
+The five implicated mutants and their dispositions:
 
-1. `RS-jmpdetect-false-00` (`IR/RealLCNFShared.lean:283`): `hasJmpToPure`'s `.jmp` arm
+1. `RS-orderalts-id-00` (`IR/RealLCNFShared.lean:155`, `orderAltsPure` made the identity):
+   a SHARED-helper mutant — the lowering and the independent semantics order alternatives
+   through the same definition, so the differential stays symmetric and no theorem
+   concludes anything the reorder changes. CLOSED HERE: a direct shape pin on
+   `orderAltsPure` (constructor alternatives precede `.default`, both input orders).
+2. `RS-tupleguard-oror-00` (`IR/RealLCNFShared.lean:106`, `isUnboxedScalarOrTuple`'s
+   `&&` to `||`): same shared-helper symmetry. CLOSED HERE: direct pins on the predicate
+   (`.tuple []` and `.tuple [.objPtr]` are not unboxed scalar tuples; a flat scalar tuple
+   is).
+3. `RB-retpin-flip-00` (`IR/RealLCNFBridge.lean:884`, `inferReturnedTypePure` keyed on
+   `dst != rv`): retTy is metadata — `lowerRealLCNFDecl_sound`'s conclusion never mentions
+   it, and the executable parity guards compare evaluation results, not declared types.
+   CLOSED HERE: direct pins on `inferReturnedTypePure`'s binder keying.
+4. `RB-ite-swap-03` (`IR/RealLCNFBridge.lean:890`, the `.ite _ t e` MATCH PATTERN's
+   binders swapped, so inference recurses else-first): same metadata blind spot. CLOSED
+   HERE: a direct pin on the then-branch-first `<|>` order with branches of different
+   inferred types.
+5. `RB-rettyfuel-offby1-00` (`IR/RealLCNFBridge.lean:914`, the `fuel + 16` inference
+   budget raised to `fuel + 17`): SURVIVED — recorded, not closed. NARROWEST STATEMENT:
+   nothing constrains `inferReturnedTypePure`'s budget headroom; distinguishing `+ 16`
+   from `+ 17` needs a lowered body whose letBind depth exceeds the lowering fuel plus 16,
+   which only join-point inlining blowup can produce, and no proof or guard constrains the
+   inferred `retTy` on such bodies (the soundness theorems never mention `retTy`; the
+   parity guards compare values). A cheap pin would have to hard-code a 17-deep
+   jp-inlining fixture against one budget constant — brittle, and it would constrain the
+   constant, not a behavior; recorded instead.
+
+The two pass-1-only survivors, each a real finding (the repo rule: a surviving mutant
+means untested, never defended), stay closed by this file's pins:
+
+6. `RS-jmpdetect-false-00` (`IR/RealLCNFShared.lean:283`): `hasJmpToPure`'s `.jmp` arm
    forced to `false`, so the recursive-join-point detector never fires. NARROWEST
    STATEMENT of what survived: no proof or guard distinguished the NAMED fail-closed
    rejection ("unsupported recursive join point", `IR/RealLCNFBridge.lean:858-860`) from
@@ -71,25 +120,15 @@ untested, never defended), and what this file does about them:
    apart. The L3 contract (`Proofs/LowerRec.lean`) freezes exactly this behavior as the
    kernel theorems `lowerImpureStepPure_recursive_jp_rejected` /
    `evalStep_recursive_jp_unsupported` (its exclusion E2: `Code.jp.recursive` stays
-   honestly `rejected`); those land with the L3 lane. CLOSED HERE executably: the
-   detector pins and the named-rejection pins below fail on the mutant.
-2. `RB-restore-drop-03` (`IR/RealLCNFBridge.lean:874`): the `.jmp` arm's bridge-state
+   honestly `rejected`); those land with the L3 lane. CLOSED HERE executably.
+7. `RB-restore-drop-03` (`IR/RealLCNFBridge.lean:874`): the `.jmp` arm's bridge-state
    restore (`fvarMap`/`activeCtor`/`jpDecls` back to their saved copies) dropped.
    NARROWEST STATEMENT: the mutant is OUTPUT-equivalent through every consumer at these
    bytes — a `.jmp` is terminal in its block, every enclosing `cases`-alternative arm
    re-restores the same three fields from its own saved copies (the restores that
-   `Proofs.RealLCNFBridge.StepMono` killed as `RB-restore-drop-00/01/02`), and the
+   `Proofs.RealLCNFBridge.StepMono` kills as `RB-restore-drop-00/01/02`), and the
    declaration entry discards the final state — so no theorem concludes anything the
-   drop changes, and no guard read the returned state. CLOSED HERE executably: the
-   state-contract pin below checks the arm's documented restore on the returned
-   `RealBridgeState` directly.
-
-With this file's guards in the closure, the confirmation pass over the same 60 sites
-reads 60/60 KILLED (0 stillborn, 0 infra) — the published H1.4 coverage number:
-
-  COVERAGE: 60/60 mutants killed (100.0%); denominator 60 = all enumerated mutants
-  (0 stillborn, 0 infra); 58/60 (96.7%) killed by the pre-existing proof stack and
-  guards alone, the 2 pass-1 survivors above killed by this file's pins.
+   drop changes, and no guard read the returned state. CLOSED HERE executably.
 
 ### Constraints, assumptions, limits
 
@@ -99,6 +138,15 @@ reads 60/60 KILLED (0 stillborn, 0 infra) — the published H1.4 coverage number
   the matrix owner, not silently claimed.
 - A kill is attributed to the FIRST failing module lake reports; later failures behind it
   are not enumerated.
+- `Tests/EvalLCNFCLITests.lean`'s elaboration-time IO uses fixed-name files under
+  `$TMPDIR` and shells into the CLI, so its verdict is only deterministic when nothing
+  else builds this library under the same TMPDIR concurrently. The r1 harness isolates
+  TMPDIR per scratch, and this leaf re-pointed `Tests/StochasticEvolveTests.lean`'s pack
+  fixture from a literal `/tmp` to `$TMPDIR` (measured false kills; see the record above).
+  A unique-name fixture inside EvalLCNFCLITests itself is the H1.1 file owner's fix,
+  recorded here as a handoff, not edited by this leaf; until it lands, two plain
+  single-TMPDIR builds of this library on one host can still fail each other's
+  elaboration — a repo-wide flake independent of this matrix.
 - The matrix measures the closure at its recorded commit; it is re-measured (and the
   script's pins re-set) whenever the two enumerated files change — they are sha-pinned in
   the harness exactly so a stale matrix fails closed instead of reading as current.
@@ -111,7 +159,7 @@ reads 60/60 KILLED (0 stillborn, 0 infra) — the published H1.4 coverage number
 No new theorems (so `AxiomAudit.lean`'s pinned count is untouched by this leaf — the L2
 and L3 lanes are raising it concurrently for their own sets); every pin is a `#guard`
 over the real lowering, elaborated on every `lake build LeanNative`, in the mutant
-harness's kill closure.
+harness's kill closure, and none performs IO or touches TMPDIR.
 -/
 
 private def fv (n : Nat) : FVarId := { name := .num `x n }
@@ -180,5 +228,43 @@ private def jmpPreState : RealBridgeState :=
       stOut.activeCtor == jmpPreState.activeCtor &&
       stOut.jpDecls.map (fun e => e.1) == jmpPreState.jpDecls.map (fun e => e.1)
   | .error _ => false
+
+/-! ### Pin 4 — `orderAltsPure` puts every constructor alternative before `.default`.
+Kills `RS-orderalts-id-00` deterministically (the pre-r1 "kill" was the TMPDIR collision;
+the lowering and the semantics share this definition, so the differential cannot see it). -/
+
+private def altCtorTrue : Alt .impure :=
+  .ctorAlt { name := ``Bool.true, cidx := 1, size := 0, usize := 0, ssize := 0 }
+    (.return (fv 1)) rfl
+
+private def altDefault : Alt .impure := .default (.return (fv 2))
+
+#guard match orderAltsPure [altDefault, altCtorTrue] with
+  | [.ctorAlt _ _ _, .default _] => true
+  | _ => false
+#guard match orderAltsPure [altCtorTrue, altDefault] with
+  | [.ctorAlt _ _ _, .default _] => true
+  | _ => false
+
+/-! ### Pin 5 — `isUnboxedScalarOrTuple` admits exactly non-empty all-scalar tuples.
+Kills `RS-tupleguard-oror-00` (`&&` to `||` admits `.tuple []` and heap-field tuples). -/
+
+#guard isUnboxedScalarOrTuple (.tuple [.i64, .f64]) == true
+#guard isUnboxedScalarOrTuple (.tuple []) == false
+#guard isUnboxedScalarOrTuple (.tuple [.objPtr]) == false
+
+/-! ### Pin 6 — `inferReturnedTypePure` keys on the returned binder and prefers the
+then-branch. Kills `RB-retpin-flip-00` (keyed on `dst != rv`) and `RB-ite-swap-03` (the
+`.ite` match binders swapped, recursing else-first): retTy is metadata no soundness
+theorem mentions, so only a direct pin constrains the inference. -/
+
+#guard inferReturnedTypePure 8 (.letBind 1 .i64 (.scalar (.constU64 0)) (.ret 1))
+  == some .i64
+#guard inferReturnedTypePure 8 (.letBind 1 .i64 (.scalar (.constU64 0)) (.ret 0))
+  == none
+#guard inferReturnedTypePure 8
+    (.ite 0 (.letBind 1 .i64 (.scalar (.constU64 0)) (.ret 1))
+            (.letBind 2 .f64 (.scalar (.constU64 0)) (.ret 2)))
+  == some .i64
 
 end LeanNative.Proofs.LowerRefines
