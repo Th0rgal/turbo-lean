@@ -6,8 +6,11 @@ import LeanNative.IR.RealLCNFSemantics
 The L3 extension of `evalStep` with a declaration environment whose local calls are
 FUEL-INDEXED over the FULL environment (L3 contract, `Proofs/LowerRec.lean`): on a
 `.let` whose value is a `.fap` to a `ctx`-local callee, the callee declaration is looked
-up in the WHOLE `Δ` and its body runs at the step's decremented fuel, so self and mutual
-recursion evaluate, bounded by the step budget `evalStep` already carries. A lookup miss
+up in the WHOLE `Δ` — whose entries PAIR each declaration with its own `RealBridgeCtx`,
+because the driver builds a per-declaration context (the contract's amendment note) —
+and its body runs at the step's decremented fuel under that paired context, so self and
+mutual recursion evaluate, bounded by the step budget `evalStep` already carries. The
+caller's `ctx` binder governs only the caller's own clauses. A lookup miss
 errors `.unsupportedCall` byte-for-byte like the old semantics, so `Δ = []` is the old
 evaluator by theorem (`evalStepR_nil`, `Proofs/LowerRec.lean`).
 
@@ -22,20 +25,20 @@ open LeanNative.IR
 open LeanNative.IR.RealLCNFBridge
 open LeanNative.Semantics
 
-/-- First declaration whose `.name` is `fn`. The hit alone (no stratified suffix) — the
-    callee re-runs under the same full `Δ`, which is what admits self and mutual
-    recursion. -/
-def lookupDeclRec? : List (Lean.Compiler.LCNF.Decl .impure) → Lean.Name →
-    Option (Lean.Compiler.LCNF.Decl .impure)
+/-- First entry whose declaration's `.name` is `fn`. The hit alone (no stratified
+    suffix), paired with the callee's own lowering context — the callee re-runs under
+    the same full `Δ`, which is what admits self and mutual recursion. -/
+def lookupDeclRec? : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx) → Lean.Name →
+    Option (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx)
   | [], _ => none
-  | sd :: Δ, fn => if sd.name == fn then some sd else lookupDeclRec? Δ fn
+  | e :: Δ, fn => if e.1.name == fn then some e else lookupDeclRec? Δ fn
 
-/-- A `lookupDeclRec?` hit is a member with that name. -/
-theorem lookupDeclRec?_mem : ∀ (Δ : List (Lean.Compiler.LCNF.Decl .impure)) (fn : Lean.Name)
-    (sd : Lean.Compiler.LCNF.Decl .impure),
-    lookupDeclRec? Δ fn = some sd → sd ∈ Δ ∧ sd.name = fn
+/-- A `lookupDeclRec?` hit is a member entry whose declaration has that name. -/
+theorem lookupDeclRec?_mem : ∀ (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx))
+    (fn : Lean.Name) (e : Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx),
+    lookupDeclRec? Δ fn = some e → e ∈ Δ ∧ e.1.name = fn
   | [], _, _, h => nomatch h
-  | sd0 :: Δ, fn, sd, h => by
+  | e0 :: Δ, fn, e, h => by
     dsimp only [lookupDeclRec?] at h
     split at h
     · next hb =>
@@ -43,7 +46,7 @@ theorem lookupDeclRec?_mem : ∀ (Δ : List (Lean.Compiler.LCNF.Decl .impure)) (
       subst h'
       exact ⟨List.mem_cons_self .., eq_of_beq hb⟩
     · next =>
-      have ⟨hm, hn⟩ := lookupDeclRec?_mem Δ fn sd h
+      have ⟨hm, hn⟩ := lookupDeclRec?_mem Δ fn e h
       exact ⟨List.mem_cons_of_mem _ hm, hn⟩
 
 /-- Verbatim mirror of `evalStep`'s stored-type / active-constructor computation for a
@@ -100,12 +103,13 @@ def letStoredR (ctx : RealBridgeCtx) (env : LEnv)
     mirrors `evalStep` clause for clause (same fuel-structural recursion, same
     `evalLetValue`, same stored-type machinery via `letStoredR`, same join-point,
     `cases`, rc and mutation handling, every recursive occurrence at the step's
-    decremented fuel and the same `Δ`) with ONE new rule, replacing exactly the arm the
-    old semantics deliberately errors on: a `.let` whose value is a `.fap` to a
-    `ctx`-local callee resolves the callee in the FULL `Δ` and runs its body at the
-    decremented fuel under the declaration-entry binding convention; a lookup miss is
+    decremented fuel, the same `Δ` and — on the caller's own clauses — the same `ctx`)
+    with ONE new rule, replacing exactly the arm the old semantics deliberately errors
+    on: a `.let` whose value is a `.fap` to a `ctx`-local callee resolves the callee in
+    the FULL `Δ` and runs its body at the decremented fuel under the CALLEE'S OWN paired
+    context and the declaration-entry binding convention; a lookup miss is
     `.error (.unsupportedCall ...)` byte-for-byte like `evalLetValue`. -/
-def evalStepR (Δ : List (Lean.Compiler.LCNF.Decl .impure)) (fuel : Nat)
+def evalStepR (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx)) (fuel : Nat)
     (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
     (target : Lean.Compiler.LCNF.Code .impure ⊕
       (Val × Bool × Nat × Option Lean.FVarId × List (Lean.Compiler.LCNF.Alt .impure))) :
@@ -175,17 +179,17 @@ def evalStepR (Δ : List (Lean.Compiler.LCNF.Decl .impure)) (fuel : Nat)
         | .fap fn args _ =>
           if (ctx.findLocalCallee? fn).isSome then
             match lookupDeclRec? Δ fn with
-            | some sd =>
+            | some (sd, sdCtx) =>
               match evalArgs env.vals args.toList with
               | .error e => .error e
               | .ok vals =>
                 match sd.value with
                 | .extern _ => .error (.unsupportedCall fn.toString)
                 | .code c =>
-                  match bindParams ctx true LEnv.empty sd.params.toList vals with
+                  match bindParams sdCtx true LEnv.empty sd.params.toList vals with
                   | .error e => .error e
                   | .ok env' =>
-                    match evalStepR Δ fuel ctx env' st (.inl c) with
+                    match evalStepR Δ fuel sdCtx env' st (.inl c) with
                     | .error e => .error e
                     | .ok (v, st') =>
                       evalStepR Δ fuel ctx
@@ -326,15 +330,15 @@ def evalStepR (Δ : List (Lean.Compiler.LCNF.Decl .impure)) (fuel : Nat)
       | .fun decl _ _ => .error (.unsupportedCall s!"local function {decl.binderName}")
 
 /-- Mirror of `evalRealLCNFCode` over `evalStepR`. -/
-def evalRealLCNFCodeR (Δ : List (Lean.Compiler.LCNF.Decl .impure)) (fuel : Nat)
+def evalRealLCNFCodeR (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx)) (fuel : Nat)
     (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
     (code : Lean.Compiler.LCNF.Code .impure) : Except UBError (Val × HeapState) :=
   evalStepR Δ fuel ctx env st (.inl code)
 
-/-- Mirror of `evalRealLCNFDecl` over `evalStepR`: `Δ` may hold `decl` itself (the
-    driver's `localCallees` includes the self name), which is what makes self and mutual
-    recursion run. -/
-def evalRealLCNFDeclR (Δ : List (Lean.Compiler.LCNF.Decl .impure)) (fuel : Nat)
+/-- Mirror of `evalRealLCNFDecl` over `evalStepR`: `Δ` may hold `decl` itself, paired
+    with its own context (the driver's `localCallees` includes the self name), which is
+    what makes self and mutual recursion run. -/
+def evalRealLCNFDeclR (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx)) (fuel : Nat)
     (ctx : RealBridgeCtx) (decl : Lean.Compiler.LCNF.Decl .impure) (args : List Val)
     (st : HeapState := HeapState.empty) : Except UBError (Val × HeapState) :=
   match decl.value with
