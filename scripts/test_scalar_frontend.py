@@ -262,7 +262,7 @@ def streamFenceStep
         # Run the actual Lean bridge: same leaf names, mismatched types/arity
         # and local calls must stay outside the canonical intrinsic boundary.
         source = '''import LeanNative.IR.Bridge
-open LeanNative.IR
+open LeanNative.IR LeanNative.IR.RealLCNFBridge
 #guard canonicalUIntCastMask? `UInt64.toUInt8 [.i64] .i8 == some 255
 #guard canonicalUIntCastMask? `UInt8.toUInt64 [.i8] .i64 == some 255
 #guard canonicalUIntCastMask? `UInt16.toUInt32 [.i16] .i32 == some 65535
@@ -277,8 +277,7 @@ open LeanNative.IR
 #guard lookupCanonicalBinOp? `UInt32.ble == some .le
 #guard lookupCanonicalBinOp? `USize.blt == some .lt
 #guard lookupCanonicalBinOp? `USize.ble == some .le
-#eval do
-  let env ← Lean.mkEmptyEnvironment
+#eval show IO Unit from do
   let rejected : List (Lean.Name × List VarId × LNIRType × List LNIRType × Bool) :=
       [(`UInt64.toUInt8, [0], .i8, [.i64], true),
        (`User.UInt64.toUInt8, [0], .i8, [.i64], false),
@@ -295,9 +294,9 @@ open LeanNative.IR
        (`USize.sub, [0, 1], .usize, [.i64, .i64], false),
        (`User.UInt8.decEq, [0, 1], .i8, [.i8, .i8], false)]
   for (name, args, ret, tys, localCall) in rejected do
-    unless (tryLowerIntrinsicCall env name args ret tys localCall).isNone do
+    unless (lowerCanonicalIntrinsicPure? name args ret tys localCall).isNone do
       throw (IO.userError s!"unexpected intrinsic: {name}")
-  match tryLowerIntrinsicCall env `UInt64.decEq [0, 1] .i8 [.i64, .i64] with
+  match lowerCanonicalIntrinsicPure? `UInt64.decEq [0, 1] .i8 [.i64, .i64] with
   | some (.scalar (.select (.binOp .eq _ _) (.constU64 1) (.constU64 0))) => pure ()
   | _ => throw (IO.userError "UInt8 comparison lost its numeric representation")
 '''
@@ -1040,38 +1039,43 @@ def callNestedPair (x : UInt64) : UInt64 :=
                 self.assertFalse(output.exists(), f"{label} published an artifact despite failure")
 
     def test_unsupported_lcnf_paths_fail_closed(self):
+        # L1 r1 (review a094d3a9 F2): ported from the deleted BridgeM wrappers to the
+        # proved pure core (lowerRealLCNFCode / lowerLitValuePure / lowerImpureLetValuePure);
+        # the pure-only cases (recursive local function, higher-order fvar call, constructor
+        # payload pattern) went with the deleted pure lowering.
         source = '''import LeanNative.IR.Bridge
-open Lean LeanNative.IR Lean.Compiler.LCNF
+open Lean LeanNative.IR LeanNative.IR.RealLCNFBridge Lean.Compiler.LCNF
 run_meta do
   let j : FVarId := ⟨`join⟩
   let x : FVarId := ⟨`value⟩
-  let r : FVarId := ⟨`res⟩
   let ty := mkConst ``UInt64
+  let ctx : RealBridgeCtx := { arch := .x86_64 }
+  let stX : RealBridgeState := { fvarMap := [(x, 0)], varTypes := [(0, .i64)], nextVarId := 1 }
   let recursive : FunDecl .impure := .mk j `join #[] ty (.jmp j #[])
-  let recLocalFn : FunDecl .pure := .mk j `recFn #[.mk x `p0 ty false] ty (.let ⟨r, `r, ty, .fvar j #[.fvar x]⟩ (.return r))
-  let p0 : Param .pure := .mk x `p0 ty false
-  let actions : List (String × BridgeM LNIRCode) :=
-    [("recursive join point", lowerImpureCode (.jp recursive (.jmp j #[]))),
-     ("unmapped join point", lowerImpureCode (.jmp j #[.fvar x])),
-     ("arity mismatch", lowerImpureCode (.jp (.mk j `join #[] ty (.return x)) (.jmp j #[.fvar x]))),
-     ("constructor tag mutation", lowerImpureCode (.setTag x 1 (.return x))),
-     ("recursive local function", lowerPureCode (.fun recLocalFn (.return x))),
-             ("higher-order fvar call", lowerPureLetValue (.fvar x #[.fvar x]) .i64 >>= fun _ => pure (.ret 0)),
-             ("constructor payload pattern", lowerPureAlts 0 false 0 [.alt `Boxed.mk #[p0] (.return x)]),
-             ("unsupported string literal", lowerLitValue (.str "abc") >>= fun _ => pure (.ret 0)),
-             ("Unsupported heap reset", lowerImpureLetValue (.reset 2 x rfl) .objPtr >>= fun _ => pure (.ret 0))]
-  for (expected, action) in actions do
-    let rejected ← try
-      let _ ← action.run' {}
-      pure false
-    catch error =>
-      let message ← error.toMessageData.toString
+  let cases : List (String × Except String Unit) :=
+    [("recursive join point",
+      (lowerRealLCNFCode 32 ctx {} (.jp recursive (.jmp j #[]))).map fun _ => ()),
+     ("unmapped join point",
+      (lowerRealLCNFCode 32 ctx stX (.jmp j #[.fvar x])).map fun _ => ()),
+     ("arity mismatch",
+      (lowerRealLCNFCode 32 ctx stX (.jp (.mk j `join #[] ty (.return x)) (.jmp j #[.fvar x]))).map fun _ => ()),
+     ("constructor tag mutation",
+      (lowerRealLCNFCode 32 ctx stX (.setTag x 1 (.return x))).map fun _ => ()),
+     ("unsupported string literal",
+      (lowerLitValuePure (.str "abc") .i64 .x86_64).map fun _ => ()),
+     ("Unsupported heap reset",
+      (lowerImpureLetValuePure ctx { stX with varTypes := [(0, .objPtr)] } (.reset 2 x rfl) .objPtr).map fun _ => ())]
+  for (expected, result) in cases do
+    match result with
+    | .ok _ => throwError "accepted unsupported {expected}"
+    | .error message =>
       unless (message.splitOn expected).length > 1 do
         throwError "wrong rejection for {expected}: {message}"
-      pure true
-    unless rejected do throwError "accepted unsupported {expected}"
+  -- the proved path still lowers an ordinary non-recursive join point
   let ordinary : FunDecl .impure := .mk j `join #[] ty (.return x)
-  let _ ← (lowerImpureCode (.jp ordinary (.jmp j #[]))).run' { varTypes := ({} : Std.HashMap VarId LNIRType).insert 0 .i64, fvarToVar := ({} : Std.HashMap FVarId VarId).insert x 0, nextVarId := 1 }
+  match lowerRealLCNFCode 32 ctx stX (.jp ordinary (.jmp j #[])) with
+  | .ok _ => pure ()
+  | .error message => throwError "ordinary join point rejected: {message}"
 '''
         with tempfile.TemporaryDirectory(prefix="unsupported_lcnf_") as directory:
             path = Path(directory) / "Boundary.lean"
