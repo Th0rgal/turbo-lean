@@ -4,7 +4,7 @@ grep -q "def verifiedAlgebraicPeepholeContract : VerifiedCodePassContract" lean/
 grep -q "def verifiedEqSatContract.*: VerifiedCodePassContract" lean/LeanNative/Transform/EqSat.lean
 grep -q "def verifiedLoopScheduleContract.*: VerifiedCodePassContract" lean/LeanNative/Transform/LoopSchedule.lean
 grep -q "def verifiedOwnershipRCContract : VerifiedCodePassContract" lean/LeanNative/Transform/OwnershipRC.lean
-grep -q "def canonicalScalarBinOpTable" lean/LeanNative/IR/Bridge.lean
+grep -q "def canonicalScalarBinOpTable" lean/LeanNative/IR/RealLCNFShared.lean
 test "$(grep -c '\.endsWith' lean/LeanNative/IR/Bridge.lean || true)" -eq 0
 test "$(wc -l < lean/LeanNative/IR/Bridge.lean)" -le 350
 test "$(wc -l < lean/LeanNative/Driver/CoreCLI.lean)" -le 1000

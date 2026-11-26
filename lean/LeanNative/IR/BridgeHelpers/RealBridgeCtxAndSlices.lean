@@ -1,5 +1,4 @@
 import LeanNative.IR.BridgeHelpers.HeapAndConstructors
-import LeanNative.Proofs.SymbolicTVRefinesDefs
 
 set_option autoImplicit true
 
@@ -328,30 +327,6 @@ def buildRealBridgeCtxM (typeExprs : List Lean.Expr) (ctorSeeds calleeSeeds : Li
     knownFVarCtors := knownFVarCtors
   }
 
-/-- Convert current `BridgeState` to `RealBridgeState`, pre-interning any free `FVarId`s in `freeFVars`. -/
-def bridgeStateToRealM (freeFVars : List Lean.FVarId) : BridgeM RealLCNFBridge.RealBridgeState := do
-  for fv in freeFVars do
-    if !(← get).localFunMap.contains fv then
-      let _ ← internFVar fv
-  let st ← get
-  return {
-    fvarMap := st.fvarToVar.toList
-    varTypes := st.varTypes.toList
-    activeCtor := st.activeCtor.toList
-    jpDecls := []
-    nextVarId := st.nextVarId
-  }
-
-/-- Synchronize allocated `VarId` counter and bindings back from `RealBridgeState` into `BridgeState`. -/
-def syncRealToBridgeStateM (rst : RealLCNFBridge.RealBridgeState) : BridgeM Unit := do
-  modify fun st => {
-    st with
-    fvarToVar := rst.fvarMap.foldl (fun m (f, v) => m.insert f v) st.fvarToVar
-    varTypes := rst.varTypes.foldl (fun m (v, t) => m.insert v t) st.varTypes
-    activeCtor := rst.activeCtor.foldl (fun m (v, c) => m.insert v c) {}
-    nextVarId := max st.nextVarId rst.nextVarId
-  }
-
 partial def pureCodeAstFuel : Lean.Compiler.LCNF.Code .pure → Nat
   | .let _ k => 1 + pureCodeAstFuel k
   | .fun d k _ | .jp d k => 1 + pureCodeAstFuel d.value + pureCodeAstFuel k
@@ -429,32 +404,6 @@ def attachBaseDeclFactsM (declName : Lean.Name) (d : LNIRDecl) : Lean.CoreM LNIR
   let merged := (sigFacts ++ baseFacts).foldl LeanNative.IR.consFact d.retainedFacts
   return { d with retainedFacts := merged }
 
-/-- Effective return type of a compression candidate: the returned tuple shape when the body
-    returns a freshly built tuple, the base declaration's `retTy` otherwise. -/
-def compressedBodyRetTy (retTy : LNIRType) (cand : LNIRCode) : LNIRType :=
-  match inferReturnedType cand with
-  | some (.tuple fs) => .tuple fs
-  | _ => retTy
-
-/-- L1 single-path driver post-pass (`roadmap/HORIZONS.md` rung L1): accept the untrusted
-    compression candidate `cand` for `d.body` only when the total, kernel-proved refinement
-    checker admits it — `LeanNative.Proofs.runSymbolicValidatedDecl`, the Contract-V2
-    `VerifiedTVPassContract` gate, backed by `symbolicValidatedDeclOpt_sound`; otherwise
-    return `d` unchanged. `params` are never changed
-    (`LeanNative.Proofs.applyValidatedCompression_refines`). -/
-def applyValidatedCompression (d : LNIRDecl) (cand : LNIRCode) : LNIRDecl :=
-  if cand == d.body then d
-  else
-    match LeanNative.Proofs.runSymbolicValidatedDecl
-        (fun d0 => { d0 with
-          body := cand
-          retTy := compressedBodyRetTy d0.retTy cand
-          assurance := AssuranceLevel.combine d0.assurance .translationValidated
-          isGpuCand := d0.params.all (fun p => p.ty.isGpuCompatible) &&
-            (compressedBodyRetTy d0.retTy cand).isGpuCompatible }) d with
-    | some d' => d'
-    | none => d
-
 /-- Delegate `Decl .impure` lowering directly to `RealLCNFBridge.lowerRealLCNFDecl` (backed by `lowerRealLCNFDecl_sound`). -/
 def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64)
@@ -469,7 +418,6 @@ def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
   checkEnvConstSignatureM env decl.name arch isExported
   let isStage1DHeap := allowRcAdt && !isExported && declQualifiesForStage1DHeap env decl.name arch
   let initSt : BridgeState := {
-    mangledSymbol := metaInfo.mangledSymbol, isSimpleGround := metaInfo.isSimpleGround,
     selfDeclName := decl.name, localDeclNames := localDeclNames, arch := arch,
     allowStage1DHeap := isStage1DHeap }
   let action : BridgeM LNIRDecl := do
@@ -530,19 +478,9 @@ def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
         callees paramTypeMap knownCtors.toList
       let fuel := codeAstFuel c + decl.params.size + 64
       match RealLCNFBridge.lowerRealLCNFDecl fuel ctx decl metaInfo.mangledSymbol with
-      | .ok d =>
-        let rstAfter := (RealLCNFBridge.internRealParams ctx {} decl.params.toList).2
-        let (nextAfter, endVarTypes) := match RealLCNFBridge.lowerRealLCNFCode fuel ctx rstAfter c with
-          | .ok (_, rstEnd) => (rstEnd.nextVarId, rstEnd.varTypes)
-          | .error _ => (d.params.length + 16, rstAfter.varTypes)
-        modify fun s => {
-          s with
-          varTypes := endVarTypes.foldl (fun m (v, t) => m.insert v t) s.varTypes
-          nextVarId := max s.nextVarId (nextAfter + 4) }
-        let compressedCand ← compressScalarCode d.body
-        -- L1: one lowering callee; the only post-pass is the kernel-proved-checker-gated
-        -- compression (`applyValidatedCompression`, `lowerRealLCNFDecl_driver_sound`).
-        attachBaseDeclFactsM decl.name (applyValidatedCompression d compressedCand)
+      -- L1 r1: one lowering callee and no body post-pass (review a094d3a9 F5 — the
+      -- round-0 checker-gated compression provably never fired and was removed).
+      | .ok d => attachBaseDeclFactsM decl.name d
       | .error msg => Lean.throwError msg
   Prod.fst <$> action.run initSt
 

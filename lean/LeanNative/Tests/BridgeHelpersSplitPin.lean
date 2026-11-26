@@ -5,9 +5,11 @@ namespace LeanNative.Tests.BridgeHelpersSplitPin
 
 open Lean
 
--- Pinned public inventory of `lean/LeanNative/IR/BridgeHelpers/` (S3a split, updated by L1:
--- the second-lowering helper cascade is deleted — see the L1 notes at the head of each
--- helper file and the w-l1 commit messages for the zero-reference evidence).
+-- Pinned public inventory of `lean/LeanNative/IR/BridgeHelpers/` (S3a split, updated by L1
+-- and its round-1 fix: the second-lowering helper cascade, the compression producer file
+-- (`ScalarDagAndJoinPoints.lean`) and the dead `BridgeM` state converters are deleted — see
+-- the L1 notes at the head of each helper file and the w-l1 / w-l1 r1 commit messages for
+-- the zero-reference evidence).
 def expectedPublicDecls : List Name := [
   `LeanNative.IR.hasSimpleGroundDecl,
   `LeanNative.IR.mangleDeclName,
@@ -58,13 +60,6 @@ def expectedPublicDecls : List Name := [
   `LeanNative.IR.canonEor3Repr,
   `LeanNative.IR.trustedGfSimdIntrinsicOp,
   `LeanNative.IR.tryLowerGfSimdIntrinsic,
-  `LeanNative.IR.isScalarJoinParamType,
-  `LeanNative.IR.isTotalScalarExpr,
-  `LeanNative.IR.collectScalarCodeRev,
-  `LeanNative.IR.collectTupleCodeRev,
-  `LeanNative.IR.codeContainsTupleOp,
-  `LeanNative.IR.gateCodeWithSymbolicTV,
-  `LeanNative.IR.compressScalarCode,
   `LeanNative.IR.isClosedConstHelperName,
   `LeanNative.IR.nameHasCompilerAuxComponent,
   `LeanNative.IR.isCompilerGeneratedAuxDecl,
@@ -87,8 +82,6 @@ def expectedPublicDecls : List Name := [
   `LeanNative.IR.factVarsInScope,
   `LeanNative.IR.collectDeclVarTys,
   `LeanNative.IR.attachBaseDeclFactsM,
-  `LeanNative.IR.compressedBodyRetTy,
-  `LeanNative.IR.applyValidatedCompression,
   `LeanNative.IR.ingestImpureDeclViaReal,
   `LeanNative.IR.expandCompilerAuxDecls,
   `LeanNative.IR.ingestModuleDeclsWith
@@ -97,10 +90,10 @@ def expectedPublicDecls : List Name := [
 def expectedPrivateDecls : List Name := [
   `LeanNative.IR.argUsesSigned,
   `LeanNative.IR.codeSignedScan,
-  `LeanNative.IR.initialSeenVarsForCode,
   `LeanNative.IR.isBuiltinLNIRRuntimeCall,
   `LeanNative.IR.collectDirectCallees,
   `LeanNative.IR.reachesDeclInCallGraph,
+  `LeanNative.IR.collectArgFVarsImpure,
   `LeanNative.IR.collectCodeTypeExprs,
   `LeanNative.IR.collectLetValueCtorAndCalleeNames,
   `LeanNative.IR.collectCodeCtorAndCalleeNames,

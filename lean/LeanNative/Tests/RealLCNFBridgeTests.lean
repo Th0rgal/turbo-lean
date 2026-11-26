@@ -3,6 +3,7 @@ import Lean.Compiler.LCNF.ToImpureType
 import LeanNative.IR.RealLCNFBridge
 import LeanNative.IR.RealLCNFSemantics
 import LeanNative.IR.BridgeHelpers
+import LeanNative.IR.Bridge
 import LeanNative.Transform.EqSat
 import LeanNative.Semantics.Eval
 import LeanNative.Proofs.RealLCNFBridgeProofs
@@ -150,46 +151,38 @@ private def recJpDecl : Decl .impure :=
 
 #guard (lowerRealLCNFDecl 32 { arch := .x86_64 } recJpDecl).isOk == false
 
-/-! ### L1 (`roadmap/HORIZONS.md` rung L1): executable mutant kills for the driver post-pass gate
+/-! ### L1 round 1 (review a094d3a9 F4): explicit requests with no impure LCNF form fail closed
 
-`applyValidatedCompression` accepts a candidate only through the kernel-proved
-`runSymbolicValidatedDecl` checker. A gate mutant that accepts without the checker flips the
-reject guards below; one that never accepts flips the accept guards. The default `LNIRDecl`
-assurance is `.verifiedKernelProof`, so acceptance is visible as the conservative
-`AssuranceLevel.combine` downgrade to `.translationValidated`. -/
+An explicitly requested declaration that has compiled code (a base or mono form) but no
+impure LCNF form raises the named `Unsupported` error instead of being dropped silently; a
+non-code constant (here: a theorem) is skipped silently. Red evidence: on the pre-fix tree
+the first case accepted an EMPTY module for `UInt64.add` (run recorded in the w-l1 r1
+commit message). -/
 
-private def l1GateBase : LNIRDecl :=
-  { name := "l1_gate_base"
-    params := [{ id := 0, name := "x", ty := .i64 }]
-    retTy := .i64
-    body := .letBind 2 .i64 (.scalar (.binOp .add (.var 0) (.constU64 1))) (.ret 2) }
+private theorem l1NonCodeProbe : True := trivial
 
--- Accepted: a structure-preserving, symbolically equal rewrite (operand commute).
-private def l1CandCommute : LNIRCode :=
-  .letBind 2 .i64 (.scalar (.binOp .add (.constU64 1) (.var 0))) (.ret 2)
-#guard (applyValidatedCompression l1GateBase l1CandCommute).body == l1CandCommute
-#guard (applyValidatedCompression l1GateBase l1CandCommute).params == l1GateBase.params
-#guard (applyValidatedCompression l1GateBase l1CandCommute).assurance == .translationValidated
-
--- Rejected (algebraic-swap mutant): a wrong-value candidate never replaces the body.
-private def l1CandWrong : LNIRCode := .letBind 2 .i64 (.scalar (.constU64 7)) (.ret 2)
-#guard (applyValidatedCompression l1GateBase l1CandWrong).body == l1GateBase.body
-#guard (applyValidatedCompression l1GateBase l1CandWrong).assurance == l1GateBase.assurance
-
--- Fail-closed (measured 2026-11-26): a fresh-variable collapse — the shape `compressScalarCode`
--- produces when it folds an `ite` or renames the result — is not admitted by the kernel-proved
--- checker, and the base body is kept.
-private def l1CandFreshCollapse : LNIRCode :=
-  .letBind 9 .i64 (.scalar (.binOp .add (.var 0) (.constU64 1))) (.ret 9)
-#guard (applyValidatedCompression l1GateBase l1CandFreshCollapse).body == l1GateBase.body
+#eval show Lean.CoreM Unit from do
+  let threw ← try
+    let _ ← ingestModuleDecls #[``UInt64.add] "l1_f4_probe" .x86_64 false
+    pure false
+  catch e =>
+    let msg ← e.toMessageData.toString
+    unless (msg.splitOn "no impure LCNF form").length > 1 do
+      Lean.throwError s!"wrong rejection for UInt64.add: {msg}"
+    pure true
+  unless threw do
+    Lean.throwError "ingestModuleDecls accepted an explicit request with no impure LCNF form"
+  let m ← ingestModuleDecls #[``l1NonCodeProbe] "l1_f4_probe2" .x86_64 false
+  unless m.decls.isEmpty do
+    Lean.throwError "non-code constant unexpectedly lowered"
 
 private def evalDeclProduces (fuel : Nat) (d : LNIRDecl) (args : List Val) (expected : Val) : Bool :=
   match evalLoweredDecl fuel d args with
   | .ok (v, hst) => v == expected && hst == HeapState.empty
   | .error _ => false
 
-/-- Test 6: Regression against branch-local `letBind` shadowing outer parameters in `flattenInlinedHelperBody`,
-    `normalizeAndInlineLocalDefs`, and `compressScalarCode` (TV-gated fail-closed fallback). -/
+/-- Test 6: Regression against branch-local `letBind` shadowing outer parameters in
+    `flattenInlinedHelperBody` and `normalizeAndInlineLocalDefs`. -/
 private def shadowedIteDecl : LNIRDecl :=
   { name := "test_shadowed_ite"
     params := [{ id := 0, name := "cond", ty := .i1 }, { id := 1, name := "x", ty := .i64 }]
@@ -231,18 +224,5 @@ private def shadowedInlineMod : LNIRModule :=
     evalDeclProduces 16 d [.bool false, .u64 42] (.u64 42) &&
     evalDeclProduces 16 d [.bool true, .u64 42] (.u64 999)
   | none => false
-
-private def checkCompressScalarShadowing : Lean.CoreM Bool := do
-  let initSt : BridgeState := {
-    varTypes := ({} : Std.HashMap VarId LNIRType).insert 0 .i1 |>.insert 1 .i64
-    nextVarId := 10 }
-  let (candBody, _) ← (compressScalarCode shadowedIteDecl.body).run initSt
-  let candDecl := { shadowedIteDecl with body := candBody }
-  return evalDeclProduces 16 candDecl [.bool false, .u64 42] (.u64 42) &&
-    evalDeclProduces 16 candDecl [.bool true, .u64 42] (.u64 999)
-
-#eval do
-  unless (← checkCompressScalarShadowing) do
-    Lean.throwError "compressScalarCode outer-scope shadowing regression failed!"
 
 end LeanNative.Tests.RealLCNFBridgeTests

@@ -77,7 +77,7 @@ EXPECTED_FRAGMENT_HASHES = {
     "21_audit_spec_strict_proofs.sh": "d0c073cae6410d0092a388ff404b2cacaea2e112f1639fe93796af0c066fd15f",
     "30_axiom_gate.sh": "49e36170e63217edc80887b8d26cb6b199b079596de0abdc54bd6e4104a8f60a",
     "35_h11_lcnf_differential.sh": "55cacb9004d575aaa08d9a9ab3a6e4d3cce746ba87cd7fcb736f0ea6203a9828",
-    "40_verified_pass_hygiene.sh": "7cbb8ca4782a952d9a2e31466de6d6677273a9f7a49e9386cb3be086d1d997e0",
+    "40_verified_pass_hygiene.sh": "e8f205dffaae69b18b3640516ebe95f6b48bad8c8b7e3221f142a01591d5d003",
     "50_plugin_mutant_gate.sh": "d7463ec4943426b4e235e6706eac9e49f4def2e2eec02437c8b510948763ea43",
     "60_conformance_fuzz_trust.sh": "fdb3048842442b9a5a3b2f7ee69bcf743afbef69e7f921470c28cfcc688ec10f",
     "70_llvm_alive2_leanmlir.sh": "78bdb696aa1e89b2300de270d9284902a58dd5a5aeb5bee78ed79cb1b89e0ca2",

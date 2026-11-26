@@ -679,7 +679,6 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.lowerImpureStepPure_sound
   , ``LeanNative.Proofs.lowerRealLCNFCode_sound
   , ``LeanNative.Proofs.lowerRealLCNFDecl_sound
-  , ``LeanNative.Proofs.applyValidatedCompression_refines
   , ``LeanNative.Proofs.lowerRealLCNFDecl_driver_sound
   , ``LeanNative.Transform.evalSeqLoop_async_refines
   , ``LeanNative.Transform.optimizeAsyncStateMachine_refines
@@ -826,7 +825,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.LedgerEmbedded32.ledgerBip32Varint_e2e_nonvacuous
   ]
 
-#guard auditedTheoremNames.length == 865
+#guard auditedTheoremNames.length == 864
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/
