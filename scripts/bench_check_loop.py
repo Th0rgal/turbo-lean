@@ -83,6 +83,7 @@ from __future__ import annotations
 
 import argparse
 from typing import NamedTuple
+import errno
 import hashlib
 import json
 import math
@@ -1212,13 +1213,19 @@ def _signal_scanned(pid: int, start: str, sig) -> bool:
     """Signal `pid` only while it is still the process that was scanned.
 
     The pidfd pins the process before its start time is re-read, so a recycled
-    pid is never signalled; without pidfd support the window between the
-    re-read and kill() is the only one left.
+    pid is never signalled. Where the kernel has no pidfd_open (before Linux
+    5.3) the signal goes by pid, and the window between the re-read and kill()
+    is the only one left. False means no signal was sent: the process is gone,
+    is another process now, or the signal was refused.
     """
     fd = None
     try:
         if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
-            fd = os.pidfd_open(pid)
+            try:
+                fd = os.pidfd_open(pid)
+            except OSError as e:
+                if e.errno != errno.ENOSYS:
+                    raise
         state, now = _proc_state_and_start(Path("/proc") / str(pid))
         if now != start or state in ("Z", "X"):
             return False
@@ -1237,7 +1244,9 @@ def _signal_scanned(pid: int, start: str, sig) -> bool:
 def terminate_scanned(procs, term_grace_s=None, kill_grace_s=None):
     """SIGTERM each scanned process, SIGKILL whichever outlives the grace period.
 
-    Returns (signalled, survivors); turbo-lean's own stop uses the same order.
+    Returns (signalled, survivors): survivors are the scanned processes still
+    running at the end, whether or not a signal reached them. turbo-lean's own
+    stop uses the same order.
     """
     term_grace_s = DAEMON_TERM_GRACE_S if term_grace_s is None else term_grace_s
     kill_grace_s = DAEMON_KILL_GRACE_S if kill_grace_s is None else kill_grace_s
@@ -1257,7 +1266,7 @@ def terminate_scanned(procs, term_grace_s=None, kill_grace_s=None):
         if alive(p):
             _signal_scanned(p[0], p[1], signal.SIGKILL)
     wait(signalled, kill_grace_s)
-    return signalled, [p for p in signalled if alive(p)]
+    return signalled, [p for p in procs if alive(p)]
 
 
 def stop_daemons(bin_path: Path, env):
@@ -1283,8 +1292,8 @@ def stop_daemons(bin_path: Path, env):
         return
     signalled, survivors = terminate_scanned(left)
     if survivors:
-        print(f"warning: {len(survivors)} process(es) of {staging} outlived SIGKILL: "
-              f"pids {[p[0] for p in survivors]}", file=sys.stderr)
+        print(f"warning: {len(survivors)} process(es) of {staging} still run after "
+              f"SIGTERM and SIGKILL: pids {[p[0] for p in survivors]}", file=sys.stderr)
     else:
         print(f"note: ended {len(signalled)} process(es) `daemon stop` left in {staging}",
               file=sys.stderr)

@@ -9,6 +9,7 @@ script with a stub binary that emulates `check --json`.
 from __future__ import annotations
 
 import contextlib
+import errno
 import importlib.util
 import io
 import json
@@ -2160,6 +2161,42 @@ class DaemonCleanup(NoForeignSignals, unittest.TestCase):
                     contextlib.redirect_stderr(io.StringIO()):
                 mod.stop_daemons(bin_path, {"TURBO_LEAN_STAGING_DIR": str(staging)})
             self.assertEqual(ours.wait(timeout=5), -signal.SIGTERM)
+
+    def test_a_kernel_without_pidfd_open_still_gets_its_daemons_ended(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-daemons-") as td:
+            staging = Path(td) / "staging"
+            bin_path = Path(sys.executable).resolve()
+            ours = self.spawn(staging, "serve")
+            self.wait_until_listed(mod, staging, bin_path, 1)
+            done = subprocess.CompletedProcess([str(bin_path), "daemon", "stop"], 0)
+            nosys = OSError(errno.ENOSYS, os.strerror(errno.ENOSYS))
+            with mock.patch.object(mod.subprocess, "run", return_value=done), \
+                    mock.patch.object(mod.os, "pidfd_open", side_effect=nosys, create=True), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                mod.stop_daemons(bin_path, {"TURBO_LEAN_STAGING_DIR": str(staging)})
+            self.assertEqual(ours.wait(timeout=5), -signal.SIGTERM)
+
+    def test_a_daemon_the_bench_could_not_signal_is_reported(self):
+        # A signal that never reaches a scanned daemon (it was refused) leaves
+        # the daemon running; the bench must name it, never report it ended.
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-daemons-") as td:
+            staging = Path(td) / "staging"
+            bin_path = Path(sys.executable).resolve()
+            ours = self.spawn(staging, "serve")
+            self.wait_until_listed(mod, staging, bin_path, 1)
+            done = subprocess.CompletedProcess([str(bin_path), "daemon", "stop"], 0)
+            err = io.StringIO()
+            with mock.patch.object(mod.subprocess, "run", return_value=done), \
+                    mock.patch.object(mod, "_signal_scanned", return_value=False), \
+                    mock.patch.object(mod, "DAEMON_TERM_GRACE_S", 0.1), \
+                    mock.patch.object(mod, "DAEMON_KILL_GRACE_S", 0.1), \
+                    contextlib.redirect_stderr(err):
+                mod.stop_daemons(bin_path, {"TURBO_LEAN_STAGING_DIR": str(staging)})
+            self.assertIsNone(ours.poll())
+            self.assertIn(f"still run after SIGTERM and SIGKILL: pids [{ours.pid}]",
+                          err.getvalue())
 
     def test_the_scope_rule_on_a_fake_proc_tree(self):
         mod = load_script()
