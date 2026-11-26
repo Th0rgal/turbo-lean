@@ -9892,29 +9892,31 @@ pub fn run_pr_verify_command(
         .map(|f| canon_dir.join(f))
         .collect();
     let mut trusted_replay_mods: Vec<String> = Vec::new();
-    // Proof irrelevance holds only across `module` boundaries. Importers of a classic (non-`module`)
-    // file can reduce through a theorem's proof (`Acc.rec` subsingleton elimination, `decide +kernel`),
-    // so a proof-only edit there needs the same dependent recheck as an interface change. The
-    // classification itself is untouched: `interface_drift` and `--disallow-statement-changes`
+    // A proof-only edit is local only for importers that cannot see proof bodies, and what an importer
+    // sees is the importer's property, not the edited file's: a classic importer of a `module` file, and
+    // a `module` importer using `import all`, both see them and can reduce through them (`Acc.rec`
+    // subsingleton elimination under `decide +kernel`). Until a per-importer visibility-aware cutoff
+    // exists, every proof edit with importers gets the same dependent recheck as an interface change.
+    // The classification itself is untouched: `interface_drift` and `--disallow-statement-changes`
     // still treat the edit as proof-only.
     let mut recheck_interface_files = classification.altered_interface_files.clone();
+    let mut proof_edit_recheck_files: Vec<String> = Vec::new();
     let mut deferred_import_graph_error: Option<anyhow::Error> = None;
-    for qualified in &classification.proof_edited_theorems {
-        let Some((rel, _)) = qualified.split_once("::") else {
-            continue;
-        };
+    let proof_edited_rels: std::collections::BTreeSet<&str> = classification
+        .proof_edited_theorems
+        .iter()
+        .filter_map(|q| q.split_once("::").map(|(rel, _)| rel))
+        .collect();
+    for rel in proof_edited_rels {
         let rel = rel.to_string();
         if recheck_interface_files.contains(&rel) {
             continue;
         }
-        let is_module = current_files
-            .get(&rel)
-            .is_some_and(|src| crate::module_builder::parse_header_info(src).is_module);
-        if is_module {
-            continue;
-        }
         match crate::lake_build::project_file_has_importers(&canon_dir, &rel) {
-            Ok(true) => recheck_interface_files.push(rel),
+            Ok(true) => {
+                proof_edit_recheck_files.push(rel.clone());
+                recheck_interface_files.push(rel);
+            }
             Ok(false) => {}
             // An unresolvable import graph fails the run, but after the gates that give a more
             // specific reason for the same defect (a package `.olean` with no source, a failed
@@ -11377,6 +11379,7 @@ pub fn run_pr_verify_command(
             "statement_digest_ms": statement_digest_ms,
             "statement_digest_kind": "constant-info+if-closure:v1",
             "lake_rechecked_modules": lake_rechecked_modules,
+            "proof_edit_recheck_files": proof_edit_recheck_files,
             "axiom_flags": classification.axiom_flags,
             "elapsed_ms": elapsed_ms
         });

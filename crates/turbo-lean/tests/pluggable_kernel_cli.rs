@@ -106,7 +106,10 @@ impl KernelTestFixture {
             .env("TURBO_LEAN_TELEMETRY", "off")
             .env("TURBO_LEAN_NO_REMOTE_TELEMETRY", "1")
             .env_remove("TURBO_LEAN_KERNEL_ENGINE")
-            .env_remove("TURBO_LEAN_KERNEL_ENGINE_FROM_CONFIG");
+            .env_remove("TURBO_LEAN_KERNEL_ENGINE_FROM_CONFIG")
+            // A sibling test may hold `TURBO_CON_LECHE_BIN` set in this process (it mutates it under
+            // `env_test_lock`); a spawned CLI must never inherit that value by accident.
+            .env_remove(kernel::CON_LECHE_BIN_ENV);
         cmd
     }
 }
@@ -1276,8 +1279,10 @@ fn real_con_leche_binary_verifies_valid_and_rejects_adversarial_olean_if_built()
 }
 
 /// Restores `TURBO_CON_LECHE_BIN` to its previous value when dropped, even if an assertion panics.
+#[cfg(unix)]
 struct ConLecheBinEnvGuard(Option<std::ffi::OsString>);
 
+#[cfg(unix)]
 impl ConLecheBinEnvGuard {
     fn set(value: &Path) -> Self {
         let prev = std::env::var_os(kernel::CON_LECHE_BIN_ENV);
@@ -1286,6 +1291,7 @@ impl ConLecheBinEnvGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for ConLecheBinEnvGuard {
     fn drop(&mut self) {
         match self.0.take() {
@@ -1301,6 +1307,9 @@ impl Drop for ConLecheBinEnvGuard {
 ///
 /// Routing half of the owner's draft PR #457 test, adapted to the no-git policy parameter. Its audit-spec
 /// half is covered by `milestone_m2_g1b_con_leche_contract_v4_and_olen_v1_model_disclosure`.
+/// Unix only, like `write_executable_script`. The fixture directory must have no `.git` ancestor: the
+/// identity gate refuses a provisioned binary under one.
+#[cfg(unix)]
 #[test]
 fn auto_kernel_routes_to_con_leche_only_for_pinned_toolchain_in_a_workspace() {
     let _env_lock = pack::tests::env_test_lock()
