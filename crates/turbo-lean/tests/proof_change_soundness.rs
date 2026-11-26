@@ -515,13 +515,11 @@ fn assert_allow_sorry_rejected(out: &Output, what: &str) {
 /// A zero-sorry file whose trailing `def` does not elaborate must fail `check --allow-sorry` and must
 /// never be reported as `file_verified`.
 ///
-/// Ported from #342 (its P0-2 case). RED at this tree's tip: `--allow-sorry` runs the theorem shards
-/// only (`mode: modulo_sorry_shards`) and reports `file_verified`, exit 0, for
-/// `def brokenTrailing : Nat := "not_a_nat"`. The same file with an added `sorry` theorem is rejected.
-/// `check --decl <thm> --allow-sorry` has the same hole (#342 P2). Ignored until the module-skeleton
-/// check from #342 is carried; run with `--ignored` to see it fail.
+/// Ported from #342 (its P0-2 case). Was red: `--allow-sorry` elaborated only the theorem shards
+/// (`mode: modulo_sorry_shards`), which stop at their own theorem, and reported `file_verified` for
+/// `def brokenTrailing : Nat := "not_a_nat"`. A file with source after its last shard now takes the
+/// whole-file path.
 #[test]
-#[ignore = "known gap: check --allow-sorry certifies a file with a broken trailing def when no theorem uses sorry (#342 P0-2/P2, not carried)"]
 fn cli_allow_sorry_rejects_zero_sorry_file_with_broken_trailing_def() {
     if !lean_available() {
         return;
@@ -540,6 +538,25 @@ fn cli_allow_sorry_rejects_zero_sorry_file_with_broken_trailing_def() {
             &format!("zero-sorry file with broken trailing def (run {run})"),
         );
     }
+}
+
+/// `check --decl <thm> --allow-sorry` elaborates only the dependency cone of `<thm>`, so a broken
+/// definition after it that the theorem does not use is not read (#342 P2 rejected it).
+/// Ignored: closing it means elaborating the whole file for a `--decl` check, which contradicts the
+/// cone-scoped design of `--decl`; that is the maintainers' call. Run with `--ignored` to see it fail.
+#[test]
+#[ignore = "design: --decl checks the dependency cone only, so an unused broken def is not read (#342 P2)"]
+fn cli_allow_sorry_decl_rejects_broken_trailing_def_outside_cone() {
+    if !lean_available() {
+        return;
+    }
+    let ws = TestWorkspace::new("allow_sorry_decl_cone");
+    fs::write(
+        ws.proj().join("W8/Partial.lean"),
+        "theorem clean_one : 1 + 1 = 2 := rfl\n\
+         def brokenTrailing : Nat := \"not_a_nat\"\n",
+    )
+    .unwrap();
     let decl = ws.run(&[
         "--json",
         "check",
@@ -551,14 +568,12 @@ fn cli_allow_sorry_rejects_zero_sorry_file_with_broken_trailing_def() {
     assert_allow_sorry_rejected(&decl, "check --decl --allow-sorry with a broken trailing def");
 }
 
-/// `check --decl <thm> --allow-sorry` must reject `sorry` in a non-theorem `def` outside the theorem
+/// `check --decl <thm> --allow-sorry` rejects `sorry` in a non-theorem `def` outside the theorem
 /// shards, even when `<thm>` does not reference it.
 ///
-/// Ported from #342 (its P1-3 case). RED at this tree's tip: the decl check reports success for
-/// `clean_target` next to `def sneakyBad : Nat := sorry`. Ignored until the maintainers decide whether
-/// this tree's `--decl --allow-sorry` contract (sorry only in theorem shards) should include defs.
+/// Ported from #342 (its P1-3 case). Was red: the decl check reported success for `clean_target`
+/// next to `def sneakyBad : Nat := sorry`.
 #[test]
-#[ignore = "known difference: check --decl --allow-sorry accepts sorry in an unrelated def (#342 P1-3, not carried)"]
 fn cli_allow_sorry_decl_rejects_def_sorry_outside_theorem_shards() {
     if !lean_available() {
         return;
