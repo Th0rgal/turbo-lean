@@ -13,6 +13,7 @@ import json
 import math
 import os
 import platform
+import re
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,10 @@ SCRIPT = Path(__file__).resolve().parent / "bench_check_loop.py"
 def load_script():
     spec = importlib.util.spec_from_file_location("bench_check_loop", SCRIPT)
     mod = importlib.util.module_from_spec(spec)
+    # Register before exec, per the importlib recipe: the script uses
+    # `from __future__ import annotations`, so its dataclass resolves field
+    # annotations through sys.modules[module name] at class-creation time.
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -393,7 +398,8 @@ class CasReplay(unittest.TestCase):
     def test_mode_result_counts_hits_and_misses_from_statuses(self):
         mod = load_script()
         m = mod.mode_result([100.0, 110.0, 120.0], [0.99] * 3,
-                            ["theorem_cache_hit", "theorem_cache_hit", "theorem_verified"])
+                            ["theorem_cache_hit", "theorem_cache_hit", "theorem_verified"],
+                            replay_mode=True)
         self.assertEqual(m["cas_replay"],
                          {"hits": 2, "misses": 1, "hit_rate": 0.6667})
 
@@ -403,15 +409,18 @@ class CasReplay(unittest.TestCase):
                             ["theorem_verified", "theorem_verified"],
                             fission_dicts=[{"fission_cached_subshards": 3,
                                             "fission_verified_subshards": None},
-                                           {}])
+                                           {}],
+                            replay_mode=True)
         self.assertEqual(m["cas_replay"]["fission_cached_subshards"], 3)
-        self.assertEqual(m["cas_replay"]["fission_verified_subshards"], 0)
+        # Never reported in any trial: None, not 0 ("the tool never emits this"
+        # must stay distinguishable from "the tool reported zero").
+        self.assertIsNone(m["cas_replay"]["fission_verified_subshards"])
         self.assertEqual(m["cas_replay"]["hits"], 0)
         self.assertEqual(m["cas_replay"]["misses"], 2)
 
     def test_mode_result_without_theorem_statuses_has_no_replay(self):
         mod = load_script()
-        m = mod.mode_result([100.0], [], ["exit_1"])
+        m = mod.mode_result([100.0], [], ["exit_1"], replay_mode=True)
         self.assertNotIn("cas_replay", m)
 
     def test_summary_separates_unedited_and_edited_conditions(self):
@@ -432,16 +441,18 @@ class CasReplay(unittest.TestCase):
         self.assertEqual(rep["unedited_recheck"]["hit_rate"], 1.0)
         self.assertEqual(rep["edited_recheck"]["misses"], 2)
         self.assertEqual(rep["edited_recheck"]["hit_rate"], 0.0)
-        self.assertEqual(rep["overall"]["check_calls"], 4)
+        self.assertEqual(rep["overall"]["classified_calls"], 4)
         self.assertEqual(rep["overall"]["hit_rate"], 0.5)
+        self.assertEqual(rep["overall"]["failed_trials"], 0)
         # The cold mode and blocked workloads are outside the recorded sequence.
         self.assertEqual(rep["overall"]["workloads"], ["w1"])
+        self.assertEqual(rep["non_ok_workloads"], [])
         self.assertIn("2 unedited warm re-checks", rep["sequence"])
 
     def test_summary_with_no_measured_warm_modes_is_empty_not_wrong(self):
         mod = load_script()
         rep = mod.summarize_cas_replay({"trials": 2, "workloads": {}})
-        self.assertEqual(rep["overall"]["check_calls"], 0)
+        self.assertEqual(rep["overall"]["classified_calls"], 0)
         self.assertIsNone(rep["overall"]["hit_rate"])
 
     def test_end_to_end_records_cas_replay(self):
@@ -459,13 +470,14 @@ class CasReplay(unittest.TestCase):
                              (10, 0, 1.0), un)
             self.assertEqual((ed["hits"], ed["misses"], ed["hit_rate"]),
                              (0, 10, 0.0), ed)
-            self.assertEqual((ov["check_calls"], ov["hit_rate"]), (20, 0.5), ov)
+            self.assertEqual((ov["classified_calls"], ov["hit_rate"]), (20, 0.5), ov)
             self.assertEqual(len(ov["workloads"]), 5, ov)
             self.assertIn("G2A CAS REPLAY:", r.stdout)
             modes = data["workloads"]["batteries_list_lemmas_top"]["modes"]
             self.assertEqual(modes["warm_cache_hit_daemon"]["cas_replay"]["hit_rate"], 1.0)
             self.assertEqual(modes["warm_edited_proof_daemon"]["cas_replay"]["hit_rate"], 0.0)
-            self.assertEqual(modes["cold_no_daemon"]["cas_replay"]["hit_rate"], 0.0)
+            # Cold runs have no CAS to hit; they are outside the replay sequence.
+            self.assertNotIn("cas_replay", modes["cold_no_daemon"])
 
 
 class BaselineStrictness(unittest.TestCase):
@@ -1465,9 +1477,125 @@ class PeakRssRecording(unittest.TestCase):
         trials = [trial("theorem_cache_hit", 801),
                   trial("failed", 999, exit_code=1),   # excluded like its timing
                   trial("theorem_cache_hit", 803)]
-        out = mod.Runner.split_trials(trials)
-        rss_mbs = out[-2]  # before the trailing failed count
-        self.assertEqual(rss_mbs, [801, 803])
+        ts = mod.Runner.split_trials(trials)
+        self.assertEqual(ts.rss_mbs, [801, 803])
+        self.assertEqual(ts.failed, 1)
+
+
+class HostFingerprint(unittest.TestCase):
+    @staticmethod
+    def _host(hostname, label, fp):
+        h = {"hostname": hostname, "machine_label": label}
+        if fp is not None:
+            h["host_fingerprint"] = fp
+        return {"host": h}
+
+    def test_same_label_different_machines_do_not_match(self):
+        mod = load_script()
+        self.assertFalse(mod.host_matches(self._host("quiet", "quiet", "a" * 64),
+                                          self._host("quiet", "quiet", "b" * 64)))
+
+    def test_same_fingerprint_same_label_matches(self):
+        mod = load_script()
+        self.assertTrue(mod.host_matches(self._host("quiet", "quiet", "a" * 64),
+                                         self._host("quiet", "quiet", "a" * 64)))
+
+    def test_same_fingerprint_different_labels_do_not_match(self):
+        mod = load_script()
+        self.assertFalse(mod.host_matches(self._host("x", "x", "a" * 64),
+                                          self._host("y", "y", "a" * 64)))
+
+    def test_legacy_hosts_without_fingerprint_compare_hostnames(self):
+        mod = load_script()
+        self.assertTrue(mod.host_matches(self._host("uruk", None, None),
+                                         self._host("uruk", None, None)))
+        self.assertFalse(mod.host_matches(self._host("uruk", None, None),
+                                          self._host("gilgamesh", None, None)))
+
+    def test_one_sided_fingerprint_falls_back_to_hostname_compare(self):
+        # An old baseline (real hostname, no fingerprint) against a new labeled
+        # run compares hostnames and mismatches; the migration is --rebaseline.
+        mod = load_script()
+        self.assertFalse(mod.host_matches(self._host("uruk", None, None),
+                                          self._host("g2a-ro-192c", "g2a-ro-192c",
+                                                     "a" * 64)))
+
+    def test_host_id_records_hex_fingerprint_never_node_name(self):
+        mod = load_script()
+        h = mod.host_id("g2a-ro-192c")
+        fp = h.get("host_fingerprint")
+        self.assertTrue(isinstance(fp, str) and re.fullmatch(r"[0-9a-f]{64}", fp), fp)
+        node = platform.node()
+        if node and node not in "g2a-ro-192c":
+            self.assertNotIn(node, json.dumps(h))
+        self.assertEqual(mod.host_id(None).get("host_fingerprint"), fp)
+
+
+class ReplaySummaryHonesty(unittest.TestCase):
+    def test_summarize_carries_failed_and_other_status_counts(self):
+        mod = load_script()
+        res = {"trials": 5, "workloads": {"w1": {
+            "expected_status": "active", "status": "failed",
+            "modes": {"warm_cache_hit_daemon": {
+                "trials": 2, "failed_trials": 3,
+                "cas_replay": {"hits": 1, "misses": 0, "hit_rate": 1.0}}}}}}
+        rep = mod.summarize_cas_replay(res)
+        un = rep["unedited_recheck"]
+        self.assertEqual(un["classified_calls"], 1)
+        self.assertEqual(un["failed_trials"], 3)
+        self.assertEqual(un["other_status_calls"], 1)
+        self.assertIsNone(un["fission_cached_subshards"])
+        self.assertIsNone(un["fission_verified_subshards"])
+        self.assertEqual(rep["non_ok_workloads"], ["w1"])
+
+    def test_fission_counters_keep_none_distinct_from_zero(self):
+        mod = load_script()
+        m = mod.mode_result([100.0], [0.99], ["theorem_verified"],
+                            fission_dicts=[{}], replay_mode=True)
+        self.assertIsNone(m["cas_replay"]["fission_cached_subshards"])
+        self.assertIsNone(m["cas_replay"]["fission_verified_subshards"])
+
+    def test_mode_result_without_replay_mode_carries_no_cas_replay(self):
+        mod = load_script()
+        m = mod.mode_result([100.0], [0.99], ["theorem_verified"])
+        self.assertNotIn("cas_replay", m)
+
+
+class OnlyWorkloadsPartialRun(unittest.TestCase):
+    def test_only_workloads_marks_skipped_and_partial_run(self):
+        with tempfile.TemporaryDirectory(prefix="m1-filter-") as td:
+            r = run_bench(Path(td), ["--no-baseline", "--only-workloads",
+                                     "batteries_list_lemmas_top",
+                                     "--out", str(Path(td) / "o.json")])
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            data = json.loads((Path(td) / "o.json").read_text())
+            self.assertEqual(data["workloads"]["batteries_unionfind_top"]["status"],
+                             "skipped_by_filter")
+            self.assertEqual(data["workloads"]["pfr_more_ruzsa_dist"]["status"],
+                             "skipped_by_filter")
+            self.assertEqual(data["verdict"]["verdict"], "partial_run")
+            self.assertIn("VERDICT: partial_run", r.stdout)
+
+    def test_rebaseline_with_only_workloads_is_usage_error(self):
+        mod = load_script()
+        with self.assertRaises(SystemExit) as cm:
+            mod.main(["--turbo-lean-bin", "x", "--batteries-dir", "b",
+                      "--pfr-dir", "p", "--rebaseline",
+                      "--only-workloads", "batteries_list_lemmas_top"])
+        self.assertEqual(cm.exception.code, 2)
+
+
+class SplitTrialsNamedFields(unittest.TestCase):
+    def test_split_trials_returns_named_fields(self):
+        mod = load_script()
+        trial = {"exit_code": 0, "external_wall_ms": 100.0,
+                 "json": {"status": "theorem_cache_hit", "peak_rss_mb": 801},
+                 "stderr": "", "psi_before": {}, "psi_after": {}}
+        ts = mod.Runner.split_trials([trial])
+        self.assertEqual(ts.rss_mbs, [801])
+        self.assertEqual(ts.failed, 0)
+        self.assertEqual(ts.runs, [100.0])
+        self.assertEqual(ts.statuses, ["theorem_cache_hit"])
 
 
 class HostIdLabel(unittest.TestCase):
