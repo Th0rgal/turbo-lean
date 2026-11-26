@@ -112,6 +112,34 @@ rel_spread 0.6493. Wall time is the denominator of every share, so contention
 inflates walls and makes the shares read smaller than they would be on a
 quiet node.
 
+## G2b: warm CAS-expr replay, on-vs-off delta
+
+Paired sequential runs on one rebuilt binary at `a3ad5f4d` (sha256
+`e4fccb2515a3ac08…`, opt-out string present in the binary with a grep
+control), same venue, flags, and label as above; 5 trials per cell; four
+active Batteries workloads. Artifacts:
+`scripts/bench_check_loop_g2b_on.json` (default) and
+`scripts/bench_check_loop_g2b_off.json` (`TURBO_LEAN_NO_WARM_CAS_REPLAY=1`).
+
+Warm cache-hit medians, OFF -> ON, classified by the bench's own
+tolerance with OFF as baseline:
+
+| workload | OFF ms | ON ms | delta | band | class |
+|---|---|---|---|---|---|
+| batteries_list_lemmas_top | 2351.3 | 2461.7 | +4.70% | ±260.1 | unchanged |
+| batteries_rbtree_lemmas_mid | 3029.5 | 3088.7 | +1.95% | ±328.0 | unchanged |
+| batteries_string_lemmas_top | 2586.0 | 2532.3 | -2.08% | ±529.3 | unchanged |
+| batteries_unionfind_top | 2233.8 | 2241.9 | +0.36% | ±248.4 | unchanged |
+
+Cold and warm-edited cells are also all unchanged; no cell of 12 falls
+outside the band. Per the H2 rule ("a change that does not move it is
+reverted") the warm default reverted to opt-in (`TURBO_LEAN_WARM_CAS_REPLAY=1`
+enables; the opt-out still forces off; the replay path is kept unchanged).
+A traced structural fact: `run_build_command_with_cas_replay` is reached only
+from the `build` CLI and `pr_verify`, never from the `check` path this bench
+drives, so the null delta here is expected by construction; a re-measure that
+could resolve a real cost must exercise `build`-shaped warm loops.
+
 ## Per-cell peak RSS across the 5 trials (MB, trial order)
 
 From `peak_rss_mb_trials` (the tool's own `peak_rss_mb` reading per check). No
