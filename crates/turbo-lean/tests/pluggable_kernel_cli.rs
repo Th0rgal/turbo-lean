@@ -28,6 +28,18 @@ mod lake_build {
     }
 }
 
+mod pack {
+    pub mod tests {
+        // Stub matching `crate::pack::tests::env_test_lock()` so the #[path]-included
+        // `kernel.rs` tests module compiles in this integration crate; within this binary it
+        // serializes the same env-mutating tests.
+        pub fn env_test_lock() -> &'static std::sync::Mutex<()> {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            &LOCK
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[path = "../src/kernel.rs"]
 mod kernel;
@@ -329,57 +341,24 @@ fn pr_and_ci_verify_base_policy_isolation_and_receipt_verification() {
     let ci_json: Value = serde_json::from_slice(&ci_out.stdout).unwrap();
     assert_eq!(ci_json["kernel_requested"], "auto");
     assert_eq!(ci_json["lean_toolchain"], toolchain);
-    // Host-honest resolved-engine assertion (G1c r2): `auto` accepts the toolchain-bundled
-    // con-leche when the host has a CAPABLE one, so compute bundled-binary acceptance the way
-    // the resolver's probe computes it (`ELAN_HOME` else `$HOME/.elan`, elan's mangling of the
-    // pinned toolchain, an executable file at `bin/con-leche`, whose `--help` advertises the
-    // `--olean` mode the executing sites require) and assert the resolved engine / recorded
-    // provenance against that, instead of pinning one host's answer. A capable bundled binary
-    // records the probed-capability marker, never the unverified pinned rev (G1c r2).
-    let bundled_accepted = kernel::normalize_lean_toolchain(toolchain)
-        == kernel::PINNED_CON_LECHE_TOOLCHAIN
-        && std::env::var_os("ELAN_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".elan")))
-            .filter(|elan_home| elan_home.is_absolute())
-            .map(|elan_home| {
-                let dir_name = kernel::PINNED_CON_LECHE_TOOLCHAIN
-                    .replace('/', "--")
-                    .replace(':', "---");
-                let bin = elan_home
-                    .join("toolchains")
-                    .join(dir_name)
-                    .join("bin")
-                    .join("con-leche");
-                let executable = bin
-                    .metadata()
-                    .map(|m| {
-                        m.is_file()
-                            && std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o111
-                                != 0
-                    })
-                    .unwrap_or(false);
-                executable
-                    && Command::new(&bin)
-                        .arg("--help")
-                        .output()
-                        .map(|out| {
-                            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-                            text.push_str(&String::from_utf8_lossy(&out.stderr));
-                            text.contains("--olean")
-                        })
-                        .unwrap_or(false)
-            })
-            .unwrap_or(false);
-    if bundled_accepted {
-        assert_eq!(ci_json["kernel_engine"], "con-leche");
-        assert_eq!(
-            ci_json["con_leche_rev"],
-            kernel::BUNDLED_CON_LECHE_PROVENANCE_MARKER
-        );
-    } else {
-        assert_eq!(ci_json["kernel_engine"], "standard");
-        assert!(ci_json["con_leche_rev"].is_null());
+    // Host-honest resolved-engine assertion (G1c r2; DA 388e906a F7): computed by the REAL
+    // selection probe through the #[path]-included kernel module, under the same environment
+    // the CLI child sees (`ELAN_HOME`, `HOME` and `TURBO_CON_LECHE_BIN` reach both), so this
+    // test cannot drift from the resolver the way a hand-rolled copy did. A capable bundled
+    // binary records the probed-capability marker, never the unverified pinned rev.
+    match kernel::probe_con_leche_support_for_selection(
+        kernel::KernelEngineSelection::Auto,
+        toolchain,
+        Some(&repo),
+    ) {
+        Some(expected_rev) => {
+            assert_eq!(ci_json["kernel_engine"], "con-leche");
+            assert_eq!(ci_json["con_leche_rev"], expected_rev);
+        }
+        None => {
+            assert_eq!(ci_json["kernel_engine"], "standard");
+            assert!(ci_json["con_leche_rev"].is_null());
+        }
     }
 
     // Explicit caller env (without FROM_CONFIG=1) in `ci-verify` without `--base` still applies and fails closed.
@@ -643,6 +622,7 @@ fn con_leche_exit_code_protocol_and_verified_cli_flags() {
     std::env::set_var("MOCK_CODE", "0");
     let rep_ok = kernel::verify_olean_modules_with_con_leche(
         &mock_bin,
+        kernel::ConLecheBinaryProvenance::ProvisionedPinnedRev,
         &search_paths,
         &roots,
         &["DemoMod.thm".to_string()],
@@ -680,6 +660,7 @@ fn con_leche_exit_code_protocol_and_verified_cli_flags() {
     std::env::set_var("MOCK_CODE", "1");
     let rep_rej = kernel::verify_olean_modules_with_con_leche(
         &mock_bin,
+        kernel::ConLecheBinaryProvenance::ProvisionedPinnedRev,
         &search_paths,
         &roots,
         &[],
@@ -695,6 +676,7 @@ fn con_leche_exit_code_protocol_and_verified_cli_flags() {
     std::env::set_var("MOCK_CODE", "2");
     let rep_dec = kernel::verify_olean_modules_with_con_leche(
         &mock_bin,
+        kernel::ConLecheBinaryProvenance::ProvisionedPinnedRev,
         &search_paths,
         &roots,
         &[],
@@ -710,6 +692,7 @@ fn con_leche_exit_code_protocol_and_verified_cli_flags() {
         std::env::set_var("MOCK_CODE", fatal_mode);
         let err = kernel::verify_olean_modules_with_con_leche(
             &mock_bin,
+            kernel::ConLecheBinaryProvenance::ProvisionedPinnedRev,
             &search_paths,
             &roots,
             &[],
@@ -729,9 +712,14 @@ fn con_leche_exit_code_protocol_and_verified_cli_flags() {
     let ndjson_path = f.root.join("sample.ndjson");
     fs::write(&ndjson_path, "{}\n").unwrap();
     std::env::set_var("MOCK_CODE", "0");
-    let nd_ok =
-        kernel::verify_ndjson_with_con_leche(&mock_bin, &ndjson_path, Some(2), Some(&scratch_dir))
-            .unwrap();
+    let nd_ok = kernel::verify_ndjson_with_con_leche(
+        &mock_bin,
+        kernel::ConLecheBinaryProvenance::ProvisionedPinnedRev,
+        &ndjson_path,
+        Some(2),
+        Some(&scratch_dir),
+    )
+    .unwrap();
     assert_eq!(nd_ok.verdict, kernel::ConLecheVerdict::Accepted);
     std::env::remove_var("MOCK_CODE");
 }
@@ -1068,6 +1056,7 @@ fn real_con_leche_binary_verifies_valid_and_rejects_adversarial_olean_if_built()
 
     let rep_valid = kernel::verify_olean_modules_with_con_leche(
         &con_leche_bin,
+        kernel::ConLecheBinaryProvenance::ProvisionedPinnedRev,
         std::slice::from_ref(&olean_dir),
         &["ValidPrelude".to_string()],
         &[],
@@ -1101,6 +1090,7 @@ fn real_con_leche_binary_verifies_valid_and_rejects_adversarial_olean_if_built()
 
     let rep_spoof = kernel::verify_olean_modules_with_con_leche(
         &con_leche_bin,
+        kernel::ConLecheBinaryProvenance::ProvisionedPinnedRev,
         std::slice::from_ref(&olean_dir),
         &["SpoofNatDiv".to_string()],
         &[],
@@ -1114,6 +1104,7 @@ fn real_con_leche_binary_verifies_valid_and_rejects_adversarial_olean_if_built()
     // Missing module on search path -> exit 3 -> fail-closed Err.
     let err_missing = kernel::verify_olean_modules_with_con_leche(
         &con_leche_bin,
+        kernel::ConLecheBinaryProvenance::ProvisionedPinnedRev,
         std::slice::from_ref(&olean_dir),
         &["NoSuchModuleAnywhere".to_string()],
         &[],

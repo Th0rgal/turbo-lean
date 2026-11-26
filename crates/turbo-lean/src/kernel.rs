@@ -169,6 +169,13 @@ pub struct KernelProvenance {
     pub kernel_engine: ResolvedKernelEngine,
     pub lean_toolchain: String,
     pub con_leche_rev: Option<String>,
+    /// The binary selection resolved for a con-leche engine, with its provenance, carried so the
+    /// executing sites run EXACTLY the probe-accepted binary (DA 388e906a F2: discovery used to
+    /// run a second time at execution, with the build in between, so a binary built mid-flow
+    /// could swap in). Never serialized: receipts carry `con_leche_rev`, and a deserialized
+    /// provenance carries no resolved binary.
+    #[serde(skip)]
+    pub con_leche_binary: Option<(PathBuf, ConLecheBinaryProvenance)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
 }
@@ -222,25 +229,37 @@ pub fn probe_con_leche_support_for_selection(
     ) {
         return probe_con_leche_support(lean_toolchain);
     }
+    discover_con_leche_binary_for_workspace_selection(requested, lean_toolchain, workspace_root)
+        .map(|(_, provenance)| provenance.recorded_rev())
+}
+
+/// The selection-time binary resolution behind [`probe_con_leche_support_for_selection`] and
+/// [`resolve_kernel_engine_in_workspace`]: the pinned-toolchain gate, then the ONE shared
+/// discovery, returning the accepted binary with its provenance. G1c r2 (review 22ae951a F1) +
+/// DA 388e906a F2: the pair this returns is stored in [`KernelProvenance`] so the executing
+/// sites run exactly this binary, with no second discovery after the build.
+fn discover_con_leche_binary_for_workspace_selection(
+    requested: KernelEngineSelection,
+    lean_toolchain: &str,
+    workspace_root: Option<&Path>,
+) -> Option<(PathBuf, ConLecheBinaryProvenance)> {
+    if !matches!(
+        requested,
+        KernelEngineSelection::Auto
+            | KernelEngineSelection::ConLeche
+            | KernelEngineSelection::Both
+    ) {
+        return None;
+    }
     if normalize_lean_toolchain(lean_toolchain) != PINNED_CON_LECHE_TOOLCHAIN {
         return None;
     }
-    // G1c r2: selection and execution share one discovery, so the binary this probe accepts is
-    // the binary the executing sites run (review 22ae951a F1). The recorded string is honest to
-    // the provenance: the pinned rev only for provisioned (identity-gated) binaries; the
-    // capability-probe marker for the toolchain-bundled binary, whose rev is unverified.
     discover_con_leche_binary_for_selection_with_provenance(
         requested,
         lean_toolchain,
         workspace_root,
     )
     .ok()
-    .map(|(_, provenance)| match provenance {
-        ConLecheBinaryProvenance::ProvisionedPinnedRev => PINNED_CON_LECHE_REV.to_string(),
-        ConLecheBinaryProvenance::ToolchainBundledProbed => {
-            BUNDLED_CON_LECHE_PROVENANCE_MARKER.to_string()
-        }
-    })
 }
 
 pub fn resolve_kernel_selection(
@@ -288,10 +307,19 @@ pub fn resolve_kernel_engine_in_workspace(
     workspace_root: Option<&Path>,
 ) -> Result<KernelProvenance> {
     let lean_toolchain = normalize_lean_toolchain(lean_toolchain);
-    let probed_con_leche_rev = workspace_root
-        .and_then(|root| {
-            probe_con_leche_support_for_selection(requested, &lean_toolchain, Some(root))
-        })
+    // DA 388e906a F2: resolve the binary ONCE, here at selection; the pair is stored in the
+    // provenance so the executing sites run exactly this path with no second discovery.
+    let discovered_binary: Option<(PathBuf, ConLecheBinaryProvenance)> =
+        workspace_root.and_then(|root| {
+            discover_con_leche_binary_for_workspace_selection(
+                requested,
+                &lean_toolchain,
+                Some(root),
+            )
+        });
+    let probed_con_leche_rev = discovered_binary
+        .as_ref()
+        .map(|(_, provenance)| provenance.recorded_rev())
         .or_else(|| probe_con_leche_support(&lean_toolchain));
     let routed_tag =
         crate::c_abi::route_kernel_engine(requested.to_c_abi_tag(), probed_con_leche_rev.is_some());
@@ -327,6 +355,12 @@ pub fn resolve_kernel_engine_in_workspace(
         kernel_engine,
         lean_toolchain,
         con_leche_rev,
+        con_leche_binary: matches!(
+            kernel_engine,
+            ResolvedKernelEngine::ConLeche | ResolvedKernelEngine::Both
+        )
+        .then_some(discovered_binary)
+        .flatten(),
         fallback_reason,
     })
 }
@@ -391,7 +425,14 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 pub fn discover_con_leche_binary(workspace_root: Option<&Path>) -> Result<PathBuf> {
-    if let Ok(raw) = std::env::var(CON_LECHE_BIN_ENV) {
+    if let Some(raw) = std::env::var_os(CON_LECHE_BIN_ENV) {
+        // DA 388e906a F5: a set but non-UTF-8 value is a reported misconfiguration, never a
+        // silent skip (which would let `auto` switch to another binary).
+        let Some(raw) = raw.to_str() else {
+            anyhow::bail!(
+                "`{CON_LECHE_BIN_ENV}` is set to a non-UTF-8 value: fail-closed misconfiguration"
+            );
+        };
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
             let p = PathBuf::from(trimmed);
@@ -486,41 +527,123 @@ pub enum ConLecheBinaryProvenance {
     ToolchainBundledProbed,
 }
 
+impl ConLecheBinaryProvenance {
+    /// The `con_leche_rev` string recorded for a binary of this provenance. DA 388e906a F1: the
+    /// recorded rev is decided HERE, from the provenance the one discovery classified, never
+    /// re-derived from paths after the fact.
+    pub fn recorded_rev(self) -> String {
+        match self {
+            Self::ProvisionedPinnedRev => PINNED_CON_LECHE_REV.to_string(),
+            Self::ToolchainBundledProbed => BUNDLED_CON_LECHE_PROVENANCE_MARKER.to_string(),
+        }
+    }
+}
+
 /// The `con_leche_rev` value recorded for a toolchain-bundled binary: a probed-capability
 /// marker, because the capability probe establishes the CLI surface, not the rev.
 pub const BUNDLED_CON_LECHE_PROVENANCE_MARKER: &str =
     "toolchain-bundled:rev-unverified:olean-help-probed";
 
 /// The capability probe for the bundled candidate (G1c r2):
-/// selection accepts a toolchain-bundled binary only when its `--help` advertises the `--olean`
-/// mode the executing sites require (`verify_olean_modules_with_con_leche`). Measured live on
-/// 2026-11-26: the v4.35.0 toolchain ships a con-leche whose usage has no `--olean` ("unknown
-/// option --olean", exit 3), so on such a host `auto` falls back to standard, the pre-G1c
-/// behavior.
+/// selection accepts a toolchain-bundled binary only when `--help` EXITS 0 and advertises the
+/// `--olean` mode the executing sites require (`verify_olean_modules_with_con_leche`), matched
+/// as a whole token so `--olean-dir` does not pass (DA 388e906a F4). The spawn is bounded by a
+/// 10 s kill and the verdict is cached per process, keyed by canonical path + mtime, so
+/// repeated resolutions spawn at most once per binary version. Measured live on 2026-11-26:
+/// the v4.35.0 toolchain ships a con-leche whose usage has no `--olean` ("unknown option
+/// --olean", exit 3), so on such a host `auto` falls back to standard, the pre-G1c behavior.
 fn con_leche_help_advertises_olean(binary_path: &Path) -> bool {
-    let Ok(out) = Command::new(binary_path).arg("--help").output() else {
-        return false;
-    };
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&out.stderr));
-    text.contains("--olean")
+    static PROBE_CACHE: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<PathBuf, (Option<std::time::SystemTime>, bool)>>,
+    > = std::sync::OnceLock::new();
+    let canon = binary_path
+        .canonicalize()
+        .unwrap_or_else(|_| binary_path.to_path_buf());
+    let mtime = canon.metadata().and_then(|m| m.modified()).ok();
+    let cache = PROBE_CACHE.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some((cached_mtime, cached)) = guard.get(&canon) {
+            if *cached_mtime == mtime {
+                return *cached;
+            }
+        }
+    }
+    let result = con_leche_help_probe_once(&canon);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(canon, (mtime, result));
+    }
+    result
 }
 
-/// The rev claim recorded for an EXECUTED binary: the probe marker when the binary is the
-/// toolchain-bundled candidate (its rev is unverified), the pinned rev otherwise (provisioned
-/// binaries are pinned-rev by the provisioning contract).
-fn executed_con_leche_rev_claim(binary_path: &Path) -> String {
-    let bundled = bundled_toolchain_con_leche_binary(
-        PINNED_CON_LECHE_TOOLCHAIN,
-        elan_home_dir().as_deref(),
-    )
-    .and_then(|p| p.canonicalize().ok());
-    if bundled.is_some()
-        && (bundled.as_deref() == Some(binary_path) || bundled == binary_path.canonicalize().ok())
-    {
-        BUNDLED_CON_LECHE_PROVENANCE_MARKER.to_string()
-    } else {
-        PINNED_CON_LECHE_REV.to_string()
+/// One bounded `--help` spawn: exit 0 required; `--olean` as a whole token over stdout+stderr.
+/// The output is read after exit, so a (hypothetical) help text larger than the pipe buffer
+/// would stall the child into the timeout kill and read as incapable: fail-closed.
+fn con_leche_help_probe_once(binary_path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut child) = Command::new(binary_path)
+        .arg("--help")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    };
+    if !status.success() {
+        return false;
+    }
+    let mut text = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut text);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let mut err_text = String::new();
+        let _ = err.read_to_string(&mut err_text);
+        text.push_str(&err_text);
+    }
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .any(|token| token == "--olean")
+}
+
+/// Whether the checkout's bridge-binary path is TRACKED in git (DA 388e906a F3, scoped):
+/// `pr-verify` materializes the head TREE, so a malicious PR can only plant a bridge binary by
+/// COMMITTING it, while a legitimate bridge binary is a build output and stays untracked.
+/// Exit 0 = tracked, exit 1 = untracked; anything else is an error the caller fails closed on.
+fn bridge_binary_is_tracked(checkout: &Path) -> Result<bool> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(["ls-files", "--error-unmatch", "--", BRIDGE_CON_LECHE_BIN_REL])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .context("failed to run `git ls-files` for the bridge-binary tracked check")?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        other => anyhow::bail!(
+            "`git ls-files --error-unmatch` for the bridge `con-leche` binary returned unexpected status {other:?}"
+        ),
     }
 }
 
@@ -547,9 +670,12 @@ pub fn discover_con_leche_binary_for_selection_with_provenance(
     lean_toolchain: &str,
     workspace_root: Option<&Path>,
 ) -> Result<(PathBuf, ConLecheBinaryProvenance)> {
-    let env_provisioned = std::env::var(CON_LECHE_BIN_ENV)
-        .map(|raw| !raw.trim().is_empty())
-        .unwrap_or(false);
+    // DA 388e906a F5: `var_os`, so a set but non-UTF-8 value still counts as provisioned (it is
+    // a reported misconfiguration downstream, never a silent switch to the bundled binary).
+    let env_provisioned = match std::env::var_os(CON_LECHE_BIN_ENV) {
+        None => false,
+        Some(raw) => raw.to_str().map(|s| !s.trim().is_empty()).unwrap_or(true),
+    };
     discover_con_leche_binary_for_selection_impl(
         requested,
         lean_toolchain,
@@ -558,6 +684,7 @@ pub fn discover_con_leche_binary_for_selection_with_provenance(
         env_provisioned,
         elan_home_dir().as_deref(),
         &con_leche_help_advertises_olean,
+        &bridge_binary_is_tracked,
     )
 }
 
@@ -572,6 +699,7 @@ fn discover_con_leche_binary_for_selection_impl(
     env_provisioned: bool,
     elan_home: Option<&Path>,
     bundled_olean_capable: &dyn Fn(&Path) -> bool,
+    bridge_tracked_in_checkout: &dyn Fn(&Path) -> Result<bool>,
 ) -> Result<(PathBuf, ConLecheBinaryProvenance)> {
     // The checkout the identity and containment gates measure against. A workspace root that
     // cannot be canonicalized fails the gates closed for every selection.
@@ -641,7 +769,40 @@ fn discover_con_leche_binary_for_selection_impl(
                     bin.display()
                 ));
             }
+            // DA 388e906a F3 (scoped): a bridge binary DELIVERED BY THE TREE is never accepted.
+            // `pr-verify` materializes the head TREE, so a planted binary at the bridge path is
+            // necessarily tracked there, while a legitimately built bridge binary is a `.lake`
+            // build output and stays untracked. A check that cannot run fails closed.
+            match bridge_tracked_in_checkout(co) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return bundled_fallback(anyhow::anyhow!(
+                        "Bridge `con-leche` binary `{}` is TRACKED in checkout `{}`: a tree-delivered binary is refused (fail-closed identity gate)",
+                        bin.display(),
+                        co.display()
+                    ));
+                }
+                Err(e) => {
+                    return bundled_fallback(anyhow::anyhow!(
+                        "Could not determine whether bridge `con-leche` binary `{}` is tracked in checkout `{}` (fail-closed): {e:#}",
+                        bin.display(),
+                        co.display()
+                    ));
+                }
+            }
         }
+    }
+    // DA 388e906a F1: classify by canonical path in ONE place. A provisioned binary that IS the
+    // toolchain-bundled candidate (e.g. `TURBO_CON_LECHE_BIN` pointing at it) carries the
+    // bundled provenance: its rev is exactly as unverified found that way, and the recorded rev
+    // must say so everywhere (selection, receipts, run reports).
+    let is_bundled_candidate = bundled_toolchain_con_leche_binary(lean_toolchain, elan_home)
+        .and_then(|p| p.canonicalize().ok())
+        .is_some_and(|cand| {
+            cand == bin || Some(cand.as_path()) == bin.canonicalize().ok().as_deref()
+        });
+    if is_bundled_candidate {
+        return Ok((bin, ConLecheBinaryProvenance::ToolchainBundledProbed));
     }
     Ok((bin, ConLecheBinaryProvenance::ProvisionedPinnedRev))
 }
@@ -687,6 +848,7 @@ fn resolve_scratch_tmpdir(explicit_tmpdir: Option<&Path>) -> Option<PathBuf> {
 fn classify_con_leche_status(
     status: ExitStatus,
     binary_path: PathBuf,
+    binary_provenance: ConLecheBinaryProvenance,
     jobs: usize,
     stdout: String,
     stderr: String,
@@ -725,12 +887,13 @@ fn classify_con_leche_status(
     } else {
         None
     };
-    let con_leche_rev = executed_con_leche_rev_claim(&binary_path);
+    // DA 388e906a F1: the run report's rev claim comes from the provenance the ONE discovery
+    // classified at selection, never re-derived from paths after the fact.
     Ok(ConLecheRunReport {
         verdict,
         exit_code: code,
         binary_path,
-        con_leche_rev,
+        con_leche_rev: binary_provenance.recorded_rev(),
         jobs,
         accepted_declarations,
         stdout,
@@ -738,8 +901,10 @@ fn classify_con_leche_status(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn verify_olean_modules_with_con_leche(
     binary_path: &Path,
+    binary_provenance: ConLecheBinaryProvenance,
     search_paths: &[PathBuf],
     root_modules: &[String],
     constants: &[String],
@@ -799,11 +964,19 @@ pub fn verify_olean_modules_with_con_leche(
     })?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    classify_con_leche_status(out.status, binary_path.to_path_buf(), jobs, stdout, stderr)
+    classify_con_leche_status(
+        out.status,
+        binary_path.to_path_buf(),
+        binary_provenance,
+        jobs,
+        stdout,
+        stderr,
+    )
 }
 
 pub fn verify_ndjson_with_con_leche(
     binary_path: &Path,
+    binary_provenance: ConLecheBinaryProvenance,
     ndjson_file: &Path,
     requested_jobs: Option<usize>,
     scratch_tmpdir: Option<&Path>,
@@ -841,7 +1014,14 @@ pub fn verify_ndjson_with_con_leche(
         })?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    classify_con_leche_status(out.status, binary_path.to_path_buf(), jobs, stdout, stderr)
+    classify_con_leche_status(
+        out.status,
+        binary_path.to_path_buf(),
+        binary_provenance,
+        jobs,
+        stdout,
+        stderr,
+    )
 }
 
 
@@ -1833,7 +2013,10 @@ mod tests {
     fn test_selection_discovery_matrix_bundled_and_provisioned() {
         // G1c r2: the env-free injected-lookup matrix over the shared selection discovery
         // (review 22ae951a F1/F4/F6; --olean capability probe, G1c r2). No environment variable is read or written, and no binary
-        // is executed: the capability probe is injected.
+        // or git process is executed: the capability probe and the bridge tracked-check are
+        // injected. Caveat (DA 388e906a F8): cases that expect acceptance rely on
+        // `std::env::temp_dir()` lying outside every git checkout; a TMPDIR inside a repo would
+        // trip the in-checkout and `.git`-ancestor gates on the fixtures.
         let tmp = std::env::temp_dir().join(format!(
             "turbo_lean_g1c_selmx_{}_{}",
             std::process::id(),
@@ -1850,6 +2033,7 @@ mod tests {
         let not_found = || anyhow::anyhow!("no provisioned con-leche");
         let olean_capable: &dyn Fn(&Path) -> bool = &|_| true;
         let olean_incapable: &dyn Fn(&Path) -> bool = &|_| false;
+        let bridge_untracked: &dyn Fn(&Path) -> anyhow::Result<bool> = &|_| Ok(false);
         let write_exec = |p: &Path| {
             std::fs::write(p, b"#!/bin/sh\nexit 0\n").unwrap();
             #[cfg(unix)]
@@ -1868,6 +2052,7 @@ mod tests {
             false,
             Some(&elan),
             olean_capable,
+            bridge_untracked,
         )
         .is_err());
 
@@ -1883,6 +2068,7 @@ mod tests {
             false,
             Some(&elan),
             olean_capable,
+            bridge_untracked,
         )
         .unwrap();
         assert_eq!(got, bundled.canonicalize().unwrap());
@@ -1899,6 +2085,7 @@ mod tests {
             false,
             Some(&elan),
             olean_incapable,
+            bridge_untracked,
         )
         .unwrap_err();
         let chain = format!("{err:#}");
@@ -1916,6 +2103,7 @@ mod tests {
                     false,
                     Some(&elan),
                     olean_capable,
+                    bridge_untracked,
                 )
                 .is_err(),
                 "explicit {req} must not take the bundled binary"
@@ -1932,6 +2120,7 @@ mod tests {
             true,
             Some(&elan),
             olean_capable,
+            bridge_untracked,
         )
         .unwrap_err();
         assert!(err.to_string().contains("points to missing"));
@@ -1945,6 +2134,7 @@ mod tests {
             false,
             Some(&elan),
             olean_capable,
+            bridge_untracked,
         )
         .is_err());
 
@@ -1957,11 +2147,13 @@ mod tests {
             false,
             Some(Path::new("relative/elan")),
             olean_capable,
+            bridge_untracked,
         )
         .is_err());
 
         // 7. a bundled binary under the checkout is rejected (review 22ae951a F4), before the
-        //    capability probe is ever consulted.
+        //    capability probe is ever consulted: the injected probe panics if it runs
+        //    (DA 388e906a F8).
         let ws2 = tmp.join("co");
         std::fs::create_dir_all(ws2.join(".git")).unwrap();
         let elan2 = ws2.join("elan");
@@ -1975,7 +2167,10 @@ mod tests {
             Err(not_found()),
             false,
             Some(&elan2),
-            olean_capable,
+            &|_: &Path| -> bool {
+                panic!("the in-checkout rejection must run before the capability probe")
+            },
+            bridge_untracked,
         )
         .is_err());
 
@@ -1993,6 +2188,7 @@ mod tests {
             true,
             None,
             olean_incapable,
+            bridge_untracked,
         )
         .unwrap();
         assert_eq!(got, prov);
@@ -2013,6 +2209,7 @@ mod tests {
             false,
             Some(&elan),
             olean_capable,
+            bridge_untracked,
         )
         .is_err());
         let (got, provenance) = discover_con_leche_binary_for_selection_impl(
@@ -2023,6 +2220,7 @@ mod tests {
             false,
             Some(&elan),
             olean_capable,
+            bridge_untracked,
         )
         .unwrap();
         assert_eq!(
@@ -2030,6 +2228,71 @@ mod tests {
             bundled.canonicalize().unwrap(),
             "auto must try the bundled binary when the identity gate rejects a discovered one"
         );
+        assert_eq!(provenance, ConLecheBinaryProvenance::ToolchainBundledProbed);
+
+        // 10. a bridge-path binary that is TRACKED in the checkout is refused (DA 388e906a F3):
+        //     pr-verify materializes the head TREE, so committing the file is how a PR plants
+        //     one; a legitimately built bridge binary is untracked build output.
+        let bridge = ws2.join(BRIDGE_CON_LECHE_BIN_REL);
+        std::fs::create_dir_all(bridge.parent().unwrap()).unwrap();
+        write_exec(&bridge);
+        let bridge = bridge.canonicalize().unwrap();
+        let err = discover_con_leche_binary_for_selection_impl(
+            KernelEngineSelection::ConLeche,
+            PINNED_CON_LECHE_TOOLCHAIN,
+            Some(&ws2),
+            Ok(bridge.clone()),
+            false,
+            None,
+            olean_capable,
+            &|_| Ok(true),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("TRACKED"), "{err:#}");
+
+        // 11. a tracked-check that cannot run fails closed.
+        assert!(discover_con_leche_binary_for_selection_impl(
+            KernelEngineSelection::ConLeche,
+            PINNED_CON_LECHE_TOOLCHAIN,
+            Some(&ws2),
+            Ok(bridge.clone()),
+            false,
+            None,
+            olean_capable,
+            &|_| Err(anyhow::anyhow!("git unavailable")),
+        )
+        .is_err());
+
+        // 12. an untracked bridge binary stays accepted, with pinned-rev provenance.
+        let (got, provenance) = discover_con_leche_binary_for_selection_impl(
+            KernelEngineSelection::ConLeche,
+            PINNED_CON_LECHE_TOOLCHAIN,
+            Some(&ws2),
+            Ok(bridge.clone()),
+            false,
+            None,
+            olean_capable,
+            bridge_untracked,
+        )
+        .unwrap();
+        assert_eq!(got, bridge);
+        assert_eq!(provenance, ConLecheBinaryProvenance::ProvisionedPinnedRev);
+
+        // 13. a provisioned binary that IS the toolchain-bundled candidate carries the bundled
+        //     provenance (DA 388e906a F1: classified by canonical path in ONE place), without
+        //     consulting the capability probe on the provisioned path.
+        let (got, provenance) = discover_con_leche_binary_for_selection_impl(
+            KernelEngineSelection::ConLeche,
+            PINNED_CON_LECHE_TOOLCHAIN,
+            Some(&ws),
+            Ok(bundled.canonicalize().unwrap()),
+            true,
+            Some(&elan),
+            olean_incapable,
+            bridge_untracked,
+        )
+        .unwrap();
+        assert_eq!(got, bundled.canonicalize().unwrap());
         assert_eq!(provenance, ConLecheBinaryProvenance::ToolchainBundledProbed);
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2043,9 +2306,12 @@ mod tests {
         // pinned rev) whether or not the host carries a provisioned bridge binary (an
         // identity-rejected discovery falls back to the bundled binary); off the pin it resolves
         // standard; explicit selections keep failing closed on provisioned binaries only. Env
-        // mutation is RAII-guarded and serialized (review 22ae951a F6).
-        static ELAN_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _env = ELAN_TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // mutation is RAII-guarded and serialized under the crate's SHARED env lock
+        // (DA 388e906a F6: a function-local lock serialized nothing against the other
+        // env-mutating tests in this binary).
+        let _env = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _bin_guard = ScopedEnvVar::remove(CON_LECHE_BIN_ENV);
 
         let tmp = std::env::temp_dir().join(format!(
@@ -2119,6 +2385,16 @@ mod tests {
             Some(BUNDLED_CON_LECHE_PROVENANCE_MARKER)
         );
         assert_eq!(auto_prov.fallback_reason, None);
+        // DA 388e906a F2: the resolved provenance carries the binary the executing sites run.
+        let (resolved_bin, resolved_provenance) = auto_prov
+            .con_leche_binary
+            .clone()
+            .expect("a resolved con-leche engine carries its binary");
+        assert_eq!(resolved_bin, bundled.canonicalize().unwrap());
+        assert_eq!(
+            resolved_provenance,
+            ConLecheBinaryProvenance::ToolchainBundledProbed
+        );
 
         // Off the pinned toolchain the bundled binary is never consulted.
         let off_pin = resolve_kernel_engine_in_workspace(
