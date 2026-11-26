@@ -11340,6 +11340,30 @@ mod pr_verify_tests {
         compute_imported_olean_interface_hashes, compute_shard_key, is_file_verified_in_lake_build,
     };
 
+    /// G1c fixture hermeticity: the in-process pr-verify/ci-verify/check flows resolve the kernel
+    /// engine from `TURBO_LEAN_KERNEL_ENGINE` (default `auto`), and since G1c `auto` can resolve
+    /// to a toolchain-bundled `con-leche` found under the host's `$ELAN_HOME`. A fixture whose
+    /// subject is not kernel-engine selection pins the engine to `standard` so host elan contents
+    /// cannot steer it; the holder must already hold `crate::pack::tests::env_test_lock()`.
+    struct KernelEngineStandardPin(Option<std::ffi::OsString>);
+
+    impl KernelEngineStandardPin {
+        fn new() -> Self {
+            let prev = std::env::var_os(crate::kernel::KERNEL_ENGINE_ENV);
+            std::env::set_var(crate::kernel::KERNEL_ENGINE_ENV, "standard");
+            Self(prev)
+        }
+    }
+
+    impl Drop for KernelEngineStandardPin {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var(crate::kernel::KERNEL_ENGINE_ENV, v),
+                None => std::env::remove_var(crate::kernel::KERNEL_ENGINE_ENV),
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_optout_trusted_pr_stale_imports_preserve_lake_tree() -> Result<()> {
@@ -11899,6 +11923,8 @@ globs = ["Corpus.+"]
         let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Subject: removed base-manifest git-dependency materialization, not kernel selection.
+        let _kernel_pin = KernelEngineStandardPin::new();
         if crate::module_builder::probe_bwrap_sandbox(Path::new(".")).is_none() {
             println!("untrusted removed base dependency fixture skipped: no working bubblewrap");
             return Ok(());
@@ -12214,6 +12240,8 @@ globs = ["Demo.+"]
         let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Subject: kernel-statement extraction and caching, not kernel-engine selection.
+        let _kernel_pin = KernelEngineStandardPin::new();
         let dir = std::env::temp_dir().join(format!(
             "turbo-kernel-statements-{}-{}",
             std::process::id(),
@@ -12397,6 +12425,8 @@ globs = ["Demo.+"]
             .lock().unwrap_or_else(|e| e.into_inner());
         let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
             .lock().unwrap_or_else(|e| e.into_inner());
+        // Subject: auxiliary-declaration statement handling, not kernel-engine selection.
+        let _kernel_pin = KernelEngineStandardPin::new();
         let dir = std::env::temp_dir().join(format!(
             "turbo-aux-414-{}-{}", std::process::id(), pack::next_tmp_id()
         ));
@@ -12645,6 +12675,8 @@ root = "Spoof"
         let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Subject: axiom/csimp policy resolution at base, not kernel-engine selection.
+        let _kernel_pin = KernelEngineStandardPin::new();
         let dir = std::env::temp_dir().join(format!(
             "turbo-kernel-policy-{}-{}",
             std::process::id(),
@@ -14526,6 +14558,8 @@ allow = [
         let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Subject: untrusted fail-closed gates and the csimp/axiom audit, not engine selection.
+        let _kernel_pin = KernelEngineStandardPin::new();
         let tmp_dir = std::env::temp_dir().join(format!(
             "turbo_lean_untrusted_pr_ci_test_{}_{}",
             std::process::id(),
@@ -17175,6 +17209,8 @@ end ParityNs
         let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Subject: theorem-type mismatch fail-closed behavior, not kernel-engine selection.
+        let _kernel_pin = KernelEngineStandardPin::new();
         let dir = std::env::temp_dir().join(format!(
             "turbo_kth_mismatch_{}_{}",
             std::process::id(),
