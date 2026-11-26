@@ -8,18 +8,23 @@ script with a stub binary that emulates `check --json`.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import math
 import os
 import platform
 import re
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parent / "bench_check_loop.py"
 
@@ -1944,6 +1949,184 @@ class CommittedArtifactIsPathFree(unittest.TestCase):
             for e in found:
                 self.assertIn(" on <pfr>/", e)
                 self.assertIn(" home <scratch>/", e)
+
+
+class DaemonCleanup(unittest.TestCase):
+    """A workload's daemons end with it, even when `daemon stop` gives up, and
+    nothing outside the workload's staging namespace is touched."""
+
+    SLEEPER = b"import time\ntime.sleep(120)\n"
+
+    def spawn(self, staging, command, daemon=True, program=SLEEPER):
+        # `python - <command>` reads its program from stdin, so `command` is the
+        # first word after the flags, where turbo-lean looks for `serve`.
+        env = dict(os.environ, TURBO_LEAN_STAGING_DIR=str(staging))
+        if daemon:
+            env["TURBO_LEAN_DAEMON"] = "1"
+        p = subprocess.Popen([sys.executable, "-", command], env=env, stdin=subprocess.PIPE,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(self.reap, p)
+        p.stdin.write(program)
+        p.stdin.close()
+        return p
+
+    def test_a_daemon_that_ignores_sigterm_is_killed(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-daemons-") as td:
+            staging = Path(td) / "staging"
+            bin_path = Path(sys.executable).resolve()
+            ready = Path(td) / "ready"
+            stubborn = self.spawn(staging, "serve", program=(
+                "import signal, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                f"open({str(ready)!r}, 'w').close()\n"
+                "time.sleep(120)\n").encode())
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(ready.exists(), "the stubborn daemon never started")
+            done = subprocess.CompletedProcess([str(bin_path), "daemon", "stop"], 0)
+            with mock.patch.object(mod.subprocess, "run", return_value=done), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                mod.stop_daemons(bin_path, {"TURBO_LEAN_STAGING_DIR": str(staging)})
+            self.assertEqual(stubborn.wait(timeout=5), -signal.SIGKILL)
+
+    @staticmethod
+    def reap(p):
+        if p.poll() is None:
+            p.kill()
+        p.wait(timeout=10)
+
+    @staticmethod
+    def wait_until_listed(mod, staging, bin_path, n):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if len(mod.scoped_daemon_processes(staging, bin_path)) >= n:
+                return
+            time.sleep(0.05)
+
+    def test_a_timed_out_daemon_stop_still_ends_this_namespace_and_only_it(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-daemons-") as td:
+            staging, other = Path(td) / "staging", Path(td) / "other"
+            bin_path = Path(sys.executable).resolve()
+            ours = self.spawn(staging, "serve")
+            theirs = self.spawn(other, "serve")
+            not_a_daemon = self.spawn(staging, "check", daemon=False)
+            self.wait_until_listed(mod, staging, bin_path, 1)
+            err = io.StringIO()
+            hung = subprocess.TimeoutExpired([str(bin_path), "daemon", "stop"],
+                                             mod.DAEMON_STOP_TIMEOUT_S)
+            with mock.patch.object(mod.subprocess, "run", side_effect=hung), \
+                    contextlib.redirect_stderr(err):
+                mod.stop_daemons(bin_path, {"TURBO_LEAN_STAGING_DIR": str(staging)})
+            self.assertEqual(ours.wait(timeout=5), -signal.SIGTERM, err.getvalue())
+            self.assertIsNone(theirs.poll(), "another namespace's daemon was signalled")
+            self.assertIsNone(not_a_daemon.poll(), "a process that is not a daemon was signalled")
+            self.assertIn("daemon stop failed", err.getvalue())
+            self.assertEqual(mod.scoped_daemon_processes(staging, bin_path), [])
+
+    def test_a_daemon_stop_that_returns_but_leaves_a_daemon_is_finished_off(self):
+        # `daemon stop` matches a server by the name `turbo-lean`, so a renamed
+        # binary's daemon survives its own stop; the bench finds it by path.
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-daemons-") as td:
+            staging = Path(td) / "staging"
+            bin_path = Path(sys.executable).resolve()
+            ours = self.spawn(staging, "serve")
+            self.wait_until_listed(mod, staging, bin_path, 1)
+            done = subprocess.CompletedProcess([str(bin_path), "daemon", "stop"], 0)
+            with mock.patch.object(mod.subprocess, "run", return_value=done), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                mod.stop_daemons(bin_path, {"TURBO_LEAN_STAGING_DIR": str(staging)})
+            self.assertEqual(ours.wait(timeout=5), -signal.SIGTERM)
+
+    def test_the_scope_rule_on_a_fake_proc_tree(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory() as td:
+            proc = Path(td).resolve() / "proc"
+            bin_path = Path(td).resolve() / "bin" / "turbo-lean-renamed"
+            staging = "/s/ns"
+            ns = f"TURBO_LEAN_STAGING_DIR={staging}"
+
+            def fake(pid, exe, args, env, state="S"):
+                d = proc / str(pid)
+                d.mkdir(parents=True)
+                (d / "exe").symlink_to(exe)
+                (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in args) + b"\0")
+                (d / "environ").write_bytes(b"\0".join(e.encode() for e in env) + b"\0")
+                (d / "stat").write_text(
+                    f"{pid} (a b) {state} " + " ".join(["0"] * 18) + f" {1000 + pid} 0\n")
+
+            b = str(bin_path)
+            fake(101, b, [b, "--cache-dir", "c", "serve"], [ns, "TURBO_LEAN_DAEMON=1"])
+            fake(102, "/x/turbo_zygote_ab", ["w"], [ns])
+            fake(103, "/x/turbo_zygote_ab", ["w", "--decl-identity"], [ns])
+            fake(104, b, [b, "check", "f.lean"], [ns, "TURBO_LEAN_DAEMON=1"])
+            fake(105, b, [b, "serve"], ["TURBO_LEAN_STAGING_DIR=/s/other", "TURBO_LEAN_DAEMON=1"])
+            fake(106, "/usr/bin/turbo-lean", ["/usr/bin/turbo-lean", "serve"],
+                 [ns, "TURBO_LEAN_DAEMON=1"])
+            fake(107, "/x/turbo-zygote", ["w"], ["TURBO_LEAN_STAGING_DIR=/s/ns-oneshot-9-1"])
+            fake(108, "/x/turbo_zygote_ab", ["w"], [ns], state="Z")
+            fake(109, b + " (deleted)", [b, "serve"], [ns, "TURBO_LEAN_DAEMON=1"])
+            fake(110, b, [b, "serve"], [ns])
+            fake(111, "/x/turbo_zygote_ab", ["w"], ["TURBO_LEAN_STAGING_DIR=/s/ns2"])
+            (proc / "self").mkdir()
+            got = mod.scoped_daemon_processes(staging, bin_path, proc_root=proc)
+            # Servers of this binary and namespace, its workers and its one-shot
+            # sibling's workers; never an audit helper, a non-serve command,
+            # another namespace or binary, a zombie, or a server without
+            # TURBO_LEAN_DAEMON=1.
+            self.assertEqual(got, [(101, "1101"), (102, "1102"), (107, "1107"), (109, "1109")])
+
+
+class ScratchRemoval(unittest.TestCase):
+    """turbo-lean writes read-only directories (closure snapshots) under its
+    home; the bench must still remove every trial directory it made."""
+
+    def test_remove_tree_clears_read_only_dirs_and_never_follows_a_symlink(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            outside = base / "outside"
+            outside.mkdir()
+            (outside / "keep.txt").write_text("k")
+            outside.chmod(0o555)
+            root = base / "scratch-root"
+            store = root / "home" / "closure-realm" / "d0"
+            store.mkdir(parents=True)
+            (store / "x.ilean").write_text("x")
+            store.chmod(0o500)
+            store.parent.chmod(0o500)
+            (root / "link").symlink_to(outside, target_is_directory=True)
+            try:
+                mod.remove_tree(root)
+                self.assertFalse(root.exists())
+                self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o555)
+                self.assertEqual((outside / "keep.txt").read_text(), "k")
+            finally:
+                outside.chmod(0o755)
+
+    def test_a_run_whose_checks_write_read_only_dirs_leaves_no_scratch(self):
+        with tempfile.TemporaryDirectory(prefix="m1-scratch-") as td:
+            root = Path(td)
+            stub, _ = make_stub_binary(root)
+            marker = "status = 'theorem_verified'\n"
+            default = stub.read_text()
+            self.assertIn(marker, default)
+            body = default.replace(marker, marker + (
+                "_snap = os.path.join(os.environ['TURBO_LEAN_HOME'], 'closure-realm', 'd0')\n"
+                "if not os.path.isdir(_snap):\n"
+                "    os.makedirs(_snap)\n"
+                "    open(os.path.join(_snap, 'x.ilean'), 'w').write('x')\n"
+                "    os.chmod(_snap, 0o500)\n"
+                "    os.chmod(os.path.dirname(_snap), 0o500)\n"), 1)
+            tmp = root / "tmp"
+            tmp.mkdir()
+            r = run_bench(root, ["--no-baseline", "--out", str(root / "o.json")],
+                          stub_body=body, env_extra={"TMPDIR": str(tmp)})
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(sorted(p.name for p in tmp.iterdir()), [])
 
 
 class OnlyWorkloadsPartialRun(unittest.TestCase):
