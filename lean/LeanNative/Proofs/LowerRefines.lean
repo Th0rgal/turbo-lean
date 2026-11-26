@@ -74,8 +74,19 @@ the pre-r1 passes is therefore environment, not the mutant; per the non-inflatio
 number is reused. The fixes: the r1 harness gives every scratch a private TMPDIR and
 TURBO_LEAN_HOME, and this leaf's one Tests edit derives the pack fixture path from
 `$TMPDIR` (the same convention `EvalLCNFCLITests` already uses). The number of record
-comes from the r1 harness over the fixed tree and is inlined below by the fold commit
-together with `scripts/proof_mutant_matrix_results.json`.
+comes from the r1 harness over the fixed tree, measured at commit 88324526 with a
+3-repetition determinism read of all five implicated ids first (identical verdicts 3/3
+each: four KILLED by this file's pins, the budget mutant SURVIVED 3/3):
+
+  COVERAGE: 59/60 mutants killed (98.3%); denominator 60 = every enumerated mutant
+  (0 stillborn, 0 infra, 0 timeout, 0 error). The one survivor is
+  `RB-rettyfuel-offby1-00`, recorded in disposition 5 below. Full table with
+  per-mutant kill attribution: `scripts/proof_mutant_matrix_results.json`
+  (toolchain leanprover/lean4:v4.35.0). 7 of the 59 kills attribute to this file
+  (`LeanNative.Proofs.LowerRefines`) as the first failing module: the six findings
+  closed in this record plus `RB-fvarlookup-flip-00`, whose inverted fvar lookup
+  Pin 3's lowering fixture also reaches — attribution names lake's FIRST failure,
+  so a mutant that several modules kill is credited to whichever elaborates first.
 
 The five implicated mutants and their dispositions:
 
