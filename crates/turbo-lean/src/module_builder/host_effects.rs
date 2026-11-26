@@ -81,13 +81,11 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
             anyhow::bail!(
                 "Failed to purge stale build artifact(s) of {} ({}): the module's \
                  artifacts are stale and the package is not purgeable from this \
-                 project root (a shared or foreign checkout). Rebuild it in its own \
-                 workspace (`lake build {}` from {}) to refresh its artifacts, then \
-                 rerun.",
+                 project root (a shared or foreign checkout). Refresh its Lake \
+                 artifacts first ({}) and retry.",
                 spec.module_name,
                 spec.pkg_root.display(),
-                spec.module_name,
-                spec.pkg_root.display()
+                non_owned_dep_refresh_remedy(&spec.module_name, &cfg.root_pkg.pkg_root)
             )
         };
         let Ok(src_raw) = fs::read_to_string(&spec.src_path) else {
@@ -919,18 +917,22 @@ pub(crate) fn dep_pkg_lake_targets_owned_by_project(
 /// * a clean git-pinned package (a manifest `git` entry, clean at its rev) is never
 ///   project-owned: its own workspace refreshes it from the pin (#434);
 /// * a root inside another package's `.lake/packages` is a nested checkout, never ours;
-/// * a `path` manifest entry is editable project state when it resolves inside the
-///   project root, or when its directory is not itself a git checkout (an editable
-///   scratch sibling, review finding 6: un-owning one turns its edited `include_str`
-///   targets into silent skips that nothing refreshes); an out-of-tree GIT clone
-///   behind a `path` entry (`require mathlib from "/abs/mathlib4"`, one clone shared
-///   across projects) is refreshed by its own workspace, exactly the #434 class
-///   (DA 71add786 finding 4);
-/// * everything else (no matching manifest entry — a hand-built or synthesized
-///   package — or a git entry whose checkout is not clean at its pin) falls back to
-///   location: a canonical root inside the project root is ours, and a symlinked
-///   `.lake/packages` directory that points at a checkout elsewhere (#434's damaged
-///   shared Mathlib) resolves outside the root and stays refused.
+/// * a canonical root inside the project root is project state;
+/// * an out-of-tree root is project state only with explicit evidence (DA 3ff1014b
+///   F1), one signal shared with the build gate's packages-dir proof (#436): a
+///   `.turbo-lean-packages-owner` marker in the package root or the directory that
+///   holds it, naming this project's canonical root, or residence in the project's
+///   own git repository (one `.git` above both, the monorepo-sibling `require`
+///   shape). The bare `.git`-existence test this replaces got both directions
+///   wrong: an editable sibling clone lost ownership (review finding 6's silent
+///   skips returned), while a `.git`-less tarball or rsync copy behind a symlinked
+///   `.lake/packages` entry stayed owned, exactly the #434 shared-checkout write;
+/// * a `path` manifest entry whose directory sits in no git repository, with the
+///   project in none either, stays editable scratch (finding 6): with no repository
+///   signal on either side there is no shared-checkout evidence. An out-of-tree GIT
+///   clone behind a `path` entry with no marker (`require mathlib from
+///   "/abs/mathlib4"`, one clone shared across projects) is refreshed by its own
+///   workspace, exactly the #434 class (DA 71add786 finding 4).
 fn pkg_root_owned_by_project(
     cfg: &ProjectConfig,
     pkg_name: &str,
@@ -943,21 +945,62 @@ fn pkg_root_owned_by_project(
     if pkg_root_inside_foreign_lake_packages(cfg, pkg_root) {
         return false;
     }
-    let inside_root = match (
-        fs::canonicalize(pkg_root),
-        fs::canonicalize(&cfg.root_pkg.pkg_root),
-    ) {
-        (Ok(pkg), Ok(root)) => pkg.starts_with(&root),
-        _ => false,
-    };
-    if manifest_entry_is_path_dep(cfg, pkg_name, pkg_base_name, pkg_root) {
-        // Inside the root it is project state; outside, only a directory that is not
-        // itself a git checkout counts as editable scratch (finding 6). An
-        // out-of-tree git clone shared across projects is #434's shape whatever the
-        // manifest entry type says (DA 71add786 finding 4).
-        return inside_root || !pkg_root.join(".git").exists();
+    let pkg_canon = fs::canonicalize(pkg_root);
+    let root_canon = fs::canonicalize(&cfg.root_pkg.pkg_root);
+    if let (Ok(pkg), Ok(root)) = (&pkg_canon, &root_canon) {
+        if pkg.starts_with(root) {
+            return true;
+        }
     }
-    inside_root
+    let Ok(root) = root_canon else {
+        return false;
+    };
+    if owner_marker_names_project(pkg_root, &root) {
+        return true;
+    }
+    let pkg_repo = pkg_canon
+        .ok()
+        .as_deref()
+        .and_then(nearest_git_ancestor);
+    match (pkg_repo, nearest_git_ancestor(&root)) {
+        (Some(pkg_repo), Some(root_repo)) => pkg_repo == root_repo,
+        (None, None) => manifest_entry_is_path_dep(cfg, pkg_name, pkg_base_name, pkg_root),
+        _ => false,
+    }
+}
+
+/// The nearest ancestor (the path itself included) holding a `.git` entry: the
+/// repository that contains `path`. `.git` may be a directory (an ordinary checkout)
+/// or a file (a linked worktree or a submodule); both count.
+fn nearest_git_ancestor(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|a| a.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+/// The explicit out-of-tree ownership proof shared with the build gate (#436): a
+/// `.turbo-lean-packages-owner` file in the package root, or in the directory that
+/// holds it (a relocated packages dir covering every entry under it), whose content
+/// is this project's canonical root.
+fn owner_marker_names_project(pkg_root: &Path, root_canon: &Path) -> bool {
+    let marker_names_root = |dir: &Path| {
+        fs::read_to_string(dir.join(".turbo-lean-packages-owner"))
+            .is_ok_and(|s| Path::new(s.trim()) == root_canon)
+    };
+    marker_names_root(pkg_root) || pkg_root.parent().is_some_and(marker_names_root)
+}
+
+/// The one remedy both non-owned-checkout refusals name (DA 3ff1014b F5): Lake, run
+/// from the PROJECT root, refreshes a dependency's artifacts through the project's
+/// own workspace and manifest. Running `lake` inside `.lake/packages/<dep>` instead
+/// resolves the dependency's own manifest and can fetch a nested `.lake/packages`
+/// with different pins.
+pub(crate) fn non_owned_dep_refresh_remedy(module: &str, project_root: &Path) -> String {
+    format!(
+        "run `lake build +{}` from the project root {}",
+        module,
+        project_root.display()
+    )
 }
 
 fn manifest_entry_is_path_dep(
@@ -3377,6 +3420,206 @@ mod host_effect_taint_tests {
         Ok(())
     }
 
+    /// DA 3ff1014b F1: out-of-tree ownership rests on explicit evidence, the same
+    /// `.turbo-lean-packages-owner` proof the build gate uses for a relocated
+    /// packages dir (#436). A standalone clone the project claims with a marker
+    /// naming the project's canonical root keeps the editable workflow (finding 6)
+    /// without re-admitting the unmarked shared clone (#434, DA 71add786 finding 4).
+    #[test]
+    fn host_effects_owner_marked_out_of_tree_clone_is_project_owned() -> Result<()> {
+        let dir = temp_dir("marked_clone_path");
+        let proj = dir.join("proj");
+        let dep = dir.join("lintlib");
+        fs::create_dir_all(&proj)?;
+        fs::create_dir_all(&dep)?;
+        let tc = include_str!("../../../../lean/lean-toolchain");
+        fs::write(dep.join("lean-toolchain"), tc)?;
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"lintlib\"\ndefaultTargets = [\"LintLib\"]\n[[lean_lib]]\nname = \"LintLib\"\n",
+        )?;
+        fs::write(dep.join("LintLib.lean"), LINTER_SHAPE)?;
+        git_init_commit(&dep)?;
+        fs::write(proj.join("lean-toolchain"), tc)?;
+        fs::write(
+            proj.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage proj where\nrequire lintlib from \"../lintlib\"\n@[default_target]\nlean_lib Proj where\n",
+        )?;
+        fs::write(proj.join("Proj.lean"), "import LintLib\ndef p : Nat := 1\n")?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [{
+                    "type": "path",
+                    "name": "lintlib",
+                    "dir": "../lintlib",
+                    "manifestFile": "lake-manifest.json",
+                    "inherited": false,
+                    "configFile": "lakefile.toml"
+                }]
+            }))?,
+        )?;
+        let canon = fs::canonicalize(&proj)?;
+        fs::write(
+            dep.join(".turbo-lean-packages-owner"),
+            format!("{}\n", canon.display()),
+        )?;
+        reset_lake_inputs_tag_memo();
+        let cfg = resolve_project_config(&canon)?;
+        let dep_pkg = cfg
+            .dep_pkgs
+            .iter()
+            .find(|dp| dp.name == "lintlib")
+            .expect("marked lintlib dependency resolves");
+        let spec = resolve_module_in_package(dep_pkg, false, "LintLib")
+            .expect("LintLib module resolves in the marked clone");
+        assert!(
+            spec_artifacts_purgeable_from_project_root(&cfg, &spec),
+            "an out-of-tree clone carrying an owner marker naming this project is \
+             project state; its artifacts are purged and rebuilt from here"
+        );
+        assert!(
+            dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
+            "an out-of-tree clone carrying an owner marker naming this project is \
+             lake-driven from here"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// DA 3ff1014b F1: a `.git`-less copy (a tarball extract, an rsync copy, a
+    /// foreign monorepo subdirectory) behind a symlinked `.lake/packages` entry
+    /// canonicalizes outside the project checkout and carries no ownership evidence,
+    /// so it stays a shared checkout (#434) even though no `.git` sits inside it.
+    #[cfg(unix)]
+    #[test]
+    fn host_effects_gitless_copy_behind_symlinked_packages_entry_is_not_owned() -> Result<()> {
+        let dir = temp_dir("gitless_copy_path");
+        let proj = dir.join("proj");
+        let copy = dir.join("lintlib_copy");
+        fs::create_dir_all(proj.join(".lake/packages"))?;
+        fs::create_dir_all(&copy)?;
+        let tc = include_str!("../../../../lean/lean-toolchain");
+        fs::write(copy.join("lean-toolchain"), tc)?;
+        fs::write(
+            copy.join("lakefile.toml"),
+            "name = \"lintlib\"\ndefaultTargets = [\"LintLib\"]\n[[lean_lib]]\nname = \"LintLib\"\n",
+        )?;
+        fs::write(copy.join("LintLib.lean"), LINTER_SHAPE)?;
+        fs::write(proj.join("lean-toolchain"), tc)?;
+        fs::write(
+            proj.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage proj where\nrequire lintlib from \".lake/packages/lintlib\"\n@[default_target]\nlean_lib Proj where\n",
+        )?;
+        fs::write(proj.join("Proj.lean"), "import LintLib\ndef p : Nat := 1\n")?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [{
+                    "type": "path",
+                    "name": "lintlib",
+                    "dir": ".lake/packages/lintlib",
+                    "manifestFile": "lake-manifest.json",
+                    "inherited": false,
+                    "configFile": "lakefile.toml"
+                }]
+            }))?,
+        )?;
+        std::os::unix::fs::symlink(&copy, proj.join(".lake/packages/lintlib"))?;
+        // The project is an ordinary checkout; the copy is in no repository at all.
+        git_init_commit(&proj)?;
+        let canon = fs::canonicalize(&proj)?;
+        reset_lake_inputs_tag_memo();
+        let cfg = resolve_project_config(&canon)?;
+        let dep_pkg = cfg
+            .dep_pkgs
+            .iter()
+            .find(|dp| dp.name == "lintlib")
+            .expect("gitless-copy lintlib dependency resolves");
+        let spec = resolve_module_in_package(dep_pkg, false, "LintLib")
+            .expect("LintLib module resolves in the gitless copy");
+        assert!(
+            !spec_artifacts_purgeable_from_project_root(&cfg, &spec),
+            "a `.git`-less out-of-tree copy behind a symlinked packages entry is a \
+             shared checkout (#434); its artifacts are never purged from this project"
+        );
+        assert!(
+            !dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
+            "a `.git`-less out-of-tree copy behind a symlinked packages entry is not \
+             lake-built from this project (#434)"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// A path dependency in the SAME repository as the project (a monorepo sibling,
+    /// `require lintlib from "../libs/lintlib"` with one `.git` above both) is the
+    /// project's own state wherever the package root sits relative to the project
+    /// root (DA 3ff1014b F1).
+    #[test]
+    fn host_effects_same_repo_monorepo_path_dep_is_project_owned() -> Result<()> {
+        let dir = temp_dir("monorepo_path");
+        let proj = dir.join("proj");
+        let dep = dir.join("libs/lintlib");
+        fs::create_dir_all(&proj)?;
+        fs::create_dir_all(&dep)?;
+        let tc = include_str!("../../../../lean/lean-toolchain");
+        fs::write(dep.join("lean-toolchain"), tc)?;
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"lintlib\"\ndefaultTargets = [\"LintLib\"]\n[[lean_lib]]\nname = \"LintLib\"\n",
+        )?;
+        fs::write(dep.join("LintLib.lean"), LINTER_SHAPE)?;
+        fs::write(proj.join("lean-toolchain"), tc)?;
+        fs::write(
+            proj.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage proj where\nrequire lintlib from \"../libs/lintlib\"\n@[default_target]\nlean_lib Proj where\n",
+        )?;
+        fs::write(proj.join("Proj.lean"), "import LintLib\ndef p : Nat := 1\n")?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [{
+                    "type": "path",
+                    "name": "lintlib",
+                    "dir": "../libs/lintlib",
+                    "manifestFile": "lake-manifest.json",
+                    "inherited": false,
+                    "configFile": "lakefile.toml"
+                }]
+            }))?,
+        )?;
+        // One repository holds both the project and the dependency.
+        git_init_commit(&dir)?;
+        let canon = fs::canonicalize(&proj)?;
+        reset_lake_inputs_tag_memo();
+        let cfg = resolve_project_config(&canon)?;
+        let dep_pkg = cfg
+            .dep_pkgs
+            .iter()
+            .find(|dp| dp.name == "lintlib")
+            .expect("monorepo lintlib dependency resolves");
+        let spec = resolve_module_in_package(dep_pkg, false, "LintLib")
+            .expect("LintLib module resolves in the monorepo sibling");
+        assert!(
+            spec_artifacts_purgeable_from_project_root(&cfg, &spec),
+            "a path dependency inside the project's own repository stays project-owned"
+        );
+        assert!(
+            dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
+            "a path dependency inside the project's own repository is lake-driven \
+             from here"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
     /// A pinned module whose gitignored `include_str` target is regenerated goes
     /// stale with no change to its source or lakefile mtimes: the resolved targets
     /// are part of the artifact's input set, so the staleness gate reads them too
@@ -3689,9 +3932,11 @@ mod host_effect_taint_tests {
                         "{label}: refusal must name the purge failure, got: {err:#}"
                     );
                     assert!(
-                        format!("{err:#}").contains("its own workspace"),
-                        "{label}: refusal must name the action that clears the \
-                         condition (an own-workspace rebuild), got: {err:#}"
+                        format!("{err:#}")
+                            .contains("`lake build +LintLib` from the project root"),
+                        "{label}: refusal must name the one remedy (a Lake refresh \
+                         driven from the project root, the same command the build \
+                         gate names), got: {err:#}"
                     );
                     assert!(
                         dep_olean.is_file() && root_olean.is_file(),

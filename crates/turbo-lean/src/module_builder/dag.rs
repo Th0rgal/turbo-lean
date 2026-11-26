@@ -10279,13 +10279,15 @@ pub(super) fn build_module_dag_inner(
                     && is_git_pinned_manifest_package(cfg, &spec)
                 {
                     anyhow::bail!(
-                        "Cannot build module `{}`: package `{}` is a git-pinned dependency checkout outside the project root ({} is neither under {} nor under an owner-marked packages dir); turbo-lean never compiles or publishes into it. Refresh its Lake artifacts first (run `lake build +{}` from the project root {}) and retry",
+                        "Cannot build module `{}`: package `{}` is a git-pinned dependency checkout outside the project root ({} is neither under {} nor under an owner-marked packages dir); turbo-lean never compiles or publishes into it. Refresh its Lake artifacts first ({}) and retry",
                         spec.module_name,
                         spec.pkg_name,
                         pkg_canon.display(),
                         root_canon.display(),
-                        spec.module_name,
-                        root_pkg.pkg_root.display()
+                        super::host_effects::non_owned_dep_refresh_remedy(
+                            &spec.module_name,
+                            &root_pkg.pkg_root
+                        )
                     );
                 }
             }
