@@ -24,7 +24,11 @@ Methodology & Honesty Rules:
   `.error (.unsupportedCall fn.toString)` whenever `(ctx.findLocalCallee? fn).isSome`. Because
   `lowerRealLCNFDecl_sound` is a forward simulation gated on `evalRealLCNFDecl ... = .ok (v, hst')`,
   its conclusion is vacuous for any declaration that calls a local helper (`lowered_vacuous_local_call`,
-  classified under `lowered_unproved` until rung **L2** adds a function environment to both semantics).
+  classified under `lowered_unproved`). Rung **L2** (`420d1d1`) added a function environment to both
+  semantics and proved `lowerRealLCNFDecl_soundF` (`lean/LeanNative/Proofs/LowerCalls.lean`) for
+  non-recursive resolved calls whose arguments are all `.fvar`. Its contract hands the reclassification
+  of those declarations (L2's "matrix moves" accept) to this script, which does not perform it yet, so
+  every lowered declaration with a local call is still counted `lowered_unproved`.
 - A call to a user function OUTSIDE the measured corpus is refused by the real lowerer and
   counted `rejected`, not `proved`, in the one measured counterexample pinned by
   `test_out_of_corpus_callee_is_rejected_never_proved` (a two-module fixture audited caller-only:
@@ -368,7 +372,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "lowered_unproved",
         "evidence_file": "lean/LeanNative/IR/RealLCNFSemantics.lean",
         "evidence_symbol": "if (ctx.findLocalCallee? fn).isSome then",
-        "notes": "Lowered to LNIRExpr.call by lowerImpureFapPure, but evalLetValue returns .error (.unsupportedCall fn.toString), making lowerRealLCNFDecl_sound vacuous until rung L2.",
+        "notes": "Lowered to LNIRExpr.call by lowerImpureFapPure; evalLetValue returns .error (.unsupportedCall fn.toString) on a local callee, so lowerRealLCNFDecl_sound is vacuous here. L2 (420d1d1) proved lowerRealLCNFDecl_soundF (Proofs/LowerCalls.lean) for non-recursive resolved calls with all-.fvar arguments; this script does not yet reclassify those declarations (L2's \"matrix moves\" handoff), so every lowered declaration with a local call stays lowered_unproved.",
     },
     {
         "id": "LetValue.fap.gf_simd",

@@ -33,7 +33,7 @@
   },
   "matrixSource": {
     "committedResults": "scripts/lcnf_coverage_results.json",
-    "measuredSourceCommit": "2d18487bfecacada542884c868953424bfc75161",
+    "measuredSourceCommit": "19ae99cd36c4dbe30f71a776f933e9258372081d",
     "spec": "scripts/lcnf_coverage.py"
   },
   "originNote": "roadmap names lean4/tests/lean/run; at the pinned rev (tag v4.35.0) upstream has reorganized the suite into test piles (tests/README.md), and the successor piles for the self-contained run tests are tests/elab and tests/compile. Paths are recorded as they exist at the pin.",
