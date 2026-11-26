@@ -3,9 +3,16 @@
 
 The former Python reference formulas and C runtime stubs were not independent
 Lean execution. They are deliberately excluded from acceptance. Full loop
-(`seqFor`), upstream 250+ `lean4/tests/lean/run`, external ecosystem Lake
-packages (`Batteries`, `SciLean`, `ArkLib`), and hardware target qualification
-remain open. Tier `C2` runs 3-way multi-module Lake package differential
+(`seqFor`), external ecosystem Lake packages beyond `Batteries` (`SciLean`,
+`ArkLib`), and hardware target qualification remain open. Tier `C1` runs the
+eight authored 3-way fixtures and, with `--c1-upstream` (or
+`TURBO_C1_UPSTREAM=1`), a manifest-driven 250-program upstream corpus
+(`scripts/c1_corpus_manifest.json`, pinned `leanprover/lean4` @ tag `v4.35.0`,
+provisioned like the C2 external arm by `git fetch --depth 1` into
+`TURBO_LEAN_HOME/c1-upstream` and gated on program count, per-file sha256 at
+the pin, and matrix-construct coverage before execution; frontend-rejected
+programs are recorded fail-closed with their syntactic matrix constructs,
+never silently dropped). Tier `C2` runs 3-way multi-module Lake package differential
 conformance (`lean -c` + `leanc`, `lean-native emit-lnir --wire` + `eval-lnir`
 + `validate-tv`, and `compile-llvm` + `clang` under ASan/UBSan) when
 provisioned via `TURBO_C2_PACKAGES_DIR` (or `--c2-packages-dir`, including
@@ -26,6 +33,7 @@ arm64 (aarch64) qualification: the differential tiers, sanitizer legs, and C2/C4
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -37,6 +45,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import build_c1_corpus_manifest as c1_corpus
 import fuzz_lcnf_conformance as fuzz
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -986,6 +995,174 @@ def run_c2_corpus(cli_dir: str | None, asan: bool, ubsan: bool, external: bool =
     }
 
 
+def ensure_c1_upstream_corpus() -> dict[str, Any]:
+    """Provision the pinned upstream `leanprover/lean4` checkout for the Tier C1
+    manifest corpus into the persistent cache (mirrors `ensure_c2_external_dep`:
+    one shallow fetch on a cold cache; a stamp file keeps warm runs offline).
+
+    The pin's toolchain correspondence is by tag (`v4.35.0`, the version of
+    PINNED_CON_LECHE_TOOLCHAIN); the lean4 repo's own `lean-toolchain` is its
+    bootstrap pointer (`build/release/stage1`), so the post-checkout assertion
+    is `git rev-parse HEAD` == the pinned commit plus the presence of the
+    corpus piles the manifest selects from."""
+    repo_url = c1_corpus.C1_UPSTREAM_REPO_URL
+    rev = c1_corpus.C1_UPSTREAM_REV
+    dep_dir = c1_corpus.corpus_cache_dir()
+    stamp = dep_dir / ".turbo-c1-provisioned"
+    base: dict[str, Any] = {
+        "repoUrl": repo_url,
+        "rev": rev,
+        "tag": c1_corpus.C1_UPSTREAM_TAG,
+        "path": str(dep_dir),
+    }
+    try:
+        if not (stamp.is_file() and stamp.read_text(encoding="utf-8").strip() == rev):
+            dep_dir.mkdir(parents=True, exist_ok=True)
+            if not (dep_dir / ".git").is_dir():
+                subprocess.run(["git", "init", "-q", str(dep_dir)], check=True, capture_output=True, text=True)
+            subprocess.run(["git", "-C", str(dep_dir), "fetch", "-q", "--depth", "1", repo_url, rev],
+                           check=True, capture_output=True, text=True)
+            subprocess.run(["git", "-C", str(dep_dir), "checkout", "-q", "--detach", rev],
+                           check=True, capture_output=True, text=True)
+            head = subprocess.run(["git", "-C", str(dep_dir), "rev-parse", "HEAD"],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+            if head != rev:
+                return {**base, "ok": False, "reason": f"checkout is at {head!r}, expected the pinned rev"}
+            stamp.write_text(rev + "\n", encoding="utf-8")
+        missing_piles = [pile for pile in c1_corpus.CORPUS_PILES if not (dep_dir / pile).is_dir()]
+        if missing_piles:
+            return {**base, "ok": False, "reason": f"corpus piles missing at the pin: {missing_piles}"}
+        return {**base, "ok": True}
+    except subprocess.CalledProcessError as err:
+        return {**base, "ok": False,
+                "reason": f"`{' '.join(str(c) for c in err.cmd)}` failed with exit {err.returncode}",
+                "stderrTail": (err.stderr or "")[-1200:]}
+    except OSError as err:
+        return {**base, "ok": False, "reason": str(err)}
+
+
+C1_UPSTREAM_PROGRAM_TIMEOUT_S = 240
+
+
+def run_c1_upstream_corpus(enabled: bool) -> dict[str, Any]:
+    """Manifest-driven upstream Tier C1 leg (roadmap leaf C1x). Opt-in like the
+    C2 external arm; fails closed (`BLOCKED_MISSING_DEPENDENCY`) when opted in
+    but provisioning fails, and fails the manifest gate (count == 250, per-file
+    sha256 at the pin, matrix-construct coverage) before any execution.
+
+    Each program runs through the real frontend (`emit-lnir --wire`). A
+    fail-closed nonzero exit is the EXPECTED shape for rejected-category
+    programs and is recorded with a `skippedReason` naming the program's
+    syntactic matrix constructs — never silently dropped. A program the
+    frontend lowers is additionally compiled (`compile-llvm`); none of the
+    pinned 250 currently lower with exported scalar entrypoints, so 3-way
+    case-vector execution of upstream programs remains open."""
+    if not enabled:
+        return {
+            "executed": False,
+            "optedIn": False,
+            "reason": (
+                "upstream corpus leg opts in via --c1-upstream / TURBO_C1_UPSTREAM=1; it "
+                "provisions the pinned leanprover/lean4 checkout into TURBO_LEAN_HOME/c1-upstream "
+                "(one network fetch per cold cache) and fails closed on a missing dependency"
+            ),
+        }
+    prov = ensure_c1_upstream_corpus()
+    if prov.get("ok") is not True:
+        return {
+            "executed": False,
+            "optedIn": True,
+            "ok": False,
+            "status": "BLOCKED_MISSING_DEPENDENCY",
+            "provision": prov,
+        }
+    corpus_root = Path(prov["path"])
+    gate = c1_corpus.verify_manifest(corpus_root=corpus_root)
+    if gate.get("ok") is not True:
+        return {"executed": True, "optedIn": True, "ok": False,
+                "status": "failed_manifest_gate", "manifestGate": gate, "provision": prov}
+    engines = fuzz.probe_engines()
+    if not (engines["full_bin"] and engines["core_bin"]):
+        return {"executed": False, "optedIn": True, "ok": False,
+                "status": "incomplete_missing_engine", "manifestGate": gate,
+                "engines": {"full_bin": engines["full_bin"], "core_bin": engines["core_bin"]}}
+    manifest = json.loads(c1_corpus.MANIFEST_PATH.read_text(encoding="utf-8"))
+    env = fuzz.pinned_toolchain_env()
+
+    def run_one(prog: dict[str, Any], tmp_dir: str) -> dict[str, Any]:
+        src = corpus_root / prog["path"]
+        wire = Path(tmp_dir) / (prog["path"].replace("/", "__") + ".lnir")
+        constructs = ", ".join(prog["matrixConstructs"])
+        try:
+            res = subprocess.run(
+                [engines["full_bin"], "emit-lnir", "--wire", str(src), "-o", str(wire)],
+                capture_output=True, text=True, env=env, timeout=C1_UPSTREAM_PROGRAM_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            return {"path": prog["path"], "outcome": "infrastructure_timeout",
+                    "skippedReason": f"emit-lnir exceeded {C1_UPSTREAM_PROGRAM_TIMEOUT_S}s"}
+        if res.returncode != 0:
+            return {
+                "path": prog["path"],
+                "outcome": "rejected_fail_closed",
+                "returncode": res.returncode,
+                "matrixConstructs": prog["matrixConstructs"],
+                "skippedReason": (
+                    f"frontend failed closed (emit-lnir exit {res.returncode}); "
+                    f"syntactic matrix constructs: {constructs}"
+                ),
+                "stderrTail": (res.stderr or "")[-240:],
+            }
+        ll = wire.with_suffix(".ll")
+        try:
+            comp = subprocess.run(
+                [engines["core_bin"], "compile-llvm", "--lnir", str(wire), "-o", str(ll)],
+                capture_output=True, text=True, env=env, timeout=C1_UPSTREAM_PROGRAM_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            return {"path": prog["path"], "outcome": "infrastructure_timeout",
+                    "skippedReason": f"compile-llvm exceeded {C1_UPSTREAM_PROGRAM_TIMEOUT_S}s"}
+        if comp.returncode != 0:
+            return {"path": prog["path"], "outcome": "lowered_llvm_failed",
+                    "returncode": comp.returncode,
+                    "matrixConstructs": prog["matrixConstructs"],
+                    "stderrTail": (comp.stderr or "")[-240:]}
+        return {"path": prog["path"], "outcome": "lowered_llvm_emitted",
+                "matrixConstructs": prog["matrixConstructs"],
+                "threeWay": "frontend+LLVM engines exercised; no exported scalar case vectors to execute"}
+
+    with tempfile.TemporaryDirectory(prefix="turbo_c1_upstream_") as tmp:
+        workers = max(1, min(8, (os.cpu_count() or 2) // 4))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            rows = list(pool.map(lambda p: run_one(p, tmp), manifest["programs"]))
+    rows.sort(key=lambda r: r["path"])
+    counts = {"rejected_fail_closed": 0, "lowered_llvm_emitted": 0,
+              "lowered_llvm_failed": 0, "infrastructure_timeout": 0}
+    failing: list[str] = []
+    for r in rows:
+        counts[r["outcome"]] += 1
+        if r["outcome"] in ("lowered_llvm_failed", "infrastructure_timeout"):
+            failing.append(r["path"])
+    ok = (
+        not failing
+        and len(rows) == manifest["programCount"]
+        and counts["rejected_fail_closed"] + counts["lowered_llvm_emitted"] == manifest["programCount"]
+    )
+    return {
+        "executed": True,
+        "optedIn": True,
+        "ok": ok,
+        "status": "passed_upstream_manifest_corpus" if ok else "failed_upstream_corpus",
+        "corpusPath": str(corpus_root),
+        "manifest": str(c1_corpus.MANIFEST_PATH),
+        "manifestGate": gate,
+        "programCount": manifest["programCount"],
+        "outcomeCounts": counts,
+        "failingPrograms": failing,
+        "programs": rows,
+    }
+
+
 def run_c1_corpus(asan: bool, ubsan: bool) -> dict[str, Any]:
     engines = fuzz.probe_engines(asan=asan, ubsan=ubsan)
     if not (engines["stock_lean_c"] and engines["lnir_eval"] and engines["c_abi_llvm"]):
@@ -1077,7 +1254,7 @@ def main() -> int:
         dest="tiers",
         action="append",
         default=None,
-        help="Comma-separated conformance tiers (C1,C2,C3,C4). Default: C4; C2 requires TURBO_C2_PACKAGES_DIR / --c2-packages-dir; C3 requires TURBO_CON_LECHE_BIN / --con-leche-bin.",
+        help="Comma-separated conformance tiers (C1,C2,C3,C4). Default: C4; C2 requires TURBO_C2_PACKAGES_DIR / --c2-packages-dir; C3 requires TURBO_CON_LECHE_BIN / --con-leche-bin; C1's upstream corpus leg opts in via --c1-upstream / TURBO_C1_UPSTREAM=1.",
     )
     parser.add_argument(
         "--c2-packages-dir",
@@ -1097,6 +1274,17 @@ def main() -> int:
             "Also run the pinned external ecosystem Tier C2 driver packages (leanprover-community/batteries); "
             "provisions each (repo_url, commit_sha, lean_toolchain) pin into TURBO_LEAN_HOME/c2-external "
             "(default ~/.cache/turbo-lean/c2-external; one network fetch per cold pin). The nightly workflow runs this."
+        ),
+    )
+    parser.add_argument(
+        "--c1-upstream",
+        action="store_true",
+        default=os.environ.get("TURBO_C1_UPSTREAM") == "1",
+        help=(
+            "Also run the manifest-driven upstream Tier C1 corpus (scripts/c1_corpus_manifest.json: "
+            "250 pinned leanprover/lean4 programs chosen by the LCNF coverage matrix); provisions the "
+            "pin into TURBO_LEAN_HOME/c1-upstream (default ~/.cache/turbo-lean/c1-upstream; one network "
+            "fetch per cold cache) and fails closed when provisioning or the manifest gate fails."
         ),
     )
     parser.add_argument("--asan", action="store_true", help="Instrument compiled LLVM IR + C driver with AddressSanitizer")
@@ -1138,6 +1326,9 @@ def main() -> int:
         for tier in tiers:
             if tier == "C1":
                 c1 = run_c1_corpus(asan=args.asan, ubsan=args.ubsan)
+                c1["upstream"] = run_c1_upstream_corpus(enabled=args.c1_upstream)
+                if args.c1_upstream and c1["upstream"].get("ok") is not True:
+                    c1["ok"] = False
                 tier_results["C1"] = c1
                 if c1.get("ok") is not True:
                     failures.append({"stage": "tier_C1_scalar_corpus", "detail": c1})
@@ -1161,7 +1352,11 @@ def main() -> int:
 
     missing_coverage = [
         "alias_RC_seqFor_llvm",
-        "upstream_lean4_run_250",
+        *(
+            []
+            if tier_results.get("C1", {}).get("upstream", {}).get("ok") is True
+            else ["upstream_lean4_run_250"]
+        ),
         *(
             []
             if tier_results.get("C2", {}).get("externalEcosystem") is True
