@@ -39,8 +39,9 @@ Typical run (one machine, one binary, `lean` on PATH through elan):
         --out <results.json>
 
 The results JSON records no absolute path: the binary is recorded relative to
-its repository (or by file name), the scratch root not at all, and
---machine-label replaces the node name in the host block.
+its repository (or by file name), path-valued caller settings as digests, the
+scratch root not at all, and --machine-label replaces the node name in the
+host block (the check-loop bench's rules, shared).
 
 Exit codes:
     0  measured: the cold build and every warm call are healthy
@@ -101,9 +102,6 @@ FIXTURE_LIB = "BenchFixture"
 # The deleted G2b warm-replay switches. No current binary reads them; they are
 # removed from every call so an older binary cannot replay either.
 RETIRED_SWITCHES = ("TURBO_LEAN_WARM_CAS_REPLAY", "TURBO_LEAN_NO_WARM_CAS_REPLAY")
-# Caller settings whose values are paths: recorded as set or unset only, so the
-# results JSON carries no host path.
-PATH_VALUED_SETTINGS = ("TURBO_LEAN_GIT", "TURBO_LEAN_HOME", "TURBO_LEAN_STAGING_DIR")
 # What every child call gets on top of the caller's environment, with the
 # scratch root written as a placeholder (the real paths stay out of the JSON).
 CHILD_COMMON = {
@@ -234,16 +232,6 @@ def lean_version(fixture_dir: Path) -> str:
     return lines[0].strip()
 
 
-def caller_settings() -> dict:
-    """The caller's TURBO_LEAN_* settings (the check-loop bench's list), with
-    path-valued entries reduced to set/unset."""
-    out = {}
-    for var in bcl.RECORDED_ENV_VARS:
-        val = os.environ.get(var)
-        out[var] = ("<set>" if val else None) if var in PATH_VALUED_SETTINGS else val
-    return out
-
-
 def read_loadavg():
     """The first three /proc/loadavg fields, or None when unreadable."""
     try:
@@ -259,15 +247,9 @@ def load1_now():
         return None
 
 
-def binary_record(binary: Path, repo_path, sha256: str) -> dict:
-    """The binary relative to its repository, else by file name: never a host path."""
-    rel = binary.name
-    if repo_path:
-        try:
-            rel = str(binary.relative_to(Path(repo_path).resolve()))
-        except ValueError:
-            pass
-    return {"path": rel, "sha256": sha256}
+# The binary relative to its repository, else by file name; the check-loop
+# bench's own rule, so both benches' artifacts carry no host path.
+binary_record = bcl.binary_record
 
 
 # ------------------------------------------------------------- build calls
@@ -497,7 +479,7 @@ def main(argv=None) -> int:
                      "load1_at_end": None, "loadavg_at_end": None,
                      "busy_allowed": args.allow_busy_node},
             "settings": {
-                "caller": caller_settings(), "child_common": dict(CHILD_COMMON),
+                "caller": bcl.recorded_settings(), "child_common": dict(CHILD_COMMON),
                 "child_removed": list(RETIRED_SWITCHES),
                 "argv_cold": ["turbo-lean"] + [
                     a.replace(str(scratch), "<scratch>") for a in build_argv("", scratch, True)[1:]],
