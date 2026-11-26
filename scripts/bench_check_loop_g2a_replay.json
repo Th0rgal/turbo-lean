@@ -1,0 +1,2063 @@
+{
+  "schema_version": 1,
+  "kind": "results",
+  "created_utc": "2026-11-26T05:34:09Z",
+  "turbo_lean_commit": "ed26b375ad1d4603734dcbd3057cbaeb84fbb54c",
+  "toolchain": {
+    "lean_toolchain": "leanprover/lean4:v4.35.0",
+    "lean_version": "Lean (version 4.35.0, x86_64-unknown-linux-gnu, commit eb6cafb7290e8bd5f2937522d8d804f58f02bafc, Release)",
+    "by_repo": {
+      "batteries": "leanprover/lean4:v4.35.0",
+      "pfr": "leanprover/lean4:v4.35.0"
+    }
+  },
+  "host": {
+    "hostname": "g2a-ro-192c",
+    "machine_label": "g2a-ro-192c",
+    "kernel": "Linux 6.12.115-140.210.amzn2023.x86_64",
+    "cpu_model": "AMD EPYC 9R14",
+    "nproc": 192,
+    "mem_gb": 1552.1
+  },
+  "trials": 5,
+  "settings": {
+    "TURBO_LEAN_GIT": "/usr/bin/git",
+    "TURBO_LEAN_ALLOWED_CSIMP": "*",
+    "TURBO_LEAN_ALLOWED_UNSAFE": "*",
+    "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY": "*",
+    "TURBO_LEAN_HOME": null,
+    "TURBO_LEAN_STAGING_DIR": null,
+    "TURBO_LEAN_NO_DAEMON": null,
+    "TURBO_LEAN_NO_REMOTE_TELEMETRY": null,
+    "TURBO_LEAN_TELEMETRY": null,
+    "TURBO_LEAN_DAEMON_IDLE_SECS": null,
+    "git_version": "git version 2.50.1",
+    "scratch_root": "/tmp/m1-bench-kbon8u44"
+  },
+  "workloads": {
+    "batteries_list_lemmas_top": {
+      "id": "batteries_list_lemmas_top",
+      "status": "ok",
+      "repo": "batteries",
+      "file": "Batteries/Data/List/Lemmas.lean",
+      "decl": "List.dropLast_eq_eraseIdx",
+      "expected_status": "active",
+      "modes": {
+        "cold_no_daemon": {
+          "runs_ms": [
+            5381.8,
+            5355.2,
+            5587.6,
+            5437.7,
+            5336.0
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 5381.8,
+          "spread_ms": 251.6,
+          "rel_spread": 0.0467,
+          "coverage_ratio_min": 1.0,
+          "coverage_ratio_external_min": 0.9962,
+          "statuses_observed": [
+            "theorem_verified"
+          ],
+          "peak_rss_mb_trials": [
+            481,
+            481,
+            481,
+            481,
+            481
+          ],
+          "cas_replay": {
+            "hits": 0,
+            "misses": 5,
+            "hit_rate": 0.0,
+            "fission_cached_subshards": 0,
+            "fission_verified_subshards": 0
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.6,
+            "cli_startup": 1.0,
+            "dependent_recheck": 9.2,
+            "elaboration": 750.2,
+            "identity_probe": 2272.9,
+            "import_refresh": 2309.0,
+            "setup": 13.4,
+            "split_and_hygiene": 36.2
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 82.7
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 81.36
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 81.36
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 80.37
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 80.37
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 79.7
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 79.7
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 79.36
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 79.36
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 77.73
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.0,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.0,
+            "io.full": 0.0,
+            "load1": 82.7
+          },
+          "psi_contended": false
+        },
+        "warm_cache_hit_daemon": {
+          "runs_ms": [
+            2449.3,
+            2433.8,
+            2555.5,
+            2445.8,
+            2454.9
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 2449.3,
+          "spread_ms": 121.6,
+          "rel_spread": 0.0497,
+          "coverage_ratio_min": 0.9999,
+          "coverage_ratio_external_min": 0.9963,
+          "statuses_observed": [
+            "theorem_cache_hit"
+          ],
+          "cas_replay": {
+            "hits": 5,
+            "misses": 0,
+            "hit_rate": 1.0,
+            "fission_cached_subshards": 0,
+            "fission_verified_subshards": 0
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.7,
+            "cli_startup": 0.8,
+            "dependent_recheck": 9.0,
+            "identity_probe": 2311.3,
+            "import_refresh": 76.3,
+            "setup": 12.6,
+            "split_and_hygiene": 26.2
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 75.99
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 75.99
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 75.99
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 74.71
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 74.71
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 74.71
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 74.71
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 73.53
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 73.53
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 73.53
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.0,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.0,
+            "io.full": 0.0,
+            "load1": 75.99
+          },
+          "psi_contended": false
+        },
+        "warm_edited_proof_daemon": {
+          "runs_ms": [
+            2787.5,
+            2940.7,
+            4956.8,
+            12544.1,
+            9203.1
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 4956.8,
+          "spread_ms": 9756.6,
+          "rel_spread": 1.9683,
+          "coverage_ratio_min": 1.0,
+          "coverage_ratio_external_min": 0.9969,
+          "statuses_observed": [
+            "theorem_verified"
+          ],
+          "peak_rss_mb_trials": [
+            185,
+            187,
+            187,
+            186,
+            186
+          ],
+          "cas_replay": {
+            "hits": 0,
+            "misses": 5,
+            "hit_rate": 0.0,
+            "fission_cached_subshards": 0,
+            "fission_verified_subshards": 0
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.7,
+            "cli_startup": 0.8,
+            "dependent_recheck": 32.8,
+            "elaboration": 280.5,
+            "identity_probe": 4512.3,
+            "import_refresh": 83.5,
+            "setup": 13.6,
+            "split_and_hygiene": 38.1
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 72.45
+            },
+            {
+              "cpu.some": 0.18,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 72.45
+            },
+            {
+              "cpu.some": 0.18,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 72.45
+            },
+            {
+              "cpu.some": 0.45,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 75.06
+            },
+            {
+              "cpu.some": 0.45,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 75.06
+            },
+            {
+              "cpu.some": 0.3,
+              "cpu.full": 0.0,
+              "memory.some": 1.23,
+              "memory.full": 1.23,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 76.57
+            },
+            {
+              "cpu.some": 0.3,
+              "cpu.full": 0.0,
+              "memory.some": 1.23,
+              "memory.full": 1.23,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 76.57
+            },
+            {
+              "cpu.some": 0.49,
+              "cpu.full": 0.0,
+              "memory.some": 16.99,
+              "memory.full": 16.99,
+              "io.some": 0.32,
+              "io.full": 0.0,
+              "load1": 81.12
+            },
+            {
+              "cpu.some": 0.49,
+              "cpu.full": 0.0,
+              "memory.some": 16.99,
+              "memory.full": 16.99,
+              "io.some": 0.32,
+              "io.full": 0.0,
+              "load1": 81.12
+            },
+            {
+              "cpu.some": 0.96,
+              "cpu.full": 0.0,
+              "memory.some": 22.26,
+              "memory.full": 22.26,
+              "io.some": 0.59,
+              "io.full": 0.24,
+              "load1": 90.05
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.96,
+            "cpu.full": 0.0,
+            "memory.some": 22.26,
+            "memory.full": 22.26,
+            "io.some": 0.59,
+            "io.full": 0.24,
+            "load1": 90.05
+          },
+          "psi_contended": true
+        }
+      }
+    },
+    "batteries_string_lemmas_top": {
+      "id": "batteries_string_lemmas_top",
+      "status": "ok",
+      "repo": "batteries",
+      "file": "Batteries/Data/String/Lemmas.lean",
+      "decl": "String.lt_antisymm",
+      "expected_status": "active",
+      "modes": {
+        "cold_no_daemon": {
+          "runs_ms": [
+            26059.3,
+            18073.0,
+            16127.9,
+            16028.9,
+            15587.7
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 16127.9,
+          "spread_ms": 10471.6,
+          "rel_spread": 0.6493,
+          "coverage_ratio_min": 1.0,
+          "coverage_ratio_external_min": 0.9971,
+          "statuses_observed": [
+            "theorem_verified"
+          ],
+          "peak_rss_mb_trials": [
+            487,
+            489,
+            489,
+            489,
+            489
+          ],
+          "cas_replay": {
+            "hits": 0,
+            "misses": 5,
+            "hit_rate": 0.0,
+            "fission_cached_subshards": 0,
+            "fission_verified_subshards": 0
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.6,
+            "cli_startup": 1.0,
+            "dependent_recheck": 9.8,
+            "elaboration": 771.9,
+            "identity_probe": 2625.3,
+            "import_refresh": 12710.5,
+            "setup": 15.9,
+            "split_and_hygiene": 61.3
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.32,
+              "cpu.full": 0.0,
+              "memory.some": 23.21,
+              "memory.full": 23.19,
+              "io.some": 1.74,
+              "io.full": 1.12,
+              "load1": 113.48
+            },
+            {
+              "cpu.some": 0.48,
+              "cpu.full": 0.0,
+              "memory.some": 10.14,
+              "memory.full": 10.09,
+              "io.some": 0.38,
+              "io.full": 0.28,
+              "load1": 113.24
+            },
+            {
+              "cpu.some": 0.48,
+              "cpu.full": 0.0,
+              "memory.some": 10.14,
+              "memory.full": 10.09,
+              "io.some": 0.38,
+              "io.full": 0.28,
+              "load1": 113.24
+            },
+            {
+              "cpu.some": 0.07,
+              "cpu.full": 0.0,
+              "memory.some": 2.89,
+              "memory.full": 2.88,
+              "io.some": 0.06,
+              "io.full": 0.04,
+              "load1": 110.97
+            },
+            {
+              "cpu.some": 0.07,
+              "cpu.full": 0.0,
+              "memory.some": 2.89,
+              "memory.full": 2.88,
+              "io.some": 0.06,
+              "io.full": 0.04,
+              "load1": 110.97
+            },
+            {
+              "cpu.some": 0.13,
+              "cpu.full": 0.0,
+              "memory.some": 0.99,
+              "memory.full": 0.98,
+              "io.some": 0.01,
+              "io.full": 0.0,
+              "load1": 100.54
+            },
+            {
+              "cpu.some": 0.13,
+              "cpu.full": 0.0,
+              "memory.some": 0.99,
+              "memory.full": 0.98,
+              "io.some": 0.01,
+              "io.full": 0.0,
+              "load1": 100.54
+            },
+            {
+              "cpu.some": 0.02,
+              "cpu.full": 0.0,
+              "memory.some": 0.19,
+              "memory.full": 0.19,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 93.14
+            },
+            {
+              "cpu.some": 0.02,
+              "cpu.full": 0.0,
+              "memory.some": 0.19,
+              "memory.full": 0.19,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 93.14
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.03,
+              "memory.full": 0.03,
+              "io.some": 0.12,
+              "io.full": 0.12,
+              "load1": 89.62
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.48,
+            "cpu.full": 0.0,
+            "memory.some": 23.21,
+            "memory.full": 23.19,
+            "io.some": 1.74,
+            "io.full": 1.12,
+            "load1": 113.48
+          },
+          "psi_contended": true
+        },
+        "warm_cache_hit_daemon": {
+          "runs_ms": [
+            2481.5,
+            2436.7,
+            2454.2,
+            2445.9,
+            2473.8
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 2454.2,
+          "spread_ms": 44.7,
+          "rel_spread": 0.0182,
+          "coverage_ratio_min": 0.9999,
+          "coverage_ratio_external_min": 0.9964,
+          "statuses_observed": [
+            "theorem_cache_hit"
+          ],
+          "cas_replay": {
+            "hits": 5,
+            "misses": 0,
+            "hit_rate": 1.0,
+            "fission_cached_subshards": 0,
+            "fission_verified_subshards": 0
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.7,
+            "cli_startup": 0.8,
+            "dependent_recheck": 9.8,
+            "identity_probe": 2237.7,
+            "import_refresh": 133.5,
+            "setup": 15.3,
+            "split_and_hygiene": 46.7
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.01,
+              "io.full": 0.01,
+              "load1": 85.36
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.01,
+              "io.full": 0.01,
+              "load1": 85.36
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.01,
+              "io.full": 0.01,
+              "load1": 85.36
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.01,
+              "io.full": 0.01,
+              "load1": 83.17
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.01,
+              "io.full": 0.01,
+              "load1": 83.17
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.3,
+              "io.full": 0.3,
+              "load1": 83.17
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.3,
+              "io.full": 0.3,
+              "load1": 83.17
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.24,
+              "io.full": 0.24,
+              "load1": 81.72
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.24,
+              "io.full": 0.24,
+              "load1": 81.72
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.2,
+              "io.full": 0.2,
+              "load1": 81.72
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.0,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.3,
+            "io.full": 0.3,
+            "load1": 85.36
+          },
+          "psi_contended": false
+        },
+        "warm_edited_proof_daemon": {
+          "runs_ms": [
+            2799.0,
+            2689.3,
+            2693.3,
+            2780.2,
+            2770.3
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 2770.3,
+          "spread_ms": 109.7,
+          "rel_spread": 0.0396,
+          "coverage_ratio_min": 1.0,
+          "coverage_ratio_external_min": 0.9969,
+          "statuses_observed": [
+            "theorem_verified"
+          ],
+          "peak_rss_mb_trials": [
+            155,
+            155,
+            155,
+            155,
+            155
+          ],
+          "cas_replay": {
+            "hits": 0,
+            "misses": 5,
+            "hit_rate": 0.0,
+            "fission_cached_subshards": 0,
+            "fission_verified_subshards": 0
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.6,
+            "cli_startup": 0.8,
+            "dependent_recheck": 35.8,
+            "elaboration": 230.1,
+            "identity_probe": 2252.8,
+            "import_refresh": 131.9,
+            "setup": 15.4,
+            "split_and_hygiene": 59.5
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.13,
+              "io.full": 0.13,
+              "load1": 79.82
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.11,
+              "io.full": 0.11,
+              "load1": 79.82
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.11,
+              "io.full": 0.11,
+              "load1": 79.82
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.09,
+              "io.full": 0.09,
+              "load1": 77.99
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.09,
+              "io.full": 0.09,
+              "load1": 77.99
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.06,
+              "io.full": 0.06,
+              "load1": 77.99
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.06,
+              "io.full": 0.06,
+              "load1": 77.99
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.04,
+              "io.full": 0.04,
+              "load1": 76.63
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.04,
+              "io.full": 0.04,
+              "load1": 76.63
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.04,
+              "io.full": 0.04,
+              "load1": 76.63
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.0,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.13,
+            "io.full": 0.13,
+            "load1": 79.82
+          },
+          "psi_contended": false
+        }
+      }
+    },
+    "batteries_rbtree_lemmas_top": {
+      "repo": "batteries",
+      "file": "Batteries/Recycling/RBTree/Lemmas.lean",
+      "decl": "RBTree.RBNode.min?_reverse",
+      "expected_status": "active",
+      "status": "pending",
+      "modes": {}
+    },
+    "batteries_rbtree_lemmas_mid": {
+      "id": "batteries_rbtree_lemmas_mid",
+      "status": "ok",
+      "repo": "batteries",
+      "file": "Batteries/Recycling/RBTree/Lemmas.lean",
+      "decl": "RBTree.RBNode.Path.ordered_iff",
+      "expected_status": "active",
+      "modes": {
+        "cold_no_daemon": {
+          "runs_ms": [
+            13771.5,
+            13478.7,
+            13531.8,
+            13389.0,
+            13686.7
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 13531.8,
+          "spread_ms": 382.5,
+          "rel_spread": 0.0283,
+          "coverage_ratio_min": 1.0,
+          "coverage_ratio_external_min": 0.9988,
+          "statuses_observed": [
+            "theorem_verified"
+          ],
+          "peak_rss_mb_trials": [
+            531,
+            528,
+            529,
+            528,
+            526
+          ],
+          "cas_replay": {
+            "hits": 0,
+            "misses": 5,
+            "hit_rate": 0.0,
+            "fission_cached_subshards": 0,
+            "fission_verified_subshards": 0
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.5,
+            "cli_startup": 0.9,
+            "dependent_recheck": 8.9,
+            "elaboration": 2561.0,
+            "identity_probe": 2707.6,
+            "import_refresh": 8196.5,
+            "setup": 12.3,
+            "split_and_hygiene": 70.8
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 1.17,
+              "io.full": 0.84,
+              "load1": 73.78
+            },
+            {
+              "cpu.some": 1.5,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.35,
+              "io.full": 0.25,
+              "load1": 72.65
+            },
+            {
+              "cpu.some": 1.5,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.35,
+              "io.full": 0.25,
+              "load1": 72.65
+            },
+            {
+              "cpu.some": 0.81,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.37,
+              "io.full": 0.29,
+              "load1": 70.49
+            },
+            {
+              "cpu.some": 0.81,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.37,
+              "io.full": 0.29,
+              "load1": 70.49
+            },
+            {
+              "cpu.some": 1.93,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.09,
+              "io.full": 0.07,
+              "load1": 72.85
+            },
+            {
+              "cpu.some": 1.93,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.09,
+              "io.full": 0.07,
+              "load1": 72.85
+            },
+            {
+              "cpu.some": 0.58,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.5,
+              "io.full": 0.5,
+              "load1": 71.03
+            },
+            {
+              "cpu.some": 0.58,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.5,
+              "io.full": 0.5,
+              "load1": 71.03
+            },
+            {
+              "cpu.some": 1.31,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.12,
+              "io.full": 0.12,
+              "load1": 68.36
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 1.93,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 1.17,
+            "io.full": 0.84,
+            "load1": 73.78
+          },
+          "psi_contended": false
+        },
+        "warm_cache_hit_daemon": {
+          "runs_ms": [
+            3071.0,
+            3149.6,
+            3008.0,
+            3030.3,
+            2935.4
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 3030.3,
+          "spread_ms": 214.2,
+          "rel_spread": 0.0707,
+          "coverage_ratio_min": 0.9999,
+          "coverage_ratio_external_min": 0.9967,
+          "statuses_observed": [
+            "theorem_cache_hit"
+          ],
+          "cas_replay": {
+            "hits": 5,
+            "misses": 0,
+            "hit_rate": 1.0,
+            "fission_cached_subshards": 0,
+            "fission_verified_subshards": 0
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.7,
+            "cli_startup": 0.8,
+            "dependent_recheck": 8.2,
+            "identity_probe": 2734.5,
+            "import_refresh": 203.6,
+            "setup": 12.1,
+            "split_and_hygiene": 64.0
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.32,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.02,
+              "io.full": 0.02,
+              "load1": 65.92
+            },
+            {
+              "cpu.some": 0.44,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.02,
+              "io.full": 0.02,
+              "load1": 66.24
+            },
+            {
+              "cpu.some": 0.44,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.02,
+              "io.full": 0.02,
+              "load1": 66.24
+            },
+            {
+              "cpu.some": 0.44,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.16,
+              "io.full": 0.01,
+              "load1": 66.87
+            },
+            {
+              "cpu.some": 0.44,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.16,
+              "io.full": 0.01,
+              "load1": 66.87
+            },
+            {
+              "cpu.some": 0.29,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.1,
+              "io.full": 0.0,
+              "load1": 66.87
+            },
+            {
+              "cpu.some": 0.29,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.1,
+              "io.full": 0.0,
+              "load1": 66.87
+            },
+            {
+              "cpu.some": 0.24,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.27,
+              "io.full": 0.18,
+              "load1": 65.91
+            },
+            {
+              "cpu.some": 0.24,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.27,
+              "io.full": 0.18,
+              "load1": 65.91
+            },
+            {
+              "cpu.some": 0.16,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.62,
+              "io.full": 0.57,
+              "load1": 65.91
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.44,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.62,
+            "io.full": 0.57,
+            "load1": 66.87
+          },
+          "psi_contended": false
+        },
+        "warm_edited_proof_daemon": {
+          "runs_ms": [
+            3584.0,
+            3669.7,
+            3624.9,
+            3630.2,
+            3682.8
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 3630.2,
+          "spread_ms": 98.7,
+          "rel_spread": 0.0272,
+          "coverage_ratio_min": 1.0,
+          "coverage_ratio_external_min": 0.9813,
+          "statuses_observed": [
+            "theorem_verified"
+          ],
+          "peak_rss_mb_trials": [
+            272,
+            272,
+            271,
+            271,
+            269
+          ],
+          "cas_replay": {
+            "hits": 0,
+            "misses": 5,
+            "hit_rate": 0.0,
+            "fission_cached_subshards": 0,
+            "fission_verified_subshards": 0
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.6,
+            "cli_startup": 0.7,
+            "dependent_recheck": 28.9,
+            "elaboration": 618.2,
+            "identity_probe": 2685.9,
+            "import_refresh": 201.8,
+            "setup": 11.9,
+            "split_and_hygiene": 71.0
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.1,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.41,
+              "io.full": 0.38,
+              "load1": 65.68
+            },
+            {
+              "cpu.some": 0.07,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.82,
+              "io.full": 0.61,
+              "load1": 65.63
+            },
+            {
+              "cpu.some": 0.07,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.82,
+              "io.full": 0.61,
+              "load1": 65.63
+            },
+            {
+              "cpu.some": 0.04,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.55,
+              "io.full": 0.41,
+              "load1": 64.45
+            },
+            {
+              "cpu.some": 0.04,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.55,
+              "io.full": 0.41,
+              "load1": 64.45
+            },
+            {
+              "cpu.some": 0.03,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.37,
+              "io.full": 0.27,
+              "load1": 64.58
+            },
+            {
+              "cpu.some": 0.03,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.37,
+              "io.full": 0.27,
+              "load1": 64.58
+            },
+            {
+              "cpu.some": 0.02,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.24,
+              "io.full": 0.18,
+              "load1": 64.58
+            },
+            {
+              "cpu.some": 0.02,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.24,
+              "io.full": 0.18,
+              "load1": 64.58
+            },
+            {
+              "cpu.some": 0.01,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.2,
+              "io.full": 0.15,
+              "load1": 63.73
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.1,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.82,
+            "io.full": 0.61,
+            "load1": 65.68
+          },
+          "psi_contended": false
+        }
+      }
+    },
+    "batteries_unionfind_top": {
+      "id": "batteries_unionfind_top",
+      "status": "ok",
+      "repo": "batteries",
+      "file": "Batteries/Data/UnionFind/Basic.lean",
+      "decl": "Batteries.UnionFind.parentD_eq",
+      "expected_status": "active",
+      "modes": {
+        "cold_no_daemon": {
+          "runs_ms": [
+            5366.1,
+            5578.5,
+            5519.8,
+            5504.9,
+            5416.5
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 5504.9,
+          "spread_ms": 212.4,
+          "rel_spread": 0.0386,
+          "coverage_ratio_min": 1.0,
+          "coverage_ratio_external_min": 0.9982,
+          "statuses_observed": [
+            "theorem_verified"
+          ],
+          "peak_rss_mb_trials": [
+            428,
+            428,
+            428,
+            428,
+            428
+          ],
+          "cas_replay": {
+            "hits": 0,
+            "misses": 5,
+            "hit_rate": 0.0,
+            "fission_cached_subshards": 0,
+            "fission_verified_subshards": 0
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.5,
+            "cli_startup": 1.0,
+            "dependent_recheck": 9.0,
+            "elaboration": 607.4,
+            "identity_probe": 2074.8,
+            "import_refresh": 2746.2,
+            "setup": 6.3,
+            "split_and_hygiene": 20.1
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.07,
+              "io.full": 0.05,
+              "load1": 61.67
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.22,
+              "io.full": 0.21,
+              "load1": 60.9
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.22,
+              "io.full": 0.21,
+              "load1": 60.9
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.12,
+              "io.full": 0.11,
+              "load1": 60.19
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.12,
+              "io.full": 0.11,
+              "load1": 60.19
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.42,
+              "io.full": 0.24,
+              "load1": 59.45
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.42,
+              "io.full": 0.24,
+              "load1": 59.45
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.43,
+              "io.full": 0.31,
+              "load1": 58.85
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.43,
+              "io.full": 0.31,
+              "load1": 58.85
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.23,
+              "io.full": 0.17,
+              "load1": 58.7
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.0,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.43,
+            "io.full": 0.31,
+            "load1": 61.67
+          },
+          "psi_contended": false
+        },
+        "warm_cache_hit_daemon": {
+          "runs_ms": [
+            2145.5,
+            2182.2,
+            2346.7,
+            2644.7,
+            2597.4
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 2346.7,
+          "spread_ms": 499.3,
+          "rel_spread": 0.2127,
+          "coverage_ratio_min": 0.9999,
+          "coverage_ratio_external_min": 0.9967,
+          "statuses_observed": [
+            "theorem_cache_hit"
+          ],
+          "cas_replay": {
+            "hits": 5,
+            "misses": 0,
+            "hit_rate": 1.0,
+            "fission_cached_subshards": 0,
+            "fission_verified_subshards": 0
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.7,
+            "cli_startup": 0.9,
+            "dependent_recheck": 9.2,
+            "identity_probe": 2245.1,
+            "import_refresh": 61.3,
+            "setup": 5.5,
+            "split_and_hygiene": 15.6
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.12,
+              "io.full": 0.09,
+              "load1": 58.65
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.1,
+              "io.full": 0.07,
+              "load1": 58.65
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.1,
+              "io.full": 0.07,
+              "load1": 58.65
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.08,
+              "io.full": 0.06,
+              "load1": 58.65
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.08,
+              "io.full": 0.06,
+              "load1": 58.65
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.07,
+              "io.full": 0.05,
+              "load1": 58.43
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.07,
+              "io.full": 0.05,
+              "load1": 58.43
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.05,
+              "io.full": 0.04,
+              "load1": 58.43
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.05,
+              "io.full": 0.04,
+              "load1": 58.43
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.03,
+              "io.full": 0.02,
+              "load1": 64.25
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.0,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.12,
+            "io.full": 0.09,
+            "load1": 64.25
+          },
+          "psi_contended": false
+        },
+        "warm_edited_proof_daemon": {
+          "runs_ms": [
+            2395.1,
+            2439.8,
+            2407.7,
+            2424.4,
+            2401.3
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 2407.7,
+          "spread_ms": 44.8,
+          "rel_spread": 0.0186,
+          "coverage_ratio_min": 1.0,
+          "coverage_ratio_external_min": 0.9968,
+          "statuses_observed": [
+            "theorem_verified"
+          ],
+          "peak_rss_mb_trials": [
+            144,
+            144,
+            144,
+            144,
+            144
+          ],
+          "cas_replay": {
+            "hits": 0,
+            "misses": 5,
+            "hit_rate": 0.0,
+            "fission_cached_subshards": 0,
+            "fission_verified_subshards": 0
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.6,
+            "cli_startup": 0.8,
+            "dependent_recheck": 16.6,
+            "elaboration": 196.7,
+            "identity_probe": 2103.4,
+            "import_refresh": 59.5,
+            "setup": 5.6,
+            "split_and_hygiene": 19.2
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.03,
+              "io.full": 0.02,
+              "load1": 65.67
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.02,
+              "io.full": 0.01,
+              "load1": 65.67
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.02,
+              "io.full": 0.01,
+              "load1": 65.67
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.19,
+              "io.full": 0.19,
+              "load1": 64.33
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.19,
+              "io.full": 0.19,
+              "load1": 64.33
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.16,
+              "io.full": 0.15,
+              "load1": 64.33
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.16,
+              "io.full": 0.15,
+              "load1": 64.33
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.13,
+              "io.full": 0.12,
+              "load1": 63.42
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.13,
+              "io.full": 0.12,
+              "load1": 63.42
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.1,
+              "io.full": 0.1,
+              "load1": 63.42
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.0,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.19,
+            "io.full": 0.19,
+            "load1": 65.67
+          },
+          "psi_contended": false
+        }
+      }
+    },
+    "pfr_more_ruzsa_dist": {
+      "status": "blocked_as_expected",
+      "expected_status": "blocked",
+      "expected_error_classes": [
+        "declaration_identity_unknown_module_prefix",
+        "stale_import_refresh_fail_closed"
+      ],
+      "exit_code": 1,
+      "probe_exit_codes": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "probe_error_classes": [
+        "stale_import_refresh_fail_closed",
+        "stale_import_refresh_fail_closed",
+        "stale_import_refresh_fail_closed",
+        "stale_import_refresh_fail_closed",
+        "stale_import_refresh_fail_closed",
+        "stale_import_refresh_fail_closed"
+      ],
+      "error_class": "stale_import_refresh_fail_closed",
+      "repo": "pfr",
+      "file": "PFR/MoreRuzsaDist.lean",
+      "decl": "rdist_of_neg_le",
+      "modes": {
+        "cold_no_daemon": {
+          "runs_ms": [
+            82.4,
+            85.1,
+            83.1,
+            82.1,
+            79.8
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 82.4,
+          "spread_ms": 5.3,
+          "rel_spread": 0.0648,
+          "coverage_ratio_min": null,
+          "coverage_ratio_external_min": null,
+          "statuses_observed": [
+            "exit_1"
+          ],
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.07,
+              "io.full": 0.07,
+              "load1": 63.39
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.05,
+              "io.full": 0.05,
+              "load1": 63.39
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.05,
+              "io.full": 0.05,
+              "load1": 63.39
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.05,
+              "io.full": 0.05,
+              "load1": 63.39
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.05,
+              "io.full": 0.05,
+              "load1": 63.39
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.05,
+              "io.full": 0.05,
+              "load1": 63.39
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.05,
+              "io.full": 0.05,
+              "load1": 63.39
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.05,
+              "io.full": 0.05,
+              "load1": 63.39
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.05,
+              "io.full": 0.05,
+              "load1": 63.39
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.05,
+              "io.full": 0.05,
+              "load1": 63.39
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.05,
+              "io.full": 0.05,
+              "load1": 63.39
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.05,
+              "io.full": 0.05,
+              "load1": 63.39
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.0,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.07,
+            "io.full": 0.07,
+            "load1": 63.39
+          },
+          "psi_contended": false,
+          "error_classes": [
+            "stale_import_refresh_fail_closed"
+          ],
+          "probe_error_classes": [
+            "stale_import_refresh_fail_closed",
+            "stale_import_refresh_fail_closed",
+            "stale_import_refresh_fail_closed",
+            "stale_import_refresh_fail_closed",
+            "stale_import_refresh_fail_closed",
+            "stale_import_refresh_fail_closed"
+          ],
+          "stderr_excerpt": "Error: Worktree opt-out prevents refreshing stale imports: Mathlib.Algebra.BigOperators.Fin, Mathlib.Analysis.SpecialFunctions.Log.NegMulLog, Mathlib.Data.Fin.Basic, Mathlib.Data.Finset.Pairwise, Mathlib.Data.Set.Basic, Mathlib.Data.Set.Card, Mathlib.Data.Set.Insert, Mathlib.MeasureTheory.Constructions.Pi, Mathlib.MeasureTheory.Group.Arithmetic, Mathlib.MeasureTheory.Integral.Bochner.Basic, Mathlib.MeasureTheory.Integral.IntegrableOn, Mathlib.MeasureTheory.Integral.Lebesgue.Basic, Mathlib.Measur"
+        }
+      }
+    }
+  },
+  "turbo_lean_dirty": false,
+  "turbo_lean_repo": "/mnt/agent2-ram/wt/turbo-lean-cbe41387/agent-a69bd15494eec4221",
+  "turbo_lean_binary": {
+    "path": "/mnt/agent2-ram/wt/turbo-lean-cbe41387/agent-a69bd15494eec4221/target-g2a/release/turbo-lean",
+    "sha256": "8ac9a35b81353fb602964d4e1996502769a8718bf73771194ae6785f7b446d80"
+  },
+  "workload_revs": {
+    "batteries": "66e469188fe07963e5cf666c7d4433f45b8131c5",
+    "pfr": "ebe2d96230b1abb190f74592aace441a0f10fe09"
+  },
+  "revs_pinned": true,
+  "node": {
+    "load1_at_start": 84.15,
+    "load1_at_end": 63.39,
+    "busy_allowed": true
+  },
+  "args": {
+    "trials": 5,
+    "warmup": 1,
+    "skip_rev_check": false,
+    "check_timeout_s": 2400,
+    "only_workloads": "batteries_list_lemmas_top,batteries_string_lemmas_top,batteries_rbtree_lemmas_mid,batteries_unionfind_top,pfr_more_ruzsa_dist"
+  },
+  "cas_replay": {
+    "sequence": "per active workload: 5 unedited warm re-checks (warm_cache_hit_daemon), then 5 edited re-checks (warm_edited_proof_daemon); warmup and settling runs excluded",
+    "unedited_recheck": {
+      "workloads": [
+        "batteries_list_lemmas_top",
+        "batteries_rbtree_lemmas_mid",
+        "batteries_string_lemmas_top",
+        "batteries_unionfind_top"
+      ],
+      "check_calls": 20,
+      "hits": 20,
+      "misses": 0,
+      "hit_rate": 1.0,
+      "fission_cached_subshards": 0,
+      "fission_verified_subshards": 0
+    },
+    "edited_recheck": {
+      "workloads": [
+        "batteries_list_lemmas_top",
+        "batteries_rbtree_lemmas_mid",
+        "batteries_string_lemmas_top",
+        "batteries_unionfind_top"
+      ],
+      "check_calls": 20,
+      "hits": 0,
+      "misses": 20,
+      "hit_rate": 0.0,
+      "fission_cached_subshards": 0,
+      "fission_verified_subshards": 0
+    },
+    "overall": {
+      "workloads": [
+        "batteries_list_lemmas_top",
+        "batteries_rbtree_lemmas_mid",
+        "batteries_string_lemmas_top",
+        "batteries_unionfind_top"
+      ],
+      "check_calls": 40,
+      "hits": 20,
+      "misses": 20,
+      "hit_rate": 0.5,
+      "fission_cached_subshards": 0,
+      "fission_verified_subshards": 0
+    }
+  },
+  "verdict": {
+    "verdict": "measurement_failed",
+    "regressions": [],
+    "improvements": [],
+    "measured_nothing": [],
+    "comparison_errors": [],
+    "unexpected_successes": [],
+    "unexpected_blocked_failures": [],
+    "pfr_status": null,
+    "skipped_reason": null,
+    "same_binary": null,
+    "baseline_commit": null,
+    "run_commit": "ed26b375ad1d4603734dcbd3057cbaeb84fbb54c",
+    "baseline_binary_sha256": null,
+    "run_binary_sha256": "8ac9a35b81353fb602964d4e1996502769a8718bf73771194ae6785f7b446d80",
+    "gates": {}
+  },
+  "run_duration_s": 495.9
+}
