@@ -77,6 +77,15 @@ def find_lean_prefix(override_lean: str | None = None) -> Path | None:
         *fuzz_san.toolchain_bin_candidates("lean"),
     ]
     pin_ver = fuzz_san.toolchain_version_token(fuzz_san.repo_pinned_toolchain())
+    if pin_ver is None:
+        # "" would be a substring of every `lean --version` banner, so a
+        # missing/empty lean/lean-toolchain must be a named error, never a
+        # silently passing version check.
+        raise RuntimeError(
+            "repo toolchain pin is missing/empty: cannot verify lean candidates "
+            f"against `lean --version` ({fuzz_san.LEAN_TOOLCHAIN_FILE} is "
+            "missing, unreadable, or empty)"
+        )
     seen: set[str] = set()
     for raw in candidates:
         if not raw or raw in seen:
@@ -878,6 +887,16 @@ def run_sanitizer_suite(
 
 
 class HeapObjSanitizerSelfTests(unittest.TestCase):
+    def test_missing_repo_pin_fails_closed(self) -> None:
+        # "" is a substring of every `lean --version` banner, so a missing or
+        # empty lean/lean-toolchain must be a named error, never a silently
+        # passing version check.
+        from unittest import mock
+
+        with mock.patch.object(fuzz_san, "repo_pinned_toolchain", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "toolchain pin"):
+                find_lean_prefix()
+
     def test_toolchain_and_link_flags_discovery(self) -> None:
         pref = find_lean_prefix()
         self.assertIsNotNone(pref, "Expected Lean v4.35.0 prefix with include/lean/lean.h and libleanrt.a")
