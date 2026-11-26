@@ -4985,6 +4985,23 @@ public def api := by
             (cold.mode, cold.replayed, cold.missing, cold.invalid),
             ("off", 0, 0, 0)
         );
+        // Opt-in unset (the G2b revert's own behavior): even a warm hit reads
+        // "off" — the selector is gated on the opt-in, not only the opt-out.
+        {
+            let _no_opt_in = ScopedEnvVar::unset("TURBO_LEAN_WARM_CAS_REPLAY");
+            let warm_unset = run_cas_expr_replay_for_build(
+                &mut store, &project, "test", "trusted", None, false, true,
+            )?;
+            assert_eq!(
+                (
+                    warm_unset.mode,
+                    warm_unset.replayed,
+                    warm_unset.missing,
+                    warm_unset.invalid
+                ),
+                ("off", 0, 0, 0)
+            );
+        }
         // Explicit flag: fail-closed, even on a warm hit with a missing shard.
         let explicit_err = run_cas_expr_replay_for_build(
             &mut store, &project, "test", "trusted", None, true, true,
