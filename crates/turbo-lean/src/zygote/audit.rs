@@ -2359,17 +2359,27 @@ pub(crate) fn run_audited_lean_shard_at_with_full_report(
         auditor.current_dir(dir);
     }
     // #443: an explicitly unbounded request lifts the DEFAULT audit cap too, so
-    // `--timeout-ms 0` truly means no artificial timeout; an explicitly configured
-    // TURBO_LEAN_AUDIT_TIMEOUT_SECS still binds.
-    let mut audit_timeout = if timeout_ms == Some(UNBOUNDED_TIMEOUT_MS)
-        && std::env::var_os("TURBO_LEAN_AUDIT_TIMEOUT_SECS").is_none()
+    // `--timeout-ms 0` truly means no artificial timeout; an explicitly configured finite
+    // TURBO_LEAN_AUDIT_TIMEOUT_SECS still binds. Both sides read the one shared parser
+    // (`explicit_audit_timeout_ms`), so `0`, an empty value and an unparsable value mean
+    // the same thing here as in `audit_timeout_ms`; and the unbounded test is a threshold
+    // (`is_unbounded_timeout_ms`), never an exact sentinel match, so a derived budget
+    // (the sentinel minus elapsed time) stays unbounded too (#443 review, finding 3).
+    let mut audit_timeout = if timeout_ms.is_some_and(is_unbounded_timeout_ms)
+        && explicit_audit_timeout_ms().is_none()
     {
         std::time::Duration::from_millis(UNBOUNDED_TIMEOUT_MS)
     } else {
         std::time::Duration::from_millis(audit_timeout_ms(false))
     };
+    // #443 review (finding 3): when the remaining request budget is the binding limit,
+    // the timeout error names the request knob, not `[audit] timeout_secs`.
+    let mut request_budget_bound = false;
     if let Some(left) = budget_left("the shard audit")? {
-        audit_timeout = audit_timeout.min(left);
+        if left < audit_timeout {
+            audit_timeout = left;
+            request_budget_bound = true;
+        }
     }
     let audit_out =
         crate::module_builder::run_command_with_timeout(&mut auditor, audit_timeout, false)
@@ -2378,10 +2388,17 @@ pub(crate) fn run_audited_lean_shard_at_with_full_report(
                 if e.downcast_ref::<crate::module_builder::CommandTimedOut>()
                     .is_some()
                 {
-                    e.context(format!(
-                        "shard audit exceeded its {}s budget (raise `[audit] timeout_secs` in turbo-lean.toml or `TURBO_LEAN_AUDIT_TIMEOUT_SECS`)",
-                        audit_timeout.as_secs()
-                    ))
+                    if request_budget_bound {
+                        e.context(format!(
+                            "shard audit exceeded the request's remaining {}s budget (the explicit `--timeout-ms` / `TURBO_LEAN_TIMEOUT_MS` request budget was the binding limit; raise it)",
+                            audit_timeout.as_secs()
+                        ))
+                    } else {
+                        e.context(format!(
+                            "shard audit exceeded its {}s budget (raise `[audit] timeout_secs` in turbo-lean.toml or `TURBO_LEAN_AUDIT_TIMEOUT_SECS`)",
+                            audit_timeout.as_secs()
+                        ))
+                    }
                 } else {
                     e.context(
                         "Failed to execute in-kernel shard auditor (`--audit-modules --shard`)",

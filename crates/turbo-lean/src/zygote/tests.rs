@@ -21,6 +21,14 @@ use super::*;
             std::env::set_var(key, value);
             Self { key, prev }
         }
+
+        /// Remove the variable for the guard's lifetime, restoring any prior value on
+        /// drop (panic-safe like `set`).
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
     }
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
@@ -2358,10 +2366,26 @@ use super::*;
         // #437: the replay budget defaults to the audit budget ...
         assert_eq!(replay_timeout_ms(false), audit_timeout_ms(false));
         assert_eq!(replay_timeout_ms(true), audit_timeout_ms(true));
+        // #443 review (finding 3): `0` or an empty TURBO_LEAN_AUDIT_TIMEOUT_SECS is
+        // explicitly unbounded (matching `eval --timeout-ms 0`); an unparsable value is
+        // no configuration at all, so the defaults apply.
+        std::env::set_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "0");
+        assert_eq!(audit_timeout_ms(false), UNBOUNDED_TIMEOUT_MS);
+        std::env::set_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "");
+        assert_eq!(audit_timeout_ms(true), UNBOUNDED_TIMEOUT_MS);
+        std::env::set_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "soon");
+        assert_eq!(audit_timeout_ms(false), 300_000);
+        std::env::remove_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS");
         // ... and has its own knob (`[replay] timeout_secs` sets this environment key).
         std::env::set_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS", "3600");
         assert_eq!(replay_timeout_ms(false), 3_600_000);
-        assert_eq!(replay_timeout_ms(true), 3_600_000);
+        // #443 review (finding 4): untrusted replay is clamped to [15, 600] s like
+        // untrusted compile timeouts, so a PR-supplied `[replay] timeout_secs` cannot
+        // hold a CI runner for hours.
+        assert_eq!(replay_timeout_ms(true), 600_000);
+        std::env::set_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS", "5");
+        assert_eq!(replay_timeout_ms(false), 5_000);
+        assert_eq!(replay_timeout_ms(true), 15_000);
         match prev_replay {
             Some(v) => std::env::set_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS", v),
             None => std::env::remove_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS"),
@@ -2370,6 +2394,45 @@ use super::*;
             Some(v) => std::env::set_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS", v),
             None => std::env::remove_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS"),
         }
+    }
+
+    #[test]
+    fn test_explicit_audit_timeout_parser_and_unbounded_threshold() {
+        // #443 review (finding 3): one shared parser decides what an explicit
+        // TURBO_LEAN_AUDIT_TIMEOUT_SECS means, and the shard auditor's unbounded-request
+        // test is a threshold, so a derived budget (the sentinel minus elapsed time)
+        // stays unbounded instead of silently falling back to the 300 s default.
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        {
+            let _unset = EnvVarGuard::unset("TURBO_LEAN_AUDIT_TIMEOUT_SECS");
+            assert_eq!(explicit_audit_timeout_ms(), None);
+        }
+        {
+            let _zero = EnvVarGuard::set("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "0");
+            assert_eq!(explicit_audit_timeout_ms(), Some(UNBOUNDED_TIMEOUT_MS));
+        }
+        {
+            let _empty = EnvVarGuard::set("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "  ");
+            assert_eq!(explicit_audit_timeout_ms(), Some(UNBOUNDED_TIMEOUT_MS));
+        }
+        {
+            let _secs = EnvVarGuard::set("TURBO_LEAN_AUDIT_TIMEOUT_SECS", " 60 ");
+            assert_eq!(explicit_audit_timeout_ms(), Some(60_000));
+        }
+        {
+            let _garbage = EnvVarGuard::set("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "soon");
+            assert_eq!(explicit_audit_timeout_ms(), None);
+        }
+        assert!(is_unbounded_timeout_ms(UNBOUNDED_TIMEOUT_MS));
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+        assert!(is_unbounded_timeout_ms(remaining_timeout_ms(
+            request_timeout_ms(0),
+            long_ago
+        )));
+        assert!(!is_unbounded_timeout_ms(600_000));
+        assert!(!is_unbounded_timeout_ms(300_000));
     }
 
     #[test]

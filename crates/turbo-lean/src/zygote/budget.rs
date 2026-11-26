@@ -531,27 +531,59 @@ pub(crate) fn invocation_timeout_ms() -> Option<u64> {
     })
 }
 
+/// The explicitly configured audit budget in milliseconds — ONE parser (#443 review,
+/// finding 3) shared by `audit_timeout_ms` and the shard auditor's unbounded-request
+/// check, so every spelling of `TURBO_LEAN_AUDIT_TIMEOUT_SECS` means the same thing on
+/// both paths. `None`: not configured (unset, or an unparsable value, which is no
+/// configuration at all). `Some(UNBOUNDED_TIMEOUT_MS)`: explicitly unbounded (`0` or an
+/// empty value, matching `eval --timeout-ms 0`). Otherwise the configured budget.
+pub(crate) fn explicit_audit_timeout_ms() -> Option<u64> {
+    let raw = std::env::var("TURBO_LEAN_AUDIT_TIMEOUT_SECS").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Some(UNBOUNDED_TIMEOUT_MS);
+    }
+    match trimmed.parse::<u64>() {
+        Ok(0) => Some(UNBOUNDED_TIMEOUT_MS),
+        Ok(secs) => Some(secs.saturating_mul(1000)),
+        Err(_) => None,
+    }
+}
+
+/// A derived request budget subtracts elapsed time from the 100-year sentinel
+/// (`remaining_timeout_ms` on `request_timeout_ms(0)`), so an unbounded budget is
+/// recognized by threshold, never by an exact match on `UNBOUNDED_TIMEOUT_MS`: anything
+/// at least half the sentinel (50 years) is an explicitly unbounded budget, never a real
+/// configuration (#443 review, finding 3).
+pub(crate) fn is_unbounded_timeout_ms(ms: u64) -> bool {
+    ms >= UNBOUNDED_TIMEOUT_MS / 2
+}
+
 /// Per-audit / `.olean`-reader budget in milliseconds (`TURBO_LEAN_AUDIT_TIMEOUT_SECS`, or
 /// `[audit] timeout_secs` in turbo-lean.toml; defaulting to 120 s in untrusted mode and
-/// 300 s in trusted mode).
+/// 300 s in trusted mode). `0` or an empty value is explicitly unbounded (#443); an
+/// unparsable value is ignored like an unset one.
 pub(crate) fn audit_timeout_ms(is_untrusted: bool) -> u64 {
-    std::env::var("TURBO_LEAN_AUDIT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(if is_untrusted { 120 } else { 300 })
-        .saturating_mul(1000)
+    explicit_audit_timeout_ms().unwrap_or(if is_untrusted { 120_000 } else { 300_000 })
 }
 
 /// Per kernel-replay-worker budget in milliseconds (`TURBO_LEAN_REPLAY_TIMEOUT_SECS`, or
 /// `[replay] timeout_secs` in turbo-lean.toml), defaulting to `audit_timeout_ms` (#437).
+/// In untrusted mode the result is clamped to [15, 600] s, the same bounds as untrusted
+/// compile timeouts (#443 review, finding 4), so a PR-supplied `[replay] timeout_secs`
+/// cannot hold a CI runner for hours.
 pub(crate) fn replay_timeout_ms(is_untrusted: bool) -> u64 {
-    std::env::var("TURBO_LEAN_REPLAY_TIMEOUT_SECS")
+    let ms = std::env::var("TURBO_LEAN_REPLAY_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&v| v > 0)
         .map(|secs| secs.saturating_mul(1000))
-        .unwrap_or_else(|| audit_timeout_ms(is_untrusted))
+        .unwrap_or_else(|| audit_timeout_ms(is_untrusted));
+    if is_untrusted {
+        ms.clamp(15_000, 600_000)
+    } else {
+        ms
+    }
 }
 
 /// Effective `.olean` declaration-identity reader budget in milliseconds: aligns with

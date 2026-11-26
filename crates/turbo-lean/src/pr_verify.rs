@@ -19724,14 +19724,16 @@ end ParityNs
             crate::module_builder::module_compile_timeout_secs_from(None, false),
             1800
         );
-        // With a recorded duration the trusted default adapts: max(300, 3x last).
+        // #437 review (finding 5): the history-based trusted default is floored at the
+        // no-history default — max(1800, 3x last) — so a recorded duration never makes
+        // the budget stricter than having no history at all.
         assert_eq!(
             crate::module_builder::module_compile_timeout_secs_with_history(
                 None,
                 false,
                 Some(436_000)
             ),
-            1308
+            1800
         );
         assert_eq!(
             crate::module_builder::module_compile_timeout_secs_with_history(
@@ -19739,7 +19741,16 @@ end ParityNs
                 false,
                 Some(10_000)
             ),
-            300
+            1800
+        );
+        // History can only raise the budget above the floor.
+        assert_eq!(
+            crate::module_builder::module_compile_timeout_secs_with_history(
+                None,
+                false,
+                Some(700_000)
+            ),
+            2100
         );
         // An explicit setting always wins, and untrusted mode ignores history.
         assert_eq!(

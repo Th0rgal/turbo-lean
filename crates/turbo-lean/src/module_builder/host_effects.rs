@@ -1831,9 +1831,11 @@ pub(super) type StagedModuleCompileOutput = (i64, String, TempDirGuard);
 ///
 /// With no explicit setting the trusted default is 1800 s — a flat 300 s killed legitimate
 /// proof-heavy modules that take over 400 s. The `last_duration_ms` parameter implements
-/// the adaptive `max(300 s, 3 × the last recorded compile duration)` policy (#437) for a
-/// caller that knows one; no production call site passes a duration yet (they all route
-/// through `module_compile_timeout_secs_from` with `None`) — the scheduler's cached action
+/// the adaptive `max(1800 s, 3 × the last recorded compile duration)` policy (#437,
+/// floored at the no-history default per the #437 review, finding 5, so having history
+/// never makes the budget stricter than having none) for a caller that knows one; no
+/// production call site passes a duration yet (they all route through
+/// `module_compile_timeout_secs_from` with `None`) — the scheduler's cached action
 /// durations (`get_cached_action_duration_ms`) are the intended source.
 pub(crate) fn module_compile_timeout_secs_with_history(
     raw_env: Option<&str>,
@@ -1847,7 +1849,7 @@ pub(crate) fn module_compile_timeout_secs_with_history(
         return configured.unwrap_or(300).clamp(15, 600);
     }
     configured.unwrap_or_else(|| match last_duration_ms {
-        Some(ms) => ms.div_ceil(1000).saturating_mul(3).max(300),
+        Some(ms) => ms.div_ceil(1000).saturating_mul(3).max(1800),
         None => 1800,
     })
 }
