@@ -252,6 +252,12 @@ CI_SAMPLE: List[Tuple[str, str]] = [
     ("RS-widthmask-i8-00", "KILLED"),
 ]
 
+# The published H1.4 coverage number (Proofs/LowerRefines.lean doc-block and
+# the HORIZONS H1.4 row). The self-test checks the committed results JSON
+# records exactly this, so the artifact, the docs and this pin move together
+# on every re-measure (review r2 F5).
+PUBLISHED_COVERAGE = "59/60"
+
 
 @dataclass
 class Mutant:
@@ -988,8 +994,12 @@ def self_test() -> int:
     finally:
         shutil.rmtree(st_tmp, ignore_errors=True)
 
-    # The committed results artifact backs the CI sample's KILLED claims
-    # (review F9): every pinned id must be recorded KILLED at the pinned shas.
+    # The committed results artifact backs the CI sample's KILLED claims and
+    # the published number (review F9, r2 F5): current schema, each file's
+    # hash against its OWN pin (not merely any pin), a full 40-hex measured
+    # commit, and summary.coverage equal to the published figure, so a stale
+    # pre-r1 artifact whose environmental kills the record disavows can never
+    # pass this check again.
     if RESULTS_PATH.exists():
         doc = json.loads(RESULTS_PATH.read_text(encoding="utf-8"))
         by_id = {r["id"]: r for r in doc.get("mutants", [])}
@@ -997,13 +1007,37 @@ def self_test() -> int:
                    if by_id.get(mid, {}).get("outcome") != exp]
         check("every CI sample id is recorded KILLED in the committed results "
               "JSON", not missing, str(missing))
-        stale = [rel for rel, sha in doc.get("files", {}).items()
-                 if sha not in PINNED_SHA256.values()]
-        check("committed results JSON was measured at the pinned source shas",
-              not stale, str(stale))
+        check("committed results JSON carries the current schema",
+              doc.get("schemaVersion") == SCHEMA, str(doc.get("schemaVersion")))
+        files = doc.get("files")
+        stale = [] if isinstance(files, dict) else ["files key missing"]
+        if isinstance(files, dict):
+            for tag, rel in FILES.items():
+                if files.get(rel) != PINNED_SHA256[tag]:
+                    stale.append(f"{rel}: {files.get(rel)} != own pin "
+                                 f"{PINNED_SHA256[tag]}")
+        check("committed results JSON was measured at each file's OWN pin",
+              not stale, "; ".join(stale))
+        mc = str(doc.get("measured_commit", ""))
+        check("committed results JSON names a full measured commit",
+              len(mc) == 40 and all(c in "0123456789abcdef" for c in mc), mc)
+        check("committed results JSON records the published coverage "
+              f"({PUBLISHED_COVERAGE})",
+              doc.get("summary", {}).get("coverage") == PUBLISHED_COVERAGE,
+              str(doc.get("summary", {}).get("coverage")))
     else:
         check("committed results JSON exists (scripts/"
               "proof_mutant_matrix_results.json)", False, "file missing")
+
+    # Review r2 F1: the kill closure must COMPILE the pin module. The
+    # LeanNative lib pulls every submodule in by glob (lakefile.lean,
+    # `.andSubmodules`); fail loudly if that glob or the module goes away.
+    lakefile = (ROOT / "lean" / "lakefile.lean").read_text(encoding="utf-8")
+    check("lakefile builds LeanNative by submodule glob, covering "
+          "Proofs/LowerRefines.lean",
+          ".andSubmodules `LeanNative" in lakefile and
+          (ROOT / "lean" / "LeanNative" / "Proofs" / "LowerRefines.lean").exists(),
+          "glob or module missing")
 
     print(f"[self-test] {'OK' if not failures else 'FAILED'} "
           f"({len(failures)} failure(s))")
