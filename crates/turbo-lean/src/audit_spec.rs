@@ -534,6 +534,32 @@ fn current_audit_namespace(stack: &[crate::splitter::ScopeFrame]) -> String {
         .join(".")
 }
 
+/// Whether a consumed declaration prefix changes the meaning of a re-emitted def.
+/// `partial`/`unsafe`/`noncomputable` alter elaboration or kernel visibility of the
+/// body, and `@[implemented_by ...]`/`@[extern ...]` rebind evaluation, so a def
+/// stripped of one of these must never seed a self-contained probe. Visibility and
+/// hint prefixes are admitted: re-emitted without them the def means the same thing,
+/// or fails to elaborate, and a probe that fails to elaborate certifies nothing.
+fn consumed_prefix_changes_semantics(consumed: &str) -> bool {
+    let mut rest = consumed;
+    while let Some(at) = rest.find("@[") {
+        let after = &rest[at + 2..];
+        let Some(close) = after.find(']') else {
+            // An unterminated attribute group means the prefix was not fully
+            // understood: refuse.
+            return true;
+        };
+        let group = &after[..close];
+        if group.contains("implemented_by") || group.contains("extern") {
+            return true;
+        }
+        rest = &after[close + 1..];
+    }
+    consumed
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|w| matches!(w, "partial" | "unsafe" | "noncomputable"))
+}
+
 fn consume_audit_decl_modifiers_and_attrs(src: &str, mut pos: usize, ln: &mut usize) -> usize {
     let bytes = src.as_bytes();
     let skip_ws_multiline = |mut p: usize, line_no: &mut usize| -> usize {
@@ -598,9 +624,14 @@ pub(super) fn extract_local_def_unfoldings(clean_src: &str) -> Vec<LocalDefUnfol
 /// command's original one-line source as `(qualified name, command text, unsafe to
 /// re-emit)`, plus the short names of definitions the extractor had to SKIP (`by`/`do`/
 /// `where`/signature-only bodies), for the self-contained kernel witness fallback
-/// probes. A def is unsafe to re-emit when its `partial`/`unsafe`/`noncomputable`/
-/// `@[...]` prefix was consumed, or when gathering stopped at a blank line that an
-/// indented continuation follows (the gathered text may truncate the real body).
+/// probes. A def is unsafe to re-emit when a semantics-changing `partial`/`unsafe`/
+/// `noncomputable` modifier (or an evaluation-bearing attribute such as
+/// `@[implemented_by ...]` or `@[extern ...]`) was consumed — a visibility or hint
+/// prefix (`private`, `scoped`, `local`, `@[simp]`, `@[inline]`, `@[reducible]`)
+/// either leaves the re-emitted meaning unchanged or makes the probe fail to
+/// elaborate, and a probe that fails to elaborate certifies nothing — or when
+/// gathering stopped at a blank line that an indented continuation follows (the
+/// gathered text may truncate the real body).
 pub(super) fn extract_local_def_unfoldings_and_sources(
     clean_src: &str,
 ) -> (
@@ -661,7 +692,7 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
         let mut cur_ln = line_no;
         let mods_start = pos;
         pos = consume_audit_decl_modifiers_and_attrs(&src, pos, &mut cur_ln);
-        let had_modifiers = src[mods_start..pos].chars().any(|c| !c.is_whitespace());
+        let semantics_changing_prefix = consumed_prefix_changes_semantics(&src[mods_start..pos]);
         if pos >= src.len() {
             break;
         }
@@ -966,7 +997,7 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
         def_srcs.push((
             def_name.clone(),
             format!("{kw} {combined}"),
-            had_modifiers || truncation_suspect,
+            semantics_changing_prefix || truncation_suspect,
         ));
         defs.push((def_name, params, body.to_string(), type_dependencies));
     }
@@ -3969,9 +4000,9 @@ pub(super) fn build_kernel_witness_minimal_probe_src(
     }) {
         return None;
     }
-    // A def whose modifiers or attributes were stripped by extraction would be
-    // re-emitted with different semantics (a `partial` def becomes transparent to
-    // `decide`): never build a self-contained probe over such a def.
+    // A def stripped of a semantics-changing modifier or an evaluation-bearing
+    // attribute would be re-emitted with different meaning (a `partial` def becomes
+    // transparent to `decide`): never build a self-contained probe over such a def.
     if local_def_srcs
         .iter()
         .zip(&included)
@@ -4813,6 +4844,7 @@ fn audit_spec_file_or_source_with_policy_inner(
         Vec<String>,
         Vec<(String, String, bool)>,
         Vec<String>,
+        bool,
     )> = None;
     if inline_src.is_none()
         && file.is_file()
@@ -4824,9 +4856,12 @@ fn audit_spec_file_or_source_with_policy_inner(
                 let (mut local_defs, mut local_def_srcs, mut skipped_defs) =
                     extract_local_def_unfoldings_and_sources(&clean_file_src);
                 let mut open_ns = extract_opened_namespaces(&clean_file_src);
+                let mut siblings_hostile = false;
                 for p in collect_external_local_def_lean_paths(file) {
                     if let Ok(sib_src) = fs::read_to_string(&p) {
                         let clean_sib = strip_audit_comments(&sib_src);
+                        siblings_hostile |=
+                            audited_src_declares_probe_hostile_commands(&clean_sib);
                         let (sib_defs, sib_srcs, sib_skipped) =
                             extract_local_def_unfoldings_and_sources(&clean_sib);
                         local_defs.extend(sib_defs);
@@ -4895,8 +4930,13 @@ fn audit_spec_file_or_source_with_policy_inner(
                     }
                 }
                 preloaded_file_src = Some(file_src);
-                preloaded_external_local_defs =
-                    Some((local_defs, open_ns, local_def_srcs, skipped_defs));
+                preloaded_external_local_defs = Some((
+                    local_defs,
+                    open_ns,
+                    local_def_srcs,
+                    skipped_defs,
+                    siblings_hostile,
+                ));
             }
         }
     }
@@ -5011,17 +5051,20 @@ fn audit_spec_file_or_source_with_policy_inner(
         // kernel witness fallback probes (original `def`/`abbrev` command sources plus
         // the names of defs the extractor had to skip), sibling external defs included
         // so cross-file references resolve.
-        let (local_defs, open_namespaces, kw_local_def_srcs, kw_skipped_defs) =
+        let (local_defs, open_namespaces, kw_local_def_srcs, kw_skipped_defs, kw_siblings_hostile) =
             if let Some(preloaded) = preloaded_external_local_defs.take() {
                 preloaded
             } else {
                 let (mut defs, mut def_srcs, mut skipped) =
                     extract_local_def_unfoldings_and_sources(&clean_src);
                 let mut opens = extract_opened_namespaces(&clean_src);
+                let mut siblings_hostile = false;
                 if inline_src.is_none() && src_path.is_file() {
                     for p in collect_external_local_def_lean_paths(src_path) {
                         if let Ok(sib_src) = fs::read_to_string(&p) {
                             let clean_sib = strip_audit_comments(&sib_src);
+                            siblings_hostile |=
+                                audited_src_declares_probe_hostile_commands(&clean_sib);
                             let (sib_defs, sib_srcs, sib_skipped) =
                                 extract_local_def_unfoldings_and_sources(&clean_sib);
                             defs.extend(sib_defs);
@@ -5035,7 +5078,7 @@ fn audit_spec_file_or_source_with_policy_inner(
                         }
                     }
                 }
-                (defs, opens, def_srcs, skipped)
+                (defs, opens, def_srcs, skipped, siblings_hostile)
             };
 
         for d in extract_decls_fast(src, decl_filter) {
@@ -5104,8 +5147,12 @@ fn audit_spec_file_or_source_with_policy_inner(
             let clean_for_ns = strip_audit_comments(src);
             let audited_line_count = src.lines().count();
             let header_import_lines = lean_header_import_lines(src);
+            // The sibling sweep re-emits defs from neighboring sources into the
+            // self-contained probes, so a probe-hostile command in a sibling is as
+            // disqualifying as one in the audited file itself.
             let minimal_probe_allowed_for_file =
-                !audited_src_declares_probe_hostile_commands(&clean_for_ns);
+                !audited_src_declares_probe_hostile_commands(&clean_for_ns)
+                    && !kw_siblings_hostile;
             // Per-candidate outcome: (certified, with_gates, self_contained).
             let mut cert: Vec<(bool, bool, bool)> =
                 vec![(false, false, false); kw_src_candidates.len()];
@@ -5969,6 +6016,31 @@ pub fn run_audit_spec_command_with_options(
 #[cfg(test)]
 mod lexer_tests {
     use super::*;
+
+    #[test]
+    fn extractor_flags_only_semantics_changing_prefixes() {
+        let src = "partial def pf1 (n : Nat) : Nat := pf1 n\n\
+                   private def priv1 (n : Nat) : Nat := n + 1\n\
+                   @[simp] def simp1 (n : Nat) : Nat := n + 2\n\
+                   @[implemented_by priv1] def impl1 (n : Nat) : Nat := n + 3\n\
+                   unsafe def uns1 (n : Nat) : Nat := n + 4\n";
+        let (_, def_srcs, _) = extract_local_def_unfoldings_and_sources(src);
+        let flag = |name: &str| {
+            def_srcs
+                .iter()
+                .find(|(n, _, _)| n == name || n.ends_with(&format!(".{name}")))
+                .unwrap_or_else(|| panic!("extractor must capture {name}: {def_srcs:?}"))
+                .2
+        };
+        assert!(flag("pf1"), "a stripped `partial` must refuse re-emission");
+        assert!(flag("uns1"), "a stripped `unsafe` must refuse re-emission");
+        assert!(
+            flag("impl1"),
+            "a stripped `@[implemented_by ...]` must refuse re-emission"
+        );
+        assert!(!flag("priv1"), "`private` alone must stay re-emittable");
+        assert!(!flag("simp1"), "`@[simp]` alone must stay re-emittable");
+    }
 
     #[test]
     fn audit_spec_toml_typo_key_wrapper_fails_closed() {
