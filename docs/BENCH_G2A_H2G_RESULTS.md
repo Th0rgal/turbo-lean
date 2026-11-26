@@ -132,13 +132,15 @@ tolerance with OFF as baseline:
 | batteries_unionfind_top | 2233.8 | 2241.9 | +0.36% | ±248.4 | unchanged |
 
 Cold and warm-edited cells are also all unchanged; no cell of 12 falls
-outside the band. Per the H2 rule ("a change that does not move it is
-reverted") the warm default reverted to opt-in (`TURBO_LEAN_WARM_CAS_REPLAY=1`
-enables; the opt-out still forces off; the replay path is kept unchanged).
-A traced structural fact: `run_build_command_with_cas_replay` is reached only
-from the `build` CLI and `pr_verify`, never from the `check` path this bench
-drives, so the null delta here is expected by construction; a re-measure that
-could resolve a real cost must exercise `build`-shaped warm loops.
+outside the band. The structural reading comes first: this bench cannot
+observe the change at all — `run_build_command_with_cas_replay` is reached
+only from the `build` CLI and `pr_verify`, never from the `check` path this
+bench drives — so the null delta is expected by construction and decides
+nothing about the replay's real cost (the runs were also taken on a busy
+node, like everything above). What landed per the delta rule is the opt-in
+(`TURBO_LEAN_WARM_CAS_REPLAY=1` enables; the opt-out still forces off; the
+replay path is kept unchanged). The G2b accept/delete decision stays open
+pending a `build`-shaped warm loop or `check`-path wiring on a quiet node.
 
 ## Per-cell peak RSS across the 5 trials (MB, trial order)
 
