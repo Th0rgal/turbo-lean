@@ -1,0 +1,11 @@
+[2026-11-25T16:53:43Z] workload batteries_list_lemmas_top ...
+  cold median=72789.8ms rel_spread=1.3099
+  warm cache-hit median=Nonems, edited median=Nonems
+[2026-11-25T17:04:31Z] workload batteries_string_lemmas_top ...
+  cold median=89576.5ms rel_spread=0.1056
+  warm cache-hit median=Nonems, edited median=Nonems
+[2026-11-25T17:15:47Z] workload batteries_rbtree_lemmas_top ...
+  cold median=Nonems rel_spread=0.0
+ENVIRONMENT ERROR (exit 4): warm setup run for batteries_rbtree_lemmas_top failed (exit -1); cannot measure warm modes: 
+timeout after 900s
+bench exit: 4
