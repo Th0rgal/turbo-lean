@@ -214,6 +214,64 @@ class Stats(unittest.TestCase):
         self.assertAlmostEqual(cold, 1000.0 * 1.20 + 25.0)
 
 
+class CheckTimeoutOverride(unittest.TestCase):
+    def test_env_override_reaches_subprocess_timeout(self):
+        # TURBO_LEAN_BENCH_CHECK_TIMEOUT_S rebinds CHECK_TIMEOUT_S after
+        # import.  The child's `--timeout` argv already reads the global at
+        # call time; subprocess.run's own bound must carry the same value,
+        # so run_check may not freeze the module global into its parameter
+        # default at definition time.
+        mod = load_script()
+        key = "TURBO_LEAN_BENCH_CHECK_TIMEOUT_S"
+        prev = os.environ.get(key)
+        os.environ[key] = "123"
+        try:
+            # Re-apply the override: rebind the module global from the env,
+            # exactly as the env-override hook does after import.
+            mod.CHECK_TIMEOUT_S = int(os.environ[key])
+
+            recorded = {}
+
+            class FakeProc:
+                returncode = 0
+                stdout = "{}"
+                stderr = ""
+
+            class FakeSubprocess:
+                TimeoutExpired = subprocess.TimeoutExpired
+
+                @staticmethod
+                def run(argv, **kwargs):
+                    recorded["argv"] = list(argv)
+                    recorded["timeout"] = kwargs.get("timeout")
+                    return FakeProc()
+
+            # Seam: replace the module-level `subprocess` binding of this
+            # freshly loaded module instance only; the real module object
+            # used by the rest of the suite is untouched.
+            mod.subprocess = FakeSubprocess
+
+            runner = object.__new__(mod.Runner)
+            runner.bin = Path("/fake/turbo-lean")
+            runner.dirs = {"batteries": Path("/fake/batteries")}
+            w = {"id": "wl", "repo": "batteries", "file": "A.lean", "decl": "d"}
+            with tempfile.TemporaryDirectory(prefix="m1-timeout-") as td:
+                tdp = Path(td)
+                runner.run_check(w, tdp / "cache", tdp / "home", tdp / "staging",
+                                 no_daemon=True)
+            # Control: the argv half already resolves the global at call time.
+            argv = recorded["argv"]
+            self.assertEqual(argv[argv.index("--timeout") + 1], "123")
+            # The property under test: the subprocess bound carries the
+            # override, not the import-time 900.
+            self.assertEqual(recorded["timeout"], 123)
+        finally:
+            if prev is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prev
+
+
 class BaselineSchema(unittest.TestCase):
     def test_validate_requires_provenance(self):
         mod = load_script()

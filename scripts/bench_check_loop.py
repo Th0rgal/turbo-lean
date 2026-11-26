@@ -895,7 +895,11 @@ class Runner:
         return argv + list(w.get("extra_args", []))
 
     def run_check(self, w, cache: Path, home: Path, staging: Path, no_daemon: bool,
-                  timeout_s=CHECK_TIMEOUT_S):
+                  timeout_s=None):
+        # Resolve at call time: a definition-time default would freeze the
+        # import-time CHECK_TIMEOUT_S and never see a later rebind (the env
+        # override), while the child's --timeout argv would.
+        timeout_s = timeout_s if timeout_s is not None else CHECK_TIMEOUT_S
         env = self.trial_env(cache, home, staging, no_daemon)
         argv = self.check_argv(w, cache, self.source_path(w))
         psi_before = sample_psi()
