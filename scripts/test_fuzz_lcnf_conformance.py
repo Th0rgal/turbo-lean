@@ -339,7 +339,22 @@ class ClangResolutionOrder(unittest.TestCase):
         self.assertEqual(
             fuzzer.toolchain_version_token("leanprover/lean4:v4.35.0"), "4.35.0"
         )
-        self.assertEqual(fuzzer.toolchain_version_token(None), "")
+        # A missing/empty pin yields None, never "": an empty token is a
+        # substring of every `lean --version` banner, so "" would silently
+        # PASS the callers' substring version checks.
+        self.assertIsNone(fuzzer.toolchain_version_token(None))
+        self.assertIsNone(fuzzer.toolchain_version_token(""))
+
+    def test_missing_pin_fails_the_version_check_closed_in_both_callers(self):
+        import run_conformance_suite as suite
+        import run_heapobj_abi_sanitizers as san
+
+        with mock.patch.object(suite, "PINNED_CON_LECHE_TOOLCHAIN", None):
+            with self.assertRaisesRegex(RuntimeError, "toolchain pin"):
+                suite.find_v435_lean_and_init()
+        with mock.patch.object(fuzzer, "repo_pinned_toolchain", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "toolchain pin"):
+                san.find_lean_prefix()
 
 
 class PinnedToolchainEnv(unittest.TestCase):

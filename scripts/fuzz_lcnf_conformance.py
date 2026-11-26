@@ -582,10 +582,16 @@ def pinned_toolchain_clang_candidates() -> list[str]:
     return toolchain_bin_candidates("clang")
 
 
-def toolchain_version_token(toolchain: str | None) -> str:
-    """`leanprover/lean4:v4.35.0` -> `4.35.0` (the token `lean --version` prints)."""
+def toolchain_version_token(toolchain: str | None) -> str | None:
+    """`leanprover/lean4:v4.35.0` -> `4.35.0` (the token `lean --version` prints).
+
+    A missing/empty toolchain yields None, never "": an empty token is a
+    substring of every version banner, so callers doing `token in ver` would
+    silently pass the version check with no pin at all. Callers must fail
+    closed (a named error) when this returns None.
+    """
     if not toolchain:
-        return ""
+        return None
     return toolchain.rsplit(":", 1)[-1].lstrip("v")
 
 
