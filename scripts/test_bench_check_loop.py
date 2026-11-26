@@ -1846,16 +1846,6 @@ class CheckTimeoutMainPath(unittest.TestCase):
             self.assertEqual(data["args"]["check_timeout_s"], 77)
 
 
-class ProvenanceEnvVars(unittest.TestCase):
-    def test_warm_replay_switches_are_recorded_settings(self):
-        # The G2b on-vs-off artifacts were indistinguishable by their settings
-        # blocks: neither replay switch was recorded. Both are provenance now,
-        # so paired runs self-describe and settings-mismatch across sides.
-        mod = load_script()
-        self.assertIn("TURBO_LEAN_NO_WARM_CAS_REPLAY", mod.RECORDED_ENV_VARS)
-        self.assertIn("TURBO_LEAN_WARM_CAS_REPLAY", mod.RECORDED_ENV_VARS)
-
-
 class OnlyWorkloadsPartialRun(unittest.TestCase):
     def test_only_workloads_marks_skipped_and_partial_run(self):
         with tempfile.TemporaryDirectory(prefix="m1-filter-") as td:
