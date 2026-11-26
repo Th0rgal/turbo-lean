@@ -4634,25 +4634,48 @@ public def api := by
     }
 
     /// G2b red→green: the pure warm-default decision. Replay runs by default only on a
-    /// warm (cache-hit) path, never when the explicit fail-closed flag already runs it,
-    /// and never when the operator opted out.
+    /// warm (cache-hit) path and never when the operator opted out. The explicit flag is
+    /// not a parameter: the selector's early return owns that case, so the decision
+    /// function has no dead argument.
     #[test]
     fn g2b_warm_default_cas_replay_decision_table() {
-        // (explicit, cache_hit, opt_out) -> warm default replay?
-        for (explicit, cache_hit, opt_out, want) in [
-            (false, true, false, true),   // the G2b default: a warm hit replays
-            (true, true, false, false),   // explicit flag owns the replay (fail-closed path)
-            (false, false, false, false), // cold build: elaboration ran anyway, no default replay
-            (false, true, true, false),   // TURBO_LEAN_NO_WARM_CAS_REPLAY=1 opts out
-            (true, false, false, false),
-            (true, true, true, false),
+        // (cache_hit, opt_out) -> warm default replay?
+        for (cache_hit, opt_out, want) in [
+            (true, false, true),   // the G2b default: a warm hit replays
+            (false, false, false), // cold build: elaboration ran anyway, no default replay
+            (true, true, false),   // TURBO_LEAN_NO_WARM_CAS_REPLAY=1 opts out
+            (false, true, false),
         ] {
             assert_eq!(
-                should_replay_cas_expr_on_warm_hit(explicit, cache_hit, opt_out),
+                should_replay_cas_expr_on_warm_hit(cache_hit, opt_out),
                 want,
-                "decision (explicit={explicit}, cache_hit={cache_hit}, opt_out={opt_out})"
+                "decision (cache_hit={cache_hit}, opt_out={opt_out})"
             );
         }
+    }
+
+    /// G2b round-1 addendum red→green (review finding 4): the leader / no-singleflight
+    /// branch is not always cold. Its cache-hit answer comes from this pure helper: warm
+    /// when the project's oleans were already up to date (no build ran), or when the
+    /// native build compiled nothing and served everything from cache or reuse.
+    #[test]
+    fn g2b_leader_branch_cache_hit_table() {
+        use crate::module_builder::NativeBuildReport;
+        let report = |compiled: usize, cached: usize, reused: usize| NativeBuildReport {
+            modules_compiled: compiled,
+            modules_cached: cached,
+            modules_up_to_date_reused: reused,
+            ..Default::default()
+        };
+        // Oleans already up to date: no build ran at all — warm whatever the report says.
+        assert!(leader_branch_cache_hit(true, &report(0, 0, 0)));
+        // Nothing compiled, everything cached or reused: warm.
+        assert!(leader_branch_cache_hit(false, &report(0, 1, 0)));
+        assert!(leader_branch_cache_hit(false, &report(0, 0, 2)));
+        // Anything compiled: cold, even when siblings came from cache.
+        assert!(!leader_branch_cache_hit(false, &report(1, 5, 5)));
+        // No evidence of warmth (an external-dep project's first visit): cold.
+        assert!(!leader_branch_cache_hit(false, &report(0, 0, 0)));
     }
 
     /// G2b red→green: `TURBO_LEAN_NO_WARM_CAS_REPLAY` is the opt-out, parsed with the
@@ -4778,6 +4801,71 @@ public def api := by
                 Some(std::slice::from_ref(&seeded)),
             )?,
             1
+        );
+        // `Some(scope)` is exact: an EMPTY scope replays nothing instead of silently
+        // widening to the whole project (only `None` means "the whole project"), so a
+        // target-cone build whose cone resolved empty never scans every file by default.
+        assert_eq!(
+            replay_project_cas_expr_shards_best_effort(
+                &mut store,
+                &project,
+                "test",
+                "trusted",
+                Some(&[]),
+            )?,
+            CasExprReplayStats::default()
+        );
+        assert_eq!(
+            replay_project_cas_expr_shards(&mut store, &project, "test", "trusted", Some(&[]))?,
+            0
+        );
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// G2b round-1 addendum red→green (review finding 1): an internal error inside the
+    /// warm-default replay (here a lakefile that fails option resolution) must not fail a
+    /// warm build that already materialized its outputs. The selector contains it as mode
+    /// `"warm_default_error"` with zero counts; the explicit fail-closed flag still
+    /// propagates the same error.
+    #[test]
+    fn g2b_warm_default_replay_error_is_contained() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = ScopedEnvVar::unset("TURBO_LEAN_NO_WARM_CAS_REPLAY");
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_g2b_err_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let project = dir.join("project");
+        fs::create_dir_all(&project)?;
+        fs::write(
+            project.join("Demo.lean"),
+            "theorem g2b_err_demo : True := by trivial\n",
+        )?;
+        // An invalid Lake config makes option resolution fail inside the replay walk.
+        fs::write(project.join("lakefile.toml"), "name = [")?;
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+
+        // Warm default: the error is contained, logged, and reported as a mode — never a
+        // failed warm build.
+        let warm = run_cas_expr_replay_for_build(
+            &mut store, &project, "test", "trusted", None, false, true,
+        )?;
+        assert_eq!(
+            (warm.mode, warm.replayed, warm.missing, warm.invalid),
+            ("warm_default_error", 0, 0, 0)
+        );
+        // The explicit fail-closed flag still surfaces the same error.
+        let explicit_err = run_cas_expr_replay_for_build(
+            &mut store, &project, "test", "trusted", None, true, true,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{explicit_err:#}").contains("Failed to resolve Lean options"),
+            "explicit mode must keep propagating internal errors: {explicit_err:#}"
         );
         fs::remove_dir_all(dir)?;
         Ok(())
