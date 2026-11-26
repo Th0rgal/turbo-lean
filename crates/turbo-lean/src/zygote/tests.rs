@@ -2307,16 +2307,13 @@ use super::*;
             let _guard = crate::pack::tests::env_test_lock()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var_os("TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER");
-            std::env::set_var("TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER", "4");
+            // Review finding 6: a panic-safe guard, so a failing assert cannot leak the
+            // multiplier into later tests.
+            let _mult_guard = EnvVarGuard::set("TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER", "4");
             let mut cmd2 = Command::new("sh");
             cmd2.args(["-c", "ulimit -v"]);
             WorkerBudget::apply_worker_rlimit(&mut cmd2, 512);
             let out2 = cmd2.output().expect("spawn sh under the AS opt-in");
-            match prev {
-                Some(v) => std::env::set_var("TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER", v),
-                None => std::env::remove_var("TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER"),
-            }
             assert!(out2.status.success(), "{out2:?}");
             assert_eq!(
                 String::from_utf8_lossy(&out2.stdout).trim(),
@@ -2359,10 +2356,10 @@ use super::*;
         let _guard = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_replay = std::env::var_os("TURBO_LEAN_REPLAY_TIMEOUT_SECS");
-        let prev_audit = std::env::var_os("TURBO_LEAN_AUDIT_TIMEOUT_SECS");
-        std::env::remove_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS");
-        std::env::remove_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS");
+        // Review finding 6: panic-safe guards, so a failing assert cannot leak the
+        // overrides into later tests.
+        let _replay_guard = EnvVarGuard::unset("TURBO_LEAN_REPLAY_TIMEOUT_SECS");
+        let _audit_guard = EnvVarGuard::unset("TURBO_LEAN_AUDIT_TIMEOUT_SECS");
         // #437: the replay budget defaults to the audit budget ...
         assert_eq!(replay_timeout_ms(false), audit_timeout_ms(false));
         assert_eq!(replay_timeout_ms(true), audit_timeout_ms(true));
@@ -2386,14 +2383,6 @@ use super::*;
         std::env::set_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS", "5");
         assert_eq!(replay_timeout_ms(false), 5_000);
         assert_eq!(replay_timeout_ms(true), 15_000);
-        match prev_replay {
-            Some(v) => std::env::set_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS", v),
-            None => std::env::remove_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS"),
-        }
-        match prev_audit {
-            Some(v) => std::env::set_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS", v),
-            None => std::env::remove_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS"),
-        }
     }
 
     #[test]
@@ -2495,10 +2484,10 @@ use super::*;
         let _guard = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_jobs = std::env::var_os("TURBO_LEAN_JOBS");
-        let prev_mem = std::env::var_os("TURBO_LEAN_MAX_MEMORY_MB");
-        std::env::remove_var("TURBO_LEAN_JOBS");
-        std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", "4096");
+        // Review finding 6: panic-safe guards, so a failing assert cannot leak the
+        // overrides into later tests.
+        let _jobs_guard = EnvVarGuard::unset("TURBO_LEAN_JOBS");
+        let _mem_guard = EnvVarGuard::set("TURBO_LEAN_MAX_MEMORY_MB", "4096");
         assert_eq!(
             WorkerBudget::from_env(),
             WorkerBudget {
@@ -2514,14 +2503,6 @@ use super::*;
         // ... but an explicit environment setting wins.
         WorkerBudget::export_effective_jobs(Some(7));
         assert_eq!(std::env::var("TURBO_LEAN_JOBS").as_deref(), Ok("3"));
-        match prev_jobs {
-            Some(v) => std::env::set_var("TURBO_LEAN_JOBS", v),
-            None => std::env::remove_var("TURBO_LEAN_JOBS"),
-        }
-        match prev_mem {
-            Some(v) => std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", v),
-            None => std::env::remove_var("TURBO_LEAN_MAX_MEMORY_MB"),
-        }
     }
 
     #[test]

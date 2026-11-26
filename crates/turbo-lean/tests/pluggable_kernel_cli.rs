@@ -607,9 +607,11 @@ fn write_executable_script(path: &Path, body: &str) {
 
 /// G1b: compile `<module>.lean` in `dir` into a REAL `<module>.olean` with the repo's pinned
 /// toolchain, so the con-leche verification path is tested over real compiled artifacts and
-/// never over synthesized `.olean` bytes or an empty search path.
+/// never over synthesized `.olean` bytes or an empty search path. Returns `None` (after
+/// printing a skip message) when no runnable Lean toolchain (`elan` or `lean`) is on PATH;
+/// a toolchain that is present but fails to compile is still a hard test failure.
 #[cfg(unix)]
-fn compile_real_olean_module(dir: &Path, module: &str) -> PathBuf {
+fn compile_real_olean_module(dir: &Path, module: &str) -> Option<PathBuf> {
     let toolchain = include_str!("../../../lean/lean-toolchain").trim();
     fs::write(dir.join("lean-toolchain"), format!("{toolchain}\n")).unwrap();
     // Locate the pinned `lean` cleanly even when no elan default toolchain is configured.
@@ -621,6 +623,21 @@ fn compile_real_olean_module(dir: &Path, module: &str) -> PathBuf {
         .filter(|o| o.status.success())
         .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
         .unwrap_or_else(|| PathBuf::from("lean"));
+    // Review finding 7: skip (never panic) when neither `elan` nor `lean` resolves to a
+    // runnable toolchain on this host.
+    match Command::new(&lean_bin)
+        .current_dir(dir)
+        .arg("--version")
+        .output()
+    {
+        Ok(v) if v.status.success() => {}
+        _ => {
+            eprintln!(
+                "no runnable Lean toolchain (`elan`/`lean`) on PATH; cannot compile a real `{module}.olean`"
+            );
+            return None;
+        }
+    }
     let src = dir.join(format!("{module}.lean"));
     fs::write(
         &src,
@@ -638,14 +655,14 @@ fn compile_real_olean_module(dir: &Path, module: &str) -> PathBuf {
             src.to_str().unwrap(),
         ])
         .output()
-        .unwrap();
+        .expect("`lean --version` succeeded, so spawning the compile must too");
     assert!(
         out.status.success(),
         "compile {module}.lean with the pinned `lean` failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    olean
+    Some(olean)
 }
 
 #[cfg(unix)]
@@ -661,7 +678,13 @@ fn con_leche_exit_code_protocol_and_verified_cli_flags() {
     let scratch_dir = f.root.join("scratch-tmp");
     fs::create_dir_all(&sp_dir).unwrap();
     fs::create_dir_all(&scratch_dir).unwrap();
-    compile_real_olean_module(&sp_dir, "DemoMod");
+    // Review finding 7: skip with a message instead of panicking on a toolchain-less host.
+    if compile_real_olean_module(&sp_dir, "DemoMod").is_none() {
+        eprintln!(
+            "skipping con_leche_exit_code_protocol_and_verified_cli_flags: no Lean toolchain on PATH"
+        );
+        return;
+    }
 
     // G1b: the con-leche verification path is exercised over a REAL compiled `.olean`
     // artifact produced by the pinned toolchain — never an empty or synthesized search path.
@@ -683,7 +706,8 @@ fn con_leche_exit_code_protocol_and_verified_cli_flags() {
     write_executable_script(
         &mock_bin,
         &format!(
-            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf 'TMPDIR=%s\\n' \"$TMPDIR\" >> \"{}\"\ncase \"$MOCK_CODE\" in\n  0)\n    echo 'con-leche: accepted 42 declarations (--verified)'\n    exit 0\n    ;;\n  1)\n    echo 'con-leche: rejected: invalid declaration' >&2\n    exit 1\n    ;;\n  2)\n    echo 'con-leche: declined: unsupported feature' >&2\n    exit 2\n    ;;\n  3)\n    echo 'con-leche: usage/internal error' >&2\n    exit 3\n    ;;\n  134)\n    echo 'con-leche: panic abort' >&2\n    exit 134\n    ;;\n  sigabrt)\n    kill -ABRT $$\n    ;;\nesac\n",
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf 'TMPDIR=%s\\n' \"$TMPDIR\" >> \"{}\"\nsp=\nfor a in \"$@\"; do case \"$a\" in --search-path=*) sp=\"${{a#--search-path=}}\";; esac; done\nif [ -n \"$sp\" ] && [ -f \"$sp/DemoMod.olean\" ]; then printf 'OLEAN_SHA256=%s\\n' \"$(sha256sum \"$sp/DemoMod.olean\" | cut -d' ' -f1)\" >> \"{}\"; fi\ncase \"$MOCK_CODE\" in\n  0)\n    echo 'con-leche: accepted 42 declarations (--verified)'\n    exit 0\n    ;;\n  1)\n    echo 'con-leche: rejected: invalid declaration' >&2\n    exit 1\n    ;;\n  2)\n    echo 'con-leche: declined: unsupported feature' >&2\n    exit 2\n    ;;\n  3)\n    echo 'con-leche: usage/internal error' >&2\n    exit 3\n    ;;\n  134)\n    echo 'con-leche: panic abort' >&2\n    exit 134\n    ;;\n  sigabrt)\n    kill -ABRT $$\n    ;;\nesac\n",
+            args_log.display(),
             args_log.display(),
             args_log.display()
         ),
@@ -731,6 +755,24 @@ fn con_leche_exit_code_protocol_and_verified_cli_flags() {
         logged
             .lines()
             .any(|l| l == format!("TMPDIR={}", scratch_dir.display())),
+        "{logged}"
+    );
+    // G1b (review finding 7): the engine under test consumed the compiled artifact — the
+    // mock read `DemoMod.olean` off its `--search-path` and hashed it, and the hash must
+    // match the bytes the test compiled.
+    let demo_sha256 = {
+        use sha2::Digest as _;
+        let mut h = sha2::Sha256::new();
+        h.update(&demo_bytes);
+        h.finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    assert!(
+        logged
+            .lines()
+            .any(|l| l == format!("OLEAN_SHA256={demo_sha256}")),
         "{logged}"
     );
 
