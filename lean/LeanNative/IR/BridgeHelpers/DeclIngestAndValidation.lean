@@ -151,7 +151,6 @@ def expandCompilerAuxDecls (declNames : Array Lean.Name) : Lean.CoreM (Array Lea
   return out
 
 def ingestModuleDeclsWith (ingestImpure : Lean.Compiler.LCNF.Decl .impure → Array Lean.Name → TargetArch → Lean.CoreM LNIRDecl)
-    (ingestMono : Lean.Compiler.LCNF.Decl .pure → Array Lean.Name → TargetArch → Lean.CoreM LNIRDecl)
     (rawDeclNames : Array Lean.Name) (moduleName : String := "LeanNative.Ingested")
     (arch : TargetArch := .x86_64) : Lean.CoreM LNIRModule := do
   let declNames ← expandCompilerAuxDecls rawDeclNames
@@ -166,12 +165,8 @@ def ingestModuleDeclsWith (ingestImpure : Lean.Compiler.LCNF.Decl .impure → Ar
       let d ← ingestImpure impureDecl declNames arch
       decls := decls ++ [d]
       rawPairs := rawPairs ++ [(name, d.name)]
-    else if let some monoDecl ← Lean.Compiler.LCNF.getMonoDecl? name then
-      if let .code c := monoDecl.value then
-        callGraph := callGraph.insert name (collectCodeLocalCallees declNames c)
-      let d ← ingestMono monoDecl declNames arch
-      decls := decls ++ [d]
-      rawPairs := rawPairs ++ [(name, d.name)]
+    -- L1: a declaration with no impure LCNF form is `Unsupported` on the proved path
+    -- (the `lowerPureCode` mono lowering is gone); it stays with the stock backend.
   if declsHaveMutualCycle callGraph then
     Lean.throwError s!"[lean-native] unsupported self-tail recursion / mutual recursion in {moduleName}: no qualified loop lowering"
   let rawMod : LNIRModule := { moduleName := moduleName, decls := decls }
