@@ -1,0 +1,647 @@
+#!/usr/bin/env python3
+"""G2b build-shaped warm loop: the opted-in warm CAS-expr replay, ON vs OFF.
+
+roadmap/HORIZONS.md, G2b: "Replay on by default for warm `check`, or deleted",
+accept column "bench delta". The pinned check-loop bench
+(scripts/bench_check_loop.py) cannot observe this change:
+`run_build_command_with_cas_replay` (crates/turbo-lean/src/lake_build/build.rs)
+is reached only from the `build` CLI and `pr_verify`, never from the `check`
+path that bench drives, so its paired ON/OFF delta was structurally null
+(docs/BENCH_G2A_H2G_RESULTS.md, G2b section). This script drives the `build`
+path itself, on a small generated Lake fixture, so its ON/OFF delta is the
+replay's own cost on a warm build:
+
+1. cold: one `turbo-lean build --seed-shards` into a fresh CAS. Expected:
+   status `built` and `shards_seeded` equal to the fixture's theorem count
+   (one receipt per theorem; on such a store the warm replay is a CAS lookup
+   plus a receipt check per shard, not a kernel replay).
+2. warm: `--warmup` discarded rounds, then `--trials` measured rounds. A round
+   is one `turbo-lean build` per side (no `--seed-shards`), and the side order
+   alternates ABBA (ON,OFF / OFF,ON / ...) so drift and in-round order effects
+   land on both sides:
+     ON   TURBO_LEAN_WARM_CAS_REPLAY=1. Expected: status `cache_hit`,
+          `cas_expr_replay_mode` `warm_opt_in`, `cas_expr_replayed` equal to
+          the seeded count, missing and invalid 0.
+     OFF  both replay switches unset. Expected: status `cache_hit`, mode `off`,
+          nothing replayed.
+3. delta: ON vs OFF medians (with quartiles) of the external wall and of the
+   tool's own `elapsed_ms`, classified by the check-loop bench's own tolerance
+   with OFF as the baseline (`tolerance_ms` at its warm floor, the rule the
+   check-loop G2b table used), plus the per-round paired difference ON - OFF.
+
+Every call is a fresh process with TURBO_LEAN_NO_DAEMON=1, telemetry off, and a
+private TURBO_LEAN_HOME, staging dir and TMPDIR under the run's scratch root. A
+call that exits non-zero, prints no JSON object, or reports anything but its
+side's expectation is a failed trial: it is kept out of the medians, counted,
+and the verdict is `measurement_failed` (exit 1). That assert is the point: a
+side whose opt-in never reaches the replay cannot pass as a measured null.
+
+Typical run (one machine, one binary, `lean` on PATH through elan):
+
+    python3 scripts/bench_build_loop.py \\
+        --turbo-lean-bin target/release/turbo-lean \\
+        --machine-label <label> --allow-busy-node \\
+        --out scripts/bench_build_loop_g2b.json
+
+The caller must not set either replay switch (TURBO_LEAN_WARM_CAS_REPLAY,
+TURBO_LEAN_NO_WARM_CAS_REPLAY): the script sets them per side, and an ambient
+value would make one side measure the wrong thing (exit 4). The results JSON
+records no absolute path: the binary is recorded relative to its repository
+(or by file name), the scratch root not at all, and --machine-label replaces
+the node name in the host block.
+
+Exit codes:
+    0  measured: the cold build and both sides are healthy, whatever the delta
+       class
+    1  measurement failed: an unhealthy cold build or a failed warm trial
+    2  usage error
+    4  environment/setup failure (missing binary or `lean`, an ambient replay
+       switch, a busy node without --allow-busy-node, ...)
+
+Python standard library only. Host identity, PSI sampling, the statistics and
+the tolerance rule are scripts/bench_check_loop.py's own, loaded from beside
+this file.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+
+
+def _load_check_loop():
+    """scripts/bench_check_loop.py as a module, for the helpers both benches share.
+
+    Loaded by path under a private module name, so it works under `python3 -I`
+    (the script's directory is then not on sys.path) and never replaces a
+    caller's own `bench_check_loop` registration.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_bench_check_loop_shared", SCRIPT_DIR / "bench_check_loop.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+bcl = _load_check_loop()
+BenchEnvError = bcl.BenchEnvError
+
+SCHEMA_VERSION = 1
+DEFAULT_TRIALS = 20
+DEFAULT_WARMUP = 1
+DEFAULT_MODULES = 4
+DEFAULT_THEOREMS_PER_MODULE = 50
+BUILD_TIMEOUT_S = 900
+SWITCH_ON = "TURBO_LEAN_WARM_CAS_REPLAY"
+SWITCH_OFF = "TURBO_LEAN_NO_WARM_CAS_REPLAY"
+SIDES = ("on", "off")
+# The check-loop bench's warm tolerance floor: the rule its G2b table used.
+TOLERANCE_MODE = "warm_cache_hit_daemon"
+FIXTURE_LIB = "BenchFixture"
+# Caller settings whose values are paths: recorded as set or unset only, so the
+# results JSON carries no host path.
+PATH_VALUED_SETTINGS = ("TURBO_LEAN_GIT", "TURBO_LEAN_HOME", "TURBO_LEAN_STAGING_DIR")
+# What every child call gets on top of the caller's environment, with the
+# scratch root written as a placeholder (the real paths stay out of the JSON).
+CHILD_COMMON = {
+    "TURBO_LEAN_HOME": "<scratch>/home",
+    "TURBO_LEAN_STAGING_DIR": "<scratch>/staging",
+    "TURBO_LEAN_NO_REMOTE_TELEMETRY": "1",
+    "TURBO_LEAN_TELEMETRY": "off",
+    "TURBO_LEAN_NO_DAEMON": "1",
+    "TMPDIR": "<scratch>/tmp",
+}
+CHILD_BY_SIDE = {
+    "cold": {SWITCH_ON: None, SWITCH_OFF: None},
+    "on": {SWITCH_ON: "1", SWITCH_OFF: None},
+    "off": {SWITCH_ON: None, SWITCH_OFF: None},
+}
+
+
+# ------------------------------------------------------------------ fixture
+
+def fixture_files(modules: int, theorems_per_module: int, toolchain: str) -> dict:
+    """The generated Lake project as {relative path: text}; deterministic.
+
+    One `lean_lib` of `modules` independent modules (they compile in parallel
+    on the cold build), each holding `theorems_per_module` distinct `omega`
+    theorems, and a root module importing them all. Each theorem is one clean
+    shard for the splitter, so the cold `--seed-shards` seeds exactly
+    modules * theorems_per_module receipts.
+    """
+    files = {
+        "lean-toolchain": toolchain.strip() + "\n",
+        "lakefile.toml": (f'name = "benchfixture"\n'
+                          f'defaultTargets = ["{FIXTURE_LIB}"]\n'
+                          f"\n"
+                          f"[[lean_lib]]\n"
+                          f'name = "{FIXTURE_LIB}"\n'),
+    }
+    imports = []
+    for m in range(modules):
+        imports.append(f"import {FIXTURE_LIB}.M{m}\n")
+        body = []
+        for t in range(theorems_per_module):
+            k = m * theorems_per_module + t + 1
+            body.append(f"theorem bf_m{m}_t{t} (n : Nat) : n + {k} = {k} + n := by omega\n")
+        files[f"{FIXTURE_LIB}/M{m}.lean"] = "\n".join(body)
+    files[f"{FIXTURE_LIB}.lean"] = "".join(imports)
+    return files
+
+
+def fixture_digest(files: dict) -> str:
+    h = hashlib.sha256()
+    for rel in sorted(files):
+        h.update(rel.encode() + b"\0" + files[rel].encode() + b"\0")
+    return h.hexdigest()
+
+
+def write_fixture(root: Path, files: dict) -> None:
+    for rel, text in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+
+
+def repo_lean_toolchain() -> str:
+    p = REPO_ROOT / "lean" / "lean-toolchain"
+    try:
+        val = p.read_text().strip()
+    except OSError as e:
+        raise BenchEnvError(
+            f"cannot read lean/lean-toolchain ({e}); pass --lean-toolchain") from e
+    if not val:
+        raise BenchEnvError("lean/lean-toolchain is empty; pass --lean-toolchain")
+    return val
+
+
+# ------------------------------------------------------------- environment
+
+def validate_environment(args) -> Path:
+    """Fail closed before any measurement; returns the resolved binary."""
+    ambient = sorted(v for v in (SWITCH_ON, SWITCH_OFF) if v in os.environ)
+    if ambient:
+        raise BenchEnvError(
+            f"{', '.join(ambient)} is set in the caller's environment; this script "
+            "sets both warm-replay switches per side, so unset them first")
+    binary = Path(args.turbo_lean_bin)
+    if not binary.is_file():
+        raise BenchEnvError(f"turbo-lean binary not found: {args.turbo_lean_bin}")
+    if not os.access(binary, os.X_OK):
+        raise BenchEnvError(f"turbo-lean binary is not executable: {args.turbo_lean_bin}")
+    if not shutil.which("lean"):
+        raise BenchEnvError(
+            "lean is not on PATH; the cold build compiles the fixture "
+            "(export PATH=\"$HOME/.elan/bin:$PATH\")")
+    return binary.resolve()
+
+
+def lean_version(fixture_dir: Path) -> str:
+    """`lean --version` run inside the fixture, so elan resolves its toolchain."""
+    lean_bin = shutil.which("lean")
+    try:
+        proc = subprocess.run([lean_bin, "--version"], cwd=str(fixture_dir),
+                              capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise BenchEnvError(f"failed to run `lean --version` in the fixture: {e}") from e
+    lines = (proc.stdout or "").strip().splitlines()
+    if proc.returncode != 0 or not lines or not lines[0].strip():
+        raise BenchEnvError(
+            f"`lean --version` in the fixture failed (exit {proc.returncode}): "
+            f"{(proc.stderr or '')[-300:].strip()}")
+    return lines[0].strip()
+
+
+def caller_settings() -> dict:
+    """The caller's TURBO_LEAN_* settings (the check-loop bench's list), with
+    path-valued entries reduced to set/unset."""
+    out = {}
+    for var in bcl.RECORDED_ENV_VARS:
+        val = os.environ.get(var)
+        out[var] = ("<set>" if val else None) if var in PATH_VALUED_SETTINGS else val
+    return out
+
+
+def read_loadavg():
+    """The first three /proc/loadavg fields, or None when unreadable."""
+    try:
+        return " ".join(Path("/proc/loadavg").read_text().split()[:3])
+    except OSError:
+        return None
+
+
+def load1_now():
+    try:
+        return round(os.getloadavg()[0], 2)
+    except (OSError, AttributeError):
+        return None
+
+
+def binary_record(binary: Path, repo_path, sha256: str) -> dict:
+    """The binary relative to its repository, else by file name: never a host path."""
+    rel = binary.name
+    if repo_path:
+        try:
+            rel = str(binary.relative_to(Path(repo_path).resolve()))
+        except ValueError:
+            pass
+    return {"path": rel, "sha256": sha256}
+
+
+# ------------------------------------------------------------- build calls
+
+def child_env(scratch: Path, side: str) -> dict:
+    env = dict(os.environ)
+    env.pop(SWITCH_ON, None)
+    env.pop(SWITCH_OFF, None)
+    env["TURBO_LEAN_HOME"] = str(scratch / "home")
+    env["TURBO_LEAN_STAGING_DIR"] = str(scratch / "staging")
+    env["TURBO_LEAN_NO_REMOTE_TELEMETRY"] = "1"
+    env["TURBO_LEAN_TELEMETRY"] = "off"
+    env["TURBO_LEAN_NO_DAEMON"] = "1"
+    env["TMPDIR"] = str(scratch / "tmp")
+    for var, val in CHILD_BY_SIDE[side].items():
+        if val is not None:
+            env[var] = val
+    return env
+
+
+def build_argv(binary, scratch: Path, seed: bool) -> list:
+    argv = [str(binary), "--cache-dir", str(scratch / "cache"), "--json",
+            "--no-telemetry", "build", "--project-dir", str(scratch / "fixture")]
+    if seed:
+        argv.append("--seed-shards")
+    return argv
+
+
+def _text(v) -> str:
+    # TimeoutExpired carries bytes whatever `text=` said, or None.
+    if v is None:
+        return ""
+    if isinstance(v, bytes):
+        return v.decode("utf-8", "replace")
+    return v
+
+
+def run_build(argv, env, timeout_s):
+    psi_before = bcl.sample_psi()
+    t0 = time.perf_counter_ns()
+    try:
+        proc = subprocess.run(argv, env=env, capture_output=True, text=True,
+                              timeout=timeout_s)
+        rc, out, err = proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired as e:
+        rc, out = -1, _text(e.stdout)
+        err = _text(e.stderr) + f"\ntimeout after {timeout_s}s"
+    wall_ms = (time.perf_counter_ns() - t0) / 1e6
+    psi_after = bcl.sample_psi()
+    return {"exit_code": rc, "external_wall_ms": wall_ms,
+            "json": bcl.parse_check_json(out or ""), "stderr": err or "",
+            "psi_before": psi_before, "psi_after": psi_after}
+
+
+def _failure_head(r):
+    if r.get("exit_code") != 0:
+        tail = (r.get("stderr") or "")[-300:].strip()
+        return f"exit {r.get('exit_code')}" + (f": {tail}" if tail else "")
+    if not isinstance(r.get("json"), dict):
+        return "no JSON object on stdout"
+    return None
+
+
+def cold_problem(r, theorems: int):
+    """None when the cold seeded build met its expectation, else why not."""
+    head = _failure_head(r)
+    if head:
+        return head
+    j = r["json"]
+    if j.get("status") != "built":
+        return f"status {j.get('status')!r}, expected 'built'"
+    if j.get("shards_seeded") != theorems:
+        return (f"shards_seeded {j.get('shards_seeded')!r}, expected {theorems} "
+                "(one per fixture theorem)")
+    return None
+
+
+def trial_problem(r, side: str, expected_replayed: int):
+    """None when a warm call met its side's expectation, else why not."""
+    head = _failure_head(r)
+    if head:
+        return head
+    j = r["json"]
+    if j.get("status") != "cache_hit":
+        return f"status {j.get('status')!r}, expected 'cache_hit'"
+    want = ("warm_opt_in", expected_replayed) if side == "on" else ("off", 0)
+    got = (j.get("cas_expr_replay_mode"), j.get("cas_expr_replayed"))
+    if got != want:
+        return f"(cas_expr_replay_mode, cas_expr_replayed) {got!r}, expected {want!r}"
+    for key in ("cas_expr_replay_missing", "cas_expr_replay_invalid"):
+        if j.get(key) != 0:
+            return f"{key} {j.get(key)!r}, expected 0"
+    return None
+
+
+def round_sides(round_index: int) -> tuple:
+    """ABBA: even rounds run ON first, odd rounds OFF first."""
+    return SIDES if round_index % 2 == 0 else tuple(reversed(SIDES))
+
+
+# --------------------------------------------------------------- statistics
+
+def quartiles(xs):
+    """(q1, q3) by the inclusive method; None for fewer than two values."""
+    if len(xs) < 2:
+        return None
+    q1, _q2, q3 = statistics.quantiles(xs, n=4, method="inclusive")
+    return q1, q3
+
+
+def series_stats(xs) -> dict:
+    q = quartiles(xs)
+    return {
+        "n": len(xs),
+        "median_ms": round(bcl.median(xs), 1) if xs else None,
+        "q1_ms": round(q[0], 1) if q else None,
+        "q3_ms": round(q[1], 1) if q else None,
+        "iqr_ms": round(q[1] - q[0], 1) if q else None,
+        "rel_spread": round(bcl.rel_spread(xs), 4) if len(xs) > 1 else 0.0,
+    }
+
+
+def tool_elapsed(t):
+    v = (t.get("json") or {}).get("elapsed_ms")
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def summarize_side(trials) -> dict:
+    """One side's measured trials, in the check-loop bench's mode-result shape
+    plus quartiles, the tool's own elapsed_ms, and what the replay reported."""
+    healthy = [t for t in trials if t["problem"] is None]
+    walls = [t["external_wall_ms"] for t in healthy]
+    out = bcl.mode_result(
+        walls, [], [str(t["json"].get("status")) for t in healthy],
+        psi_lists=[[t["psi_before"], t["psi_after"]] for t in healthy],
+        failed_trials=len(trials) - len(healthy))
+    # The build path has no phase-coverage meter; these stay out rather than null.
+    out.pop("coverage_ratio_min", None)
+    out.pop("coverage_ratio_external_min", None)
+    wall = series_stats(walls)
+    out.update({"q1_ms": wall["q1_ms"], "q3_ms": wall["q3_ms"], "iqr_ms": wall["iqr_ms"]})
+    elapsed = [e for e in (tool_elapsed(t) for t in healthy) if e is not None]
+    out["tool_elapsed_ms"] = dict(series_stats(elapsed), runs_ms=[round(e, 1) for e in elapsed])
+
+    def observed(key):
+        return sorted({t["json"].get(key) for t in healthy}, key=repr)
+    out["replay"] = {"modes_observed": observed("cas_expr_replay_mode"),
+                     "replayed_observed": observed("cas_expr_replayed"),
+                     "missing_observed": observed("cas_expr_replay_missing"),
+                     "invalid_observed": observed("cas_expr_replay_invalid")}
+    out["materialized_files_observed"] = observed("materialized_files")
+    problems = [f"round {t['round']}: {t['problem']}" for t in trials if t["problem"]]
+    if problems:
+        out["problems"] = problems[:5]
+    return out
+
+
+def classify_delta(off_median: float, off_rel_spread: float, on_median: float,
+                   mode: str = TOLERANCE_MODE) -> dict:
+    """ON against OFF by the check-loop bench's gate, OFF as the baseline: a
+    noise band from OFF's own spread, applied in both directions."""
+    tol = bcl.tolerance_ms(off_median, off_rel_spread, mode)
+    band = tol - off_median
+    delta = on_median - off_median
+    if on_median > tol:
+        cls = "regressed"
+    elif on_median < off_median - band:
+        cls = "improved"
+    else:
+        cls = "unchanged"
+    return {"off_median_ms": round(off_median, 1), "on_median_ms": round(on_median, 1),
+            "delta_ms": round(delta, 1),
+            "delta_pct": round(100.0 * delta / off_median, 2) if off_median else None,
+            "noise_band_ms": round(band, 1), "class": cls}
+
+
+def paired_differences(trials, value) -> dict:
+    """Per measured round in which both sides were healthy: ON minus OFF."""
+    by_round = {}
+    for t in trials:
+        if t["measured"] and t["problem"] is None:
+            v = value(t)
+            if v is not None:
+                by_round.setdefault(t["round"], {})[t["side"]] = v
+    diffs = [sides["on"] - sides["off"] for _r, sides in sorted(by_round.items())
+             if "on" in sides and "off" in sides]
+    stats = series_stats(diffs)
+    return {"rounds": len(diffs), "median_ms": stats["median_ms"],
+            "q1_ms": stats["q1_ms"], "q3_ms": stats["q3_ms"],
+            "on_slower_rounds": sum(1 for d in diffs if d > 0)}
+
+
+def summarize_delta(sides: dict, trials, replayed: int):
+    on, off = sides["on"], sides["off"]
+    if on.get("median_ms") is None or off.get("median_ms") is None:
+        return None
+    wall = classify_delta(off["median_ms"], off["rel_spread"], on["median_ms"])
+    on_el, off_el = on["tool_elapsed_ms"], off["tool_elapsed_ms"]
+    elapsed = (classify_delta(off_el["median_ms"], off_el["rel_spread"], on_el["median_ms"])
+               if on_el.get("median_ms") is not None and off_el.get("median_ms") is not None
+               else None)
+    out = {"tolerance_rule": f"bench_check_loop.tolerance_ms(OFF median, OFF rel_spread, "
+                             f"{TOLERANCE_MODE!r}), OFF as baseline",
+           "external_wall": wall, "tool_elapsed": elapsed,
+           "paired_external_wall": paired_differences(trials, lambda t: t["external_wall_ms"]),
+           "paired_tool_elapsed": paired_differences(trials, tool_elapsed),
+           "replayed_shards_per_on_call": replayed}
+    if replayed:
+        out["external_wall_delta_per_replayed_shard_ms"] = round(wall["delta_ms"] / replayed, 3)
+    return out
+
+
+# --------------------------------------------------------------------- main
+
+def cold_record(r, problem) -> dict:
+    j = r.get("json") if isinstance(r.get("json"), dict) else {}
+    rec = {"exit_code": r.get("exit_code"),
+           "external_wall_ms": round(r["external_wall_ms"], 1),
+           "problem": problem}
+    for key in ("status", "elapsed_ms", "shards_seeded", "modules_total",
+                "modules_compiled", "artifacts_stored", "materialized_files",
+                "cas_expr_replay_mode"):
+        rec[key] = j.get(key)
+    return rec
+
+
+def print_summary(results) -> None:
+    delta = results.get("delta")
+    sides = results.get("sides") or {}
+    if delta:
+        on, off = sides["on"], sides["off"]
+        w, p = delta["external_wall"], delta["paired_external_wall"]
+        line = (f"G2B BUILD LOOP: warm cache-hit build, external wall OFF {off['median_ms']} ms "
+                f"(IQR {off['q1_ms']}-{off['q3_ms']}, n={off['trials']}) vs ON "
+                f"{on['median_ms']} ms (IQR {on['q1_ms']}-{on['q3_ms']}, n={on['trials']}): "
+                f"{w['delta_ms']:+.1f} ms ({w['delta_pct']:+.2f}%), band +/-{w['noise_band_ms']} ms: "
+                f"{w['class']} | paired ON-OFF median {p['median_ms']} ms over {p['rounds']} rounds "
+                f"(ON slower in {p['on_slower_rounds']})")
+        el = delta.get("tool_elapsed")
+        if el:
+            line += (f" | tool elapsed_ms OFF {el['off_median_ms']} vs ON {el['on_median_ms']}: "
+                     f"{el['delta_ms']:+.1f} ms, band +/-{el['noise_band_ms']} ms: {el['class']}")
+        line += f" | {delta['replayed_shards_per_on_call']} shards replayed per ON call"
+        print(line, flush=True)
+    v = results["verdict"]
+    print(f"VERDICT: {v['verdict']}"
+          + (f" problems={v['problems']}" if v["problems"] else ""), flush=True)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--turbo-lean-bin", default="target/release/turbo-lean")
+    ap.add_argument("--trials", type=int, default=DEFAULT_TRIALS,
+                    help=f"measured rounds; a round is one warm build per side "
+                         f"(default {DEFAULT_TRIALS})")
+    ap.add_argument("--warmup", type=int, default=DEFAULT_WARMUP,
+                    help=f"discarded rounds before the measured ones (default {DEFAULT_WARMUP})")
+    ap.add_argument("--modules", type=int, default=DEFAULT_MODULES,
+                    help=f"fixture modules (default {DEFAULT_MODULES})")
+    ap.add_argument("--theorems-per-module", type=int, default=DEFAULT_THEOREMS_PER_MODULE,
+                    help=f"theorems per fixture module (default {DEFAULT_THEOREMS_PER_MODULE})")
+    ap.add_argument("--lean-toolchain",
+                    help="toolchain line for the fixture (default: lean/lean-toolchain)")
+    ap.add_argument("--build-timeout-s", type=int, default=BUILD_TIMEOUT_S,
+                    help=f"per-call wall budget in seconds (default {BUILD_TIMEOUT_S})")
+    ap.add_argument("--scratch-dir",
+                    help="parent directory of the run's scratch root (default: the "
+                         "system temp dir); the root is removed at the end")
+    ap.add_argument("--keep-scratch", action="store_true",
+                    help="leave the scratch root (fixture, CAS, homes) in place")
+    ap.add_argument("--out", help="write the results JSON here")
+    ap.add_argument("--machine-label",
+                    help="recorded as the host hostname in place of the live node name")
+    ap.add_argument("--allow-busy-node", action="store_true",
+                    help=f"run even when the 1-min load average exceeds "
+                         f"{bcl.BUSY_LOAD_THRESHOLD} (recorded as busy_allowed)")
+    args = ap.parse_args(argv)
+    for name in ("trials", "modules", "theorems_per_module", "build_timeout_s"):
+        if getattr(args, name) < 1:
+            ap.error(f"--{name.replace('_', '-')} must be >= 1, got {getattr(args, name)}")
+    if args.warmup < 0:
+        ap.error(f"--warmup must be >= 0, got {args.warmup}")
+
+    t_start = time.monotonic()
+    scratch = None
+    try:
+        binary = validate_environment(args)
+        if args.scratch_dir and not Path(args.scratch_dir).is_dir():
+            raise BenchEnvError(f"--scratch-dir is not a directory: {args.scratch_dir}")
+        loadavg_at_start = read_loadavg()
+        load_at_start = bcl.require_quiet_node(args)
+        toolchain_line = args.lean_toolchain or repo_lean_toolchain()
+        files = fixture_files(args.modules, args.theorems_per_module, toolchain_line)
+        theorems = args.modules * args.theorems_per_module
+        scratch = Path(tempfile.mkdtemp(prefix="g2b-build-loop-",
+                                        dir=args.scratch_dir)).resolve()
+        for sub in ("fixture", "cache", "home", "staging", "tmp"):
+            (scratch / sub).mkdir()
+        (scratch / "tmp").chmod(0o700)
+        write_fixture(scratch / "fixture", files)
+        lean_ver = lean_version(scratch / "fixture")
+        git_bin = os.environ.get("TURBO_LEAN_GIT") or shutil.which("git") or "git"
+        commit, dirty, repo_path = bcl.turbo_lean_commit_for(binary, git_bin)
+        binary_sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+        results = {
+            "schema_version": SCHEMA_VERSION, "kind": "build_loop_results",
+            "created_utc": bcl.utc_now_iso(), "leaf": "G2b",
+            "turbo_lean_commit": commit, "turbo_lean_dirty": dirty,
+            "turbo_lean_binary": binary_record(binary, repo_path, binary_sha),
+            "toolchain": {"lean_toolchain": toolchain_line, "lean_version": lean_ver},
+            "host": bcl.host_id(args.machine_label),
+            "node": {"load1_at_start": load_at_start, "loadavg_at_start": loadavg_at_start,
+                     "load1_at_end": None, "loadavg_at_end": None,
+                     "busy_allowed": args.allow_busy_node},
+            "settings": {
+                "caller": caller_settings(), "child_common": dict(CHILD_COMMON),
+                "child_by_side": {k: dict(v) for k, v in CHILD_BY_SIDE.items()},
+                "argv_cold": ["turbo-lean"] + [
+                    a.replace(str(scratch), "<scratch>") for a in build_argv("", scratch, True)[1:]],
+                "argv_warm": ["turbo-lean"] + [
+                    a.replace(str(scratch), "<scratch>") for a in build_argv("", scratch, False)[1:]],
+            },
+            "fixture": {"lib": FIXTURE_LIB, "modules": args.modules,
+                        "theorems_per_module": args.theorems_per_module,
+                        "theorems": theorems, "sha256": fixture_digest(files)},
+            "args": {"trials": args.trials, "warmup": args.warmup,
+                     "build_timeout_s": args.build_timeout_s},
+        }
+        print(f"[{bcl.utc_now_iso()}] cold seeded build ({args.modules} modules x "
+              f"{args.theorems_per_module} theorems) ...", flush=True)
+        cold = run_build(build_argv(binary, scratch, True), child_env(scratch, "cold"),
+                         args.build_timeout_s)
+        problem = cold_problem(cold, theorems)
+        results["cold"] = cold_record(cold, problem)
+        problems = [f"cold: {problem}"] if problem else []
+        trials = []
+        if not problem:
+            seeded = cold["json"]["shards_seeded"]
+            print(f"  cold built in {cold['external_wall_ms']:.0f} ms, {seeded} shards seeded; "
+                  f"{args.warmup} warmup + {args.trials} measured ABBA rounds ...", flush=True)
+            for rnd in range(args.warmup + args.trials):
+                for side in round_sides(rnd):
+                    r = run_build(build_argv(binary, scratch, False),
+                                  child_env(scratch, side), args.build_timeout_s)
+                    r.update(round=rnd, side=side, measured=rnd >= args.warmup,
+                             problem=trial_problem(r, side, seeded))
+                    trials.append(r)
+            measured = [t for t in trials if t["measured"]]
+            results["sequence"] = [{"round": t["round"], "side": t["side"],
+                                    "measured": t["measured"], "ok": t["problem"] is None}
+                                   for t in trials]
+            sides = {side: summarize_side([t for t in measured if t["side"] == side])
+                     for side in SIDES}
+            results["sides"] = sides
+            for side in SIDES:
+                for p in sides[side].get("problems", []):
+                    problems.append(f"{side}: {p}")
+            warm_failed = [t for t in trials if not t["measured"] and t["problem"]]
+            for t in warm_failed[:3]:
+                problems.append(f"{t['side']} warmup round {t['round']}: {t['problem']}")
+            results["delta"] = summarize_delta(sides, trials, seeded)
+        results["verdict"] = {"verdict": "measurement_failed" if problems else "measured",
+                              "problems": problems}
+        results["run_duration_s"] = round(time.monotonic() - t_start, 1)
+        results["node"]["load1_at_end"] = load1_now()
+        results["node"]["loadavg_at_end"] = read_loadavg()
+        payload = json.dumps(results, indent=2)
+        if args.out:
+            Path(args.out).write_text(payload + "\n")
+            print(f"results written to {args.out}")
+        else:
+            print(payload)
+        print_summary(results)
+        return 1 if problems else 0
+    except BenchEnvError as e:
+        print(f"ENVIRONMENT ERROR (exit 4): {e}", file=sys.stderr)
+        return 4
+    finally:
+        if scratch is not None and not args.keep_scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
