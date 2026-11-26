@@ -71,6 +71,7 @@ import importlib.util
 import json
 import os
 import shutil
+import stat
 import statistics
 import subprocess
 import sys
@@ -175,6 +176,35 @@ def write_fixture(root: Path, files: dict) -> None:
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text)
+
+
+def remove_tree(root: Path) -> None:
+    """Remove the run's scratch root, read-only directories included.
+
+    The tool's closure-snapshot store (TURBO_LEAN_HOME/closure-realm/
+    closure-snapshots/<digest>/...) is written with read-only directories,
+    which a plain rmtree cannot empty, so every directory under the root is
+    made owner-writable first. Symlinks are never followed or chmodded, and
+    nothing outside the root is touched. What still cannot be removed is
+    reported, never silently left behind.
+    """
+    if not root.exists():
+        return
+    try:
+        os.chmod(root, stat.S_IRWXU)
+    except OSError:
+        pass
+    for dirpath, dirnames, _files in os.walk(root, followlinks=False):
+        for name in dirnames:
+            p = os.path.join(dirpath, name)
+            if not os.path.islink(p):
+                try:
+                    os.chmod(p, stat.S_IRWXU)
+                except OSError:
+                    pass
+    shutil.rmtree(root, ignore_errors=True)
+    if root.exists():
+        print(f"warning: scratch root not fully removed: {root}", file=sys.stderr)
 
 
 def repo_lean_toolchain() -> str:
@@ -640,7 +670,7 @@ def main(argv=None) -> int:
         return 4
     finally:
         if scratch is not None and not args.keep_scratch:
-            shutil.rmtree(scratch, ignore_errors=True)
+            remove_tree(scratch)
 
 
 if __name__ == "__main__":

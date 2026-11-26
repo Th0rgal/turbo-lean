@@ -15,6 +15,7 @@ import io
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -66,6 +67,16 @@ if log and os.environ.get("FAKE_FAIL_CALL"):
         sys.stderr.write("fake failure\n")
         sys.exit(3)
 if seed:
+    # Like the real tool's closure-snapshot store: read-only directories under
+    # TURBO_LEAN_HOME, which a plain rmtree cannot empty.
+    snap = os.path.join(os.environ["TURBO_LEAN_HOME"], "closure-realm",
+                        "closure-snapshots", "d0", "BenchFixture")
+    os.makedirs(snap)
+    with open(os.path.join(snap, "M0.ilean"), "w") as fh:
+        fh.write("x")
+    os.chmod(os.path.join(snap, "M0.ilean"), 0o444)
+    os.chmod(snap, 0o500)
+    os.chmod(os.path.dirname(snap), 0o500)
     out = {"status": "built", "shards_seeded": int(os.environ.get("FAKE_SEEDED", theorems)),
            "cas_expr_replay_mode": "off", "cas_expr_replayed": 0,
            "cas_expr_replay_missing": 0, "cas_expr_replay_invalid": 0,
@@ -153,6 +164,28 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(a, mod.fixture_digest(mod.fixture_files(2, 3, "tc")))
         self.assertNotEqual(a, mod.fixture_digest(mod.fixture_files(2, 4, "tc")))
         self.assertNotEqual(a, mod.fixture_digest(mod.fixture_files(2, 3, "tc2")))
+
+    def test_remove_tree_clears_read_only_dirs_and_never_follows_a_symlink(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            outside = base / "outside"
+            outside.mkdir()
+            (outside / "keep.txt").write_text("k")
+            outside.chmod(0o555)
+            root = base / "scratch-root"
+            store = root / "home" / "closure-realm" / "d0"
+            store.mkdir(parents=True)
+            (store / "x.ilean").write_text("x")
+            store.chmod(0o500)
+            store.parent.chmod(0o500)
+            (root / "link").symlink_to(outside, target_is_directory=True)
+            try:
+                mod.remove_tree(root)
+                self.assertFalse(root.exists())
+                self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o555)
+                self.assertEqual((outside / "keep.txt").read_text(), "k")
+            finally:
+                outside.chmod(0o755)
 
     def test_write_fixture_round_trips(self):
         files = mod.fixture_files(2, 2, "tc")
@@ -350,6 +383,8 @@ class EndToEndTests(unittest.TestCase):
             self.assertTrue(res["verdict"]["problems"][0].startswith("cold: shards_seeded 5"))
             self.assertNotIn("sides", res)
             self.assertEqual(len(read_calls(root)), 1)
+            # A failed run still removes its scratch root, read-only store included.
+            self.assertEqual(list((root / "scratch").iterdir()), [])
 
     def test_an_ambient_replay_switch_is_refused_before_any_call(self):
         for var, val in ((SWITCH_OFF, "1"), (SWITCH_ON, "0")):
