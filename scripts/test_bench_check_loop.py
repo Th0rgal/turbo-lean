@@ -42,8 +42,20 @@ GUARD_REFUSAL = "test guard refused"
 BENCH_CMD = [sys.executable, str(Path(__file__).resolve()), "--run-guarded", str(SCRIPT)]
 
 
+# Pids of processes a test started through Popen and recorded here, so the guard
+# admits them even when /proc cannot show the parent chain (a sandbox that hides
+# parents, or a subreaper that adopted them).
+RECORDED_PIDS = set()
+
+
+def record_started(popen) -> None:
+    RECORDED_PIDS.add(popen.pid)
+
+
 def started_by_this_run(pid: int) -> bool:
-    """True when `pid` is this test process or one of its descendants."""
+    """True when `pid` is this test process, a recorded child, or a descendant."""
+    if pid in RECORDED_PIDS:
+        return True
     me = os.getpid()
     for _ in range(64):
         if pid == me:
@@ -1940,13 +1952,28 @@ class CheckTimeoutMainPath(unittest.TestCase):
 class CommittedArtifactIsPathFree(unittest.TestCase):
     """A results JSON is committed, so it carries no host path."""
 
+    MACHINE_ID = "0123456789abcdef0123456789abcdef"
+
+    @classmethod
+    def digest(cls, value, machine_id=None):
+        """The committed form of a path setting: HMAC of the value keyed by the machine-id."""
+        import hashlib
+        import hmac
+        key = (machine_id or cls.MACHINE_ID).encode()
+        return "<hmac:" + hmac.new(key, value.encode(), hashlib.sha256).hexdigest()[:12] + ">"
+
     @staticmethod
-    def digest(value):
+    def legacy_digest(value):
         import hashlib
         return "<sha256:" + hashlib.sha256(value.encode()).hexdigest()[:12] + ">"
 
-    def test_recorded_settings_digest_path_values_and_keep_the_rest(self):
+    def load(self):
         mod = load_script()
+        mod.read_machine_id = lambda: self.MACHINE_ID
+        return mod
+
+    def test_recorded_settings_digest_path_values_and_keep_the_rest(self):
+        mod = self.load()
         got = mod.recorded_settings({"TURBO_LEAN_GIT": "/usr/bin/git",
                                      "TURBO_LEAN_HOME": "/home/someone/.cache/tl",
                                      "TURBO_LEAN_ALLOWED_CSIMP": "*"})
@@ -1958,19 +1985,59 @@ class CommittedArtifactIsPathFree(unittest.TestCase):
         # A digest is kept as it is, so re-recording an artifact changes nothing.
         d = got["TURBO_LEAN_GIT"]
         self.assertEqual(mod.recorded_setting("TURBO_LEAN_GIT", d), d)
+        self.assertEqual(mod.recorded_setting("TURBO_LEAN_GIT", self.legacy_digest("/x")),
+                         self.legacy_digest("/x"))
+
+    def test_the_digest_is_keyed_by_the_machine_id_so_a_path_cannot_be_confirmed(self):
+        mod = self.load()
+        plain = self.legacy_digest("/usr/bin/git")
+        got = mod.recorded_setting("TURBO_LEAN_GIT", "/usr/bin/git")
+        self.assertNotEqual(got, plain)
+        self.assertNotIn(plain[len("<sha256:"):-1], got)
+        mod.read_machine_id = lambda: "another-machine-id"
+        self.assertNotEqual(mod.recorded_setting("TURBO_LEAN_GIT", "/usr/bin/git"), got)
+
+    def test_without_a_machine_id_a_set_path_is_recorded_as_set_only(self):
+        mod = load_script()
+        mod.read_machine_id = lambda: ""
+        self.assertEqual(mod.recorded_setting("TURBO_LEAN_GIT", "/usr/bin/git"), "<set>")
+        self.assertIsNone(mod.recorded_setting("TURBO_LEAN_GIT", None))
+        base = {"settings": {"TURBO_LEAN_GIT": "/usr/bin/git"}}
+        self.assertTrue(mod.settings_match(base, {"settings": {"TURBO_LEAN_GIT": "<set>"}}))
+        # Set against unset is still a different setting.
+        self.assertFalse(mod.settings_match(base, {"settings": {"TURBO_LEAN_GIT": None}}))
 
     def test_settings_match_reads_a_raw_path_and_its_digest_alike(self):
-        mod = load_script()
+        mod = self.load()
         base = full_valid_baseline(mod)
         base["settings"]["TURBO_LEAN_GIT"] = "/usr/bin/git"
         res = {"settings": dict(base["settings"])}
         res["settings"]["TURBO_LEAN_GIT"] = self.digest("/usr/bin/git")
         self.assertTrue(mod.settings_match(base, res))
+        # An older artifact's unkeyed digest of the same path still reads equal to
+        # the raw path it came from.
+        res["settings"]["TURBO_LEAN_GIT"] = self.legacy_digest("/usr/bin/git")
+        self.assertTrue(mod.settings_match(base, res))
         # A different path is still a different setting.
-        res["settings"]["TURBO_LEAN_GIT"] = self.digest("/opt/git/bin/git")
-        self.assertFalse(mod.settings_match(base, res))
-        res["settings"]["TURBO_LEAN_GIT"] = "/opt/git/bin/git"
-        self.assertFalse(mod.settings_match(base, res))
+        for other in (self.digest("/opt/git/bin/git"), self.legacy_digest("/opt/git/bin/git"),
+                      "/opt/git/bin/git"):
+            res["settings"]["TURBO_LEAN_GIT"] = other
+            self.assertFalse(mod.settings_match(base, res), other)
+
+    def test_a_stderr_excerpt_naming_the_git_binary_directory_is_scrubbed(self):
+        mod = self.load()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            dirs = {"batteries": root / "b", "pfr": root / "p"}
+            roots = mod.host_path_roots(root / "scratch", dirs, root / "bin" / "turbo-lean",
+                                        str(root / "gitdir" / "git"))
+            text = f"fatal: {root}/gitdir/git failed in {root}/scratch/w"
+            scrubbed = mod.scrub_host_paths(text, roots)
+            self.assertNotIn(str(root), scrubbed)
+            self.assertIn("<git-dir>/git", scrubbed)
+            # A bare `git` found on PATH has no directory to scrub.
+            self.assertIsNotNone(mod.host_path_roots(root / "scratch", dirs,
+                                                     root / "bin" / "turbo-lean", "git"))
 
     def test_scrub_replaces_the_longest_root_first_and_never_the_filesystem_root(self):
         mod = load_script()
@@ -2023,9 +2090,8 @@ class CommittedArtifactIsPathFree(unittest.TestCase):
             self.assertNotIn("turbo_lean_repo", data)
             self.assertNotIn("scratch_root", data["settings"])
             self.assertEqual(data["turbo_lean_binary"]["path"], "fake-turbo-lean")
-            self.assertTrue(data["settings"]["TURBO_LEAN_GIT"].startswith("<sha256:"))
-            self.assertEqual(data["settings"]["TURBO_LEAN_HOME"],
-                             self.digest(str(root / "tl-home")))
+            self.assertTrue(data["settings"]["TURBO_LEAN_GIT"].startswith(("<hmac:", "<set>")))
+            self.assertRegex(data["settings"]["TURBO_LEAN_HOME"], r"^(<hmac:[0-9a-f]{12}>|<set>)$")
 
             def excerpts(node):
                 if isinstance(node, dict):
@@ -2044,10 +2110,13 @@ class CommittedArtifactIsPathFree(unittest.TestCase):
                 self.assertIn(" home <scratch>/", e)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "the guard reads /proc")
 class ForeignSignalGuard(unittest.TestCase):
     """The test run's own guard refuses a process outside its tree and lets its
     children through. Signal 0 only checks that a target exists."""
 
+    @unittest.skipIf(os.getpid() == 1, "as pid 1 this process adopts the orphan, so it "
+                     "stays inside the tree; run under `bash -c` in the namespace")
     def test_a_process_that_left_this_run_is_refused(self):
         # The test starts a process that leaves its tree by a double fork, so
         # init or a subreaper adopts it: to the guard it then looks like any
@@ -2099,7 +2168,21 @@ class ForeignSignalGuard(unittest.TestCase):
             child.wait(timeout=10)
         self.assertEqual(REFUSED_SIGNALS, [])
 
+    def test_a_recorded_popen_pid_is_let_through_without_a_parent_chain(self):
+        REFUSED_SIGNALS.clear()
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            with mock.patch.object(Path, "read_text", side_effect=OSError("no /proc parents")):
+                self.assertFalse(started_by_this_run(child.pid))
+                record_started(child)
+                self.assertTrue(started_by_this_run(child.pid))
+        finally:
+            RECORDED_PIDS.discard(child.pid)
+            child.kill()
+            child.wait(timeout=10)
 
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "the daemon scan reads /proc")
 class DaemonCleanup(NoForeignSignals, unittest.TestCase):
     """A workload's daemons end with it, even when `daemon stop` gives up, and
     nothing outside the workload's staging namespace is touched."""
@@ -2114,6 +2197,7 @@ class DaemonCleanup(NoForeignSignals, unittest.TestCase):
             env["TURBO_LEAN_DAEMON"] = "1"
         p = subprocess.Popen([sys.executable, "-", command], env=env, stdin=subprocess.PIPE,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        record_started(p)
         self.addCleanup(self.reap, p)
         p.stdin.write(program)
         p.stdin.close()

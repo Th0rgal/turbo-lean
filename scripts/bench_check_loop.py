@@ -15,10 +15,17 @@ each measured mode result) and run-wide (top-level `cas_replay`).
 A results JSON is meant to be committed, so it records no host path: the
 binary is recorded relative to its repository (else by file name), the
 repository and scratch root are left out, path-valued settings
-(PATH_VALUED_SETTINGS) are recorded as a `<sha256:...>` digest of the value,
-and a recorded stderr excerpt names the scratch root, the checkouts, the
+(PATH_VALUED_SETTINGS) are recorded as an HMAC digest of the value keyed by the
+machine-id (`<hmac:...>`, or `<set>` without a machine-id), and a recorded
+stderr excerpt names the scratch root, the checkouts, the
 binary's directory, this repository, the working directory, the temp dir and
-the home dir by placeholder.
+the home dir by placeholder. This holds for results written from now on. Two
+committed files predate it: bench_check_loop_baseline.json (raw
+TURBO_LEAN_GIT and TURBO_LEAN_HOME values and a scratch_root line, from a
+sandbox host) and bench_check_loop_m1b_noise.json (a raw `/usr/bin/git`). They
+stay as written because the baseline's host is not one this code can key a
+digest for, and an unkeyed digest would no longer compare equal to a keyed
+one; settings_match reads their raw paths as it always has.
 
 Each workload's daemons are stopped when the workload ends. `daemon stop`
 waits on turbo-lean's user-wide lifecycle lock, which any other turbo-lean
@@ -85,6 +92,7 @@ import argparse
 from typing import NamedTuple
 import errno
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -175,19 +183,38 @@ PATH_VALUED_SETTINGS = ("TURBO_LEAN_GIT", "TURBO_LEAN_HOME", "TURBO_LEAN_STAGING
 PATH_DIGEST_PREFIX = "<sha256:"
 
 
+PATH_HMAC_PREFIX = "<hmac:"
+PATH_SET_MARK = "<set>"
+
+
+def _legacy_path_digest(val) -> str:
+    """The unkeyed digest older artifacts recorded for a path (read, never written)."""
+    return f"{PATH_DIGEST_PREFIX}{hashlib.sha256(str(val).encode()).hexdigest()[:12]}>"
+
+
+def _is_recorded_form(val) -> bool:
+    return isinstance(val, str) and (val.startswith((PATH_DIGEST_PREFIX, PATH_HMAC_PREFIX))
+                                     or val == PATH_SET_MARK)
+
+
 def recorded_setting(var: str, val):
     """The committed form of one recorded setting.
 
-    A path-valued setting becomes `<sha256:` + the first 12 hex digits of the
-    value's SHA-256 + `>`; an already-digested value is kept as it is, so a raw
-    path in an older artifact and the digest of the same path compare equal.
+    A path-valued setting becomes `<hmac:` + the first 12 hex digits of
+    HMAC-SHA256(machine-id, value) + `>`. The key keeps a committed digest from
+    confirming a guessed path (host_id rejects an unkeyed hash of the node name
+    for the same reason), and settings_match only compares settings after the
+    hosts match, so the same machine-id keys both sides. Without a machine-id a
+    set path is recorded as `<set>`. An already-recorded value is kept as it is.
     Other settings are recorded verbatim.
     """
-    if var not in PATH_VALUED_SETTINGS or not val:
+    if var not in PATH_VALUED_SETTINGS or not val or _is_recorded_form(val):
         return val
-    if isinstance(val, str) and val.startswith(PATH_DIGEST_PREFIX):
-        return val
-    return f"{PATH_DIGEST_PREFIX}{hashlib.sha256(str(val).encode()).hexdigest()[:12]}>"
+    machine_id = read_machine_id()
+    if not machine_id:
+        return PATH_SET_MARK
+    mac = hmac.new(machine_id.encode(), str(val).encode(), hashlib.sha256).hexdigest()
+    return f"{PATH_HMAC_PREFIX}{mac[:12]}>"
 
 
 def recorded_settings(environ=None) -> dict:
@@ -682,9 +709,27 @@ def settings_match(base, res) -> bool:
     """Every recorded TURBO_LEAN_* setting must agree, not just four keys.
 
     Both sides are read in committed form (recorded_setting), so a raw path in an
-    older artifact and the digest of the same path compare equal."""
-    key = lambda s: {v: recorded_setting(v, s.get(v)) for v in RECORDED_ENV_VARS}
-    return key(base.get("settings") or {}) == key(res.get("settings") or {})
+    older artifact and the digest of the same path compare equal on this host. An
+    older artifact's unkeyed `<sha256:` digest equals the raw path it came from;
+    against a keyed digest it cannot be checked and reads as different. A `<set>`
+    mark (no machine-id) equals any set path and nothing unset."""
+    bs, rs = base.get("settings") or {}, res.get("settings") or {}
+    return all(_setting_equal(v, bs.get(v), rs.get(v)) for v in RECORDED_ENV_VARS)
+
+
+def _setting_equal(var, a, b) -> bool:
+    na, nb = recorded_setting(var, a), recorded_setting(var, b)
+    if na == nb:
+        return True
+    if var not in PATH_VALUED_SETTINGS or not na or not nb:
+        return False
+    if PATH_SET_MARK in (na, nb):
+        return True
+    for legacy, other in ((a, b), (b, a)):
+        if (isinstance(legacy, str) and legacy.startswith(PATH_DIGEST_PREFIX)
+                and isinstance(other, str) and not _is_recorded_form(other)):
+            return legacy == _legacy_path_digest(other)
+    return False
 
 
 def workload_revs_match(base, res) -> bool:
@@ -1278,6 +1323,15 @@ def _signal_scanned(pid: int, start: str, sig) -> bool:
             os.close(fd)
 
 
+def _grace_from_env(name: str, default: float) -> float:
+    """A grace period in seconds from the environment; the default when unset or invalid."""
+    try:
+        v = float(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return v if v >= 0 else default
+
+
 def terminate_scanned(procs, term_grace_s=None, kill_grace_s=None):
     """SIGTERM each scanned process, SIGKILL whichever outlives the grace period.
 
@@ -1285,8 +1339,10 @@ def terminate_scanned(procs, term_grace_s=None, kill_grace_s=None):
     running at the end, whether or not a signal reached them. turbo-lean's own
     stop uses the same order.
     """
-    term_grace_s = DAEMON_TERM_GRACE_S if term_grace_s is None else term_grace_s
-    kill_grace_s = DAEMON_KILL_GRACE_S if kill_grace_s is None else kill_grace_s
+    term_grace_s = (_grace_from_env("TURBO_LEAN_BENCH_DAEMON_TERM_GRACE_S", DAEMON_TERM_GRACE_S)
+                    if term_grace_s is None else term_grace_s)
+    kill_grace_s = (_grace_from_env("TURBO_LEAN_BENCH_DAEMON_KILL_GRACE_S", DAEMON_KILL_GRACE_S)
+                    if kill_grace_s is None else kill_grace_s)
 
     def alive(p):
         state, now = _proc_state_and_start(Path("/proc") / str(p[0]))
