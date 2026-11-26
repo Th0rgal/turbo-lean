@@ -82,11 +82,20 @@ each: four KILLED by this file's pins, the budget mutant SURVIVED 3/3):
   (0 stillborn, 0 infra, 0 timeout, 0 error). The one survivor is
   `RB-rettyfuel-offby1-00`, recorded in disposition 5 below. Full table with
   per-mutant kill attribution: `scripts/proof_mutant_matrix_results.json`
-  (toolchain leanprover/lean4:v4.35.0). 7 of the 59 kills attribute to this file
-  (`LeanNative.Proofs.LowerRefines`) as the first failing module: the six findings
-  closed in this record plus `RB-fvarlookup-flip-00`, whose inverted fvar lookup
-  Pin 3's lowering fixture also reaches — attribution names lake's FIRST failure,
-  so a mutant that several modules kill is credited to whichever elaborates first.
+  (toolchain leanprover/lean4:v4.35.0). At 88324526, 7 of the 59 kills attributed to
+  this file (`LeanNative.Proofs.LowerRefines`) as the first failing module: the six
+  findings closed in this record plus `RB-fvarlookup-flip-00`, whose inverted fvar
+  lookup Pin 3's lowering fixture also reaches — attribution names lake's FIRST
+  failure, so a mutant that several modules kill is credited to whichever elaborates
+  first.
+
+  RE-MEASURED at commit da40658f (gap-l3, 2026-11-26), after L2's
+  `Tests/RealLCNFCallTests.lean` and L3's `Tests/RealLCNFRecTests.lean` joined the
+  closure (both are absent at 88324526): 59/60 again, every mutant's outcome identical
+  to the 88324526 run, the same survivor. The results JSON now records this run. In it
+  the six findings above still attribute here first, `RB-fvarlookup-flip-00` is first
+  reported from `Tests/RealLCNFCallTests.lean`, and five kills are first reported from
+  L3's guards in `Tests/RealLCNFRecTests.lean`.
 
 The five implicated mutants and their dispositions:
 
