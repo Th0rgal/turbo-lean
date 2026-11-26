@@ -324,11 +324,20 @@ impl WorkerBudget {
     }
 
     /// A named explanation when a replay worker's failure may trace to the per-worker
-    /// memory cap (#435). An `RLIMIT_DATA` breach surfaces as a failed allocation
-    /// (ENOMEM / `std::bad_alloc` / "out of memory" on stderr with a plain non-zero
-    /// exit) — an rlimit never SIGKILLs — so a definite attribution needs the allocation
-    /// signature; a signal exit gets a "may have been", naming both possibilities.
-    /// Empty when no cap was applied or nothing points at memory.
+    /// memory cap (#435). The ALLOCATION SIGNATURE on stderr decides first (review
+    /// bfa9d056 F2): an `RLIMIT_DATA` breach surfaces as a failed allocation (ENOMEM /
+    /// `std::bad_alloc` / "out of memory"), and a C++ `bad_alloc` that nobody catches
+    /// reaches `std::terminate` and ABORTS, so the definite attribution must not be
+    /// masked by the SIGABRT that delivery takes. A signal exit WITHOUT the signature
+    /// gets the "may have been" note: SIGKILL in particular proves nothing by itself
+    /// (a cgroup OOM kill is memory, an operator kill is not), so it stays
+    /// non-definite and keeps the bisection that isolates the module. Empty when no
+    /// cap was applied or nothing points at memory.
+    ///
+    /// Both notes state the one real condition (review bfa9d056 F7): the cap is
+    /// `RLIMIT_DATA_HEADROOM_MULT x max(budget / workers, REPLAY_WORKER_EST_RSS_MB)`,
+    /// so raising `--max-memory-mb` and lowering the worker count move the SAME
+    /// quotient, and neither moves the cap until that quotient exceeds the floor.
     pub fn memory_kill_note(
         status: &std::process::ExitStatus,
         stderr: &str,
@@ -337,41 +346,47 @@ impl WorkerBudget {
         let Some(mb) = rlimit_mb else {
             return String::new();
         };
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            if let Some(sig) = status.signal() {
-                return format!(
-                    "\nworker died with signal {sig}; it may have been out of memory under \
-                     the per-worker cap of {mb} MiB (RLIMIT_DATA from --max-memory-mb / \
-                     TURBO_LEAN_MAX_MEMORY_MB), or it may have died for an unrelated \
-                     reason; the cap is the per-worker share floored at \
-                     {REPLAY_WORKER_EST_RSS_MB} MiB, times {RLIMIT_DATA_HEADROOM_MULT}, \
-                     so raising the budget moves it only once the share passes \
-                     {REPLAY_WORKER_EST_RSS_MB} MiB; lower --jobs / TURBO_LEAN_JOBS to \
-                     raise the share, then retry"
-                );
-            }
-        }
+        let lever = format!(
+            "the cap is {RLIMIT_DATA_HEADROOM_MULT}x the per-worker share, floored at \
+             {REPLAY_WORKER_EST_RSS_MB} MiB, so it rises only once --max-memory-mb / \
+             TURBO_LEAN_MAX_MEMORY_MB divided by the worker count (--jobs / \
+             TURBO_LEAN_JOBS, or the audit pool width on the audit path) exceeds \
+             {REPLAY_WORKER_EST_RSS_MB} MiB; raise the budget or lower the worker \
+             count until it does"
+        );
         let lower = stderr.to_ascii_lowercase();
-        let alloc_failure = !status.success()
-            && [
-                "out of memory",
-                "bad_alloc",
-                "enomem",
-                "cannot allocate memory",
-                "memory allocation failed",
-            ]
-            .iter()
-            .any(|needle| lower.contains(needle));
-        if alloc_failure {
+        let alloc_signature = [
+            "out of memory",
+            "bad_alloc",
+            "enomem",
+            "cannot allocate memory",
+            "memory allocation failed",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
+        #[cfg(unix)]
+        let signal = {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal()
+        };
+        #[cfg(not(unix))]
+        let signal: Option<i32> = None;
+        if alloc_signature && !status.success() {
+            let died = signal
+                .map(|sig| format!(" (the worker died with signal {sig} delivering it)"))
+                .unwrap_or_default();
             return format!(
                 "\nworker failed to allocate under the per-worker memory cap of {mb} MiB \
-                 (RLIMIT_DATA from --max-memory-mb / TURBO_LEAN_MAX_MEMORY_MB); the cap \
-                 is the per-worker share floored at {REPLAY_WORKER_EST_RSS_MB} MiB, times \
-                 {RLIMIT_DATA_HEADROOM_MULT}, so raising the budget moves it only once \
-                 the share passes {REPLAY_WORKER_EST_RSS_MB} MiB; lower --jobs / \
-                 TURBO_LEAN_JOBS to raise the share"
+                 (RLIMIT_DATA from --max-memory-mb / TURBO_LEAN_MAX_MEMORY_MB){died}; \
+                 {lever}"
+            );
+        }
+        if let Some(sig) = signal {
+            return format!(
+                "\nworker died with signal {sig}; it may have been out of memory under \
+                 the per-worker cap of {mb} MiB (RLIMIT_DATA from --max-memory-mb / \
+                 TURBO_LEAN_MAX_MEMORY_MB), or it may have died for an unrelated \
+                 reason; {lever}, then retry"
             );
         }
         String::new()
@@ -390,8 +405,10 @@ impl WorkerBudget {
     /// (`"per-worker memory cap of"`), never the "may have been" signal note (review
     /// a64324fd F5). Bisection is skipped only when the worker provably hit the cap,
     /// because halving a capped chunk redoes full-closure loads under the same cap; a
-    /// SIGSEGV or SIGABRT from an unrelated crash still gets the bisection that
-    /// isolates the failing module.
+    /// SIGSEGV or SIGKILL with no allocation signature still gets the bisection that
+    /// isolates the failing module. An abort DELIVERING an allocation failure (SIGABRT
+    /// with `bad_alloc` on stderr) is definite: `memory_kill_note` checks the stderr
+    /// signature before the signal (review bfa9d056 F2).
     pub fn error_names_definite_memory_cap(err: &anyhow::Error) -> bool {
         format!("{err:#}").contains("per-worker memory cap of")
     }

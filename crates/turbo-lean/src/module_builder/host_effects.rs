@@ -90,7 +90,15 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
                     &spec.module_name,
                     &cfg.root_pkg.pkg_root,
                     &spec.pkg_root,
-                    OwnerMarkerSite::PkgRootOrParent,
+                    OwnerMarkerSite::PkgRootOrParent {
+                        clean_git_pinned: is_clean_git_pinned_pkg(
+                            cfg,
+                            false,
+                            &spec.pkg_name,
+                            "",
+                            &spec.pkg_root,
+                        ),
+                    },
                 )
             )
         };
@@ -991,23 +999,30 @@ fn pkg_root_owned_by_project(
     // `pkg_root`'s own components are walked instead, which catches a symlinked
     // packages slot the lexical test also caught. A symlink anywhere on the declared
     // route loses this grant conservatively; the owner marker is the way back.
-    let raw_symlink_free = pkg_canon.as_deref().ok().is_some_and(|canon| {
-        let declared = declared_path_dep_dirs(cfg, pkg_name, pkg_base_name, pkg_root);
+    // Review bfa9d056 F6: the declared manifest dirs are computed ONCE (the grant arm
+    // reuses them), and the symlink walk is LAZY — only the same-repository arm needs
+    // it, and this function runs once per dependency module in the purge walk, so an
+    // eager per-entry canonicalize+lstat here is the same per-module I/O the sweep's
+    // F6 fix removed.
+    let declared = declared_path_dep_dirs(cfg, pkg_name, pkg_base_name, pkg_root);
+    let raw_symlink_free = |canon: &Path| {
         if declared.is_empty() {
             lexical_normalize(pkg_root) == *canon && components_symlink_free(pkg_root)
         } else {
             declared.iter().any(|dir| {
-                components_symlink_free(dir)
-                    && fs::canonicalize(dir).is_ok_and(|c| c == *canon)
+                components_symlink_free(dir) && fs::canonicalize(dir).is_ok_and(|c| c == *canon)
             })
         }
-    });
-    let pkg_repo = pkg_canon
-        .ok()
-        .as_deref()
-        .and_then(nearest_git_ancestor);
+    };
+    let pkg_canon = pkg_canon.ok();
+    let pkg_repo = pkg_canon.as_deref().and_then(nearest_git_ancestor);
     match (pkg_repo, nearest_git_ancestor(&root)) {
-        (Some(pkg_repo), Some(root_repo)) => raw_symlink_free && pkg_repo == root_repo,
+        (Some(pkg_repo), Some(root_repo)) => {
+            pkg_canon
+                .as_deref()
+                .is_some_and(|canon| raw_symlink_free(canon))
+                && pkg_repo == root_repo
+        }
         // Review cf31dd1e F2: a plain-directory `path` dependency (`require foo from
         // "../foo"`, no `.git` anywhere above it) is editable scratch — finding 6's
         // shape — whether or not the PROJECT is a git checkout; the previous
@@ -1020,9 +1035,8 @@ fn pkg_root_owned_by_project(
         // tarball case: all three stay non-owned without the marker.
         (None, _) => manifest_path_dep_grants_scratch_ownership(
             cfg,
-            pkg_name,
-            pkg_base_name,
-            pkg_root,
+            &declared,
+            pkg_canon.as_deref(),
         ),
         _ => false,
     }
@@ -1082,18 +1096,22 @@ fn declared_path_dep_dirs(
 /// arm already grants.
 fn manifest_path_dep_grants_scratch_ownership(
     cfg: &ProjectConfig,
-    pkg_name: &str,
-    pkg_base_name: &str,
-    pkg_root: &Path,
+    declared: &[PathBuf],
+    pkg_canon: Option<&Path>,
 ) -> bool {
     let slot = lexical_normalize(&cfg.root_pkg.pkg_root.join(&cfg.root_pkg.packages_dir));
-    declared_path_dep_dirs(cfg, pkg_name, pkg_base_name, pkg_root)
-        .iter()
-        .any(|dir| {
-            dir.starts_with(&cfg.root_pkg.pkg_root)
-                && components_symlink_free(dir)
-                && !lexical_normalize(dir).starts_with(&slot)
-        })
+    declared.iter().any(|dir| {
+        dir.starts_with(&cfg.root_pkg.pkg_root)
+            && components_symlink_free(dir)
+            && !lexical_normalize(dir).starts_with(&slot)
+            // Review bfa9d056 F6: the entry must canonicalize to THIS package's root —
+            // an entry matched only by the target base name must not grant ownership
+            // to a different package that happens to share it.
+            && fs::canonicalize(dir)
+                .ok()
+                .zip(pkg_canon)
+                .is_some_and(|(a, b)| a == *b)
+    })
 }
 
 /// Every on-disk component of `path`, the leaf included, is reached without a symlink:
@@ -1160,7 +1178,12 @@ fn owner_marker_names_project(pkg_root: &Path, root_canon: &Path) -> bool {
 /// #436 build-scope gate (`dag.rs`) honors only a marker in the project's canonical
 /// packages dir, so a marker placed in the package root cannot clear that gate.
 pub(crate) enum OwnerMarkerSite {
-    PkgRootOrParent,
+    /// The ownership walk's marker sites (package root or the directory holding it).
+    /// `clean_git_pinned` says whether the package is a clean git-pinned checkout —
+    /// `pkg_root_owned_by_project` refuses those BEFORE its marker check, so for them
+    /// no marker clears the refusal and the hint must not be shown (review bfa9d056
+    /// F3).
+    PkgRootOrParent { clean_git_pinned: bool },
     PackagesDir(PathBuf),
 }
 
@@ -1180,6 +1203,16 @@ pub(crate) enum OwnerMarkerSite {
 /// very write the refusal exists to stop. The canonical project root is also what
 /// `owner_marker_names_project` and the #436 gate compare marker CONTENT against, so
 /// the marker hint prints that form too.
+///
+/// Review bfa9d056 F3: a marker hint is shown only when the marker would actually
+/// clear the CALLER's gate. The #436 build-scope gate honors a marker only in the
+/// project's canonical packages dir, and only a packages dir OUTSIDE the root needs
+/// one (an in-tree packages dir already counts), so the `PackagesDir` hint appears
+/// only when the package canonically lives under that dir and the dir is out of tree
+/// — for the usual #434 shape (in-tree packages dir, one entry symlinked elsewhere)
+/// no marker clears that gate and none is suggested. The ownership walk refuses a
+/// clean git-pinned checkout before its marker check, so `PkgRootOrParent` shows the
+/// hint only when the package is not clean git-pinned.
 pub(crate) fn non_owned_dep_refresh_remedy(
     module: &str,
     project_root: &Path,
@@ -1197,25 +1230,57 @@ pub(crate) fn non_owned_dep_refresh_remedy(
         );
     }
     let marker_hint = match marker_site {
-        OwnerMarkerSite::PkgRootOrParent => format!(
+        OwnerMarkerSite::PkgRootOrParent {
+            clean_git_pinned: false,
+        } => Some(format!(
             "mark it with a `.turbo-lean-packages-owner` file (in {} or the directory \
              that holds it) naming {}",
             pkg_canon.display(),
             root_canon.display()
-        ),
-        OwnerMarkerSite::PackagesDir(dir) => format!(
-            "put a `.turbo-lean-packages-owner` file naming {} in the packages dir {} \
-             (the build-scope gate honors the marker only there)",
-            root_canon.display(),
-            dir.display()
-        ),
+        )),
+        OwnerMarkerSite::PkgRootOrParent {
+            clean_git_pinned: true,
+        } => None,
+        OwnerMarkerSite::PackagesDir(dir) => {
+            let dir_canon = fs::canonicalize(&dir).unwrap_or_else(|_| lexical_normalize(&dir));
+            if pkg_canon.starts_with(&dir_canon) && !dir_canon.starts_with(&root_canon) {
+                Some(format!(
+                    "put a `.turbo-lean-packages-owner` file naming {} in the packages \
+                     dir {} (the build-scope gate honors the marker only there)",
+                    root_canon.display(),
+                    dir_canon.display()
+                ))
+            } else {
+                None
+            }
+        }
     };
-    format!(
-        "refresh it from that checkout's own workspace (`lake build` in {}), or, if \
-         this project truly owns it, {}",
-        pkg_canon.display(),
-        marker_hint
-    )
+    match marker_hint {
+        Some(hint) => format!(
+            "refresh it from that checkout's own workspace (`lake build` in {}), or, \
+             if this project truly owns it, {}",
+            pkg_canon.display(),
+            hint
+        ),
+        None => format!(
+            "refresh it from that checkout's own workspace (`lake build` in {})",
+            pkg_canon.display()
+        ),
+    }
+}
+
+/// Whether this package is a clean git-pinned checkout — the shape
+/// `pkg_root_owned_by_project` refuses before its marker check, so no owner marker
+/// clears an ownership refusal for it (review bfa9d056 F3). A thin pub(crate) wrapper
+/// so the lake_build sweep (outside this module tree) can feed
+/// `OwnerMarkerSite::PkgRootOrParent` honestly.
+pub(crate) fn pkg_is_clean_git_pinned(
+    cfg: &ProjectConfig,
+    pkg_name: &str,
+    pkg_base_name: &str,
+    pkg_root: &Path,
+) -> bool {
+    is_clean_git_pinned_pkg(cfg, false, pkg_name, pkg_base_name, pkg_root)
 }
 
 /// A package root inside a *different* package's `.lake/packages` is a nested checkout
@@ -3144,16 +3209,138 @@ pub(super) fn run_audit_or_replay_batch_worker_bound(
                     per_mod.insert(chunk[0].clone(), (Err(chunk_err), None));
                 } else if crate::zygote::WorkerBudget::error_names_definite_memory_cap(&chunk_err)
                 {
-                    // Review a64324fd F5: a chunk that provably hit the per-worker
-                    // memory cap is recorded for the WHOLE chunk, mirroring the
-                    // union-replay arm's early return above — the per-module retry
-                    // below would redo up to a chunk's worth of full-closure loads
-                    // under the same cap, the cost the no-bisect rule (review
-                    // bb7c0f2f F4) exists to avoid, and the error text already names
-                    // the knob to raise.
+                    // Review a64324fd F5, reshaped by bfa9d056 F1: a chunk that
+                    // provably hit the per-worker memory cap is neither retried
+                    // module-by-module (up to a chunk's worth of full-closure loads
+                    // under the same cap, the cost the no-bisect rule exists to avoid)
+                    // nor failed outright for every module — a 128-module worker loads
+                    // the UNION of their import closures, so halves with small unions
+                    // can pass where the whole chunk could not, and a bisected run
+                    // whose first half already audited cleanly must not report those
+                    // modules as failed. One retry at half size, no further splitting:
+                    // a half that caps again records that half; any other half error
+                    // falls to the per-module retry for that half only.
                     let text = format!("{chunk_err:#}");
-                    for m in chunk {
-                        per_mod.insert(m.clone(), (Err(anyhow::anyhow!("{text}")), None));
+                    let mid = chunk.len() / 2;
+                    for half in [&chunk[..mid], &chunk[mid..]] {
+                        if half.is_empty() {
+                            continue;
+                        }
+                        let half_skip_replay = (is_untrusted && pre_replayed)
+                            || (!is_untrusted
+                                && (pre_replayed
+                                    || half.iter().all(|m| snap_replayed.contains(m))));
+                        let half_res = crate::zygote::ensure_bound_audit_closure(
+                            snap,
+                            "sched_audit_before_chunk",
+                        )
+                        .and_then(|_| {
+                            run_audit_chunk_subprocess(
+                                store_root,
+                                cfg,
+                                half,
+                                &snap_lp,
+                                &snap_binds,
+                                is_untrusted,
+                                half_skip_replay,
+                                pinned_fd,
+                                audit_concurrency,
+                            )?;
+                            let _ = crate::zygote::ensure_bound_audit_closure(
+                                snap,
+                                "sched_audit_after_chunk",
+                            )?;
+                            Ok(())
+                        });
+                        match half_res {
+                            Ok(()) => {
+                                for m in half {
+                                    let record_rep =
+                                        !is_untrusted && !snap_replayed.contains(m);
+                                    let record_aud = !is_untrusted;
+                                    per_mod.insert(
+                                        m.clone(),
+                                        (
+                                            Ok(()),
+                                            Some(ModuleAuditAuthority::Snapshot((
+                                                std::sync::Arc::clone(snap),
+                                                record_rep,
+                                                record_aud,
+                                            ))),
+                                        ),
+                                    );
+                                }
+                            }
+                            Err(half_err)
+                                if half.len() > 1
+                                    && crate::zygote::WorkerBudget::error_names_definite_memory_cap(
+                                        &half_err,
+                                    ) =>
+                            {
+                                let half_text = format!("{half_err:#}");
+                                for m in half {
+                                    per_mod.insert(
+                                        m.clone(),
+                                        (
+                                            Err(anyhow::anyhow!(
+                                                "{half_text}\n(whole-chunk attribution: {text})"
+                                            )),
+                                            None,
+                                        ),
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                for m in half {
+                                    let single_skip_replay = (is_untrusted && pre_replayed)
+                                        || (!is_untrusted
+                                            && (pre_replayed || snap_replayed.contains(m)));
+                                    let single_res = crate::zygote::ensure_bound_audit_closure(
+                                        snap,
+                                        "sched_audit_before_chunk",
+                                    )
+                                    .and_then(|_| {
+                                        run_audit_chunk_subprocess(
+                                            store_root,
+                                            cfg,
+                                            std::slice::from_ref(m),
+                                            &snap_lp,
+                                            &snap_binds,
+                                            is_untrusted,
+                                            single_skip_replay,
+                                            pinned_fd,
+                                            audit_concurrency,
+                                        )?;
+                                        let _ = crate::zygote::ensure_bound_audit_closure(
+                                            snap,
+                                            "sched_audit_after_chunk",
+                                        )?;
+                                        Ok(())
+                                    });
+                                    match single_res {
+                                        Ok(()) => {
+                                            let record_rep =
+                                                !is_untrusted && !snap_replayed.contains(m);
+                                            let record_aud = !is_untrusted;
+                                            per_mod.insert(
+                                                m.clone(),
+                                                (
+                                                    Ok(()),
+                                                    Some(ModuleAuditAuthority::Snapshot((
+                                                        std::sync::Arc::clone(snap),
+                                                        record_rep,
+                                                        record_aud,
+                                                    ))),
+                                                ),
+                                            );
+                                        }
+                                        Err(e) => {
+                                            per_mod.insert(m.clone(), (Err(e), None));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 } else {
                     for m in chunk {
@@ -4131,7 +4318,9 @@ mod host_effect_taint_tests {
             "LintLib",
             &proj,
             &raw_pkg,
-            OwnerMarkerSite::PkgRootOrParent,
+            OwnerMarkerSite::PkgRootOrParent {
+                clean_git_pinned: false,
+            },
         );
         assert!(
             msg.contains("own workspace"),
@@ -4145,6 +4334,26 @@ mod host_effect_taint_tests {
             !msg.contains("from the project root"),
             "the in-project `lake build` advice would write through the symlink: {msg}"
         );
+        assert!(
+            msg.contains(".turbo-lean-packages-owner"),
+            "a non-pinned out-of-tree checkout gets the ownership-walk marker hint: {msg}"
+        );
+        // Review bfa9d056 F3: a CLEAN GIT-PINNED checkout is refused before the
+        // ownership walk's marker check, so no marker clears it and the hint must not
+        // be shown.
+        let msg_pinned = non_owned_dep_refresh_remedy(
+            "LintLib",
+            &proj,
+            &raw_pkg,
+            OwnerMarkerSite::PkgRootOrParent {
+                clean_git_pinned: true,
+            },
+        );
+        assert!(
+            msg_pinned.contains("own workspace")
+                && !msg_pinned.contains(".turbo-lean-packages-owner"),
+            "a clean git-pinned checkout gets no marker hint: {msg_pinned}"
+        );
         // A real in-tree subdirectory keeps the project-workspace remedy.
         let real = proj.join(".lake/packages/real");
         fs::create_dir_all(&real)?;
@@ -4152,14 +4361,19 @@ mod host_effect_taint_tests {
             "Real",
             &proj,
             &real,
-            OwnerMarkerSite::PkgRootOrParent,
+            OwnerMarkerSite::PkgRootOrParent {
+                clean_git_pinned: false,
+            },
         );
         assert!(
             msg2.contains("run `lake build +Real` from the project root"),
             "in-tree entry keeps the project-workspace remedy: {msg2}"
         );
-        // The #436 build-scope gate honors the marker only in the packages dir, so
-        // its remedy must say so instead of pointing at the package root.
+        // Review bfa9d056 F3: for the usual #434 shape — an IN-TREE packages dir with
+        // one entry symlinked to a shared checkout — the #436 gate already counts the
+        // packages dir without any marker, and the package's canonical home is not
+        // under it, so a packages-dir marker cannot clear that gate and the hint is
+        // suppressed: only the own-workspace remedy remains.
         let msg3 = non_owned_dep_refresh_remedy(
             "LintLib",
             &proj,
@@ -4167,8 +4381,33 @@ mod host_effect_taint_tests {
             OwnerMarkerSite::PackagesDir(proj.join(".lake/packages")),
         );
         assert!(
-            msg3.contains("in the packages dir"),
-            "the dag-gate remedy names the packages dir marker site: {msg3}"
+            msg3.contains("own workspace")
+                && !msg3.contains("in the packages dir")
+                && !msg3.contains(".turbo-lean-packages-owner"),
+            "an in-tree packages dir earns no marker hint, since the gate honors the \
+             marker only on an out-of-tree packages dir: {msg3}"
+        );
+        // The hint IS shown when the marker would clear the gate: the packages dir
+        // itself is relocated outside the project root and the package canonically
+        // lives under it.
+        let proj2 = dir.join("proj2");
+        let ext_pkgs = dir.join("ext_pkgs");
+        fs::create_dir_all(proj2.join(".lake"))?;
+        fs::create_dir_all(ext_pkgs.join("lintlib"))?;
+        std::os::unix::fs::symlink(&ext_pkgs, proj2.join(".lake/packages"))?;
+        let relocated_pkg = proj2.join(".lake/packages/lintlib");
+        let msg4 = non_owned_dep_refresh_remedy(
+            "LintLib",
+            &proj2,
+            &relocated_pkg,
+            OwnerMarkerSite::PackagesDir(proj2.join(".lake/packages")),
+        );
+        let ext_canon = fs::canonicalize(&ext_pkgs)?;
+        assert!(
+            msg4.contains("in the packages dir")
+                && msg4.contains(&ext_canon.display().to_string()),
+            "a relocated out-of-tree packages dir holding the package gets the \
+             packages-dir marker hint, naming the canonical dir: {msg4}"
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())
