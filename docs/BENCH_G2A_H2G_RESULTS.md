@@ -139,8 +139,13 @@ bench drives — so the null delta is expected by construction and decides
 nothing about the replay's real cost (the runs were also taken on a busy
 node, like everything above). What landed per the delta rule is the opt-in
 (`TURBO_LEAN_WARM_CAS_REPLAY=1` enables; the opt-out still forces off; the
-replay path is kept unchanged). The G2b accept/delete decision stays open
-pending a `build`-shaped warm loop or `check`-path wiring on a quiet node.
+replay path is kept unchanged). The G2b accept/delete decision stays open;
+the forward options are a `build`-shaped warm loop or `check`-path wiring
+measured on a quiet node, or deleting the path — the leaf's other branch.
+With the revert the telemetry mode strings were renamed (`warm_default` to
+`warm_opt_in`, `warm_default_error` to `warm_opt_in_error`), a telemetry
+contract change; no external consumer of the old strings was found
+(pr_verify and the integration tests read zero occurrences).
 
 ## Per-cell peak RSS across the 5 trials (MB, trial order)
 
