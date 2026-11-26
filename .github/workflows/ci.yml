@@ -127,6 +127,10 @@ jobs:
             turbo-lean-cas-
 
       - name: Build & Test LeanNative Core and turbo-lean CLI
+        env:
+          # This job installed Lean above, so a test that needs a real toolchain must
+          # fail rather than skip when it cannot find one.
+          TURBO_LEAN_REQUIRE_LEAN: "1"
         run: |
           (cd lean && lake build)
           ./lean/.lake/build/bin/lean-native-core self-test
@@ -304,6 +308,10 @@ jobs:
           (cd lean && "$HOME/.elan/bin/lean" --version)
 
       - name: Build & Test LeanNative Core and turbo-lean CLI on arm64
+        env:
+          # This job installed Lean above, so a test that needs a real toolchain must
+          # fail rather than skip when it cannot find one.
+          TURBO_LEAN_REQUIRE_LEAN: "1"
         run: |
           (cd lean && lake build)
           ./lean/.lake/build/bin/lean-native-core self-test

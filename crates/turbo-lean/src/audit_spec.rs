@@ -6902,6 +6902,10 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
             "attribute [instance] foo\n",
             "elab \"go\" : tactic => pure ()\n",
             "scoped infixl:65 \" +. \" => g\n",
+            // Review 29baa2ab F4 residual, pinned by a64324fd F9: `@[tactic k]`
+            // registers a tactic elaborator without the `instance`/`macro`/`elab`
+            // attribute substrings.
+            "@[tactic fooElab] def f : Nat := 0\n",
         ] {
             assert!(
                 audited_src_declares_probe_hostile_commands(src),
@@ -6911,6 +6915,8 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
         for src in [
             "def chk (p q : Bool) : Bool := p && !q\ntheorem t : True := trivial\n",
             "def infixes (n : Nat) : Nat := n\n",
+            // A benign attribute must not be flagged (a64324fd F9 control case).
+            "@[simp] theorem s : True := trivial\n",
         ] {
             assert!(
                 !audited_src_declares_probe_hostile_commands(src),
