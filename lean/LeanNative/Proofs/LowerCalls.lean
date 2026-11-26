@@ -219,19 +219,28 @@ variable — `RealLCNFBridge.lean:576-589`), and `evalArg` ERRORS on an erased/`
 argument (`.typeError "erased runtime argument"`) rather than producing `.u64 0`, so a
 source-side `evalArgs` success forces every argument of a resolved call to be `.fvar`
 and the zero-bind list empty — `lowerCallArgs_align` below therefore covers exactly the
-reachable shape, and the zero-bind wrapper is exercised only on runs the source
-semantics refuses anyway.
+shape the SOURCE SEMANTICS accepts, which is narrower than what the lowerer emits: a
+resolved local call with an erased or `type` argument goes through the zero-bind path
+in the lowering but errors on the source side (`evalArgs` at
+`RealLCNFCallSemantics.lean:204` via `evalArg` at `RealLCNFSemantics.lean:317`), so the
+soundness theorem says nothing about such calls and they STAY `lowered_unproved`
+(review 6f812155 F1, option 2: recorded in the coverage handoff below rather than given
+placeholder semantics, which would be a semantics change outside this unit).
 
 ### Acceptance (quoted) and gates
 
 - "leaf `0 sorryAx`": every theorem in the proved set lands kernel-checked; the leaf's
   theorems are appended to `AxiomAudit.lean`'s `auditedTheoremNames` with the pinned
   count raised exactly.
-- "matrix moves": the semantics and proofs landed here are exactly what
-  `scripts/lcnf_coverage.py`'s methodology names as the condition for reclassifying
-  `lowered_vacuous_local_call` out of `lowered_unproved`. That script and its committed
-  results are H1.0's files; the reclassification handoff is lead-accepted and the commit
-  is the matrix owner's, once this leaf merges.
+- "matrix moves": the semantics and proofs landed here are the condition
+  `scripts/lcnf_coverage.py`'s methodology names for reclassifying
+  `lowered_vacuous_local_call` rows out of `lowered_unproved` — for resolved calls whose
+  arguments are all `.fvar`. Coverage handoff (review 6f812155 F1): a resolved local
+  call with an erased or `type` argument is NOT covered by the theorem (the source
+  semantics errors on it, paragraph above), so such rows stay `lowered_unproved` and the
+  matrix owner reclassifies only the all-`.fvar` rows. That script and its committed
+  results are H1.0's files; the handoff is lead-accepted and the commit is the matrix
+  owner's, once this leaf merges.
 - Gates: `(cd lean && lake build TurboLean LeanNative)` (the new modules are in the
   `LeanNative` lib's `.andSubmodules` glob);
   `turbo-lean --json audit-spec lean/TurboLean/Spec.lean` (98/98) and
@@ -245,8 +254,10 @@ semantics refuses anyway.
   actually runs; a call-arity mismatch errors; a nested chain whose middle declaration
   resolves its own callee only under ITS entry context (with a caller-context negative
   control, pinning review F1's fix); a callee that exhausts its own entry fuel while the
-  ambient fuel is ample (pinning the per-entry fuel); a self-call that falls to the old
-  `.unsupportedCall` behavior; and `Δ = [] / Φ = []` runs equal to the old evaluators.
+  ambient fuel is ample (pinning the per-entry fuel); a self-call that resolves ONCE —
+  a depth-1 STOP run (the suffix-exercised branch carries no call) is ok, and the
+  depth-2 miss keeps the old `.unsupportedCall`-shaped error; and `Δ = [] / Φ = []`
+  runs equal to the old evaluators.
 -/
 
 namespace LeanNative.Proofs

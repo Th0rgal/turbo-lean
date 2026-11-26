@@ -16,8 +16,10 @@ Contract: `lean/LeanNative/Proofs/LowerCalls.lean` (acceptance section). Familie
 3. Per-entry context and fuel (review F1): a nested chain whose middle declaration
    resolves its own callee only under ITS entry context, with a caller-context negative
    control; and a callee that exhausts its own entry fuel while the ambient fuel is ample.
-4. A self-call falls to the old `.unsupportedCall` behavior under pairwise-fresh
-   environments (stratification: the callee body runs under the STRICT SUFFIX).
+4. A self-call resolves ONCE (depth-1 unrolling, not an immediate miss): a body whose
+   suffix-exercised branch carries no call runs ok (the depth-1 STOP, guard 4b), and
+   the unconditionally recursive body's nested call misses under the STRICT SUFFIX and
+   keeps the old `.unsupportedCall`-shaped error (the depth-2 miss, guard 4).
 5. `Δ = [] / Φ = []` runs agree with the old evaluators (`exceptAgrees` compares
    ok-payloads exactly and errors by shape, since `UBError` carries no `BEq`; the kernel
    theorems `evalCodeF_nil` / `evalStepF_nil` carry the full equality).
@@ -75,7 +77,7 @@ private def runCodeF (Φ : FuncEnv) (body : LNIRCode) (arg : Val) : Except UBErr
 --    succeeds (guard 1); the LNIR fuel is pass-through (loops only), so the per-entry
 --    fuel pin lives on the source side below.
 
--- 4. Stratified self-call, depth-1: `g_self` IS the single entry, so evaluating its
+-- 4. Stratified self-call, depth-2 MISS: `g_self` IS the single entry, so evaluating its
 --    body under the full Φ resolves the self-call ONCE against its own entry; the
 --    unrolled body runs under the strict suffix ([]), where the nested self-call
 --    misses and falls to `evalExpr`, which errors on the unknown symbol.
@@ -86,6 +88,24 @@ private def selfL : LNIRDecl :=
     body := .letBind 1 .i64 (.call "g_self" [0] .i64 false) (.ret 1) }
 
 #guard (runCodeF [(selfL, 32)] selfL.body (.u64 5)).isOk == false
+
+-- 4b. Stratified self-call, depth-1 STOP (review 6f812155 F3): the branch the unrolled
+--     body takes under the strict suffix carries no call (`x = 0` lands in the `else`
+--     arm), so the ONE resolution suffices and the run is ok — this distinguishes
+--     depth-1 unrolling from an immediate miss, which guard 4's `.isOk == false` alone
+--     cannot: an immediate miss would also error here.
+private def selfStopL : LNIRDecl :=
+  { name := "g_stop"
+    params := [{ id := 0, name := "x", ty := .i64 }]
+    retTy := .i64
+    body := .letBind 1 .i64 (.scalar (.constU64 0))
+      (.ite 0
+        (.letBind 2 .i64 (.call "g_stop" [1] .i64 false) (.ret 2))
+        (.ret 1)) }
+
+#guard (match runCodeF [(selfStopL, 32)] selfStopL.body (.u64 5) with
+        | .ok (v, hst) => v == .u64 0 && hst == HeapState.empty
+        | .error _ => false)
 
 -- 5. Φ = [] agrees with the old evaluator: on a call-free body (both ok, same value) and
 --    on a call-bearing body (both error).
@@ -196,17 +216,19 @@ private def ctxC : RealBridgeCtx := { arch := .x86_64 }
 private def boxSpec : RcCtorLayoutSpec :=
   { ctorName := `l2_box, cidx := 0, objSlots := 1, usizeSlots := 1, scalarSlots := [] }
 
-/-- `l2_u o y`: write `y` into `o`'s usize slot (logical index 1), read it back. -/
+/-- `l2_u o y`: write `y` into `o`'s usize slot (logical index 1), read it back. The
+object parameter is typed `ImpureType.tobject` (review 6f812155 F4), so the fixture is a
+program the driver could produce — `.objPtr` is passed where an object is declared. -/
 private def calleeU : Decl .impure :=
   let u64 := ImpureType.uint64
-  mkDecl `l2_u #[mkParam 60 u64, mkParam 61 u64] u64 <|
+  mkDecl `l2_u #[mkParam 60 ImpureType.tobject, mkParam 61 u64] u64 <|
     .uset (fv 60) 1 (fv 61) (
       .let (mkLet 62 u64 (.uproj 1 (fv 60) rfl)) <|
       .return (fv 62)) rfl
 
 private def callerU : Decl .impure :=
   let u64 := ImpureType.uint64
-  mkDecl `l2_uc #[mkParam 65 u64, mkParam 66 u64] u64 <|
+  mkDecl `l2_uc #[mkParam 65 ImpureType.tobject, mkParam 66 u64] u64 <|
     .let (mkLet 67 u64 (.fap `l2_u #[.fvar (fv 65), .fvar (fv 66)] rfl)) <|
     .return (fv 67)
 
@@ -228,10 +250,13 @@ private def heapU : Nat × HeapState := HeapState.empty.allocHeapCtor 0 [.u64 7]
 #guard (evalRealLCNFDeclF [(calleeU, ctxUNoLayout, 32)] 32 ctxUTop callerU
           [.objPtr heapU.1, .u64 42] heapU.2).isOk == false
 
--- 4. Stratified self-call, depth-1: `l2_self` is in Δ, so the top-level run resolves
---    its self-call once against its own entry; the unrolled body runs under the strict
---    suffix ([]), where the nested call misses and keeps the old `.unsupportedCall`
---    error, which propagates out through the resolved outer call.
+-- 4. Stratified self-call, depth-2 MISS (source side): `l2_self` is in Δ, so the
+--    top-level run resolves its self-call once against its own entry; the unrolled body
+--    runs under the strict suffix ([]), where the nested call misses and keeps the old
+--    `.unsupportedCall` error, which propagates out through the resolved outer call.
+--    (This fixture is unconditionally recursive, so its run errors by construction; the
+--    depth-1 STOP that distinguishes one resolution from an immediate miss is the
+--    LNIR-side guard 4b above.)
 private def selfS : Decl .impure :=
   let u64 := ImpureType.uint64
   mkDecl `l2_self #[mkParam 20 u64] u64 <|
