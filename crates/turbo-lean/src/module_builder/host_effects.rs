@@ -628,8 +628,13 @@ fn classify_clean_pinned_dep_source(
 /// hold a new rev where a target's tracked-ness changed, so
 /// [`reset_lake_inputs_tag_memo`] clears this memo at every memo-window boundary (once
 /// per CLI command and per serve / MCP request).
+/// Entries are `(window, tracked)` and a read accepts only the current window, so a
+/// git read that started before a reset cannot serve the new window a stale answer by
+/// inserting after it — the same shape as `CLEAN_GIT_PIN_MEMO` and
+/// `publish_lake_inputs_tag` (DA 71add786 finding 2). The reset also clears the map,
+/// bounding growth.
 pub(super) static TRACKED_INCLUDE_MEMO: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<(PathBuf, PathBuf), bool>>,
+    std::sync::Mutex<HashMap<(PathBuf, PathBuf), (u64, bool)>>,
 > = std::sync::OnceLock::new();
 
 /// Inside-the-root is not pinned-by-the-rev. The checkout is clean, so a *tracked*
@@ -640,15 +645,21 @@ pub(super) static TRACKED_INCLUDE_MEMO: std::sync::OnceLock<
 /// path) in [`TRACKED_INCLUDE_MEMO`]: classification runs many times per module per
 /// check, and the checkout is pinned for the memo window's lifetime.
 fn include_targets_tracked_at_pin(canon_pkg_root: &Path, rels: &[PathBuf]) -> bool {
+    // Captured before any git runs: an insert stamped with this window is ignored by
+    // every reader whose window is newer (DA 71add786 finding 2).
+    let window = current_memo_window();
     let memo = TRACKED_INCLUDE_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut pending: Vec<&PathBuf> = Vec::new();
     {
         let memo = memo.lock().unwrap_or_else(|e| e.into_inner());
         for rel in rels {
             match memo.get(&(canon_pkg_root.to_path_buf(), rel.clone())) {
-                Some(false) => return false,
-                Some(true) => {}
-                None => pending.push(rel),
+                Some(&(w, tracked)) if w == window => {
+                    if !tracked {
+                        return false;
+                    }
+                }
+                _ => pending.push(rel),
             }
         }
     }
@@ -664,7 +675,7 @@ fn include_targets_tracked_at_pin(canon_pkg_root: &Path, rels: &[PathBuf]) -> bo
         });
         memo.lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert((canon_pkg_root.to_path_buf(), rel.clone()), tracked);
+            .insert((canon_pkg_root.to_path_buf(), rel.clone()), (window, tracked));
         all_tracked &= tracked;
     }
     all_tracked
@@ -3852,6 +3863,34 @@ mod host_effect_taint_tests {
         assert!(
             !include_targets_tracked_at_pin(&canon, &rels),
             "a new memo window must re-read git: the pin can move while the daemon runs"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// The publication half of the tracked-include memo, exercised deterministically
+    /// (the shape of `test_lake_inputs_tag_memo_rejects_cross_request_publication`):
+    /// an entry stamped with a superseded window — what a git read started before a
+    /// reset would insert afterwards — is ignored, never served to the new window.
+    #[test]
+    fn tracked_include_memo_ignores_entries_from_a_superseded_window() -> Result<()> {
+        let dir = temp_dir("tracked_stale_window");
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("data.txt"), "x\n")?;
+        git_init_commit(&dir)?;
+        let canon = fs::canonicalize(&dir)?;
+        let rel = PathBuf::from("data.txt");
+        reset_lake_inputs_tag_memo();
+        let superseded = current_memo_window().wrapping_sub(1);
+        TRACKED_INCLUDE_MEMO
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((canon.clone(), rel.clone()), (superseded, false));
+        assert!(
+            include_targets_tracked_at_pin(&canon, &[rel]),
+            "a planted wrong answer stamped with a superseded window must be ignored: \
+             the tracked file re-reads as tracked"
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())
