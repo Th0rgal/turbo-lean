@@ -3677,13 +3677,22 @@ lean_lib Smoke where
 
         let cfg = resolve_project_config(&proj)?;
         // 1. `build <Lib>` (trusted, no prebuilt adoption) fails closed instead of scheduling a
-        //    native compile that would publish into the other checkout.
+        //    native compile that would publish into the other checkout. The remedy named by the
+        //    refusal is decided on CANONICAL paths (review a64324fd F2, after the #436 follow-up
+        //    canonicalized the gate's compare): this entry is a SYMLINK to the other checkout, so
+        //    running `lake build +DepPin` from the project root would write through the symlink —
+        //    the very publish this gate stops — and the message must instead point at the
+        //    checkout's own workspace, with the marker hint naming the packages dir, the only
+        //    place this gate honors the owner marker.
         let err = build_module_dag(&cfg, &["App".to_string()])
             .expect_err("stale pinned out-of-tree dep must not become a DAG build node")
             .to_string();
         assert!(
             err.contains("outside the project root")
-                && err.contains("`lake build +DepPin` from the project root")
+                && err.contains("own workspace (`lake build` in ")
+                && err.contains("put a `.turbo-lean-packages-owner` file naming")
+                && err.contains("in the packages dir")
+                && !err.contains("`lake build +DepPin` from the project root")
                 && !err.contains("adopted read-only"),
             "unexpected error: {err}"
         );
