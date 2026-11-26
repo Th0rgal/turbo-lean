@@ -27,6 +27,12 @@ stay as written because the baseline's host is not one this code can key a
 digest for, and an unkeyed digest would no longer compare equal to a keyed
 one; settings_match reads their raw paths as it always has.
 
+Two environment knobs set how long the bench waits for a workload's daemons to
+end: TURBO_LEAN_BENCH_DAEMON_TERM_GRACE_S (seconds between SIGTERM and SIGKILL,
+default DAEMON_TERM_GRACE_S) and TURBO_LEAN_BENCH_DAEMON_KILL_GRACE_S (seconds
+after SIGKILL, default DAEMON_KILL_GRACE_S). A value that is not a finite
+number of at least 0 is ignored. Both are recorded with the other settings.
+
 Each workload's daemons are stopped when the workload ends. `daemon stop`
 waits on turbo-lean's user-wide lifecycle lock, which any other turbo-lean
 command of the same user holds while it runs, so the bench gives it
@@ -175,6 +181,7 @@ RECORDED_ENV_VARS = [
     "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY", "TURBO_LEAN_HOME", "TURBO_LEAN_STAGING_DIR",
     "TURBO_LEAN_NO_DAEMON", "TURBO_LEAN_NO_REMOTE_TELEMETRY", "TURBO_LEAN_TELEMETRY",
     "TURBO_LEAN_DAEMON_IDLE_SECS", "TURBO_LEAN_BENCH_CHECK_TIMEOUT_S",
+    "TURBO_LEAN_BENCH_DAEMON_TERM_GRACE_S", "TURBO_LEAN_BENCH_DAEMON_KILL_GRACE_S",
 ]
 # Recorded settings whose values are host paths. A results JSON is committed, so
 # these are recorded as a digest of the value, never the path itself; the digest
@@ -717,7 +724,25 @@ def settings_match(base, res) -> bool:
     against a keyed digest it cannot be checked and reads as different. A `<set>`
     mark (no machine-id) equals any set path and nothing unset."""
     bs, rs = base.get("settings") or {}, res.get("settings") or {}
-    return all(_setting_equal(v, bs.get(v), rs.get(v)) for v in RECORDED_ENV_VARS)
+    return all(_live_setting_equal(v, bs.get(v), rs.get(v)) for v in RECORDED_ENV_VARS)
+
+
+def _live_setting_equal(var, base_val, res_val) -> bool:
+    """One setting, record against record or, for a path, baseline against the live value.
+
+    A baseline written in an earlier form (raw, unkeyed digest, keyed digest from
+    another run, `<set>`) cannot be compared with this run's keyed record directly,
+    though the setting is the same. When this run's record is what the live
+    environment's value records as, the baseline's value is compared with that live
+    raw value in whichever form the baseline uses."""
+    if _setting_equal(var, base_val, res_val):
+        return True
+    if var not in PATH_VALUED_SETTINGS:
+        return False
+    live = os.environ.get(var)
+    if live and res_val and (res_val == live or res_val == recorded_setting(var, live)):
+        return _setting_equal(var, base_val, live)
+    return False
 
 
 def _setting_equal(var, a, b) -> bool:
@@ -1334,7 +1359,7 @@ def _grace_from_env(name: str, default: float) -> float:
         v = float(os.environ.get(name, ""))
     except ValueError:
         return default
-    return v if v >= 0 else default
+    return v if math.isfinite(v) and v >= 0 else default
 
 
 def terminate_scanned(procs, term_grace_s=None, kill_grace_s=None):
