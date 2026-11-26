@@ -1595,6 +1595,29 @@ class HostFingerprint(unittest.TestCase):
                                           self._host("g2a-ro-192c", "g2a-ro-192c",
                                                      "a" * 64)))
 
+    def test_label_on_one_side_only_does_not_match(self):
+        # The help promises a labeled baseline is never compared with a run
+        # under another condition; an unlabeled run is another condition,
+        # same machine or not.
+        mod = load_script()
+        labeled = self._host("quiet", "quiet", "a" * 64)
+        unlabeled = self._host("node-1", None, "a" * 64)
+        self.assertFalse(mod.host_matches(labeled, unlabeled))
+        self.assertFalse(mod.host_matches(unlabeled, labeled))
+
+    def test_host_mismatch_reason_names_fingerprints(self):
+        mod = load_script()
+        base = full_valid_baseline(mod)
+        base["host"]["host_fingerprint"] = "a" * 64
+        base["host"]["machine_label"] = "quiet"
+        base["host"]["hostname"] = "quiet"
+        res = mod_results_like(mod, base, 1000.0)
+        res["host"] = dict(base["host"], host_fingerprint="b" * 64)
+        v = mod.compare_run(base, res)
+        self.assertEqual(v["verdict"], "comparison_skipped_host_mismatch")
+        self.assertIn(("a" * 64)[:12], v["skipped_reason"])
+        self.assertIn(("b" * 64)[:12], v["skipped_reason"])
+
     def test_host_id_records_hex_fingerprint_never_node_name(self):
         mod = load_script()
         h = mod.host_id("g2a-ro-192c")

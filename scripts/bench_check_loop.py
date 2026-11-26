@@ -490,9 +490,14 @@ def host_matches(base, res) -> bool:
         # before. An old baseline (real hostname) against a new labeled run
         # therefore mismatches; the migration path is --rebaseline.
         return False
-    # The label can only narrow the match further; it never widens it, since
-    # two machines sharing a label still differ in fingerprint above.
+    # The label narrows the match: it never admits two machines (the
+    # fingerprint check above already refused them), and a label present on
+    # only one side is a condition mismatch too — the help promises a
+    # baseline from a different label is never compared, and "no label" is
+    # a different condition.
     lb, lr = bh.get("machine_label"), rh.get("machine_label")
+    if bool(lb) != bool(lr):
+        return False
     if lb and lr and lb != lr:
         return False
     return True
@@ -652,12 +657,18 @@ def compare_run(baseline, res):
             "refusing comparison across different Lean toolchains")
         return verdict
     if not host_matches(baseline, res):
+        bh, rh = baseline.get("host") or {}, res.get("host") or {}
+
+        def fp12(h):
+            fp = h.get("host_fingerprint")
+            return fp[:12] if isinstance(fp, str) and fp else None
         verdict["verdict"] = "comparison_skipped_host_mismatch"
         verdict["skipped_reason"] = (
-            f"baseline host {baseline.get('host', {}).get('hostname')}/"
-            f"{baseline.get('host', {}).get('machine_label')} != this host "
-            f"{res.get('host', {}).get('hostname')}/{res.get('host', {}).get('machine_label')}; "
-            "a baseline from another machine proves nothing here")
+            f"baseline host {bh.get('hostname')}/{bh.get('machine_label')}"
+            f" (fingerprint {fp12(bh)}) != this host "
+            f"{rh.get('hostname')}/{rh.get('machine_label')}"
+            f" (fingerprint {fp12(rh)}); "
+            "a baseline from another machine or condition proves nothing here")
         return verdict
     if not settings_match(baseline, res):
         verdict["verdict"] = "comparison_skipped_settings_mismatch"
