@@ -122,7 +122,11 @@
    unless the live `ConstantInfo.type` structurally equals the frozen copy (modulo the documented
    per-declaration matcher renaming) and its `Expr.hash` equals the pinned `306234630` (measured
    on v4.35.0); the file-level SHA-256 is recorded in the freezing commit.
-3. No generated coverage matrix exists yet (`H1.0` is an open leaf; no JSON is committed).
+3. The generated coverage matrix is a measurement, not a proof (`H1.0`): `scripts/lcnf_coverage.py`
+   runs the real lowerer over its corpora, the committed results (`scripts/lcnf_coverage_results.json`,
+   measured at `19ae99c`) pin the bridge-source digests, and CI's `verify` job emits the JSON. A
+   declaration counts as `proved` when the proved path lowers it with no local call, so
+   `lowerRealLCNFDecl_sound` applies to it; the count does not re-check that theorem.
 4. The `Contract V4 M2`/`M3` theorems are stated over the in-repo `"OLEN"` v1 model — `ConLeche.lean`
    says so in-file (`lean/TurboLean/ConLeche.lean:7,12`: "binary `"OLEN"` v1 … shard model format,
    NOT raw Lean 4 `.olean`"), as does the root `README.md:42`; the proof against real `.olean`
