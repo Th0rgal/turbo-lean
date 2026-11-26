@@ -49,3 +49,22 @@ def host_target_arch() -> str:
             f"unsupported host CPU architecture {machine!r}: the native-emission "
             "legs support x86_64 and aarch64 hosts only"
         ) from None
+
+
+def host_arch_or_skip(test) -> str:
+    """`host_target_arch()` for a unittest leg: the arch, or a skip of the
+    calling test on machines the native-emission legs do not support. Shared
+    by the test modules so the arch is computed lazily per test (an
+    import-time computation breaks importing those modules at all on such
+    machines). `test` is the running unittest.TestCase; only `skipTest` is
+    used. Runner entrypoints must not use this: they fail closed on the
+    `host_target_arch()` RuntimeError instead of skipping."""
+    try:
+        return host_target_arch()
+    except RuntimeError as exc:
+        test.skipTest(str(exc))
+
+
+def cross_arch_for(host: str) -> str:
+    """The opposite CPU arch for the symmetric cross-emission test legs."""
+    return "x86_64" if host == "arm64" else "arm64"

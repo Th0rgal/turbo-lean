@@ -30,12 +30,6 @@ def tearDownModule():
 
 SPEC_LEAN = fuzzer.ROOT / "lean" / "LeanNative" / "Spec.lean"
 
-# The primary `--arch` legs run the host CPU's TargetArch spelling; the opposite
-# CPU arch stays covered as the symmetric cross-emission leg (an arm64 host
-# cross-emits x86_64 IR, an x86_64 host cross-emits arm64 IR).
-HOST_ARCH = host_arch.host_target_arch()
-CROSS_ARCH = "x86_64" if HOST_ARCH == "arm64" else "arm64"
-
 # Arch-specific LLVM signature shapes for the stage-1B declarations: the x86_64
 # ABI lowering carries `zeroext` return/param attributes that the AArch64
 # lowering omits.
@@ -55,6 +49,28 @@ ENUM256_IR_NEEDLE = {
     "x86_64": "define dso_local zeroext i16 @big_enum_tag(i16 zeroext noundef %arg_v0)",
     "arm64": "define dso_local i16 @big_enum_tag(i16 noundef %arg_v0)",
 }
+
+
+# The primary `--arch` legs run the host CPU's TargetArch spelling; the opposite
+# CPU arch stays covered as the symmetric cross-emission leg (an arm64 host
+# cross-emits x86_64 IR, an x86_64 host cross-emits arm64 IR).
+def host_arch_or_skip(test: unittest.TestCase) -> str:
+    """The host CPU in the `--arch` spelling, computed lazily per test.
+
+    host_arch.host_target_arch() raises on unsupported machines, so an
+    import-time HOST_ARCH computation broke importing this module at all
+    (including test_fuzz_lcnf_conformance's `import test_scalar_frontend`).
+    The arch-dependent legs call this instead and skip on such hosts, and skip
+    (never KeyError) when the arch has no S1B_IR_NEEDLES entry
+    (ENUM256_IR_NEEDLE shares the same key set)."""
+    arch = host_arch.host_arch_or_skip(test)
+    if arch not in S1B_IR_NEEDLES:
+        test.skipTest(f"host arch {arch!r} has no S1B_IR_NEEDLES entry")
+    return arch
+
+
+# The opposite CPU arch for the symmetric cross-emission legs.
+cross_arch_for = host_arch.cross_arch_for
 
 
 def _requested_sanitizers() -> tuple[bool, bool]:
@@ -336,6 +352,8 @@ def unsignedOuter (x : UInt64) : UInt64 := unsignedInner x + 1
         self._assert_batch_sanitizer_receipts(result)
 
     def test_stage1b_narrow_abi_usize_bool_enums_joinpoints_and_divmod_zero(self):
+        host = host_arch_or_skip(self)
+        cross = cross_arch_for(host)
         engines = fuzzer.probe_engines()
         self.assertTrue(all(engines[k] for k in ("stock_lean_c", "lnir_eval", "c_abi_llvm")), engines)
         lean_bin = engines["lean_bin"]
@@ -488,7 +506,7 @@ def s1b_enum_branch (tag : UInt8) (x : UInt64) (y : UInt64) : UInt64 :=
 
             wire_path = tmpdir / "stage1b.lnir"
             subprocess.run(
-                [full_bin, "emit-lnir", "--wire", "--arch", HOST_ARCH, str(lean_path), "-o", str(wire_path)],
+                [full_bin, "emit-lnir", "--wire", "--arch", host, str(lean_path), "-o", str(wire_path)],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -501,7 +519,7 @@ def s1b_enum_branch (tag : UInt8) (x : UInt64) (y : UInt64) : UInt64 :=
             cases_jsonl = tmpdir / "cases.jsonl"
             cases_jsonl.write_text("\n".join(json.dumps(c) for c in cases) + "\n", encoding="utf-8")
             ev_out = subprocess.check_output(
-                [core_bin, "eval-lnir", "--lnir", str(wire_path), "--arch", HOST_ARCH, "--opt", "--cases-file", str(cases_jsonl)],
+                [core_bin, "eval-lnir", "--lnir", str(wire_path), "--arch", host, "--opt", "--cases-file", str(cases_jsonl)],
                 text=True,
             )
             ev_rows = json.loads(ev_out)
@@ -510,25 +528,25 @@ def s1b_enum_branch (tag : UInt8) (x : UInt64) (y : UInt64) : UInt64 :=
                 self.assertTrue(r["ok"], r)
             lnir_vals = [int(r["value_u64"]) for r in ev_rows]
 
-            ll_host = tmpdir / f"stage1b.{HOST_ARCH}.ll"
-            ll_cross = tmpdir / f"stage1b.{CROSS_ARCH}.ll"
+            ll_host = tmpdir / f"stage1b.{host}.ll"
+            ll_cross = tmpdir / f"stage1b.{cross}.ll"
             subprocess.run(
-                [core_bin, "compile-llvm", "--lnir", str(wire_path), "--arch", HOST_ARCH, "-o", str(ll_host)],
+                [core_bin, "compile-llvm", "--lnir", str(wire_path), "--arch", host, "-o", str(ll_host)],
                 check=True,
                 capture_output=True,
                 text=True,
             )
             subprocess.run(
-                [core_bin, "compile-llvm", "--lnir", str(wire_path), "--arch", CROSS_ARCH, "-o", str(ll_cross)],
+                [core_bin, "compile-llvm", "--lnir", str(wire_path), "--arch", cross, "-o", str(ll_cross)],
                 check=True,
                 capture_output=True,
                 text=True,
             )
             ir_host = ll_host.read_text(encoding="utf-8")
             ir_cross = ll_cross.read_text(encoding="utf-8")
-            for needle in S1B_IR_NEEDLES[HOST_ARCH]:
+            for needle in S1B_IR_NEEDLES[host]:
                 self.assertIn(needle, ir_host)
-            for needle in S1B_IR_NEEDLES[CROSS_ARCH]:
+            for needle in S1B_IR_NEEDLES[cross]:
                 self.assertIn(needle, ir_cross)
 
             c_lines = [
@@ -724,6 +742,8 @@ def crcStep2 (crc : UInt32) (b : UInt8) : UInt32 :=
         self._assert_batch_sanitizer_receipts(result)
 
     def test_wasm32_usize_semantics_and_gpu_usize_rejection(self):
+        host = host_arch_or_skip(self)
+        cross = cross_arch_for(host)
         engines = fuzzer.probe_engines()
         core_bin = engines["core_bin"]
         full_bin = engines["full_bin"]
@@ -746,7 +766,7 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
                 text=True,
             )
             subprocess.run(
-                [full_bin, "emit-lnir", "--wire", "--arch", HOST_ARCH, str(src_path), "-o", str(native_wire)],
+                [full_bin, "emit-lnir", "--wire", "--arch", host, str(src_path), "-o", str(native_wire)],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -777,7 +797,7 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
                         "--lnir",
                         str(native_wire),
                         "--arch",
-                        HOST_ARCH,
+                        host,
                         "--batch-json",
                         "--args",
                         "wasm_usize_probe:4294967295,33",
@@ -793,7 +813,7 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
             # USize is 64-bit on both CPU arches, so the expectation is identical.
             cross_wire = tmpdir / "cross.lnir"
             subprocess.run(
-                [full_bin, "emit-lnir", "--wire", "--arch", CROSS_ARCH, str(src_path), "-o", str(cross_wire)],
+                [full_bin, "emit-lnir", "--wire", "--arch", cross, str(src_path), "-o", str(cross_wire)],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -806,7 +826,7 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
                         "--lnir",
                         str(cross_wire),
                         "--arch",
-                        CROSS_ARCH,
+                        cross,
                         "--batch-json",
                         "--args",
                         "wasm_usize_probe:4294967295,33",
@@ -922,7 +942,8 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
             subprocess.run([full_bin, "emit-lnir", "--wire", str(enum256_src), "-o", str(enum256_wire)], check=True, capture_output=True, text=True)
             # Text-only emission: check BOTH CPU arches on any host, so the x86 CI
             # job exercises the arm64 needle and an arm64 host the x86_64 one.
-            for e_arch in (HOST_ARCH, CROSS_ARCH):
+            host = host_arch_or_skip(self)
+            for e_arch in (host, cross_arch_for(host)):
                 e_ll = tmpdir / f"enum256.{e_arch}.ll"
                 subprocess.run([core_bin, "compile-llvm", "--lnir", str(enum256_wire), "--arch", e_arch, "-o", str(e_ll)], check=True, capture_output=True, text=True)
                 self.assertIn(ENUM256_IR_NEEDLE[e_arch], e_ll.read_text(encoding="utf-8"))
@@ -1100,6 +1121,7 @@ run_meta do
                 self.assertTrue((spool_mode / "events.jsonl").is_file(), f"{mode_flag} failed to emit events.jsonl")
 
     def test_validate_ingested_module_deduplicates_diamond_and_duplicate_call_edges(self):
+        host = host_arch_or_skip(self)
         engines = fuzzer.probe_engines()
         lean_src = """def k (x : UInt64) : UInt64 := (x ^^^ 0x9e3779b97f4a7c15) + 1
 
@@ -1127,7 +1149,7 @@ def f (x : UInt64) : UInt64 :=
             src.write_text(lean_src, encoding="utf-8")
             wire = tmp / "diamond.lnir"
             res = subprocess.run(
-                [engines["full_bin"], "emit-lnir", "--wire", "--arch", HOST_ARCH, str(src), "-o", str(wire)],
+                [engines["full_bin"], "emit-lnir", "--wire", "--arch", host, str(src), "-o", str(wire)],
                 capture_output=True, text=True,
             )
             self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
@@ -1140,7 +1162,7 @@ def f (x : UInt64) : UInt64 :=
                 encoding="utf-8",
             )
             ev_res = subprocess.run(
-                [engines["core_bin"], "eval-lnir", "--lnir", str(wire), "--arch", HOST_ARCH, "--opt", "--cases-file", str(cases_jsonl)],
+                [engines["core_bin"], "eval-lnir", "--lnir", str(wire), "--arch", host, "--opt", "--cases-file", str(cases_jsonl)],
                 capture_output=True, text=True,
             )
             self.assertEqual(ev_res.returncode, 0, ev_res.stdout + ev_res.stderr)
