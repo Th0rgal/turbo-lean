@@ -3211,7 +3211,13 @@ use super::*;
             ctx.worker_lean_path,
             format!("{}:{}", snap.dir.display(), tc.display())
         );
-        assert!(snap.dir.starts_with(closure_snapshot_root()));
+        // `ensure_private_dir` returns the canonicalized root, so a snapshot dir is
+        // always a canonical path, while `closure_snapshot_root()` is the raw
+        // env/HOME derivation: on a host whose HOME is a symlink the two differ, so
+        // the containment check canonicalizes the root the same way production does.
+        assert!(snap.dir.starts_with(
+            fs::canonicalize(closure_snapshot_root()).expect("snapshot root exists")
+        ));
         use std::os::unix::fs::MetadataExt;
         let (src, copy) = (
             fs::metadata(lib2.join("Priv.olean")).unwrap(),
