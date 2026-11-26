@@ -22,7 +22,7 @@
   },
   "trials": 5,
   "settings": {
-    "TURBO_LEAN_GIT": "/usr/bin/git",
+    "TURBO_LEAN_GIT": "<sha256:106aa8849497>",
     "TURBO_LEAN_ALLOWED_CSIMP": "*",
     "TURBO_LEAN_ALLOWED_UNSAFE": "*",
     "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY": "*",
@@ -32,8 +32,7 @@
     "TURBO_LEAN_NO_REMOTE_TELEMETRY": null,
     "TURBO_LEAN_TELEMETRY": null,
     "TURBO_LEAN_DAEMON_IDLE_SECS": null,
-    "git_version": "git version 2.50.1",
-    "scratch_root": "/tmp/m1-bench-49lx9a7f"
+    "git_version": "git version 2.50.1"
   },
   "workloads": {
     "batteries_list_lemmas_top": {
@@ -1774,9 +1773,16 @@
     }
   },
   "turbo_lean_dirty": false,
-  "turbo_lean_repo": "/mnt/agent2-ram/wt/turbo-lean-cbe41387/agent-a69bd15494eec4221",
+  "path_scrub": {
+    "raw_results_sha256": "e0af122856bb0918d620476b2478cbd93fe500ac11d92d781e81f2216e71c28b",
+    "raw_results_commit": "8d53e221",
+    "removed": ["turbo_lean_repo", "settings.scratch_root"],
+    "rewritten": ["turbo_lean_binary.path, relative to its repository",
+                  "settings.TURBO_LEAN_GIT, as the digest of its path"],
+    "note": "Host paths removed after the run, into the form scripts/bench_check_loop.py now writes; no measured value changed. The raw file is this path at raw_results_commit."
+  },
   "turbo_lean_binary": {
-    "path": "/mnt/agent2-ram/wt/turbo-lean-cbe41387/agent-a69bd15494eec4221/target-g2a/release/turbo-lean",
+    "path": "target-g2a/release/turbo-lean",
     "sha256": "e4fccb2515a3ac08ffb1b7cb3d01f4c63c338d66761e3fb8835598d8af37ad2e"
   },
   "workload_revs": {
