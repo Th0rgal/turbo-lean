@@ -1041,8 +1041,10 @@ def callNestedPair (x : UInt64) : UInt64 :=
     def test_unsupported_lcnf_paths_fail_closed(self):
         # L1 r1 (review a094d3a9 F2): ported from the deleted BridgeM wrappers to the
         # proved pure core (lowerRealLCNFCode / lowerLitValuePure / lowerImpureLetValuePure);
-        # the pure-only cases (recursive local function, higher-order fvar call, constructor
-        # payload pattern) went with the deleted pure lowering.
+        # the pure-only cases (recursive local function, constructor payload pattern) went
+        # with the deleted pure lowering. L1 r2 (review 47512851 F3): the higher-order fvar
+        # case is NOT pure-only — LetValue .impure keeps `.fvar id args` — so it is ported
+        # to lowerImpureLetValuePure below.
         source = '''import LeanNative.IR.Bridge
 open Lean LeanNative.IR LeanNative.IR.RealLCNFBridge Lean.Compiler.LCNF
 run_meta do
@@ -1061,6 +1063,8 @@ run_meta do
       (lowerRealLCNFCode 32 ctx stX (.jp (.mk j `join #[] ty (.return x)) (.jmp j #[.fvar x]))).map fun _ => ()),
      ("constructor tag mutation",
       (lowerRealLCNFCode 32 ctx stX (.setTag x 1 (.return x))).map fun _ => ()),
+     ("higher-order fvar call",
+      (lowerImpureLetValuePure ctx stX (.fvar x #[.fvar x]) .i64).map fun _ => ()),
      ("unsupported string literal",
       (lowerLitValuePure (.str "abc") .i64 .x86_64).map fun _ => ()),
      ("Unsupported heap reset",
