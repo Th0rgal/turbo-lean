@@ -595,15 +595,22 @@ pub(super) fn extract_local_def_unfoldings(clean_src: &str) -> Vec<LocalDefUnfol
 }
 
 /// Like [`extract_local_def_unfoldings`], but also returns each captured `def`/`abbrev`
-/// command's original one-line source as `(qualified name, command text, had stripped
-/// modifiers or attributes)`, for the self-contained kernel witness fallback probes. A
-/// def whose `partial`/`unsafe`/`noncomputable`/`@[...]` prefix was consumed cannot be
-/// re-emitted faithfully, and the flag lets the probe builder refuse it.
+/// command's original one-line source as `(qualified name, command text, unsafe to
+/// re-emit)`, plus the short names of definitions the extractor had to SKIP (`by`/`do`/
+/// `where`/signature-only bodies), for the self-contained kernel witness fallback
+/// probes. A def is unsafe to re-emit when its `partial`/`unsafe`/`noncomputable`/
+/// `@[...]` prefix was consumed, or when gathering stopped at a blank line that an
+/// indented continuation follows (the gathered text may truncate the real body).
 pub(super) fn extract_local_def_unfoldings_and_sources(
     clean_src: &str,
-) -> (Vec<LocalDefUnfolding>, Vec<(String, String, bool)>) {
+) -> (
+    Vec<LocalDefUnfolding>,
+    Vec<(String, String, bool)>,
+    Vec<String>,
+) {
     let mut defs = Vec::new();
     let mut def_srcs: Vec<(String, String, bool)> = Vec::new();
+    let mut skipped_def_names: Vec<String> = Vec::new();
     let src = strip_audit_comments(clean_src);
     let bytes = src.as_bytes();
     let mut scope_stack: Vec<crate::splitter::ScopeFrame> = Vec::new();
@@ -747,6 +754,7 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
             .map(|off| kw_end + off)
             .unwrap_or(src.len());
         let mut combined = src[kw_end..first_line_end].trim().to_string();
+        let mut truncation_suspect = false;
         line_no = cur_ln + usize::from(first_line_end < src.len());
         let mut next_ls = if first_line_end < src.len() {
             first_line_end + 1
@@ -768,6 +776,21 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
                 } else {
                     src.len()
                 };
+                // A blank line ends gathering; an indented non-empty line after it is
+                // continuation-shaped, so the gathered text may truncate the real body.
+                let mut peek = next_ls;
+                while peek < src.len() {
+                    let pe = src[peek..]
+                        .find('\n')
+                        .map(|o| peek + o)
+                        .unwrap_or(src.len());
+                    let pt = &src[peek..pe];
+                    if !pt.trim().is_empty() {
+                        truncation_suspect = pt.starts_with(' ') || pt.starts_with('\t');
+                        break;
+                    }
+                    peek = pe + 1;
+                }
                 break;
             }
             if matches!(next_trim, "end" | "section" | "mutual")
@@ -819,10 +842,30 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
         }
         line_start = next_ls;
 
+        let first_decl_short_name = |s: &str| -> String {
+            let mut end = 0;
+            for (ci, c) in s.char_indices() {
+                if is_ident_continue(c) || c == '.' || c == '«' || c == '»' {
+                    end = ci + c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let raw = s[..end].trim();
+            raw.rsplit('.').next().unwrap_or(raw).to_string()
+        };
         let Some((sig, body_raw)) = split_at_first_top_level_assign(&combined) else {
+            let n = first_decl_short_name(combined.trim_start());
+            if !n.is_empty() {
+                skipped_def_names.push(n);
+            }
             continue;
         };
         if sig.ends_with(" where") || sig.contains(" where ") {
+            let n = first_decl_short_name(sig.trim_start());
+            if !n.is_empty() {
+                skipped_def_names.push(n);
+            }
             continue;
         }
         let body = body_raw.trim();
@@ -832,6 +875,10 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
             || body.starts_with("Id.run")
             || body.ends_with(" do")
         {
+            let n = first_decl_short_name(sig.trim_start());
+            if !n.is_empty() {
+                skipped_def_names.push(n);
+            }
             continue;
         }
         let mut name_end = 0;
@@ -916,10 +963,14 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
                 i += 1;
             }
         }
-        def_srcs.push((def_name.clone(), format!("{kw} {combined}"), had_modifiers));
+        def_srcs.push((
+            def_name.clone(),
+            format!("{kw} {combined}"),
+            had_modifiers || truncation_suspect,
+        ));
         defs.push((def_name, params, body.to_string(), type_dependencies));
     }
-    (defs, def_srcs)
+    (defs, def_srcs, skipped_def_names)
 }
 
 fn replace_ident_in_interpolated_string(lit: &str, ident: &str, replacement: &str) -> String {
@@ -3605,6 +3656,14 @@ pub(super) fn kernel_witness_mode_from_env() -> KernelWitnessMode {
 const KERNEL_WITNESS_HARNESS_BEGIN: &str = "-- TURBO_SPEC_AUDIT_KERNEL_WITNESS_HARNESS_BEGIN";
 const KERNEL_WITNESS_HARNESS_END: &str = "-- TURBO_SPEC_AUDIT_KERNEL_WITNESS_HARNESS_END";
 
+/// Appended after every verbatim probe's generated block. Its `#check` info output is
+/// the positive evidence that Lean elaborated the appended suffix at all: a failed
+/// header, an unterminated literal swallowing the suffix, or a `#exit` inside the
+/// audited block suppresses it, while per-command error recovery still emits it when
+/// individual witness theorems fail.
+const KERNEL_WITNESS_SENTINEL_NAME: &str = "_turbo_audit_kw_probe_sentinel";
+const KERNEL_WITNESS_SENTINEL_MARKER: &str = "_turbo_audit_kw_probe_sentinel : Nat";
+
 /// The Lean-side kernel witness replay harness, inlined byte-identically from
 /// `lean/TurboLean/PolicyGates.lean` (the single source of truth) into every probe.
 pub(super) fn audit_kernel_witness_harness_block() -> Option<&'static str> {
@@ -3784,7 +3843,7 @@ pub(super) fn build_kernel_witness_probe_src(
         .join("\n");
     let (theorems, gates, names) = kernel_witness_probe_theorems(candidates, include_gates)?;
     let probe = format!(
-        "{audited_src}\n\n-- generated by `turbo-lean audit-spec --kernel-witness`; never written into the audited tree\n{open_lines}\nnamespace _TurboAuditKernelWitnessProbe\n{harness}\nend _TurboAuditKernelWitnessProbe\n\n{theorems}{gates}",
+        "{audited_src}\n\n-- generated by `turbo-lean audit-spec --kernel-witness`; never written into the audited tree\n{open_lines}\nnamespace _TurboAuditKernelWitnessProbe\n{harness}\nend _TurboAuditKernelWitnessProbe\n\n{theorems}{gates}\ndef {KERNEL_WITNESS_SENTINEL_NAME} : Nat := 2026\n#check {KERNEL_WITNESS_SENTINEL_NAME}\n",
     );
     Some((probe, names))
 }
@@ -3840,6 +3899,7 @@ fn kernel_witness_probe_theorems(
 /// candidate text mentions, not the audited file's proofs or imports.
 pub(super) fn build_kernel_witness_minimal_probe_src(
     local_def_srcs: &[(String, String, bool)],
+    skipped_def_names: &[String],
     candidates: &[(usize, SpecKernelWitnessCandidate)],
     include_gates: bool,
 ) -> Option<(String, Vec<String>)> {
@@ -3875,6 +3935,39 @@ pub(super) fn build_kernel_witness_minimal_probe_src(
         if !grew {
             break;
         }
+    }
+    // Two extracted defs sharing a short name (`A.f` and `B.f`) cannot both re-emit
+    // into the probe's flat namespace, and emitting either one silently rebinds the
+    // candidates' short-name references: refuse the reconstructed context outright.
+    if local_def_srcs.iter().zip(&included).any(|(entry, inc)| {
+        *inc && {
+            let short = entry
+                .0
+                .rsplit_once('.')
+                .map_or(entry.0.as_str(), |(_, s)| s);
+            local_def_srcs
+                .iter()
+                .filter(|other| {
+                    other
+                        .0
+                        .rsplit_once('.')
+                        .map_or(other.0.as_str(), |(_, s)| s)
+                        == short
+                })
+                .count()
+                > 1
+        }
+    }) {
+        return None;
+    }
+    // A def the extractor skipped (a `by`/`do`/`where`/signature-only body) cannot be
+    // re-emitted; when the candidate texts or an included def reference its short
+    // name, a reconstructed context would mis-resolve or silently drop it.
+    if skipped_def_names.iter().any(|short| {
+        seed.iter()
+            .any(|txt| replace_ident_boundary(txt, short, "__REF__") != *txt)
+    }) {
+        return None;
     }
     // A def whose modifiers or attributes were stripped by extraction would be
     // re-emitted with different semantics (a `partial` def becomes transparent to
@@ -3982,9 +4075,7 @@ pub(super) fn run_kernel_witness_probe(
     // Memoize certified probes only when self-contained: a probe whose embedded audited
     // source imports modules can change meaning when the imported content changes,
     // without a byte of the probe text changing.
-    let standalone = !probe_src
-        .lines()
-        .any(|l| l.trim_start().starts_with("import "));
+    let standalone = lean_header_import_lines(probe_src).is_empty();
     let memo_key = {
         let mut h = blake3::Hasher::new();
         h.update(b"audit-spec-kernel-witness-probe-v2\0");
@@ -4061,13 +4152,16 @@ pub(super) fn run_kernel_witness_probe(
 }
 
 /// Line numbers of `error:` diagnostics in a Lean compile log
-/// (`<path>:<line>:<col>: error: ...`).
+/// (`<path>:<line>:<col>: error: ...`), counting only the probe module's own file
+/// (its scratch name carries `TurboAuditedShard`), never a diagnostic some other file
+/// or a quoted message happens to print.
 fn lean_error_lines(diagnostics: &str) -> Vec<usize> {
     let mut out = Vec::new();
     for line in diagnostics.lines() {
         let parts: Vec<&str> = line.split(':').collect();
         for i in 0..parts.len().saturating_sub(3) {
-            if parts[i + 1].trim().parse::<usize>().is_ok()
+            if parts[i].contains("TurboAuditedShard")
+                && parts[i + 1].trim().parse::<usize>().is_ok()
                 && parts[i + 2].trim().parse::<usize>().is_ok()
                 && parts[i + 3].trim_start().starts_with("error")
             {
@@ -4081,6 +4175,26 @@ fn lean_error_lines(diagnostics: &str) -> Vec<usize> {
     out
 }
 
+/// 1-based line numbers of header import commands, matching the module-system forms
+/// the splitter recognizes (`import`, `public import`, `meta import`,
+/// `public meta import`) plus a `module` header line.
+fn lean_header_import_lines(src: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (i, line) in src.lines().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("import ")
+            || t.starts_with("public import ")
+            || t.starts_with("meta import ")
+            || t.starts_with("public meta import ")
+            || t == "module"
+            || t.starts_with("module ")
+        {
+            out.push(i + 1);
+        }
+    }
+    out
+}
+
 /// Commands in the audited source that change how appended or reconstructed text
 /// elaborates (instances, notation, macros, custom syntax and elaborators, attribute
 /// applications): a self-contained probe cannot reproduce them, so their presence
@@ -4089,7 +4203,7 @@ fn audited_src_declares_probe_hostile_commands(clean_src: &str) -> bool {
     clean_src.lines().any(|line| {
         let mut t = line.trim_start();
         loop {
-            let mut advanced = false;
+            let before = t;
             for m in [
                 "local ",
                 "scoped ",
@@ -4101,15 +4215,51 @@ fn audited_src_declares_probe_hostile_commands(clean_src: &str) -> bool {
             ] {
                 if let Some(rest) = t.strip_prefix(m) {
                     t = rest.trim_start();
-                    advanced = true;
                 }
             }
-            if !advanced {
+            // An `@[...]` group: an instance-making attribute is hostile by itself,
+            // and an unterminated group hides its content, so it fails closed.
+            if let Some(rest) = t.strip_prefix("@[") {
+                let mut depth = 1usize;
+                let mut close = None;
+                for (i, c) in rest.char_indices() {
+                    match c {
+                        '[' => depth += 1,
+                        ']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(end) = close else {
+                    return true;
+                };
+                if rest[..end].contains("instance") {
+                    return true;
+                }
+                t = rest[end + 1..].trim_start();
+                continue;
+            }
+            // `open … in` / `set_option … in` prefixes reach the command they modify.
+            for p in ["open ", "set_option "] {
+                if t.starts_with(p) {
+                    if let Some(ix) = t.find(" in ") {
+                        t = t[ix + 4..].trim_start();
+                    }
+                    break;
+                }
+            }
+            if t == before {
                 break;
             }
         }
         [
             "instance",
+            "notation3",
             "notation",
             "macro_rules",
             "macro",
@@ -4122,6 +4272,7 @@ fn audited_src_declares_probe_hostile_commands(clean_src: &str) -> bool {
             "prefix",
             "postfix",
             "attribute",
+            "deriving instance",
         ]
         .iter()
         .any(|kw| {
@@ -4656,7 +4807,13 @@ fn audit_spec_file_or_source_with_policy_inner(
         policy.effective_forbidden_for_path(file);
     let mut cache_target_path: Option<PathBuf> = None;
     let mut preloaded_file_src: Option<String> = None;
-    let mut preloaded_external_local_defs: Option<(Vec<LocalDefUnfolding>, Vec<String>)> = None;
+    #[allow(clippy::type_complexity)]
+    let mut preloaded_external_local_defs: Option<(
+        Vec<LocalDefUnfolding>,
+        Vec<String>,
+        Vec<(String, String, bool)>,
+        Vec<String>,
+    )> = None;
     if inline_src.is_none()
         && file.is_file()
         && (!expand_umbrella_subdir || !file.with_extension("").is_dir())
@@ -4664,12 +4821,17 @@ fn audit_spec_file_or_source_with_policy_inner(
         if let Ok(file_bytes) = fs::read(file) {
             if let Ok(file_src) = String::from_utf8(file_bytes.clone()) {
                 let clean_file_src = strip_audit_comments(&file_src);
-                let mut local_defs = extract_local_def_unfoldings(&clean_file_src);
+                let (mut local_defs, mut local_def_srcs, mut skipped_defs) =
+                    extract_local_def_unfoldings_and_sources(&clean_file_src);
                 let mut open_ns = extract_opened_namespaces(&clean_file_src);
                 for p in collect_external_local_def_lean_paths(file) {
                     if let Ok(sib_src) = fs::read_to_string(&p) {
                         let clean_sib = strip_audit_comments(&sib_src);
-                        local_defs.extend(extract_local_def_unfoldings(&clean_sib));
+                        let (sib_defs, sib_srcs, sib_skipped) =
+                            extract_local_def_unfoldings_and_sources(&clean_sib);
+                        local_defs.extend(sib_defs);
+                        local_def_srcs.extend(sib_srcs);
+                        skipped_defs.extend(sib_skipped);
                         for ons in extract_opened_namespaces(&clean_sib) {
                             if !open_ns.contains(&ons) {
                                 open_ns.push(ons);
@@ -4733,7 +4895,8 @@ fn audit_spec_file_or_source_with_policy_inner(
                     }
                 }
                 preloaded_file_src = Some(file_src);
-                preloaded_external_local_defs = Some((local_defs, open_ns));
+                preloaded_external_local_defs =
+                    Some((local_defs, open_ns, local_def_srcs, skipped_defs));
             }
         }
     }
@@ -4844,17 +5007,26 @@ fn audit_spec_file_or_source_with_policy_inner(
                 forbidden_scope_decls.push(v);
             }
         }
-        let (local_defs, open_namespaces) =
+        // A2 (#367): one extraction serves the eval unfoldings AND the self-contained
+        // kernel witness fallback probes (original `def`/`abbrev` command sources plus
+        // the names of defs the extractor had to skip), sibling external defs included
+        // so cross-file references resolve.
+        let (local_defs, open_namespaces, kw_local_def_srcs, kw_skipped_defs) =
             if let Some(preloaded) = preloaded_external_local_defs.take() {
                 preloaded
             } else {
-                let mut defs = extract_local_def_unfoldings(&clean_src);
+                let (mut defs, mut def_srcs, mut skipped) =
+                    extract_local_def_unfoldings_and_sources(&clean_src);
                 let mut opens = extract_opened_namespaces(&clean_src);
                 if inline_src.is_none() && src_path.is_file() {
                     for p in collect_external_local_def_lean_paths(src_path) {
                         if let Ok(sib_src) = fs::read_to_string(&p) {
                             let clean_sib = strip_audit_comments(&sib_src);
-                            defs.extend(extract_local_def_unfoldings(&clean_sib));
+                            let (sib_defs, sib_srcs, sib_skipped) =
+                                extract_local_def_unfoldings_and_sources(&clean_sib);
+                            defs.extend(sib_defs);
+                            def_srcs.extend(sib_srcs);
+                            skipped.extend(sib_skipped);
                             for ons in extract_opened_namespaces(&clean_sib) {
                                 if !opens.contains(&ons) {
                                     opens.push(ons);
@@ -4863,29 +5035,7 @@ fn audit_spec_file_or_source_with_policy_inner(
                         }
                     }
                 }
-                (defs, opens)
-            };
-        // A2 (#367): original `def`/`abbrev` command sources for the self-contained
-        // kernel witness fallback probes (sibling external defs included so cross-file
-        // references resolve).
-        let kw_local_def_srcs: Vec<(String, String, bool)> =
-            if kernel_witness == KernelWitnessMode::Replay {
-                let mut srcs = extract_local_def_unfoldings_and_sources(&clean_src).1;
-                if inline_src.is_none() && src_path.is_file() {
-                    for p in collect_external_local_def_lean_paths(src_path) {
-                        if let Ok(sib_src) = fs::read_to_string(&p) {
-                            srcs.extend(
-                                extract_local_def_unfoldings_and_sources(&strip_audit_comments(
-                                    &sib_src,
-                                ))
-                                .1,
-                            );
-                        }
-                    }
-                }
-                srcs
-            } else {
-                Vec::new()
+                (defs, opens, def_srcs, skipped)
             };
 
         for d in extract_decls_fast(src, decl_filter) {
@@ -4953,34 +5103,48 @@ fn audit_spec_file_or_source_with_policy_inner(
         if kernel_witness == KernelWitnessMode::Replay && !kw_src_candidates.is_empty() {
             let clean_for_ns = strip_audit_comments(src);
             let audited_line_count = src.lines().count();
+            let header_import_lines = lean_header_import_lines(src);
             let minimal_probe_allowed_for_file =
                 !audited_src_declares_probe_hostile_commands(&clean_for_ns);
             // Per-candidate outcome: (certified, with_gates, self_contained).
             let mut cert: Vec<(bool, bool, bool)> =
                 vec![(false, false, false); kw_src_candidates.len()];
-            // `Ok(Some((with_gates, self_contained)))` certifies every candidate in
-            // the set; `Ok(None)` means every admissible probe shape was rejected.
-            // The self-contained shapes run only when every verbatim rejection's
-            // errors lie inside the embedded audited block (the audited source itself
-            // fails to re-elaborate): a rejection in the appended theorems, or one
-            // with no located error at all (a `sorry` in the audited proofs), means
-            // the kernel has spoken about this context, and a weaker reconstructed
-            // context must never overrule it.
-            let try_candidate_set = |cands: &[(usize, SpecKernelWitnessCandidate)]|
-             -> Result<Option<(bool, bool)>, String> {
+            // `Ok((Some((with_gates, self_contained)), _))` certifies every candidate
+            // in the set; `Ok((None, block_verdict))` means every admissible shape was
+            // rejected, with the verbatim block verdict exported so per-candidate
+            // retries skip shapes that cannot change. The self-contained shapes demand
+            // POSITIVE evidence: the verbatim probe's sentinel output proves Lean
+            // elaborated the appended block at all (a failed header, a literal that
+            // swallows the suffix or a `#exit` suppresses it), and every located
+            // probe-file error must lie inside the embedded audited block. A pure
+            // header-import failure is no kernel verdict at all: it aborts replay as
+            // `imports_unresolved` rather than letting a reconstructed context vote on
+            // semantics the unresolved imports could change.
+            // `cands: &[(usize, SpecKernelWitnessCandidate)]`, pinned by the builder
+            // calls below; `prior_block_broken` carries the batch verdict into
+            // per-candidate retries.
+            let try_candidate_set = |cands, prior_block_broken: Option<bool>| {
                 let mut rejected: Vec<String> = Vec::new();
-                let mut audited_block_broken: Option<bool> = None;
-                for (minimal, gated) in
-                    [(false, true), (false, false), (true, true), (true, false)]
+                let mut audited_block_broken: Option<bool> = prior_block_broken;
+                for (minimal, gated) in [(false, true), (false, false), (true, true), (true, false)]
                 {
                     if minimal
-                        && (!minimal_probe_allowed_for_file
-                            || audited_block_broken != Some(true))
+                        && (!minimal_probe_allowed_for_file || audited_block_broken != Some(true))
                     {
                         continue;
                     }
+                    if !minimal && prior_block_broken == Some(true) {
+                        // The batch already proved the audited block itself fails to
+                        // elaborate; that holds for every candidate subset.
+                        continue;
+                    }
                     let built = if minimal {
-                        build_kernel_witness_minimal_probe_src(&kw_local_def_srcs, cands, gated)
+                        build_kernel_witness_minimal_probe_src(
+                            &kw_local_def_srcs,
+                            &kw_skipped_defs,
+                            cands,
+                            gated,
+                        )
                     } else {
                         build_kernel_witness_probe_src(src, &clean_for_ns, cands, gated)
                     };
@@ -4994,12 +5158,21 @@ fn audit_spec_file_or_source_with_policy_inner(
                     }
                     match run_kernel_witness_probe(src_path, &probe, &names) {
                         Ok(KernelWitnessProbeRun::Certified) => {
-                            return Ok(Some((gated, minimal)));
+                            return Ok((Some((gated, minimal)), audited_block_broken));
                         }
                         Ok(KernelWitnessProbeRun::Rejected { diagnostics }) => {
                             if !minimal {
                                 let errs = lean_error_lines(&diagnostics);
-                                let in_block = !errs.is_empty()
+                                let suffix_elaborated =
+                                    diagnostics.contains(KERNEL_WITNESS_SENTINEL_MARKER);
+                                if !suffix_elaborated
+                                    && !errs.is_empty()
+                                    && errs.iter().all(|l| header_import_lines.contains(l))
+                                {
+                                    return Err("imports_unresolved".to_string());
+                                }
+                                let in_block = suffix_elaborated
+                                    && !errs.is_empty()
                                     && errs.iter().all(|l| *l <= audited_line_count);
                                 audited_block_broken =
                                     Some(audited_block_broken.unwrap_or(true) && in_block);
@@ -5009,31 +5182,39 @@ fn audit_spec_file_or_source_with_policy_inner(
                         Err(reason) => return Err(reason),
                     }
                 }
-                Ok(None)
+                Ok((None, audited_block_broken))
             };
             if audit_kernel_witness_harness_block().is_none() {
                 kw_unavailable.get_or_insert_with(|| "harness_block_missing".to_string());
             } else {
-                match try_candidate_set(&kw_src_candidates) {
+                // A batch timeout says nothing a smaller probe cannot still answer;
+                // every other unavailability (toolchain, store, runner, unresolved
+                // imports) holds for candidate subsets too.
+                let mut per_candidate_seed: Option<Option<bool>> = None;
+                match try_candidate_set(&kw_src_candidates, None) {
+                    Err(reason) if reason.contains("timed out") && kw_src_candidates.len() > 1 => {
+                        per_candidate_seed = Some(None);
+                    }
                     Err(reason) => {
                         kw_unavailable.get_or_insert(reason);
                     }
-                    Ok(Some((with_gates, self_contained))) => {
+                    Ok((Some((with_gates, self_contained)), _)) => {
                         cert.fill((true, with_gates, self_contained));
                     }
-                    Ok(None) if kw_src_candidates.len() == 1 => kw_rejected_probes += 1,
-                    Ok(None) => {
-                        for (i, entry) in kw_src_candidates.iter().enumerate() {
-                            match try_candidate_set(std::slice::from_ref(entry)) {
-                                Err(reason) => {
-                                    kw_unavailable.get_or_insert(reason);
-                                    break;
-                                }
-                                Ok(Some((with_gates, self_contained))) => {
-                                    cert[i] = (true, with_gates, self_contained);
-                                }
-                                Ok(None) => kw_rejected_probes += 1,
+                    Ok((None, _)) if kw_src_candidates.len() == 1 => kw_rejected_probes += 1,
+                    Ok((None, batch_verdict)) => per_candidate_seed = Some(batch_verdict),
+                }
+                if let Some(seed) = per_candidate_seed {
+                    for (i, entry) in kw_src_candidates.iter().enumerate() {
+                        match try_candidate_set(std::slice::from_ref(entry), seed) {
+                            Err(reason) => {
+                                kw_unavailable.get_or_insert(reason);
+                                break;
                             }
+                            Ok((Some((with_gates, self_contained)), _)) => {
+                                cert[i] = (true, with_gates, self_contained);
+                            }
+                            Ok((None, _)) => kw_rejected_probes += 1,
                         }
                     }
                 }
@@ -5136,7 +5317,13 @@ fn audit_spec_file_or_source_with_policy_inner(
         KernelWitnessMode::Off => "off".to_string(),
         KernelWitnessMode::Replay => {
             if let Some(reason) = &kw_unavailable {
-                format!("unavailable({reason})")
+                if kw_any_replayed {
+                    // Candidates certified before replay became unavailable keep their
+                    // labels; say both rather than contradict them.
+                    format!("replayed+unavailable({reason})")
+                } else {
+                    format!("unavailable({reason})")
+                }
             } else if kw_any_replayed {
                 "replayed".to_string()
             } else if kw_rejected_probes > 0 {
@@ -6470,8 +6657,9 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
                 upgrade_label: true,
             }),
         };
-        let (probe, names) = build_kernel_witness_minimal_probe_src(&def_srcs, &[(0, cand)], true)
-            .expect("a candidate with a concrete negative side must build a probe");
+        let (probe, names) =
+            build_kernel_witness_minimal_probe_src(&def_srcs, &[], &[(0, cand)], true)
+                .expect("a candidate with a concrete negative side must build a probe");
         assert!(probe.contains("def chkDep"), "{probe}");
         assert!(
             probe.contains("def chk (p q : Bool)"),
@@ -6506,7 +6694,7 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
             }),
         };
         assert!(
-            build_kernel_witness_minimal_probe_src(&def_srcs, &[(0, cand)], true).is_none(),
+            build_kernel_witness_minimal_probe_src(&def_srcs, &[], &[(0, cand)], true).is_none(),
             "re-emitting a stripped-modifier def would change its semantics"
         );
     }
@@ -6540,13 +6728,123 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
         }
     }
 
-    /// A2 r2 (#367): error positions parse from Lean diagnostics so the probe ladder
-    /// can tell an audited-block failure from a rejected witness theorem.
+    /// A2 r3 (#367): a def the extractor skipped (a `by`/`do`/`where` body) that the
+    /// candidate texts reference disables the self-contained probe outright.
+    #[test]
+    fn audit_spec_kernel_witness_minimal_probe_refuses_skipped_def_references() {
+        let cand = SpecKernelWitnessCandidate {
+            pos: None,
+            neg: Some(KernelWitnessSide {
+                lets: vec!["let n : Nat := 0x0".to_string()],
+                body: "tricky n = 0".to_string(),
+                assign_desc: "n=0".to_string(),
+                upgrade_label: true,
+            }),
+        };
+        assert!(
+            build_kernel_witness_minimal_probe_src(
+                &[],
+                &["tricky".to_string()],
+                &[(0, cand)],
+                true
+            )
+            .is_none(),
+            "a reference to an unextractable def must refuse the reconstructed context"
+        );
+    }
+
+    /// A2 r3 (#367): two extracted defs sharing a short name (`A.f` and `B.f`) flatten
+    /// to one `_root_` name in the reconstructed probe, so re-emitting either silently
+    /// rebinds the candidates' short-name references: the fallback is refused.
+    #[test]
+    fn audit_spec_kernel_witness_minimal_probe_refuses_short_name_collisions() {
+        let cand = || SpecKernelWitnessCandidate {
+            pos: None,
+            neg: Some(KernelWitnessSide {
+                lets: vec!["let n : Nat := 0x0".to_string()],
+                body: "f n = 0".to_string(),
+                assign_desc: "n=0".to_string(),
+                upgrade_label: true,
+            }),
+        };
+        let colliding = vec![
+            (
+                "A.f".to_string(),
+                "def f (n : Nat) : Nat := n".to_string(),
+                false,
+            ),
+            (
+                "B.f".to_string(),
+                "def f (n : Nat) : Nat := n + 1".to_string(),
+                false,
+            ),
+        ];
+        assert!(
+            build_kernel_witness_minimal_probe_src(&colliding, &[], &[(0, cand())], true).is_none(),
+            "a short name carried by two extracted defs must refuse the fallback"
+        );
+        let lone = vec![(
+            "A.f".to_string(),
+            "def f (n : Nat) : Nat := n".to_string(),
+            false,
+        )];
+        assert!(
+            build_kernel_witness_minimal_probe_src(&lone, &[], &[(0, cand())], true).is_some(),
+            "one unambiguous def must still build the probe"
+        );
+    }
+
+    /// A2 r3 (#367): attribute groups and `open`/`set_option … in` prefixes reach the
+    /// command they modify, instance-making attributes are hostile by themselves, and
+    /// an unterminated attribute group fails closed.
+    #[test]
+    fn audit_spec_kernel_witness_hostile_scan_prefixed_forms() {
+        for src in [
+            "@[reducible] instance : LE Nat := ⟨fun _ _ => False⟩\n",
+            "@[instance] def myLE : LE Nat := ⟨fun _ _ => False⟩\n",
+            "@[default_instance] def d : Nat := 0\n",
+            "open Foo in instance : LE Nat := ⟨fun _ _ => False⟩\n",
+            "set_option pp.all true in notation \"!!\" => f\n",
+            "deriving instance Repr for Foo\n",
+            "notation3 \"sum\" => f\n",
+            "@[simp,\n  reducible] def unterminatedAttrOnThisLine : Nat := 0\n",
+        ] {
+            assert!(
+                audited_src_declares_probe_hostile_commands(src),
+                "must be detected as probe-hostile: {src}"
+            );
+        }
+        for src in [
+            "@[simp] def plain (n : Nat) : Nat := n\n",
+            "open Foo in def g (n : Nat) : Nat := n\n",
+            "set_option pp.all true\ndef h (n : Nat) : Nat := n\n",
+            "inductive T where\n  | mk\nderiving Repr\n",
+        ] {
+            assert!(
+                !audited_src_declares_probe_hostile_commands(src),
+                "must not be flagged as probe-hostile: {src}"
+            );
+        }
+    }
+
+    /// A2 r3 (#367): the header recognizer covers the module-system import forms, so
+    /// the memo and the `imports_unresolved` classification see what the splitter sees.
+    #[test]
+    fn audit_spec_kernel_witness_header_import_lines_forms() {
+        let src = "module\nimport A\npublic import B\nmeta import C\npublic meta import D\n\ntheorem t : True := trivial\n";
+        assert_eq!(lean_header_import_lines(src), vec![1, 2, 3, 4, 5]);
+        assert!(lean_header_import_lines("def f : Nat := 0\n").is_empty());
+    }
+
+    /// A2 r2+r3 (#367): error positions parse from Lean diagnostics so the probe
+    /// ladder can tell an audited-block failure from a rejected witness theorem, and
+    /// only the probe module's own scratch file counts.
     #[test]
     fn audit_spec_kernel_witness_lean_error_lines_parse() {
-        let diag = "/x/P.lean:3:61: error: unsolved goals\np q : Bool\n/x/P.lean:4:0: \
-                    error: unexpected identifier; expected command\n/x/P.lean:9:2: \
-                    warning: declaration uses 'sorry'\n";
+        let diag = "/x/TurboAuditedShard_9.lean:3:61: error: unsolved goals\np q : Bool\n\
+                    /x/TurboAuditedShard_9.lean:4:0: error: unexpected identifier; \
+                    expected command\n/x/TurboAuditedShard_9.lean:9:2: warning: \
+                    declaration uses 'sorry'\n/x/Other.lean:7:1: error: foreign file\n";
         assert_eq!(lean_error_lines(diag), vec![3, 4]);
         assert!(lean_error_lines("warning: only warnings here\n").is_empty());
     }
