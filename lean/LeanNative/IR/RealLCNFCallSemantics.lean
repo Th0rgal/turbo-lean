@@ -9,14 +9,29 @@ sha-pins that file; it imports `LeanNative.IR.RealLCNFSemantics` only, so the H1
 separation pin (`Tests/RealLCNFSeparationPin.lean`) is preserved: nothing here touches
 the lowerer module.
 
-`evalStepF` mirrors `evalStep` clause for clause (same fuel recursion, same
-`evalLetValue`, same `storedTy`/`storedCtor` machinery, same join-point and `cases`
-handling, recursive occurrences at the same `Δ`) with ONE new rule, replacing exactly the
+Each environment entry carries its declaration's OWN `RealBridgeCtx` and fuel: the driver
+builds a separate context per declaration (`paramTypeMap`, `allowStage1DHeap`,
+`ctorLayouts`, `typeOverrides` are per-declaration), so a callee evaluated under the
+CALLER's context would describe a module the driver never emits (the concrete failure: a
+callee `uset`/`sset` on a constructor the caller never mentions falls back to the raw
+slot index). The call rule therefore runs the callee under the entry's own context and
+fuel, and `DeclEnvLowers` requires the per-entry lowering
+`lowerRealLCNFDecl fuel_i ctx_i sd ld.name = .ok ld`.
+
+`evalStepF` mirrors `evalStep` clause for clause (same `evalLetValue`, same
+`storedTy`/`storedCtor` machinery, same join-point and `cases` handling, recursive
+occurrences at the same `Δ` and ambient `ctx`) with ONE new rule, replacing exactly the
 arm the old semantics deliberately errors on: a `.let` whose value is `.fap fn args _`
-with `(ctx.findLocalCallee? fn).isSome` and `fn` bound in `Δ` runs the callee declaration
-under the strict suffix after it, at the step's decremented fuel. On a lookup miss the
-arm keeps the old `.error (.unsupportedCall fn.toString)` byte for byte, so `Δ = []` is
-the old semantics (`evalStepF_nil`, proved in `LowerCalls.lean`).
+with `(ctx.findLocalCallee? fn).isSome` (the CALL SITE's gate is the caller's map — the
+map the lowerer consulted when it emitted the call) and `fn` bound in `Δ` runs the callee
+declaration under the entry's own context and fuel and the strict suffix. On a lookup
+miss the arm keeps the old `.error (.unsupportedCall fn.toString)` byte for byte, so
+`Δ = []` is the old semantics (`evalStepF_nil`, proved in `LowerCalls.lean`). The
+environment is stratified: a call resolves only against strictly later entries, and in
+the environments `DeclEnvLowers` admits (pairwise-fresh names) a self or backward call
+misses; with duplicate names in `Δ` a self-call can resolve once against a later entry.
+Termination is lexicographic on `(Δ.length, fuel)`: every mirrored recursion keeps `Δ`
+and decrements the ambient fuel, and the call rule strictly shrinks the environment.
 -/
 
 namespace LeanNative.IR.RealLCNFSemantics
@@ -26,33 +41,93 @@ open LeanNative.IR.RealLCNFBridge
 open LeanNative.Semantics
 
 /-- Source-side function environment: the LCNF declarations a local call may resolve
-    against, in dependency order (callees strictly later than callers). -/
-abbrev DeclEnv := List (Lean.Compiler.LCNF.Decl .impure)
+    against, in dependency order (callees strictly later than callers), each with its
+    OWN lowering/evaluation context and fuel. -/
+abbrev DeclEnv := List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)
 
 namespace DeclEnv
 
-/-- First declaration whose `.name` is `fn`, paired with the strict suffix after it. -/
-def lookup? : DeclEnv → Lean.Name → Option (Lean.Compiler.LCNF.Decl .impure × DeclEnv)
+/-- First entry whose declaration is named `fn`, paired with the strict suffix after it. -/
+def lookup? : DeclEnv → Lean.Name →
+    Option ((Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat) × DeclEnv)
   | [], _ => none
-  | d :: Δ, fn => if d.name == fn then some (d, Δ) else lookup? Δ fn
+  | p :: Δ, fn => if p.1.name == fn then some (p, Δ) else lookup? Δ fn
 
-/-- The local-call view of a let-bound value: callee declaration, strict suffix, and
-    arguments, when the value is `.fap fn args _`, the driver's mangled-name map knows
-    `fn` (`ctx.findLocalCallee?`), and `fn` is bound in `Δ`. `none` for every other
+theorem lookup?_length : ∀ (Δ : DeclEnv) (fn : Lean.Name)
+    (p : Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat) (Δ' : DeclEnv),
+    lookup? Δ fn = some (p, Δ') → Δ'.length < Δ.length := by
+  intro Δ
+  induction Δ with
+  | nil => intro fn p Δ' h; exact nomatch h
+  | cons p0 Δ ih =>
+    intro fn p Δ' h
+    unfold lookup? at h
+    split at h
+    · injection h with h
+      cases h
+      exact Nat.lt_succ_self _
+    · exact Nat.lt_succ_of_lt (ih fn p Δ' h)
+
+/-- The local-call view of a let-bound value: callee entry (declaration, its own context
+    and fuel), strict suffix, and arguments, when the value is `.fap fn args _`, the
+    CALLER's mangled-name map knows `fn` (`ctx.findLocalCallee?` — the map the lowerer
+    consulted at this call site), and `fn` is bound in `Δ`. `none` for every other
     value — those keep `evalLetValue`'s behavior, including its deliberate
     `.unsupportedCall` error when `findLocalCallee?` hits but `Δ` misses. -/
 def callTarget? (Δ : DeclEnv) (ctx : RealBridgeCtx) :
     Lean.Compiler.LCNF.LetValue .impure →
-    Option (Lean.Compiler.LCNF.Decl .impure × DeclEnv × Array (Lean.Compiler.LCNF.Arg .impure))
+    Option ((Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat) × DeclEnv ×
+      Array (Lean.Compiler.LCNF.Arg .impure))
   | .fap fn args _ =>
     match lookup? Δ fn with
-    | some (sd, Δ') =>
-      if (ctx.findLocalCallee? fn).isSome then some (sd, Δ', args) else none
+    | some (p, Δ') =>
+      if (ctx.findLocalCallee? fn).isSome then some (p, Δ', args) else none
     | none => none
   | _ => none
 
+theorem callTarget?_length {Δ : DeclEnv} {ctx : RealBridgeCtx}
+    {lv : Lean.Compiler.LCNF.LetValue .impure}
+    {p : Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat} {Δ' : DeclEnv}
+    {args : Array (Lean.Compiler.LCNF.Arg .impure)}
+    (h : callTarget? Δ ctx lv = some (p, Δ', args)) : Δ'.length < Δ.length :=
+  -- `cases lv` cannot build the dependent elimination here ("Missing cases: _"), so
+  -- enumerate the constructors of `LetValue .impure` by hand; every non-`fap` arm
+  -- reduces `callTarget?` to `none`, refuting `h`. A `_` catch-all would keep
+  -- `callTarget?` stuck, so the enumeration is explicit.
+  match lv, h with
+  | .lit _, h => nomatch h
+  | .erased, h => nomatch h
+  | .proj _ _ _ hpu, _ => nomatch hpu
+  | .const _ _ _ hpu, _ => nomatch hpu
+  | .fvar _ _, h => nomatch h
+  | .ctor _ _ _, h => nomatch h
+  | .oproj _ _ _, h => nomatch h
+  | .uproj _ _ _, h => nomatch h
+  | .sproj _ _ _ _, h => nomatch h
+  | .pap _ _ _, h => nomatch h
+  | .reset _ _ _, h => nomatch h
+  | .reuse _ _ _ _ _, h => nomatch h
+  | .box _ _ _, h => nomatch h
+  | .unbox _ _, h => nomatch h
+  | .isShared _ _, h => nomatch h
+  | .fap fn args0 _, h => by
+    -- `unfold` leaves the outer matcher un-iota-reduced (our `fn` shadowed by the
+    -- arm binder); `simp only [callTarget?]` reduces it on the literal `.fap`.
+    simp only [callTarget?] at h
+    match hl : lookup? Δ fn with
+    | none => rw [hl] at h; exact nomatch h
+    | some (p0, Δ0) =>
+      rw [hl] at h
+      simp only at h  -- iota-reduce the matcher on the literal `some (p0, Δ0)`
+      split at h
+      · injection h with h
+        cases h
+        exact lookup?_length Δ _ _ _ hl
+      · exact nomatch h
+
 end DeclEnv
 
+set_option linter.unusedVariables false in
 /-- L2 environment-aware real-LCNF step evaluation (see the module docstring). -/
 def evalStepF (Δ : DeclEnv) (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
     (target : Lean.Compiler.LCNF.Code .impure ⊕
@@ -119,18 +194,18 @@ def evalStepF (Δ : DeclEnv) (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st
       match code with
       | .let decl k =>
         let rawTy := lowerGroundImpureTypeWith ctx decl.type
-        match DeclEnv.callTarget? Δ ctx decl.value with
-        | some (sd, Δ', args) =>
+        match hc : DeclEnv.callTarget? Δ ctx decl.value with
+        | some ((sd, ctxD, fuelD), Δ', args) =>
           match evalArgs env.vals args.toList with
           | .error e => .error e
           | .ok vals =>
-            match bindParams ctx true LEnv.empty sd.params.toList vals with
+            match bindParams ctxD true LEnv.empty sd.params.toList vals with
             | .error e => .error e
             | .ok envCallee =>
               match sd.value with
               | .extern _ => .error (.unsupportedCall s!"extern {sd.name}")
               | .code c =>
-                match evalStepF Δ' fuel ctx envCallee st (.inl c) with
+                match evalStepF Δ' fuelD ctxD envCallee st (.inl c) with
                 | .error e => .error e
                 | .ok (v, st') =>
                   let storedTy := if isUnboxedScalarOrTuple rawTy then rawTy else .i64
@@ -297,6 +372,12 @@ def evalStepF (Δ : DeclEnv) (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st
             | .ok env' => evalStepF Δ fuel ctx env' st (.inl body.code)
             | .error e => .error e
       | .fun decl _ _ => .error (.unsupportedCall s!"local function {decl.binderName}")
+termination_by (Δ.length, fuel)
+decreasing_by
+  all_goals simp_wf
+  all_goals first
+    | exact Prod.Lex.left _ _ (DeclEnv.callTarget?_length hc)
+    | (apply Prod.Lex.right; simp +arith)
 
 /-- L2 environment-aware mirror of `evalRealLCNFCode`. -/
 def evalRealLCNFCodeF (Δ : DeclEnv) (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv)

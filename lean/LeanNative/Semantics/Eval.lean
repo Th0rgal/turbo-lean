@@ -633,48 +633,54 @@ namespace LeanNative.Semantics
 open LeanNative.IR
 
 /-- Function environment: the lowered declarations a `.call` may resolve against, in
-    dependency order (callees strictly later than callers). -/
-abbrev FuncEnv := List LNIRDecl
+    dependency order (callees strictly later than callers), each paired with ITS OWN
+    fuel — the fuel its declaration was lowered and is evaluated with. The driver builds
+    a separate context and fuel per declaration, so environment entries carry their own
+    (the source side's `DeclEnv` additionally carries the per-declaration
+    `RealBridgeCtx`). -/
+abbrev FuncEnv := List (LNIRDecl × Nat)
 
 namespace FuncEnv
 
-/-- First declaration named `fn`, paired with the STRICT SUFFIX of the environment after
-    it. The callee body evaluates under that suffix, so the environment is stratified and
-    only non-recursive (forward) call chains resolve; a self or backward call misses. -/
-def lookup? : FuncEnv → String → Option (LNIRDecl × FuncEnv)
+/-- First entry whose declaration is named `fn`, paired with the STRICT SUFFIX of the
+    environment after it. The callee body evaluates under that suffix, so the
+    environment is stratified: a call resolves only against strictly later entries, and
+    in the environments `DeclEnvLowers` admits (pairwise-fresh names) a self or backward
+    call therefore misses and keeps the old `evalExpr` behavior. -/
+def lookup? : FuncEnv → String → Option ((LNIRDecl × Nat) × FuncEnv)
   | [], _ => none
-  | d :: Φ, fn => if d.name == fn then some (d, Φ) else lookup? Φ fn
+  | p :: Φ, fn => if p.1.name == fn then some (p, Φ) else lookup? Φ fn
 
-theorem lookup?_length : ∀ (Φ : FuncEnv) (fn : String) (d : LNIRDecl) (Φ' : FuncEnv),
-    lookup? Φ fn = some (d, Φ') → Φ'.length < Φ.length := by
+theorem lookup?_length : ∀ (Φ : FuncEnv) (fn : String) (p : LNIRDecl × Nat) (Φ' : FuncEnv),
+    lookup? Φ fn = some (p, Φ') → Φ'.length < Φ.length := by
   intro Φ
   induction Φ with
-  | nil => intro fn d Φ' h; exact nomatch h
-  | cons d0 Φ ih =>
-    intro fn d Φ' h
+  | nil => intro fn p Φ' h; exact nomatch h
+  | cons p0 Φ ih =>
+    intro fn p Φ' h
     unfold lookup? at h
     split at h
     · injection h with h
       cases h
       exact Nat.lt_succ_self _
-    · exact Nat.lt_succ_of_lt (ih fn d Φ' h)
+    · exact Nat.lt_succ_of_lt (ih fn p Φ' h)
 
-/-- The user-call view of a let-bound expression: callee, strict suffix, and argument
-    variables, when the expression is a non-extern `.call` whose symbol is bound in `Φ`.
-    `none` for every other expression — including extern calls and lookup misses, which
-    keep `evalCode`'s `evalExpr` behavior. -/
-def callTarget? (Φ : FuncEnv) : LNIRExpr → Option (LNIRDecl × FuncEnv × List VarId)
-  | .call fn args _ false => (lookup? Φ fn).map fun (ld, Φ') => (ld, Φ', args)
+/-- The user-call view of a let-bound expression: callee entry (declaration and its own
+    fuel), strict suffix, and argument variables, when the expression is a non-extern
+    `.call` whose symbol is bound in `Φ`. `none` for every other expression — including
+    extern calls and lookup misses, which keep `evalCode`'s `evalExpr` behavior. -/
+def callTarget? (Φ : FuncEnv) : LNIRExpr → Option ((LNIRDecl × Nat) × FuncEnv × List VarId)
+  | .call fn args _ false => (lookup? Φ fn).map fun (p, Φ') => (p, Φ', args)
   | _ => none
 
-theorem callTarget?_length {Φ : FuncEnv} {e : LNIRExpr} {ld : LNIRDecl} {Φ' : FuncEnv}
-    {args : List VarId} (h : callTarget? Φ e = some (ld, Φ', args)) :
+theorem callTarget?_length {Φ : FuncEnv} {e : LNIRExpr} {p : LNIRDecl × Nat}
+    {Φ' : FuncEnv} {args : List VarId} (h : callTarget? Φ e = some (p, Φ', args)) :
     Φ'.length < Φ.length := by
   unfold callTarget? at h
   split at h
   · match hl : lookup? Φ ‹String› with
     | none => rw [hl] at h; exact nomatch h
-    | some (ld0, Φ0) =>
+    | some (p0, Φ0) =>
       rw [hl] at h
       simp only [Option.map_some] at h
       injection h with h
@@ -684,25 +690,49 @@ theorem callTarget?_length {Φ : FuncEnv} {e : LNIRExpr} {ld : LNIRDecl} {Φ' : 
 
 end FuncEnv
 
+/-- `true` iff the expression is a `.call` (extern or not). -/
+def _root_.LeanNative.IR.LNIRExpr.isCall : LNIRExpr → Bool
+  | .call .. => true
+  | _ => false
+
+/-- `true` iff the code contains no `.call` expression at all (extern and intrinsic calls
+    included) — on such code `evalCodeF` and `evalCode` agree for every function
+    environment (`LeanNative.Proofs.evalCodeF_callFree`). -/
+def callFreeCode : LNIRCode → Bool
+  | .letBind _ _ val k => !val.isCall && callFreeCode k
+  | .rawStore _ _ _ _ k => callFreeCode k
+  | .incRef _ _ k => callFreeCode k
+  | .decRef _ _ k => callFreeCode k
+  | .ite _ t e => callFreeCode t && callFreeCode e
+  | .seqFor _ _ _ _ _ _ stepBody k => callFreeCode stepBody && callFreeCode k
+  | .parFor _ _ _ _ _ k => callFreeCode k
+  | .ret _ => true
+  | .unreachable => true
+
 set_option linter.unusedVariables false in
 /-- L2 environment-aware `LNIRCode` evaluation. Mirrors `evalCode` clause for clause
     (same instruction semantics, same `evalExpr`, same loop helpers, recursive
-    occurrences at the same `Φ`) with ONE new rule: a let-bound non-extern `.call` whose
-    symbol is bound in `Φ` runs the callee body under the strict suffix after it, with
-    the declaration-entry binding convention of `lowerRealLCNFDecl_sound`'s conclusion
-    and the ambient `fuel` unchanged (fuel-indexed calls are L3). An extern call or a
-    lookup miss delegates to `evalExpr` exactly as `evalCode` does. -/
+    occurrences at the same `Φ` and ambient `fuel`) with ONE new rule: a let-bound
+    non-extern `.call` whose symbol is bound in `Φ` runs the callee body under the strict
+    suffix after its entry, at the ENTRY's OWN fuel (the fuel its declaration was lowered
+    with — the driver builds per-declaration fuels), with the declaration-entry binding
+    convention of `lowerRealLCNFDecl_sound`'s conclusion, and errors on an argument-count
+    mismatch (the source side's `bindParams` is strict). An extern call or a lookup miss
+    delegates to `evalExpr` exactly as `evalCode` does; under the pairwise-fresh
+    environments `DeclEnvLowers` admits, a self or backward call is such a miss. -/
 def evalCodeF : FuncEnv → Nat → VarEnv → HeapState → LNIRCode → Except UBError (Val × HeapState)
   | Φ, fuel, env, st, .letBind dst _ty val k =>
     match hc : FuncEnv.callTarget? Φ val with
-    | some (ld, Φ', args) =>
+    | some ((ld, fuelD), Φ', args) =>
       match evalVarList env args with
       | .ok vals =>
-        match evalCodeF Φ' fuel
-            ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
-            st ld.body with
-        | .ok (v, st') => evalCodeF Φ fuel (env.bind dst v) st' k
-        | .error err => .error err
+        if vals.length = ld.params.length then
+          match evalCodeF Φ' fuelD
+              ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
+              st ld.body with
+          | .ok (v, st') => evalCodeF Φ fuel (env.bind dst v) st' k
+          | .error err => .error err
+        else .error (.typeError "call arity mismatch")
       | .error err => .error err
     | none =>
       match evalExpr env st val with

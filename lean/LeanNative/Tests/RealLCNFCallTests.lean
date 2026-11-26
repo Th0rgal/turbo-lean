@@ -7,18 +7,20 @@ import LeanNative.Semantics.Eval
 /-!
 # L2 (roadmap/HORIZONS.md rung L2 "Calls"): executable guards for the call semantics
 
-Contract: `lean/LeanNative/Proofs/LowerCalls.lean` (acceptance section). Three families:
+Contract: `lean/LeanNative/Proofs/LowerCalls.lean` (acceptance section). Families:
 
 1. A two-declaration environment where the caller's result is WRONG unless the callee
-   body actually runs — kills call-as-noop mutants of `evalCodeF` / `evalStepF` (the
-   result is value-sensitive in the callee's contribution).
-2. A self-call falls to the old `.unsupportedCall` behavior: the environment is
-   stratified (a callee body runs under the STRICT SUFFIX), so recursion is out of scope
-   for L2 by construction, not by accident.
-3. `Δ = [] / Φ = []` runs equal the old evaluators on the same inputs (executable
-   conservativity, beside the kernel theorems `evalCodeF_nil` / `evalStepF_nil`;
-   `exceptAgrees` compares ok-payloads exactly and error-results by shape, since
-   `UBError` carries no `BEq`).
+   body actually runs — kills call-as-noop mutants of `evalCodeF` / `evalStepF`.
+2. A call-arity mismatch errors on the LNIR side (review F4; `bindParams` is strict on
+   the source side).
+3. Per-entry context and fuel (review F1): a nested chain whose middle declaration
+   resolves its own callee only under ITS entry context, with a caller-context negative
+   control; and a callee that exhausts its own entry fuel while the ambient fuel is ample.
+4. A self-call falls to the old `.unsupportedCall` behavior under pairwise-fresh
+   environments (stratification: the callee body runs under the STRICT SUFFIX).
+5. `Δ = [] / Φ = []` runs agree with the old evaluators (`exceptAgrees` compares
+   ok-payloads exactly and errors by shape, since `UBError` carries no `BEq`; the kernel
+   theorems `evalCodeF_nil` / `evalStepF_nil` carry the full equality).
 
 Plus the end-to-end instance: lowering caller and callee with `lowerRealLCNFDecl` and
 evaluating the lowered caller under the lowered environment produces the source result —
@@ -59,11 +61,19 @@ private def runCodeF (Φ : FuncEnv) (body : LNIRCode) (arg : Val) : Except UBErr
   evalCodeF Φ 32 (VarEnv.empty.bind 0 arg) HeapState.empty body
 
 -- 1. The callee body must actually run: g 5 = (5+1) + 5 = 11.
-#guard (match runCodeF [calleeL] callerBodyL (.u64 5) with
+#guard (match runCodeF [(calleeL, 32)] callerBodyL (.u64 5) with
         | .ok (v, hst) => v == .u64 11 && hst == HeapState.empty
         | .error _ => false)
 
--- 2. Self/backward call misses the stratified environment: the callee body runs under
+-- 2. Arity mismatch errors (review F4): a 0-argument call to a 1-parameter callee.
+#guard (runCodeF [(calleeL, 32)]
+  (.letBind 1 .i64 (.call "f_sym" [] .i64 false) (.ret 1)) (.u64 5)).isOk == false
+
+-- 3. Per-entry fuel: the callee runs at ITS entry's fuel. With entry fuel 32 the chain
+--    succeeds (guard 1); the LNIR fuel is pass-through (loops only), so the per-entry
+--    fuel pin lives on the source side below.
+
+-- 4. Self/backward call misses the stratified environment: the callee body runs under
 --    the strict suffix, so `g_self` calling itself errors like the old semantics.
 private def selfL : LNIRDecl :=
   { name := "g_self"
@@ -71,9 +81,9 @@ private def selfL : LNIRDecl :=
     retTy := .i64
     body := .letBind 1 .i64 (.call "g_self" [0] .i64 false) (.ret 1) }
 
-#guard (runCodeF [selfL] selfL.body (.u64 5)).isOk == false
+#guard (runCodeF [(selfL, 32)] selfL.body (.u64 5)).isOk == false
 
--- 3. Φ = [] agrees with the old evaluator: on a call-free body (both ok, same value) and
+-- 5. Φ = [] agrees with the old evaluator: on a call-free body (both ok, same value) and
 --    on a call-bearing body (both error).
 #guard exceptAgrees (runCodeF [] calleeL.body (.u64 5))
   (evalCode 32 (VarEnv.empty.bind 0 (.u64 5)) HeapState.empty calleeL.body)
@@ -124,19 +134,55 @@ private def callerS : Decl .impure :=
 private def ctxS : RealBridgeCtx :=
   { arch := .x86_64, localCallees := [(`l2_callee, "f_sym")] }
 
-private def declProducesF (Δ : DeclEnv) (d : Decl .impure) (args : List Val)
-    (expected : Val) : Bool :=
-  match evalRealLCNFDeclF Δ 32 ctxS d args with
+private def declProducesF (Δ : DeclEnv) (ctx : RealBridgeCtx) (d : Decl .impure)
+    (args : List Val) (expected : Val) : Bool :=
+  match evalRealLCNFDeclF Δ 32 ctx d args with
   | .ok (v, hst) => v == expected && hst == HeapState.empty
   | .error _ => false
 
 -- 1. The callee body must actually run: l2_caller 5 = (5+1) + 5 = 11.
-#guard declProducesF [calleeS] callerS [.u64 5] (.u64 11)
+#guard declProducesF [(calleeS, ctxS, 32)] ctxS callerS [.u64 5] (.u64 11)
 
 -- The old semantics deliberately errors on the same program (the vacuity L2 closes).
 #guard (evalRealLCNFDecl 32 ctxS callerS [.u64 5]).isOk == false
 
--- 2. A self-call errors under the stratified environment (strict suffix for the callee).
+-- 3a. Per-entry FUEL: the callee runs at ITS entry's fuel — entry fuel 1 exhausts inside
+--     the callee body while the ambient fuel (32) is ample.
+#guard (evalRealLCNFDeclF [(calleeS, ctxS, 1)] 32 ctxS callerS [.u64 5]).isOk == false
+
+-- 3b. Per-entry CONTEXT (review F1's fix, pinned): a → b → c where only b's OWN entry
+--     context maps c. Under per-entry contexts the chain computes a 5 = (5+1+5)+5 = 16;
+--     with b's entry carrying the TOP context instead (the pre-F1 caller-context
+--     semantics), b's call to c cannot resolve and the run errors.
+private def declC : Decl .impure :=
+  let u64 := ImpureType.uint64
+  mkDecl `l2_c #[mkParam 50 u64] u64 <|
+    .let (mkLet 51 u64 (.lit (.uint64 1))) <|
+    .let (mkLet 52 u64 (.fap ``UInt64.add #[.fvar (fv 50), .fvar (fv 51)] rfl)) <|
+    .return (fv 52)
+
+private def declB : Decl .impure :=
+  let u64 := ImpureType.uint64
+  mkDecl `l2_b #[mkParam 30 u64] u64 <|
+    .let (mkLet 31 u64 (.fap `l2_c #[.fvar (fv 30)] rfl)) <|
+    .let (mkLet 32 u64 (.fap ``UInt64.add #[.fvar (fv 31), .fvar (fv 30)] rfl)) <|
+    .return (fv 32)
+
+private def declA : Decl .impure :=
+  let u64 := ImpureType.uint64
+  mkDecl `l2_a #[mkParam 40 u64] u64 <|
+    .let (mkLet 41 u64 (.fap `l2_b #[.fvar (fv 40)] rfl)) <|
+    .let (mkLet 42 u64 (.fap ``UInt64.add #[.fvar (fv 41), .fvar (fv 40)] rfl)) <|
+    .return (fv 42)
+
+private def ctxTop : RealBridgeCtx := { arch := .x86_64, localCallees := [(`l2_b, "b_sym")] }
+private def ctxB : RealBridgeCtx := { arch := .x86_64, localCallees := [(`l2_c, "c_sym")] }
+private def ctxC : RealBridgeCtx := { arch := .x86_64 }
+
+#guard declProducesF [(declB, ctxB, 32), (declC, ctxC, 32)] ctxTop declA [.u64 5] (.u64 16)
+#guard (evalRealLCNFDeclF [(declB, ctxTop, 32), (declC, ctxC, 32)] 32 ctxTop declA [.u64 5]).isOk == false
+
+-- 4. A self-call errors under the stratified environment (strict suffix for the callee).
 private def selfS : Decl .impure :=
   let u64 := ImpureType.uint64
   mkDecl `l2_self #[mkParam 20 u64] u64 <|
@@ -146,9 +192,9 @@ private def selfS : Decl .impure :=
 private def ctxSelf : RealBridgeCtx :=
   { arch := .x86_64, localCallees := [(`l2_self, "l2_self_sym")] }
 
-#guard (evalRealLCNFDeclF [selfS] 32 ctxSelf selfS [.u64 5]).isOk == false
+#guard (evalRealLCNFDeclF [(selfS, ctxSelf, 32)] 32 ctxSelf selfS [.u64 5]).isOk == false
 
--- 3. Δ = [] agrees with the old evaluator on the same inputs (caller errors both ways;
+-- 5. Δ = [] agrees with the old evaluator on the same inputs (caller errors both ways;
 --    callee succeeds both ways with the same payload).
 #guard exceptAgrees (evalRealLCNFDeclF [] 32 ctxS callerS [.u64 5])
   (evalRealLCNFDecl 32 ctxS callerS [.u64 5])
@@ -169,7 +215,7 @@ private def e2eCallSound : Bool :=
   match loweredPair? with
   | some (fL, gL) =>
     let venv := (gL.params.zip [Val.u64 5]).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty
-    match evalCodeF [fL] 32 venv HeapState.empty gL.body with
+    match evalCodeF [(fL, 32)] 32 venv HeapState.empty gL.body with
     | .ok (v, hst) => v == .u64 11 && hst == HeapState.empty
     | .error _ => false
   | none => false
