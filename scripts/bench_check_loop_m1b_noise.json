@@ -175,7 +175,7 @@
   },
   "why_aa": "one binary (e4fccb25...) at a3ad5f4d on this host; the toggled warm CAS replay is unreachable from the check path the bench drives (HORIZONS G2b)"
  },
- "created_utc": "2026-11-26T19:03:17Z",
+ "created_utc": "2026-11-26T19:09:33Z",
  "fresh_pair": [
   {
    "args": {
@@ -496,16 +496,16 @@
      "median": 0.2039,
      "min": 0.2015
     },
-    "n_cells": 15,
-    "n_trials": 75,
+    "n_cells": 14,
+    "n_trials": 70,
     "rel_iqr": {
      "max": 0.4923,
-     "median": 0.0154,
+     "median": 0.0159,
      "min": 0.0006
     },
     "rel_spread": {
      "max": 1.3706,
-     "median": 0.0386,
+     "median": 0.0377,
      "min": 0.0183
     }
    },
