@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M1 pinned benchmark of the `turbo-lean check` loop (roadmap/HORIZONS.md line 142).
+"""M1 pinned benchmark of the `turbo-lean check` loop (roadmap/HORIZONS.md, row M1).
 
 Measures the five pinned `Batteries` declarations and the pinned `PFR`
 declaration (expected `blocked` today) across three loop regimes, writes a
@@ -15,10 +15,35 @@ each measured mode result) and run-wide (top-level `cas_replay`).
 A results JSON is meant to be committed, so it records no host path: the
 binary is recorded relative to its repository (else by file name), the
 repository and scratch root are left out, path-valued settings
-(PATH_VALUED_SETTINGS) are recorded as a `<sha256:...>` digest of the value,
-and a recorded stderr excerpt names the scratch root, the checkouts, the
+(PATH_VALUED_SETTINGS) are recorded as an HMAC digest of the value keyed by the
+machine-id (`<hmac:...>`, or `<set>` without a machine-id), and a recorded
+stderr excerpt names the scratch root, the checkouts, the
 binary's directory, this repository, the working directory, the temp dir and
-the home dir by placeholder.
+the home dir by placeholder. This holds for results written from now on. Two
+committed files predate it: bench_check_loop_baseline.json (raw
+TURBO_LEAN_GIT and TURBO_LEAN_HOME values and a scratch_root line, from a
+sandbox host) and bench_check_loop_m1b_noise.json (a raw `/usr/bin/git`). They
+stay as written because the baseline's host is not one this code can key a
+digest for, and an unkeyed digest would no longer compare equal to a keyed
+one; settings_match reads their raw paths as it always has.
+
+Each workload's daemons are stopped when the workload ends. `daemon stop`
+waits on turbo-lean's user-wide lifecycle lock, which any other turbo-lean
+command of the same user holds while it runs, so the bench gives it
+DAEMON_STOP_TIMEOUT_S and then ends whatever the workload's staging namespace
+still runs itself, by turbo-lean's own scope rule widened to renamed builds
+and one-shot runs (scoped_daemon_processes).
+
+Prerequisite: a fresh `Batteries` clone at the pinned rev fails every check
+until each workload's import closure is built. Without the built `.olean`
+files the identity probe exits 1 with "produced no `.olean`" and every cold
+trial fails, so build the workloads' modules in the clone first:
+
+    lake build Batteries.Data.List.Lemmas Batteries.Data.String.Lemmas \
+        Batteries.Recycling.RBTree.Lemmas Batteries.Data.UnionFind.Basic
+
+(a single-workload run needs only its own module, as the M1b noise runs did
+with `lake build Batteries.Data.UnionFind.Basic`).
 
 Typical before/after on one machine (the only comparison this script trusts),
 with the environment it requires (TURBO_LEAN_GIT must be git >= 2.46) and the
@@ -65,7 +90,9 @@ from __future__ import annotations
 
 import argparse
 from typing import NamedTuple
+import errno
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -73,6 +100,7 @@ import platform
 import re
 import shutil
 import signal
+import stat
 import statistics
 import subprocess
 import sys
@@ -155,19 +183,38 @@ PATH_VALUED_SETTINGS = ("TURBO_LEAN_GIT", "TURBO_LEAN_HOME", "TURBO_LEAN_STAGING
 PATH_DIGEST_PREFIX = "<sha256:"
 
 
+PATH_HMAC_PREFIX = "<hmac:"
+PATH_SET_MARK = "<set>"
+
+
+def _legacy_path_digest(val) -> str:
+    """The unkeyed digest older artifacts recorded for a path (read, never written)."""
+    return f"{PATH_DIGEST_PREFIX}{hashlib.sha256(str(val).encode()).hexdigest()[:12]}>"
+
+
+def _is_recorded_form(val) -> bool:
+    return isinstance(val, str) and (val.startswith((PATH_DIGEST_PREFIX, PATH_HMAC_PREFIX))
+                                     or val == PATH_SET_MARK)
+
+
 def recorded_setting(var: str, val):
     """The committed form of one recorded setting.
 
-    A path-valued setting becomes `<sha256:` + the first 12 hex digits of the
-    value's SHA-256 + `>`; an already-digested value is kept as it is, so a raw
-    path in an older artifact and the digest of the same path compare equal.
+    A path-valued setting becomes `<hmac:` + the first 12 hex digits of
+    HMAC-SHA256(machine-id, value) + `>`. The key keeps a committed digest from
+    confirming a guessed path (host_id rejects an unkeyed hash of the node name
+    for the same reason), and settings_match only compares settings after the
+    hosts match, so the same machine-id keys both sides. Without a machine-id a
+    set path is recorded as `<set>`. An already-recorded value is kept as it is.
     Other settings are recorded verbatim.
     """
-    if var not in PATH_VALUED_SETTINGS or not val:
+    if var not in PATH_VALUED_SETTINGS or not val or _is_recorded_form(val):
         return val
-    if isinstance(val, str) and val.startswith(PATH_DIGEST_PREFIX):
-        return val
-    return f"{PATH_DIGEST_PREFIX}{hashlib.sha256(str(val).encode()).hexdigest()[:12]}>"
+    machine_id = read_machine_id()
+    if not machine_id:
+        return PATH_SET_MARK
+    mac = hmac.new(machine_id.encode(), str(val).encode(), hashlib.sha256).hexdigest()
+    return f"{PATH_HMAC_PREFIX}{mac[:12]}>"
 
 
 def recorded_settings(environ=None) -> dict:
@@ -187,16 +234,85 @@ def binary_record(binary: Path, repo_path, sha256: str) -> dict:
     return {"path": rel, "sha256": sha256}
 
 
+# A character that continues a path component, so a root right before or after
+# one is part of a longer name (`/home/u` in `/home/u2` or `/data/home/u`).
+_PATH_NAME_CHAR = r"[\w.\-~+@%]"
+
+
 def scrub_host_paths(text: str, roots) -> str:
     """Replace each (root, placeholder) host root in free text, longest root first.
 
-    A root that is empty or the filesystem root itself is skipped, so a bare `/`
-    (a sandbox's home, say) never rewrites every path in the text.
+    A root is replaced only as whole path components: not where a name character
+    follows it (`/home/u2` keeps its name under a root `/home/u`) or precedes it
+    (`/data/home/u`). A root that is empty or the filesystem root itself is
+    skipped, so a bare `/` (a sandbox's home, say) never rewrites every path.
     """
     for root, placeholder in sorted(roots, key=lambda r: len(r[0] or ""), reverse=True):
         if root and len(Path(root).parts) > 1:
-            text = text.replace(root, placeholder)
+            # A sentence period right after the root ends the path (`in /home/u.`),
+            # a period followed by a name character continues it (`/home/u.bak`).
+            pattern = (rf"(?<!{_PATH_NAME_CHAR}){re.escape(root)}"
+                       rf"(?![\w\-~+@%]|\.{_PATH_NAME_CHAR})")
+            text = re.sub(pattern, lambda _m: placeholder, text)
     return text
+
+
+def host_path_roots(scratch, dirs, bin_path, git_bin, extra_roots=()) -> list:
+    """The (root, placeholder) pairs a recorded stderr excerpt may name.
+
+    Each root appears as written and as resolved, since a symlinked home or temp
+    dir prints either way. The directory of an absolute TURBO_LEAN_GIT is one,
+    because the setting itself is recorded only as a digest.
+    """
+    roots = [(str(scratch), "<scratch>"),
+             *((str(dirs[k]), f"<{k}>") for k in ("batteries", "pfr") if k in dirs),
+             (str(Path(bin_path).parent), "<bin-dir>"),
+             (str(Path(__file__).resolve().parent.parent), "<repo>"),
+             (os.getcwd(), "<cwd>"),
+             (tempfile.gettempdir(), "<tmp>"),
+             (os.path.expanduser("~"), "<home>")]
+    if git_bin and os.path.isabs(git_bin):
+        roots.append((str(Path(git_bin).parent), "<git-dir>"))
+    roots.extend((str(r), p) for r, p in extra_roots)
+    return roots + [(os.path.realpath(r), p) for r, p in roots if os.path.isabs(r)]
+
+
+def _decode_partial(v) -> str:
+    """Text of the partial output a TimeoutExpired carries (bytes, str or None)."""
+    if v is None:
+        return ""
+    if isinstance(v, bytes):
+        return v.decode("utf-8", "replace")
+    return v
+
+
+def remove_tree(root) -> None:
+    """Remove a directory the bench made, read-only directories included.
+
+    turbo-lean writes its closure-snapshot store (TURBO_LEAN_HOME/closure-realm/
+    closure-snapshots/<digest>/...) with read-only directories, which a plain
+    rmtree cannot empty, so every directory under `root` is made owner-writable
+    first. Symlinks are never followed or chmodded, and nothing outside `root`
+    is touched. What still cannot be removed is reported, never silently left.
+    """
+    root = Path(root)
+    if not root.exists():
+        return
+    try:
+        os.chmod(root, stat.S_IRWXU)
+    except OSError:
+        pass
+    for dirpath, dirnames, _files in os.walk(root, followlinks=False):
+        for name in dirnames:
+            p = os.path.join(dirpath, name)
+            if not os.path.islink(p):
+                try:
+                    os.chmod(p, stat.S_IRWXU)
+                except OSError:
+                    pass
+    shutil.rmtree(root, ignore_errors=True)
+    if root.exists():
+        print(f"warning: could not fully remove {root}", file=sys.stderr)
 
 
 VERDICT_EXIT = {
@@ -596,9 +712,27 @@ def settings_match(base, res) -> bool:
     """Every recorded TURBO_LEAN_* setting must agree, not just four keys.
 
     Both sides are read in committed form (recorded_setting), so a raw path in an
-    older artifact and the digest of the same path compare equal."""
-    key = lambda s: {v: recorded_setting(v, s.get(v)) for v in RECORDED_ENV_VARS}
-    return key(base.get("settings") or {}) == key(res.get("settings") or {})
+    older artifact and the digest of the same path compare equal on this host. An
+    older artifact's unkeyed `<sha256:` digest equals the raw path it came from;
+    against a keyed digest it cannot be checked and reads as different. A `<set>`
+    mark (no machine-id) equals any set path and nothing unset."""
+    bs, rs = base.get("settings") or {}, res.get("settings") or {}
+    return all(_setting_equal(v, bs.get(v), rs.get(v)) for v in RECORDED_ENV_VARS)
+
+
+def _setting_equal(var, a, b) -> bool:
+    na, nb = recorded_setting(var, a), recorded_setting(var, b)
+    if na == nb:
+        return True
+    if var not in PATH_VALUED_SETTINGS or not na or not nb:
+        return False
+    if PATH_SET_MARK in (na, nb):
+        return True
+    for legacy, other in ((a, b), (b, a)):
+        if (isinstance(legacy, str) and legacy.startswith(PATH_DIGEST_PREFIX)
+                and isinstance(other, str) and not _is_recorded_form(other)):
+            return legacy == _legacy_path_digest(other)
+    return False
 
 
 def workload_revs_match(base, res) -> bool:
@@ -1063,13 +1197,204 @@ def detect_toolchain(dirs):
 
 # ----------------------------------------------------------- daemon control
 
-def stop_daemons(bin_path: Path, env):
-    """Stop daemons scoped to this workload's staging/cache, best effort."""
+# `daemon stop` first takes turbo-lean's one user-wide lifecycle lock
+# exclusively, and every running turbo-lean command of the same user holds that
+# lock shared, so on a shared machine a scoped stop waits on unrelated work, and
+# overlapping commands can keep it waiting indefinitely. The bench gives it this
+# long, then ends whatever its own staging namespace still has running itself.
+DAEMON_STOP_TIMEOUT_S = 20
+DAEMON_TERM_GRACE_S = 2.0
+DAEMON_KILL_GRACE_S = 1.0
+# Worker invocations turbo-lean's own scoped stop leaves alone.
+_AUDIT_WORKER_FLAGS = (b"--audit-modules", b"--decl-identity", b"--public-sig")
+
+
+def _is_serve_command(args) -> bool:
+    """turbo-lean's is_serve_command: the first command word after argv[0] is `serve`."""
+    words = iter([a for a in args if a][1:])
+    for a in words:
+        if a in (b"--cache-dir", b"--max-memory-mb", b"--telemetry"):
+            next(words, None)
+        elif not a.startswith(b"-"):
+            return a == b"serve"
+    return False
+
+
+def _proc_state_and_start(proc_dir: Path):
+    """(state letter, starttime) from /proc/<pid>/stat, or (None, None)."""
     try:
-        subprocess.run([str(bin_path), "daemon", "stop"], env=env, timeout=60,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        text = (proc_dir / "stat").read_text()
+    except OSError:
+        return None, None
+    _comm, sep, rest = text.rpartition(") ")
+    fields = rest.split() if sep else []
+    if len(fields) < 20:
+        return None, None
+    return fields[0], fields[19]  # fields 3 and 22
+
+
+def scoped_daemon_processes(staging, bin_path, proc_root: Path = Path("/proc")) -> list:
+    """(pid, starttime) of every live process of this user in one staging namespace.
+
+    turbo-lean's own scoped-stop rule (zygote/daemon.rs, owned_lifecycle_process):
+    `serve` daemons carrying TURBO_LEAN_DAEMON=1 and zygote workers (except the
+    audit helpers) whose TURBO_LEAN_STAGING_DIR is the namespace. The bench
+    widens it twice. A one-shot run's disposable `-oneshot-` sibling namespace
+    counts as this namespace, so workers a killed one-shot check left behind are
+    found. A server is matched by the bench's own binary path, where turbo-lean
+    requires the file name `turbo-lean`, so a renamed binary's daemons are found
+    too.
+    """
+    staging = str(staging)
+    exact = os.fsencode(f"TURBO_LEAN_STAGING_DIR={staging}")
+    sibling = os.fsencode(f"TURBO_LEAN_STAGING_DIR={staging}-oneshot-")
+    bin_real = os.path.realpath(str(bin_path))
+    uid, me = os.geteuid(), os.getpid()
+    found = []
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid <= 1 or pid == me:
+            continue
+        # Cheapest test first: a busy machine runs tens of thousands of
+        # processes, and only the bench binary and zygote workers are read further.
+        try:
+            if entry.stat().st_uid != uid:
+                continue
+            exe = os.readlink(entry / "exe")
+        except OSError:
+            continue
+        if exe.endswith(" (deleted)"):
+            exe = exe[: -len(" (deleted)")]
+        name = os.path.basename(exe)
+        maybe_worker = name.startswith("turbo_zygote_") or name == "turbo-zygote"
+        if exe != bin_real and not maybe_worker:
+            continue
+        try:
+            args = (entry / "cmdline").read_bytes().split(b"\0")
+            env = (entry / "environ").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if not any(v == exact or v.startswith(sibling) for v in env):
+            continue
+        server = (exe == bin_real and _is_serve_command(args)
+                  and b"TURBO_LEAN_DAEMON=1" in env)
+        worker = maybe_worker and not any(a in _AUDIT_WORKER_FLAGS for a in args)
+        if not (server or worker):
+            continue
+        state, start = _proc_state_and_start(entry)
+        if start is None or state in ("Z", "X"):
+            continue
+        found.append((pid, start))
+    return sorted(found)
+
+
+def _signal_scanned(pid: int, start: str, sig) -> bool:
+    """Signal `pid` only while it is still the process that was scanned.
+
+    The pidfd pins the process before its start time is re-read, so a recycled
+    pid is never signalled. Where the kernel has no pidfd_open (before Linux
+    5.3) the signal goes by pid, and the window between the re-read and kill()
+    is the only one left. False means no signal was sent: the process is gone,
+    is another process now, or the signal was refused.
+    """
+    fd = None
+    try:
+        if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+            try:
+                fd = os.pidfd_open(pid)
+            except OSError as e:
+                # ENOSYS (no pidfd_open), EPERM or any other refusal falls back to
+                # kill() after the start-time check; only ESRCH means it is gone.
+                if e.errno == errno.ESRCH:
+                    raise
+        state, now = _proc_state_and_start(Path("/proc") / str(pid))
+        if now != start or state in ("Z", "X"):
+            return False
+        if fd is not None:
+            signal.pidfd_send_signal(fd, sig)
+        else:
+            os.kill(pid, sig)
+        return True
+    except OSError:
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _grace_from_env(name: str, default: float) -> float:
+    """A grace period in seconds from the environment; the default when unset or invalid."""
+    try:
+        v = float(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return v if v >= 0 else default
+
+
+def terminate_scanned(procs, term_grace_s=None, kill_grace_s=None):
+    """SIGTERM each scanned process, SIGKILL whichever outlives the grace period.
+
+    Returns (signalled, survivors): survivors are the scanned processes still
+    running at the end, whether or not a signal reached them. turbo-lean's own
+    stop uses the same order.
+    """
+    term_grace_s = (_grace_from_env("TURBO_LEAN_BENCH_DAEMON_TERM_GRACE_S", DAEMON_TERM_GRACE_S)
+                    if term_grace_s is None else term_grace_s)
+    kill_grace_s = (_grace_from_env("TURBO_LEAN_BENCH_DAEMON_KILL_GRACE_S", DAEMON_KILL_GRACE_S)
+                    if kill_grace_s is None else kill_grace_s)
+
+    def alive(p):
+        state, now = _proc_state_and_start(Path("/proc") / str(p[0]))
+        return now == p[1] and state not in (None, "Z", "X")
+
+    def wait(procs_, seconds):
+        deadline = time.monotonic() + seconds
+        while any(alive(p) for p in procs_) and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+    signalled = [p for p in procs if _signal_scanned(p[0], p[1], signal.SIGTERM)]
+    wait(signalled, term_grace_s)
+    for p in signalled:
+        if alive(p):
+            _signal_scanned(p[0], p[1], signal.SIGKILL)
+    wait(signalled, kill_grace_s)
+    return signalled, [p for p in procs if alive(p)]
+
+
+def stop_daemons(bin_path: Path, env):
+    """End every daemon of this workload's staging namespace.
+
+    `daemon stop` goes first; whatever the namespace still has running after it
+    (it timed out waiting on the lifecycle lock, failed, or never matched the
+    process) is terminated here by the same scope rule, so a trial never leaks
+    a daemon.
+    """
+    try:
+        subprocess.run([str(bin_path), "daemon", "stop"], env=env,
+                       timeout=DAEMON_STOP_TIMEOUT_S, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=False)
     except (OSError, subprocess.SubprocessError) as e:
-        print(f"warning: daemon stop failed ({e}); killing via pidfiles", file=sys.stderr)
+        print(f"warning: daemon stop failed ({e}); ending the namespace's "
+              "daemons directly", file=sys.stderr)
+    staging = env.get("TURBO_LEAN_STAGING_DIR")
+    if not staging:
+        return
+    left = scoped_daemon_processes(staging, bin_path)
+    if not left:
+        return
+    signalled, survivors = terminate_scanned(left)
+    if survivors:
+        print(f"warning: {len(survivors)} process(es) of {staging} still run after "
+              f"SIGTERM and SIGKILL: pids {[p[0] for p in survivors]}", file=sys.stderr)
+    else:
+        print(f"note: ended {len(signalled)} process(es) `daemon stop` left in {staging}",
+              file=sys.stderr)
 
 
 # --------------------------------------------------------------- check call
@@ -1145,18 +1470,7 @@ class Runner:
         # --check-timeout-s; getattr keeps stub args objects in tests working.
         self.check_timeout_s = getattr(args, "check_timeout_s", None) or CHECK_TIMEOUT_S
         self.scratch = Path(tempfile.mkdtemp(prefix="m1-bench-")).resolve()
-        # Host roots a recorded stderr excerpt may name, each as written and as
-        # resolved (a symlinked home or temp dir prints either way).
-        roots = [(str(self.scratch), "<scratch>"),
-                 (str(self.dirs["batteries"]), "<batteries>"),
-                 (str(self.dirs["pfr"]), "<pfr>"),
-                 (str(self.bin.parent), "<bin-dir>"),
-                 (str(Path(__file__).resolve().parent.parent), "<repo>"),
-                 (os.getcwd(), "<cwd>"),
-                 (tempfile.gettempdir(), "<tmp>"),
-                 (os.path.expanduser("~"), "<home>")]
-        self.path_roots = roots + [(os.path.realpath(r), p) for r, p in roots
-                                   if os.path.isabs(r)]
+        self.path_roots = host_path_roots(self.scratch, self.dirs, self.bin, self.git_bin)
         self.revs = {}
         self.oleans_guard_violated = False
         self._edited_path = None      # source file currently holding a bench edit
@@ -1237,7 +1551,9 @@ class Runner:
                                   timeout=timeout_s)
             rc, out, err = proc.returncode, proc.stdout, proc.stderr
         except subprocess.TimeoutExpired as e:
-            rc, out, err = -1, e.stdout or "", (e.stderr or "") + f"\ntimeout after {timeout_s}s"
+            # TimeoutExpired carries bytes (or None) whatever `text=True` said.
+            rc, out = -1, _decode_partial(e.stdout)
+            err = _decode_partial(e.stderr) + f"\ntimeout after {timeout_s}s"
         wall_ms = (time.perf_counter_ns() - t0) / 1e6
         psi_after = sample_psi()
         parsed = parse_check_json(out or "")
@@ -1324,7 +1640,7 @@ class Runner:
                 p.mkdir(parents=True)
             self.remove_verified_sources(w)
             r = self.run_check(w, cache, home, staging, no_daemon=True)
-            shutil.rmtree(d, ignore_errors=True)
+            remove_tree(d)
             if i >= self.warmups:
                 trial_results.append(r)
         ts = self.split_trials(trial_results)
@@ -1390,7 +1706,7 @@ class Runner:
             return warm_cache, warm_edit
         finally:
             stop_daemons(self.bin, self.trial_env(cache, home, staging, no_daemon=False))
-            shutil.rmtree(d, ignore_errors=True)
+            remove_tree(d)
             self.assert_source_clean(w)
 
     def run_pfr_workload(self, w):
@@ -1422,7 +1738,7 @@ class Runner:
                         f"({len(missing)} deleted, {len(extra)} created, e.g. "
                         f"{sorted(missing | extra)[:3]}); aborting before more damage. "
                         "This must never happen (--no-auto-worktree-link is mandatory).")
-            shutil.rmtree(d, ignore_errors=True)
+            remove_tree(d)
             probe_exits.append(r["exit_code"])
             cls = (classify_error(r["exit_code"], r.get("json"), r["stderr"])
                    if r["exit_code"] != 0 else "unexpected_exit_0")
@@ -1825,7 +2141,7 @@ def main(argv=None):
         print(f"ENVIRONMENT ERROR (exit 4): {e}", file=sys.stderr)
         return 4
     finally:
-        shutil.rmtree(runner.scratch, ignore_errors=True)
+        remove_tree(runner.scratch)
 
 
 if __name__ == "__main__":

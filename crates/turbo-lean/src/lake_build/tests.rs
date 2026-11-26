@@ -5022,6 +5022,33 @@ public def api := by
             replay_project_cas_expr_shards(&mut store, &project, "test", "trusted", Some(&[]))?,
             0
         );
+
+        // `None` is the whole project when it succeeds too: in a second project whose
+        // three files are all seeded, it visits every one of them (three replays, not
+        // the one or none a narrowed walk would report).
+        let clean = dir.join("clean_project");
+        fs::create_dir_all(&clean)?;
+        let mut seeds = Vec::new();
+        for i in 0..3 {
+            let src = format!("theorem cas_replay_clean_{i} : {i} + 1 = 1 + {i} := by omega\n");
+            let path = clean.join(format!("Clean{i}.lean"));
+            fs::write(&path, &src)?;
+            let split = split_lean_source(&src, &[]);
+            assert_eq!(split.shards.len(), 1);
+            seeds.push((path, src, split));
+        }
+        seed_project_theorem_shards_from_splits(
+            &mut store,
+            &clean,
+            "test",
+            "trusted",
+            false,
+            &seeds,
+        )?;
+        assert_eq!(
+            replay_project_cas_expr_shards(&mut store, &clean, "test", "trusted", None)?,
+            3
+        );
         fs::remove_dir_all(dir)?;
         Ok(())
     }

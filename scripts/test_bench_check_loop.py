@@ -8,20 +8,98 @@ script with a stub binary that emulates `check --json`.
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import importlib.util
+import io
 import json
 import math
 import os
 import platform
 import re
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parent / "bench_check_loop.py"
+
+# The bench signals processes it finds in /proc, and several tests let it run
+# against the real /proc. For the whole test run, every way it can send a signal
+# (os.kill, os.killpg, a pidfd from os.pidfd_open) refuses a target that this
+# test process did not start, so a defect or a mutation in its scope rule can
+# never reach another process of the same user on a shared machine. A bench the
+# tests run as a subprocess starts through BENCH_CMD, which runs it inside this
+# module, so it carries the same guard. Each refusal is written to stderr and
+# recorded in REFUSED_SIGNALS; the NoForeignSignals tests fail on any.
+REFUSED_SIGNALS = []
+GUARD_REFUSAL = "test guard refused"
+BENCH_CMD = [sys.executable, str(Path(__file__).resolve()), "--run-guarded", str(SCRIPT)]
+
+
+# Pids of processes a test started through Popen and recorded here, so the guard
+# admits them even when /proc cannot show the parent chain (a sandbox that hides
+# parents, or a subreaper that adopted them).
+RECORDED_PIDS = set()
+
+
+def record_started(popen) -> None:
+    RECORDED_PIDS.add(popen.pid)
+
+
+def started_by_this_run(pid: int) -> bool:
+    """True when `pid` is this test process, a recorded child, or a descendant."""
+    if pid in RECORDED_PIDS:
+        return True
+    me = os.getpid()
+    for _ in range(64):
+        if pid == me:
+            return True
+        if pid <= 1:
+            return False
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_text().rpartition(") ")[2].split()
+            pid = int(fields[1])  # field 4: the parent pid
+        except (OSError, IndexError, ValueError):
+            return False
+    return False
+
+
+def _refuse_foreign(name, real):
+    def guarded(pid, *args):
+        if not started_by_this_run(pid):
+            REFUSED_SIGNALS.append((name, pid))
+            sys.stderr.write(f"{GUARD_REFUSAL} {name}({pid})\n")
+            raise PermissionError(f"test guard: {name}({pid}) targets a process "
+                                  "this test run did not start")
+        return real(pid, *args)
+    return guarded
+
+
+os.kill = _refuse_foreign("kill", os.kill)
+os.killpg = _refuse_foreign("killpg", os.killpg)
+if hasattr(os, "pidfd_open"):
+    os.pidfd_open = _refuse_foreign("pidfd_open", os.pidfd_open)
+
+
+class NoForeignSignals:
+    """A test fails when the bench tried to signal a process it did not start."""
+
+    def setUp(self):
+        super().setUp()
+        REFUSED_SIGNALS.clear()
+
+    def tearDown(self):
+        refused = list(REFUSED_SIGNALS)
+        REFUSED_SIGNALS.clear()
+        super().tearDown()
+        self.assertEqual(refused, [], "the bench tried to signal a process this test "
+                         "did not start")
 
 
 def load_script():
@@ -124,10 +202,15 @@ def run_bench(root, extra, stub_body=None, env_extra=None, make_projects=True):
                TURBO_LEAN_ALLOWED_CSIMP="*", TURBO_LEAN_ALLOWED_UNSAFE="*",
                TURBO_LEAN_ALLOWED_IMPLEMENTED_BY="*", FAKE_PFR_FAIL="1")
     env.update(env_extra or {})
-    cmd = [sys.executable, str(SCRIPT), "--turbo-lean-bin", str(stub),
-           "--batteries-dir", str(bats), "--pfr-dir", str(pfr),
-           "--trials", "2", "--warmup", "0", "--skip-rev-check", "--allow-busy-node"] + extra
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+    cmd = BENCH_CMD + ["--turbo-lean-bin", str(stub),
+                       "--batteries-dir", str(bats), "--pfr-dir", str(pfr),
+                       "--trials", "2", "--warmup", "0", "--skip-rev-check",
+                       "--allow-busy-node"] + extra
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+    if GUARD_REFUSAL in r.stderr:
+        raise AssertionError("the bench tried to signal a process this test did not "
+                             "start:\n" + r.stderr)
+    return r
 
 
 def sample_baseline(mod, **overrides):
@@ -1092,7 +1175,7 @@ class PfrAndSourceSafety(unittest.TestCase):
             src = Path(td) / "batteries" / "Batteries" / "Data" / "String" / "Lemmas.lean"
             original = src.read_text()
             proc = subprocess.Popen(
-                [sys.executable, str(SCRIPT), "--turbo-lean-bin", str(Path(td) / "fake-turbo-lean"),
+                BENCH_CMD + ["--turbo-lean-bin", str(Path(td) / "fake-turbo-lean"),
                  "--batteries-dir", str(Path(td) / "batteries"), "--pfr-dir", str(Path(td) / "pfr"),
                  "--trials", "1", "--warmup", "0", "--skip-rev-check", "--allow-busy-node",
                  "--no-baseline", "--out", str(Path(td) / "o2.json")],
@@ -1167,7 +1250,7 @@ class Provenance(unittest.TestCase):
                        PATH=str(Path(td) / "fake-bin") + os.pathsep + os.environ.get("PATH", ""),
                        TURBO_LEAN_ALLOWED_CSIMP="*", TURBO_LEAN_ALLOWED_UNSAFE="*",
                        TURBO_LEAN_ALLOWED_IMPLEMENTED_BY="*", FAKE_PFR_FAIL="1")
-            cmd = [sys.executable, str(SCRIPT), "--turbo-lean-bin", str(stub),
+            cmd = BENCH_CMD + ["--turbo-lean-bin", str(stub),
                    "--batteries-dir", str(Path(td) / "batteries"),
                    "--pfr-dir", str(Path(td) / "pfr"),
                    "--trials", "1", "--warmup", "0", "--skip-rev-check",
@@ -1347,9 +1430,8 @@ class ComparabilityAndProvenance(unittest.TestCase):
                 mutate(base)
                 p = Path(td) / f"{name}.json"
                 p.write_text(json.dumps(base))
-                return subprocess.run(
-                    [sys.executable, str(SCRIPT), "--validate-only", str(p)],
-                    capture_output=True, text=True, timeout=300)
+                return subprocess.run(BENCH_CMD + ["--validate-only", str(p)],
+                                      capture_output=True, text=True, timeout=300)
 
             ok = cli("valid", lambda b: None)
             self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
@@ -1526,6 +1608,27 @@ class CliFlags(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             argv = runner.check_argv(mod.WORKLOADS[0], Path(td), Path(td) / "f.lean")
         self.assertEqual(argv[argv.index("--timeout") + 1], str(mod.CHECK_TIMEOUT_S))
+
+    def test_a_timed_out_check_keeps_the_stderr_it_wrote_first(self):
+        # TimeoutExpired carries the partial stderr as bytes, whatever `text=` said.
+        mod = load_script()
+        runner = self._make_runner(mod, self._runner_args())
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            stub = root / "slow-turbo-lean"
+            stub.write_text("#!/usr/bin/env python3\n"
+                            "import sys, time\n"
+                            "sys.stderr.write('partial stderr\\n')\n"
+                            "sys.stderr.flush()\n"
+                            "time.sleep(30)\n")
+            stub.chmod(0o755)
+            with mock.patch.object(runner, "check_argv", return_value=[str(stub)]), \
+                    mock.patch.object(runner, "trial_env", return_value=dict(os.environ)), \
+                    mock.patch.object(runner, "source_path", return_value=root / "f.lean"):
+                r = runner.run_check(mod.WORKLOADS[0], root, root, root, True, timeout_s=1)
+        self.assertEqual(r["exit_code"], -1)
+        self.assertIn("partial stderr", r["stderr"])
+        self.assertIn("timeout after 1s", r["stderr"])
 
     def test_only_workloads_unknown_name_exits_2(self):
         mod = load_script()
@@ -1849,13 +1952,28 @@ class CheckTimeoutMainPath(unittest.TestCase):
 class CommittedArtifactIsPathFree(unittest.TestCase):
     """A results JSON is committed, so it carries no host path."""
 
+    MACHINE_ID = "0123456789abcdef0123456789abcdef"
+
+    @classmethod
+    def digest(cls, value, machine_id=None):
+        """The committed form of a path setting: HMAC of the value keyed by the machine-id."""
+        import hashlib
+        import hmac
+        key = (machine_id or cls.MACHINE_ID).encode()
+        return "<hmac:" + hmac.new(key, value.encode(), hashlib.sha256).hexdigest()[:12] + ">"
+
     @staticmethod
-    def digest(value):
+    def legacy_digest(value):
         import hashlib
         return "<sha256:" + hashlib.sha256(value.encode()).hexdigest()[:12] + ">"
 
-    def test_recorded_settings_digest_path_values_and_keep_the_rest(self):
+    def load(self):
         mod = load_script()
+        mod.read_machine_id = lambda: self.MACHINE_ID
+        return mod
+
+    def test_recorded_settings_digest_path_values_and_keep_the_rest(self):
+        mod = self.load()
         got = mod.recorded_settings({"TURBO_LEAN_GIT": "/usr/bin/git",
                                      "TURBO_LEAN_HOME": "/home/someone/.cache/tl",
                                      "TURBO_LEAN_ALLOWED_CSIMP": "*"})
@@ -1867,19 +1985,59 @@ class CommittedArtifactIsPathFree(unittest.TestCase):
         # A digest is kept as it is, so re-recording an artifact changes nothing.
         d = got["TURBO_LEAN_GIT"]
         self.assertEqual(mod.recorded_setting("TURBO_LEAN_GIT", d), d)
+        self.assertEqual(mod.recorded_setting("TURBO_LEAN_GIT", self.legacy_digest("/x")),
+                         self.legacy_digest("/x"))
+
+    def test_the_digest_is_keyed_by_the_machine_id_so_a_path_cannot_be_confirmed(self):
+        mod = self.load()
+        plain = self.legacy_digest("/usr/bin/git")
+        got = mod.recorded_setting("TURBO_LEAN_GIT", "/usr/bin/git")
+        self.assertNotEqual(got, plain)
+        self.assertNotIn(plain[len("<sha256:"):-1], got)
+        mod.read_machine_id = lambda: "another-machine-id"
+        self.assertNotEqual(mod.recorded_setting("TURBO_LEAN_GIT", "/usr/bin/git"), got)
+
+    def test_without_a_machine_id_a_set_path_is_recorded_as_set_only(self):
+        mod = load_script()
+        mod.read_machine_id = lambda: ""
+        self.assertEqual(mod.recorded_setting("TURBO_LEAN_GIT", "/usr/bin/git"), "<set>")
+        self.assertIsNone(mod.recorded_setting("TURBO_LEAN_GIT", None))
+        base = {"settings": {"TURBO_LEAN_GIT": "/usr/bin/git"}}
+        self.assertTrue(mod.settings_match(base, {"settings": {"TURBO_LEAN_GIT": "<set>"}}))
+        # Set against unset is still a different setting.
+        self.assertFalse(mod.settings_match(base, {"settings": {"TURBO_LEAN_GIT": None}}))
 
     def test_settings_match_reads_a_raw_path_and_its_digest_alike(self):
-        mod = load_script()
+        mod = self.load()
         base = full_valid_baseline(mod)
         base["settings"]["TURBO_LEAN_GIT"] = "/usr/bin/git"
         res = {"settings": dict(base["settings"])}
         res["settings"]["TURBO_LEAN_GIT"] = self.digest("/usr/bin/git")
         self.assertTrue(mod.settings_match(base, res))
+        # An older artifact's unkeyed digest of the same path still reads equal to
+        # the raw path it came from.
+        res["settings"]["TURBO_LEAN_GIT"] = self.legacy_digest("/usr/bin/git")
+        self.assertTrue(mod.settings_match(base, res))
         # A different path is still a different setting.
-        res["settings"]["TURBO_LEAN_GIT"] = self.digest("/opt/git/bin/git")
-        self.assertFalse(mod.settings_match(base, res))
-        res["settings"]["TURBO_LEAN_GIT"] = "/opt/git/bin/git"
-        self.assertFalse(mod.settings_match(base, res))
+        for other in (self.digest("/opt/git/bin/git"), self.legacy_digest("/opt/git/bin/git"),
+                      "/opt/git/bin/git"):
+            res["settings"]["TURBO_LEAN_GIT"] = other
+            self.assertFalse(mod.settings_match(base, res), other)
+
+    def test_a_stderr_excerpt_naming_the_git_binary_directory_is_scrubbed(self):
+        mod = self.load()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            dirs = {"batteries": root / "b", "pfr": root / "p"}
+            roots = mod.host_path_roots(root / "scratch", dirs, root / "bin" / "turbo-lean",
+                                        str(root / "gitdir" / "git"))
+            text = f"fatal: {root}/gitdir/git failed in {root}/scratch/w"
+            scrubbed = mod.scrub_host_paths(text, roots)
+            self.assertNotIn(str(root), scrubbed)
+            self.assertIn("<git-dir>/git", scrubbed)
+            # A bare `git` found on PATH has no directory to scrub.
+            self.assertIsNotNone(mod.host_path_roots(root / "scratch", dirs,
+                                                     root / "bin" / "turbo-lean", "git"))
 
     def test_scrub_replaces_the_longest_root_first_and_never_the_filesystem_root(self):
         mod = load_script()
@@ -1888,6 +2046,17 @@ class CommittedArtifactIsPathFree(unittest.TestCase):
             mod.scrub_host_paths(text, [("/tmp", "<tmp>"), ("/tmp/m1-bench-x", "<scratch>"),
                                         ("/", "<root>"), ("", "<empty>")]),
             "failed in <scratch>/w/cold_0 and <tmp>/other, see /")
+
+    def test_scrub_replaces_a_root_only_as_whole_path_components(self):
+        mod = load_script()
+        roots = [("/home/u", "<home>")]
+        text = "in /home/u/x, /home/u2/x, /data/home/u/x and /home/u"
+        self.assertEqual(mod.scrub_host_paths(text, roots),
+                         "in <home>/x, /home/u2/x, /data/home/u/x and <home>")
+        # A sentence period or comma after the root still ends the path; a period
+        # that starts another name does not.
+        self.assertEqual(mod.scrub_host_paths("see /home/u. Then /home/u, and /home/u.bak", roots),
+                         "see <home>. Then <home>, and /home/u.bak")
 
     def test_binary_is_recorded_relative_to_its_repository_or_by_name(self):
         mod = load_script()
@@ -1925,9 +2094,8 @@ class CommittedArtifactIsPathFree(unittest.TestCase):
             self.assertNotIn("turbo_lean_repo", data)
             self.assertNotIn("scratch_root", data["settings"])
             self.assertEqual(data["turbo_lean_binary"]["path"], "fake-turbo-lean")
-            self.assertTrue(data["settings"]["TURBO_LEAN_GIT"].startswith("<sha256:"))
-            self.assertEqual(data["settings"]["TURBO_LEAN_HOME"],
-                             self.digest(str(root / "tl-home")))
+            self.assertTrue(data["settings"]["TURBO_LEAN_GIT"].startswith(("<hmac:", "<set>")))
+            self.assertRegex(data["settings"]["TURBO_LEAN_HOME"], r"^(<hmac:[0-9a-f]{12}>|<set>)$")
 
             def excerpts(node):
                 if isinstance(node, dict):
@@ -1944,6 +2112,311 @@ class CommittedArtifactIsPathFree(unittest.TestCase):
             for e in found:
                 self.assertIn(" on <pfr>/", e)
                 self.assertIn(" home <scratch>/", e)
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "the guard reads /proc")
+class ForeignSignalGuard(unittest.TestCase):
+    """The test run's own guard refuses a process outside its tree and lets its
+    children through. Signal 0 only checks that a target exists."""
+
+    @unittest.skipIf(os.getpid() == 1, "as pid 1 this process adopts the orphan, so it "
+                     "stays inside the tree; run under `bash -c` in the namespace")
+    def test_a_process_that_left_this_run_is_refused(self):
+        # The test starts a process that leaves its tree by a double fork, so
+        # init or a subreaper adopts it: to the guard it then looks like any
+        # other process of the user. It exits when the test closes `hold_w`.
+        hold_r, hold_w = os.pipe()
+        report_r, report_w = os.pipe()
+        child = os.fork()
+        if child == 0:
+            try:
+                os.close(report_r)
+                grandchild = os.fork()
+                if grandchild == 0:
+                    try:
+                        os.close(hold_w)
+                        os.read(hold_r, 1)
+                    finally:
+                        os._exit(0)
+                os.write(report_w, f"{grandchild}\n".encode())
+            finally:
+                os._exit(0)
+        os.close(hold_r)
+        os.close(report_w)
+        os.waitpid(child, 0)
+        target = int(os.read(report_r, 32).decode().strip())
+        os.close(report_r)
+        try:
+            REFUSED_SIGNALS.clear()
+            self.assertFalse(started_by_this_run(target))
+            with self.assertRaises(PermissionError):
+                os.kill(target, 0)
+            if hasattr(os, "pidfd_open"):
+                with self.assertRaises(PermissionError):
+                    os.pidfd_open(target)
+            self.assertEqual([pid for _, pid in REFUSED_SIGNALS],
+                             [target] * (2 if hasattr(os, "pidfd_open") else 1))
+        finally:
+            REFUSED_SIGNALS.clear()
+            os.close(hold_w)
+
+    def test_a_child_is_let_through(self):
+        REFUSED_SIGNALS.clear()
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            os.kill(child.pid, 0)
+            if hasattr(os, "pidfd_open"):
+                os.close(os.pidfd_open(child.pid))
+        finally:
+            child.kill()
+            child.wait(timeout=10)
+        self.assertEqual(REFUSED_SIGNALS, [])
+
+    def test_any_pidfd_open_refusal_but_a_vanished_process_falls_back_to_kill(self):
+        mod = load_script()
+        for code, signalled in ((errno.EPERM, True), (errno.ENOSYS, True), (errno.ESRCH, False)):
+            with self.subTest(errno=code):
+                child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+                record_started(child)
+                try:
+                    _state, start = mod._proc_state_and_start(Path("/proc") / str(child.pid))
+                    refusal = OSError(code, os.strerror(code))
+                    with mock.patch.object(mod.os, "pidfd_open", side_effect=refusal,
+                                           create=True):
+                        sent = mod._signal_scanned(child.pid, start, signal.SIGTERM)
+                    self.assertEqual(sent, signalled)
+                finally:
+                    child.kill()
+                    child.wait(timeout=10)
+
+    def test_a_recorded_popen_pid_is_let_through_without_a_parent_chain(self):
+        REFUSED_SIGNALS.clear()
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            with mock.patch.object(Path, "read_text", side_effect=OSError("no /proc parents")):
+                self.assertFalse(started_by_this_run(child.pid))
+                record_started(child)
+                self.assertTrue(started_by_this_run(child.pid))
+        finally:
+            RECORDED_PIDS.discard(child.pid)
+            child.kill()
+            child.wait(timeout=10)
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "the daemon scan reads /proc")
+class DaemonCleanup(NoForeignSignals, unittest.TestCase):
+    """A workload's daemons end with it, even when `daemon stop` gives up, and
+    nothing outside the workload's staging namespace is touched."""
+
+    SLEEPER = b"import time\ntime.sleep(120)\n"
+
+    def spawn(self, staging, command, daemon=True, program=SLEEPER):
+        # `python - <command>` reads its program from stdin, so `command` is the
+        # first word after the flags, where turbo-lean looks for `serve`.
+        env = dict(os.environ, TURBO_LEAN_STAGING_DIR=str(staging))
+        if daemon:
+            env["TURBO_LEAN_DAEMON"] = "1"
+        p = subprocess.Popen([sys.executable, "-", command], env=env, stdin=subprocess.PIPE,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        record_started(p)
+        self.addCleanup(self.reap, p)
+        p.stdin.write(program)
+        p.stdin.close()
+        return p
+
+    def test_a_daemon_that_ignores_sigterm_is_killed(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-daemons-") as td:
+            staging = Path(td) / "staging"
+            bin_path = Path(sys.executable).resolve()
+            ready = Path(td) / "ready"
+            stubborn = self.spawn(staging, "serve", program=(
+                "import signal, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                f"open({str(ready)!r}, 'w').close()\n"
+                "time.sleep(120)\n").encode())
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(ready.exists(), "the stubborn daemon never started")
+            done = subprocess.CompletedProcess([str(bin_path), "daemon", "stop"], 0)
+            with mock.patch.object(mod.subprocess, "run", return_value=done), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                mod.stop_daemons(bin_path, {"TURBO_LEAN_STAGING_DIR": str(staging)})
+            self.assertEqual(stubborn.wait(timeout=5), -signal.SIGKILL)
+
+    @staticmethod
+    def reap(p):
+        if p.poll() is None:
+            p.kill()
+        p.wait(timeout=10)
+
+    @staticmethod
+    def wait_until_listed(mod, staging, bin_path, n):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if len(mod.scoped_daemon_processes(staging, bin_path)) >= n:
+                return
+            time.sleep(0.05)
+
+    def test_a_timed_out_daemon_stop_still_ends_this_namespace_and_only_it(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-daemons-") as td:
+            staging, other = Path(td) / "staging", Path(td) / "other"
+            bin_path = Path(sys.executable).resolve()
+            ours = self.spawn(staging, "serve")
+            theirs = self.spawn(other, "serve")
+            not_a_daemon = self.spawn(staging, "check", daemon=False)
+            self.wait_until_listed(mod, staging, bin_path, 1)
+            err = io.StringIO()
+            hung = subprocess.TimeoutExpired([str(bin_path), "daemon", "stop"],
+                                             mod.DAEMON_STOP_TIMEOUT_S)
+            with mock.patch.object(mod.subprocess, "run", side_effect=hung), \
+                    contextlib.redirect_stderr(err):
+                mod.stop_daemons(bin_path, {"TURBO_LEAN_STAGING_DIR": str(staging)})
+            self.assertEqual(ours.wait(timeout=5), -signal.SIGTERM, err.getvalue())
+            self.assertIsNone(theirs.poll(), "another namespace's daemon was signalled")
+            self.assertIsNone(not_a_daemon.poll(), "a process that is not a daemon was signalled")
+            self.assertIn("daemon stop failed", err.getvalue())
+            self.assertEqual(mod.scoped_daemon_processes(staging, bin_path), [])
+
+    def test_a_daemon_stop_that_returns_but_leaves_a_daemon_is_finished_off(self):
+        # `daemon stop` matches a server by the name `turbo-lean`, so a renamed
+        # binary's daemon survives its own stop; the bench finds it by path.
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-daemons-") as td:
+            staging = Path(td) / "staging"
+            bin_path = Path(sys.executable).resolve()
+            ours = self.spawn(staging, "serve")
+            self.wait_until_listed(mod, staging, bin_path, 1)
+            done = subprocess.CompletedProcess([str(bin_path), "daemon", "stop"], 0)
+            with mock.patch.object(mod.subprocess, "run", return_value=done), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                mod.stop_daemons(bin_path, {"TURBO_LEAN_STAGING_DIR": str(staging)})
+            self.assertEqual(ours.wait(timeout=5), -signal.SIGTERM)
+
+    def test_a_kernel_without_pidfd_open_still_gets_its_daemons_ended(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-daemons-") as td:
+            staging = Path(td) / "staging"
+            bin_path = Path(sys.executable).resolve()
+            ours = self.spawn(staging, "serve")
+            self.wait_until_listed(mod, staging, bin_path, 1)
+            done = subprocess.CompletedProcess([str(bin_path), "daemon", "stop"], 0)
+            nosys = OSError(errno.ENOSYS, os.strerror(errno.ENOSYS))
+            with mock.patch.object(mod.subprocess, "run", return_value=done), \
+                    mock.patch.object(mod.os, "pidfd_open", side_effect=nosys, create=True), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                mod.stop_daemons(bin_path, {"TURBO_LEAN_STAGING_DIR": str(staging)})
+            self.assertEqual(ours.wait(timeout=5), -signal.SIGTERM)
+
+    def test_a_daemon_the_bench_could_not_signal_is_reported(self):
+        # A signal that never reaches a scanned daemon (it was refused) leaves
+        # the daemon running; the bench must name it, never report it ended.
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-daemons-") as td:
+            staging = Path(td) / "staging"
+            bin_path = Path(sys.executable).resolve()
+            ours = self.spawn(staging, "serve")
+            self.wait_until_listed(mod, staging, bin_path, 1)
+            done = subprocess.CompletedProcess([str(bin_path), "daemon", "stop"], 0)
+            err = io.StringIO()
+            with mock.patch.object(mod.subprocess, "run", return_value=done), \
+                    mock.patch.object(mod, "_signal_scanned", return_value=False), \
+                    mock.patch.object(mod, "DAEMON_TERM_GRACE_S", 0.1), \
+                    mock.patch.object(mod, "DAEMON_KILL_GRACE_S", 0.1), \
+                    contextlib.redirect_stderr(err):
+                mod.stop_daemons(bin_path, {"TURBO_LEAN_STAGING_DIR": str(staging)})
+            self.assertIsNone(ours.poll())
+            self.assertIn(f"still run after SIGTERM and SIGKILL: pids [{ours.pid}]",
+                          err.getvalue())
+
+    def test_the_scope_rule_on_a_fake_proc_tree(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory() as td:
+            proc = Path(td).resolve() / "proc"
+            bin_path = Path(td).resolve() / "bin" / "turbo-lean-renamed"
+            staging = "/s/ns"
+            ns = f"TURBO_LEAN_STAGING_DIR={staging}"
+
+            def fake(pid, exe, args, env, state="S"):
+                d = proc / str(pid)
+                d.mkdir(parents=True)
+                (d / "exe").symlink_to(exe)
+                (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in args) + b"\0")
+                (d / "environ").write_bytes(b"\0".join(e.encode() for e in env) + b"\0")
+                (d / "stat").write_text(
+                    f"{pid} (a b) {state} " + " ".join(["0"] * 18) + f" {1000 + pid} 0\n")
+
+            b = str(bin_path)
+            fake(101, b, [b, "--cache-dir", "c", "serve"], [ns, "TURBO_LEAN_DAEMON=1"])
+            fake(102, "/x/turbo_zygote_ab", ["w"], [ns])
+            fake(103, "/x/turbo_zygote_ab", ["w", "--decl-identity"], [ns])
+            fake(104, b, [b, "check", "f.lean"], [ns, "TURBO_LEAN_DAEMON=1"])
+            fake(105, b, [b, "serve"], ["TURBO_LEAN_STAGING_DIR=/s/other", "TURBO_LEAN_DAEMON=1"])
+            fake(106, "/usr/bin/turbo-lean", ["/usr/bin/turbo-lean", "serve"],
+                 [ns, "TURBO_LEAN_DAEMON=1"])
+            fake(107, "/x/turbo-zygote", ["w"], ["TURBO_LEAN_STAGING_DIR=/s/ns-oneshot-9-1"])
+            fake(108, "/x/turbo_zygote_ab", ["w"], [ns], state="Z")
+            fake(109, b + " (deleted)", [b, "serve"], [ns, "TURBO_LEAN_DAEMON=1"])
+            fake(110, b, [b, "serve"], [ns])
+            fake(111, "/x/turbo_zygote_ab", ["w"], ["TURBO_LEAN_STAGING_DIR=/s/ns2"])
+            (proc / "self").mkdir()
+            got = mod.scoped_daemon_processes(staging, bin_path, proc_root=proc)
+            # Servers of this binary and namespace, its workers and its one-shot
+            # sibling's workers; never an audit helper, a non-serve command,
+            # another namespace or binary, a zombie, or a server without
+            # TURBO_LEAN_DAEMON=1.
+            self.assertEqual(got, [(101, "1101"), (102, "1102"), (107, "1107"), (109, "1109")])
+
+
+class ScratchRemoval(NoForeignSignals, unittest.TestCase):
+    """turbo-lean writes read-only directories (closure snapshots) under its
+    home; the bench must still remove every trial directory it made."""
+
+    def test_remove_tree_clears_read_only_dirs_and_never_follows_a_symlink(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            outside = base / "outside"
+            outside.mkdir()
+            (outside / "keep.txt").write_text("k")
+            outside.chmod(0o555)
+            root = base / "scratch-root"
+            store = root / "home" / "closure-realm" / "d0"
+            store.mkdir(parents=True)
+            (store / "x.ilean").write_text("x")
+            store.chmod(0o500)
+            store.parent.chmod(0o500)
+            (root / "link").symlink_to(outside, target_is_directory=True)
+            try:
+                mod.remove_tree(root)
+                self.assertFalse(root.exists())
+                self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o555)
+                self.assertEqual((outside / "keep.txt").read_text(), "k")
+            finally:
+                outside.chmod(0o755)
+
+    def test_a_run_whose_checks_write_read_only_dirs_leaves_no_scratch(self):
+        with tempfile.TemporaryDirectory(prefix="m1-scratch-") as td:
+            root = Path(td)
+            stub, _ = make_stub_binary(root)
+            marker = "status = 'theorem_verified'\n"
+            default = stub.read_text()
+            self.assertIn(marker, default)
+            body = default.replace(marker, marker + (
+                "_snap = os.path.join(os.environ['TURBO_LEAN_HOME'], 'closure-realm', 'd0')\n"
+                "if not os.path.isdir(_snap):\n"
+                "    os.makedirs(_snap)\n"
+                "    open(os.path.join(_snap, 'x.ilean'), 'w').write('x')\n"
+                "    os.chmod(_snap, 0o500)\n"
+                "    os.chmod(os.path.dirname(_snap), 0o500)\n"), 1)
+            tmp = root / "tmp"
+            tmp.mkdir()
+            r = run_bench(root, ["--no-baseline", "--out", str(root / "o.json")],
+                          stub_body=body, env_extra={"TMPDIR": str(tmp)})
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(sorted(p.name for p in tmp.iterdir()), [])
 
 
 class OnlyWorkloadsPartialRun(unittest.TestCase):
@@ -2020,4 +2493,11 @@ class HostIdLabel(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    if sys.argv[1:2] == ["--run-guarded"]:
+        # BENCH_CMD: run the bench in this process, which carries the signal
+        # guard installed above, as `python3 bench_check_loop.py ARGS` would.
+        import runpy
+        sys.argv = sys.argv[2:]
+        runpy.run_path(sys.argv[0], run_name="__main__")
+    else:
+        unittest.main(verbosity=2)

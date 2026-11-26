@@ -142,7 +142,7 @@ opt-in (`TURBO_LEAN_WARM_CAS_REPLAY=1` enabled; the opt-out still forced off;
 the replay path was kept unchanged). The forward options were a
 `build`-shaped warm loop or `check`-path wiring measured on a quiet node, or
 deleting the path, the leaf's other branch; the next section took the first
-and it ended on the second. With the revert the telemetry mode strings were
+and the leaf ended on its deleted branch. With the revert the telemetry mode strings were
 renamed (`warm_default` to `warm_opt_in`, `warm_default_error` to
 `warm_opt_in_error`), a telemetry contract change; no external consumer of
 the old strings was found (pr_verify and the integration tests read zero
@@ -174,13 +174,14 @@ Lean 4.35.0, machine label `g2b-build-192c` (192 CPUs), run started
 `66.83 57.98 84.05` at end (`busy_allowed` true), PSI not contended
 (memory.some and io.some at most 3.63). Cold seeded build: 26.4 s, 5 modules
 compiled, 200 shards seeded. Artifact: `scripts/bench_build_loop_g2b.json`.
-Command, as run at `0a593169` (the current script has no sides, and its
-`--out` must not point at this artifact):
+Command, as run at `0a593169`. It reproduces the table below only at that
+commit: the current script has no sides, and its `--out` must not point at this
+artifact:
 
 ```
 python3 scripts/bench_build_loop.py --turbo-lean-bin target/release/turbo-lean \
     --machine-label g2b-build-192c --allow-busy-node \
-    --out scripts/bench_build_loop_g2b.json
+    --out <results.json>
 ```
 
 Warm cache-hit builds, 20 measured calls per side:
@@ -207,7 +208,8 @@ fixture. Limits: one run, on a loaded node, on a synthetic 200-shard fixture;
 the cost should scale with the replayed shard count of a real warm build,
 which this run does not measure.
 
-This measurement closed the leaf on its deleted branch. The replay bought
+Outcome: the warm trigger was deleted in `f4dfa82e`. This measurement closed
+the leaf on its deleted branch. The replay bought
 nothing on this path: the warm build's outputs are already in place, and the
 replay only read the CAS, filled derived split caches and reported counters,
 so it never gated, repaired or invalidated anything. A measured cost with no
