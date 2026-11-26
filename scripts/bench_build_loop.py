@@ -101,6 +101,11 @@ DEFAULT_WARMUP = 1
 DEFAULT_MODULES = 4
 DEFAULT_THEOREMS_PER_MODULE = 50
 BUILD_TIMEOUT_S = 900
+# The warm-replay mode strings a binary from before the trigger's deletion reported
+# when its replay ran (HORIZONS.md row G2b).
+REPLAYING_MODES = ("warm_default", "warm_default_error", "warm_opt_in", "warm_opt_in_error")
+# After a timed-out call's group is killed, how long its pipes may stay open.
+KILL_DRAIN_S = 5
 FIXTURE_LIB = "BenchFixture"
 # The deleted G2b warm-replay opt-in. No current binary reads it; it is removed
 # from every call, and the force-off switch is set in CHILD_COMMON, so an older
@@ -208,6 +213,10 @@ def refuse_other_artifact(out: Path) -> None:
     """
     if not out.exists():
         return
+    if out.is_dir():
+        raise BenchEnvError(f"--out: {out.name} is a directory")
+    if not os.access(out, os.W_OK):
+        raise BenchEnvError(f"--out: {out.name} exists and is not writable")
     try:
         old = json.loads(out.read_text())
     except (OSError, ValueError) as e:
@@ -275,6 +284,11 @@ def build_argv(binary, scratch: Path, seed: bool) -> list:
     return argv
 
 
+def _partial(v) -> str:
+    """Text of the partial output a TimeoutExpired carries (bytes, str or None)."""
+    return bcl._decode_partial(v)
+
+
 def _kill_group(proc) -> None:
     """SIGKILL the call's whole process group (it leads its own session)."""
     try:
@@ -297,7 +311,16 @@ def run_build(argv, env, timeout_s):
         rc = proc.returncode
     except subprocess.TimeoutExpired:
         _kill_group(proc)
-        out, err = proc.communicate()
+        try:
+            out, err = proc.communicate(timeout=KILL_DRAIN_S)
+        except subprocess.TimeoutExpired as e:
+            # A descendant that left the process group (a zygote worker) can still
+            # hold the pipes: keep what was read, close our ends and move on.
+            out, err = _partial(e.stdout), _partial(e.stderr)
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe is not None:
+                    pipe.close()
+            proc.wait()
         rc = -1
         err = (err or "") + f"\ntimeout after {timeout_s}s"
     except BaseException:
@@ -318,15 +341,9 @@ def path_roots(scratch: Path, binary: Path, git_bin=None) -> list:
     repository, the working and temp directories, the home directory, and the
     directory of an absolute TURBO_LEAN_GIT, each as written and as resolved.
     """
-    roots = [(str(scratch), "<scratch>"),
-             (str(Path(binary).parent), "<bin-dir>"),
-             (str(REPO_ROOT), "<repo>"),
-             (os.getcwd(), "<cwd>"),
-             (tempfile.gettempdir(), "<tmp>"),
-             (os.path.expanduser("~"), "<home>")]
-    if git_bin and os.path.isabs(git_bin):
-        roots.append((str(Path(git_bin).parent), "<git-dir>"))
-    return roots + [(os.path.realpath(r), p) for r, p in roots if os.path.isabs(r)]
+    lean = shutil.which("lean")
+    toolchain = [(str(Path(lean).parent), "<lean-dir>")] if lean else []
+    return bcl.host_path_roots(scratch, {}, binary, git_bin, extra_roots=toolchain)
 
 
 def _failure_head(r, roots=None):
@@ -366,10 +383,16 @@ def trial_problem(r, roots=None):
     if status != "cache_hit":
         return f"status {status!r}, expected 'cache_hit'"
     replayed, mode = j.get("cas_expr_replayed"), j.get("cas_expr_replay_mode")
-    if replayed not in (None, 0) or mode not in (None, "off"):
+    numeric = isinstance(replayed, (int, float)) and not isinstance(replayed, bool)
+    if (numeric and replayed > 0) or mode in REPLAYING_MODES:
         return (f"a warm replay ran (cas_expr_replayed {replayed!r}, "
                 f"cas_expr_replay_mode {mode!r}); the bench measures a build that "
                 "replays nothing")
+    if replayed is not None and not numeric:
+        return f"unrecognized cas_expr_replayed {replayed!r}; cannot tell whether a replay ran"
+    if mode not in (None, "off"):
+        return (f"unrecognized cas_expr_replay_mode {mode!r}; cannot tell whether a "
+                "replay ran")
     return None
 
 
@@ -562,6 +585,8 @@ def main(argv=None) -> int:
             warm_failed = [t for t in trials if not t["measured"] and t["problem"]]
             for t in warm_failed[:3]:
                 problems.append(f"warmup call {t['call']}: {t['problem']}")
+        # Every problem string passes the scrub once more, whatever built it.
+        problems = [bcl.scrub_host_paths(p, roots) for p in problems]
         results["verdict"] = {"verdict": "measurement_failed" if problems else "measured",
                               "problems": problems}
         results["run_duration_s"] = round(time.monotonic() - t_start, 1)

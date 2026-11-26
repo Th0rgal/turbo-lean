@@ -81,7 +81,9 @@ if log and os.environ.get("FAKE_FAIL_CALL"):
 if not seed and os.environ.get("FAKE_HANG_PID_FILE"):
     # A warm call that hangs with a child of its own holding the output pipe.
     import subprocess
-    child = subprocess.Popen(["sleep", "120"])
+    # FAKE_HANG_DETACH puts the child in its own session, like a zygote worker.
+    child = subprocess.Popen(["sleep", "120"],
+                             start_new_session=bool(os.environ.get("FAKE_HANG_DETACH")))
     with open(os.environ["FAKE_HANG_PID_FILE"], "w") as fh:
         fh.write(str(child.pid))
     sys.stderr.write("hung call\n")
@@ -313,6 +315,17 @@ class ExpectationTests(unittest.TestCase):
                                       "cas_expr_replay_mode": "warm_opt_in"}})
         self.assertIn("warm_opt_in", moded)
 
+    def test_an_unknown_replay_mode_is_reported_as_unrecognized_not_as_a_replay(self):
+        weird = mod.trial_problem(
+            {"exit_code": 0, "json": {"status": "cache_hit", "cas_expr_replay_mode": "turbo"}})
+        self.assertIn("unrecognized", weird)
+        self.assertNotIn("a warm replay ran", weird)
+        for mode in mod.REPLAYING_MODES:
+            self.assertIn("a warm replay ran", mod.trial_problem(
+                {"exit_code": 0, "json": {"status": "cache_hit", "cas_expr_replay_mode": mode}}))
+        self.assertIn("unrecognized", mod.trial_problem(
+            {"exit_code": 0, "json": {"status": "cache_hit", "cas_expr_replayed": "many"}}))
+
     def test_failure_heads_name_the_scratch_root_by_placeholder(self):
         roots = mod.path_roots(Path("/run/x/build-loop-ab12"), Path("/opt/tl/bin/turbo-lean"),
                                "/opt/gitbin/git")
@@ -420,6 +433,26 @@ class EndToEndTests(unittest.TestCase):
             # A failing call's excerpt carries no host path at all.
             for host_path in {str(root), os.path.realpath(str(root))}:
                 self.assertNotIn(host_path, text)
+
+    def test_a_descendant_outside_the_group_that_holds_the_pipes_cannot_hang_the_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            pid_file = root / "child.pid"
+            try:
+                # The child left the call's process group, so the group kill misses it
+                # and it keeps the output pipes open; the run must still finish.
+                proc = run_script(root, extra=["--build-timeout-s", "1"], trials=1,
+                                  warmup=0, timeout=60,
+                                  env_extra={"FAKE_HANG_PID_FILE": str(pid_file),
+                                             "FAKE_HANG_DETACH": "1"})
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                res = json.loads((root / "out.json").read_text())
+                problems = " ".join(res["verdict"]["problems"])
+                self.assertIn("timeout after 1s", problems)
+                self.assertIn("hung call", problems)
+            finally:
+                if pid_file.is_file():
+                    stop_own_child(int(pid_file.read_text()))
 
     def test_a_timed_out_call_takes_its_children_with_it(self):
         with tempfile.TemporaryDirectory() as td:
@@ -578,6 +611,11 @@ class InProcessTests(unittest.TestCase):
                     self.assertIn("--out", err)
                     self.assertEqual(out.read_text(), text)
             self.assertEqual(list(scratch.iterdir()), [])
+
+    def test_an_out_path_that_is_a_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(mod.BenchEnvError):
+                mod.refuse_other_artifact(Path(td))
 
     def test_a_previous_result_of_this_schema_may_be_replaced(self):
         with tempfile.TemporaryDirectory() as td:

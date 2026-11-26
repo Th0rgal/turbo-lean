@@ -2053,6 +2053,10 @@ class CommittedArtifactIsPathFree(unittest.TestCase):
         text = "in /home/u/x, /home/u2/x, /data/home/u/x and /home/u"
         self.assertEqual(mod.scrub_host_paths(text, roots),
                          "in <home>/x, /home/u2/x, /data/home/u/x and <home>")
+        # A sentence period or comma after the root still ends the path; a period
+        # that starts another name does not.
+        self.assertEqual(mod.scrub_host_paths("see /home/u. Then /home/u, and /home/u.bak", roots),
+                         "see <home>. Then <home>, and /home/u.bak")
 
     def test_binary_is_recorded_relative_to_its_repository_or_by_name(self):
         mod = load_script()
@@ -2167,6 +2171,23 @@ class ForeignSignalGuard(unittest.TestCase):
             child.kill()
             child.wait(timeout=10)
         self.assertEqual(REFUSED_SIGNALS, [])
+
+    def test_any_pidfd_open_refusal_but_a_vanished_process_falls_back_to_kill(self):
+        mod = load_script()
+        for code, signalled in ((errno.EPERM, True), (errno.ENOSYS, True), (errno.ESRCH, False)):
+            with self.subTest(errno=code):
+                child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+                record_started(child)
+                try:
+                    _state, start = mod._proc_state_and_start(Path("/proc") / str(child.pid))
+                    refusal = OSError(code, os.strerror(code))
+                    with mock.patch.object(mod.os, "pidfd_open", side_effect=refusal,
+                                           create=True):
+                        sent = mod._signal_scanned(child.pid, start, signal.SIGTERM)
+                    self.assertEqual(sent, signalled)
+                finally:
+                    child.kill()
+                    child.wait(timeout=10)
 
     def test_a_recorded_popen_pid_is_let_through_without_a_parent_chain(self):
         REFUSED_SIGNALS.clear()

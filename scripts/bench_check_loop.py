@@ -249,12 +249,15 @@ def scrub_host_paths(text: str, roots) -> str:
     """
     for root, placeholder in sorted(roots, key=lambda r: len(r[0] or ""), reverse=True):
         if root and len(Path(root).parts) > 1:
-            pattern = (rf"(?<!{_PATH_NAME_CHAR}){re.escape(root)}(?!{_PATH_NAME_CHAR})")
+            # A sentence period right after the root ends the path (`in /home/u.`),
+            # a period followed by a name character continues it (`/home/u.bak`).
+            pattern = (rf"(?<!{_PATH_NAME_CHAR}){re.escape(root)}"
+                       rf"(?![\w\-~+@%]|\.{_PATH_NAME_CHAR})")
             text = re.sub(pattern, lambda _m: placeholder, text)
     return text
 
 
-def host_path_roots(scratch, dirs, bin_path, git_bin) -> list:
+def host_path_roots(scratch, dirs, bin_path, git_bin, extra_roots=()) -> list:
     """The (root, placeholder) pairs a recorded stderr excerpt may name.
 
     Each root appears as written and as resolved, since a symlinked home or temp
@@ -262,8 +265,7 @@ def host_path_roots(scratch, dirs, bin_path, git_bin) -> list:
     because the setting itself is recorded only as a digest.
     """
     roots = [(str(scratch), "<scratch>"),
-             (str(dirs["batteries"]), "<batteries>"),
-             (str(dirs["pfr"]), "<pfr>"),
+             *((str(dirs[k]), f"<{k}>") for k in ("batteries", "pfr") if k in dirs),
              (str(Path(bin_path).parent), "<bin-dir>"),
              (str(Path(__file__).resolve().parent.parent), "<repo>"),
              (os.getcwd(), "<cwd>"),
@@ -271,6 +273,7 @@ def host_path_roots(scratch, dirs, bin_path, git_bin) -> list:
              (os.path.expanduser("~"), "<home>")]
     if git_bin and os.path.isabs(git_bin):
         roots.append((str(Path(git_bin).parent), "<git-dir>"))
+    roots.extend((str(r), p) for r, p in extra_roots)
     return roots + [(os.path.realpath(r), p) for r, p in roots if os.path.isabs(r)]
 
 
@@ -1306,7 +1309,9 @@ def _signal_scanned(pid: int, start: str, sig) -> bool:
             try:
                 fd = os.pidfd_open(pid)
             except OSError as e:
-                if e.errno != errno.ENOSYS:
+                # ENOSYS (no pidfd_open), EPERM or any other refusal falls back to
+                # kill() after the start-time check; only ESRCH means it is gone.
+                if e.errno == errno.ESRCH:
                     raise
         state, now = _proc_state_and_start(Path("/proc") / str(pid))
         if now != start or state in ("Z", "X"):
