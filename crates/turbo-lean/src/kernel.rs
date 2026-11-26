@@ -2713,6 +2713,11 @@ mod tests {
     // bail (DA b08785bc F6).
     #[test]
     fn real_tracked_gate_refuses_tree_delivered_bridge_binary() {
+        // This test mutates process env (ELAN_HOME), like the bundled-binary test above:
+        // hold the shared env lock so concurrent kernel tests read a stable environment.
+        let _env = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("turbo-lean-tracked-{}", std::process::id()));
         let co = tmp.join("checkout");
         let bridge = co.join(BRIDGE_CON_LECHE_BIN_REL);

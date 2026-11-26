@@ -1415,39 +1415,39 @@ pub(crate) fn input_closure_sweep_mods(
     cfg: &crate::module_builder::ProjectConfig,
     dag: &crate::module_builder::ModuleDag,
 ) -> std::collections::BTreeSet<String> {
-    let owned_dep_pkgs: std::collections::HashSet<&str> = cfg
+    // Review cf31dd1e F4 (elevating 29baa2ab F3): ownership is keyed on the package
+    // ROOT — an identity — never on name strings. A non-owned package whose origName
+    // collides with an owned package's name must not ride into the closure, and an
+    // owned package whose node spells the other name form must not silently drop out
+    // (an empty closure makes `all_fresh_on_disk` vacuously true and clears the
+    // explicit `input_libs` seeds). Both the raw and the canonical root forms go into
+    // the set, so the lookup needs no per-node syscall whichever form the dag recorded.
+    let owned_dep_roots: std::collections::HashSet<std::path::PathBuf> = cfg
         .dep_pkgs
         .iter()
         .filter(|dp| crate::module_builder::dep_pkg_lake_targets_owned_by_project(cfg, dp))
         .flat_map(|dp| {
-            [
-                dp.name.as_str(),
-                crate::module_builder::pkg_target_base_name(dp),
-            ]
+            let raw = dp.pkg_root.clone();
+            let canon = dp.pkg_root.canonicalize().unwrap_or_else(|_| raw.clone());
+            [raw, canon]
         })
         .collect();
     let node_owned = |n: &crate::module_builder::ModuleNode| {
-        n.is_root_pkg || owned_dep_pkgs.contains(n.pkg_name.as_str())
+        n.is_root_pkg || owned_dep_roots.contains(&n.pkg_root)
     };
     let mut closure: std::collections::BTreeSet<String> = dag
         .nodes
         .iter()
         .filter_map(|(m, n)| {
-            if !node_owned(n) {
-                return None;
-            }
-            let spec_has_include_str = crate::module_builder::resolve_module_in_package(
-                &cfg.root_pkg,
-                true,
-                m,
-            )
-            .or_else(
-                || match crate::module_builder::resolve_import_site(cfg, m) {
-                    crate::module_builder::ImportSite::Module(s) => Some(*s),
-                    _ => None,
-                },
-            )
-            .is_some_and(|spec| {
+            let owned = node_owned(n);
+            let spec = crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, m)
+                .or_else(
+                    || match crate::module_builder::resolve_import_site(cfg, m) {
+                        crate::module_builder::ImportSite::Module(s) => Some(*s),
+                        _ => None,
+                    },
+                );
+            let spec_has_include_str = spec.as_ref().is_some_and(|spec| {
                 fs::read_to_string(&spec.src_path)
                     .map(|s| {
                         crate::module_builder::module_directly_depends_on_lake_inputs(
@@ -1459,17 +1459,38 @@ pub(crate) fn input_closure_sweep_mods(
                     })
                     .unwrap_or(true)
             });
-            if !crate::module_builder::input_bearing_libs_for_module(cfg, m).is_empty()
+            let input_bearing = !crate::module_builder::input_bearing_libs_for_module(cfg, m)
+                .is_empty()
                 || !crate::module_builder::input_bearing_exes_for_module(cfg, m).is_empty()
                 || spec_has_include_str
                 || fs::read_to_string(&n.src_path)
                     .map(|s| crate::module_builder::source_uses_include_str(&s))
-                    .unwrap_or(false)
-            {
-                Some(m.clone())
-            } else {
-                None
+                    .unwrap_or(false);
+            if !input_bearing {
+                return None;
             }
+            if !owned {
+                // Review cf31dd1e F6: an EXCLUDED non-owned input-bearing seed used to
+                // fail the freshness check loudly; now that the sweep skips it, a stale
+                // one must not go silent while the purge path fails closed on the same
+                // state. Say so once, naming the remedy.
+                if spec
+                    .as_ref()
+                    .is_some_and(crate::module_builder::spec_own_artifact_stale_on_disk)
+                {
+                    eprintln!(
+                        "[turbo-lean] input-bearing module `{}` lives in a non-owned checkout and its artifacts are stale on disk; the freshness sweep does not cover it — {}",
+                        m,
+                        crate::module_builder::non_owned_dep_refresh_remedy(
+                            m,
+                            &cfg.root_pkg.pkg_root,
+                            &n.pkg_root,
+                        )
+                    );
+                }
+                return None;
+            }
+            Some(m.clone())
         })
         .collect();
     let mut changed = !closure.is_empty();

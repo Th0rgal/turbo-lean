@@ -230,16 +230,22 @@ impl WorkerBudget {
     /// finding 2). `RLIMIT_DATA` meters writable private VIRTUAL mappings — the heap,
     /// malloc arenas and pthread stacks (a 256 MiB `LEAN_STACK_SIZE_KB` worker stack
     /// counts against it) — not resident memory, so a cap equal to an RSS-sized share
-    /// would fail workers whose resident use fits the budget. The hard cap therefore
-    /// binds only when the per-worker share is at least the worker RSS estimate
-    /// (`REPLAY_WORKER_EST_RSS_MB`), and then with `RLIMIT_DATA_HEADROOM_MULT` headroom
-    /// over the share. A tighter budget (the governor documents 256 and 512 MiB values)
-    /// stays advisory: scheduling width, SHM quotas and batch sizing still honor it, but
-    /// no rlimit is applied, so trusted kernel replay does not fail outright under it.
+    /// would fail workers whose resident use fits the budget. The cap is therefore the
+    /// share FLOORED at the worker RSS estimate (`REPLAY_WORKER_EST_RSS_MB`), with
+    /// `RLIMIT_DATA_HEADROOM_MULT` headroom: monotone in the budget, so RAISING
+    /// `--max-memory-mb` can never newly fail a worker (review bb7c0f2f F2: the old
+    /// shape applied NO cap below a 2048 MiB share and a 4096 MiB cap at it, so a
+    /// 5 GiB-footprint worker passed at share 2000 and failed at share 2048, and the
+    /// kill note's "raise the budget" advice pointed the wrong way). A tighter budget
+    /// (the governor documents 256 and 512 MiB values) still gets the 4096 MiB floor
+    /// cap, generous enough that trusted kernel replay does not fail outright under it
+    /// while scheduling width, SHM quotas and batch sizing enforce the real share.
     pub fn per_worker_rlimit_mb(&self, parallelism: usize) -> Option<u64> {
         self.per_worker_share_mb(parallelism)
-            .filter(|&mb| mb >= REPLAY_WORKER_EST_RSS_MB)
-            .map(|mb| mb.saturating_mul(RLIMIT_DATA_HEADROOM_MULT))
+            .map(|mb| {
+                mb.max(REPLAY_WORKER_EST_RSS_MB)
+                    .saturating_mul(RLIMIT_DATA_HEADROOM_MULT)
+            })
     }
 
     /// Shrink the replay closure batch cap when the per-worker budget is tight: one module
@@ -269,7 +275,11 @@ impl WorkerBudget {
     /// also includes the mmapped (read-only, file-backed) `.olean` closure, so an AS cap
     /// sized from an RSS budget fails replays whose mappings exceed it even though
     /// resident memory fits. `TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER=<n>` opts into
-    /// `RLIMIT_AS = n ×` the cap. Fail-open inside the child: a worker that cannot lower
+    /// `RLIMIT_AS = n ×` the `rlimit_mb` passed here — the HEADROOM-APPLIED
+    /// `RLIMIT_DATA` cap from `per_worker_rlimit_mb`, not the raw budget share, so an
+    /// operator's `=4` means 4 × (2 × share-or-floor) (review bb7c0f2f F7: the base is
+    /// stated so existing settings are re-checked, not silently rescaled). Fail-open
+    /// inside the child: a worker that cannot lower
     /// its limits still runs, and the machine-wide LRU governor remains the backstop.
     pub fn apply_worker_rlimit(cmd: &mut Command, rlimit_mb: u64) {
         #[cfg(unix)]
@@ -534,14 +544,16 @@ pub(crate) fn invocation_timeout_ms() -> Option<u64> {
 /// The explicitly configured audit budget in milliseconds — ONE parser (#443 review,
 /// finding 3) shared by `audit_timeout_ms` and the shard auditor's unbounded-request
 /// check, so every spelling of `TURBO_LEAN_AUDIT_TIMEOUT_SECS` means the same thing on
-/// both paths. `None`: not configured (unset, or an unparsable value, which is no
-/// configuration at all). `Some(UNBOUNDED_TIMEOUT_MS)`: explicitly unbounded (`0` or an
-/// empty value, matching `eval --timeout-ms 0`). Otherwise the configured budget.
+/// both paths. `None`: not configured (unset, an EMPTY value, or an unparsable value,
+/// which is no configuration at all — an empty export such as `VAR=${UNSET}` in CI must
+/// not silently mean "no timeout"; review bb7c0f2f F1). `Some(UNBOUNDED_TIMEOUT_MS)`:
+/// explicitly unbounded (a literal `0`, matching `eval --timeout-ms 0`). Otherwise the
+/// configured budget.
 pub(crate) fn explicit_audit_timeout_ms() -> Option<u64> {
     let raw = std::env::var("TURBO_LEAN_AUDIT_TIMEOUT_SECS").ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Some(UNBOUNDED_TIMEOUT_MS);
+        return None;
     }
     match trimmed.parse::<u64>() {
         Ok(0) => Some(UNBOUNDED_TIMEOUT_MS),
@@ -561,10 +573,19 @@ pub(crate) fn is_unbounded_timeout_ms(ms: u64) -> bool {
 
 /// Per-audit / `.olean`-reader budget in milliseconds (`TURBO_LEAN_AUDIT_TIMEOUT_SECS`, or
 /// `[audit] timeout_secs` in turbo-lean.toml; defaulting to 120 s in untrusted mode and
-/// 300 s in trusted mode). `0` or an empty value is explicitly unbounded (#443); an
-/// unparsable value is ignored like an unset one.
+/// 300 s in trusted mode). A literal `0` is explicitly unbounded (#443); an empty or
+/// unparsable value is ignored like an unset one. In untrusted mode the result is clamped
+/// to [15, 600] s like the replay and compile budgets (review bb7c0f2f F1), so a
+/// PR-supplied `[audit] timeout_secs = 0` cannot hold a CI runner; the explicitly
+/// unbounded spelling still reaches the shard auditor's OWN check through
+/// `explicit_audit_timeout_ms`, which is trusted-side only.
 pub(crate) fn audit_timeout_ms(is_untrusted: bool) -> u64 {
-    explicit_audit_timeout_ms().unwrap_or(if is_untrusted { 120_000 } else { 300_000 })
+    let ms = explicit_audit_timeout_ms().unwrap_or(if is_untrusted { 120_000 } else { 300_000 });
+    if is_untrusted {
+        ms.clamp(15_000, 600_000)
+    } else {
+        ms
+    }
 }
 
 /// Per kernel-replay-worker budget in milliseconds (`TURBO_LEAN_REPLAY_TIMEOUT_SECS`, or

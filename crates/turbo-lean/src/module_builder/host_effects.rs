@@ -71,8 +71,9 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
         // The stale-and-unowned case: these artifacts may embed host state, Lake's
         // traces do not cover host reads, and deleting is not ours to do (#434: the
         // package belongs to a shared or foreign checkout), so the walk fails closed,
-        // deletes nothing, and names the action that clears the condition: an
-        // own-workspace rebuild refreshes the stale artifact, after which the walk no
+        // deletes nothing, and names the action that clears the condition — WHICH
+        // workspace refreshes the artifact depends on where the package lives (review
+        // cf31dd1e F3; see `non_owned_dep_refresh_remedy`) — after which the walk no
         // longer refuses. Staleness is the mtime gate of
         // `spec_own_artifact_stale_on_disk` (source, package config, resolved
         // `include_str` targets); a `run_cmd` host read whose external input changed
@@ -85,7 +86,7 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
                  artifacts first ({}) and retry.",
                 spec.module_name,
                 spec.pkg_root.display(),
-                non_owned_dep_refresh_remedy(&spec.module_name, &cfg.root_pkg.pkg_root)
+                non_owned_dep_refresh_remedy(&spec.module_name, &cfg.root_pkg.pkg_root, &spec.pkg_root)
             )
         };
         let Ok(src_raw) = fs::read_to_string(&spec.src_path) else {
@@ -146,7 +147,7 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
 /// reuse, so a purge refusal would protect nothing. Beyond an mtime gate by design,
 /// and so undetected here: a `run_cmd` host read whose external input changed, and a
 /// non-literal or unresolvable `include_str` target.
-fn spec_own_artifact_stale_on_disk(spec: &DiscoveredModuleSpec) -> bool {
+pub(crate) fn spec_own_artifact_stale_on_disk(spec: &DiscoveredModuleSpec) -> bool {
     let olean = spec_olean_path(spec);
     let Ok(om) = fs::metadata(&olean) else {
         return false;
@@ -955,18 +956,113 @@ fn pkg_root_owned_by_project(
     let Ok(root) = root_canon else {
         return false;
     };
-    if owner_marker_names_project(pkg_root, &root) {
+    // Review cf31dd1e F1: the marker is checked on the CANONICAL package root, the same
+    // form the #436 build gate canonicalizes, never the raw path. On the raw path,
+    // `pkg_root.parent()` is the project's `.lake/packages` SLOT: when that slot is a
+    // symlink to a relocated, marker-owned packages dir, a nested symlinked entry
+    // pointing at a SHARED checkout would inherit the marker and re-open the #434
+    // write; canonically, that entry's parent is wherever the shared checkout lives,
+    // which carries no marker.
+    if pkg_canon
+        .as_deref()
+        .ok()
+        .is_some_and(|pkg| owner_marker_names_project(pkg, &root))
+    {
         return true;
     }
+    // Review cf31dd1e F5: the same-repository grant covers the LEXICAL monorepo-sibling
+    // `require … from "../libs/x"` shape only. A package reached THROUGH A SYMLINK (the
+    // #434 shape) must not inherit ownership from an enclosing repository, and an
+    // unrelated enclosing checkout (a dotfiles repository at `$HOME`) would otherwise
+    // make every git-less neighbor under it count as owned. The raw path therefore has
+    // to reach the package without a symlink hop: its lexical normalization equals its
+    // canonicalization. A symlink above BOTH roots loses this grant conservatively; the
+    // owner marker is the way back.
+    let raw_symlink_free = pkg_canon
+        .as_deref()
+        .ok()
+        .is_some_and(|canon| lexical_normalize(pkg_root) == *canon);
     let pkg_repo = pkg_canon
         .ok()
         .as_deref()
         .and_then(nearest_git_ancestor);
     match (pkg_repo, nearest_git_ancestor(&root)) {
-        (Some(pkg_repo), Some(root_repo)) => pkg_repo == root_repo,
-        (None, None) => manifest_entry_is_path_dep(cfg, pkg_name, pkg_base_name, pkg_root),
+        (Some(pkg_repo), Some(root_repo)) => raw_symlink_free && pkg_repo == root_repo,
+        // Review cf31dd1e F2: a plain-directory `path` dependency (`require foo from
+        // "../foo"`, no `.git` anywhere above it) is editable scratch — finding 6's
+        // shape — whether or not the PROJECT is a git checkout; the previous
+        // `(None, Some(_)) => false` arm silently dropped it from the closure sweep
+        // and made the purge refuse as soon as the project was in git. An entry under
+        // the project's own packagesDir SLOT (a symlinked or copied
+        // `.lake/packages/<dep>`) is NOT that shape: a git-less copy there is the
+        // #434 tarball case and stays non-owned.
+        (None, _) => manifest_path_dep_declared_outside_packages_slot(
+            cfg,
+            pkg_name,
+            pkg_base_name,
+            pkg_root,
+        ),
         _ => false,
     }
+}
+
+/// Whether the manifest names this package as a `path` dependency whose DECLARED
+/// directory lies outside the project's own packagesDir slot (review cf31dd1e F2): a `path` entry
+/// declared under `.lake/packages/<dep>` is where a symlinked or copied tarball lives —
+/// the #434 shape — whatever form the resolved package root takes (the resolver may
+/// hand back the symlink's canonical target, which no raw-path test on the root can
+/// see). The declared location is compared lexically, never canonicalized, precisely so
+/// the symlink target cannot launder the entry out of the slot.
+fn manifest_path_dep_declared_outside_packages_slot(
+    cfg: &ProjectConfig,
+    pkg_name: &str,
+    pkg_base_name: &str,
+    pkg_root: &Path,
+) -> bool {
+    let slot = lexical_normalize(&cfg.root_pkg.pkg_root.join(&cfg.root_pkg.packages_dir));
+    let pkg_canon = pkg_root.canonicalize().ok();
+    cfg.manifest_packages.iter().any(|mp| {
+        if mp.pkg_type != "path" {
+            return false;
+        }
+        let matches = mp.name == pkg_name
+            || (!pkg_base_name.is_empty() && mp.name == pkg_base_name)
+            || mp.dir == pkg_root
+            || mp
+                .dir
+                .canonicalize()
+                .ok()
+                .zip(pkg_canon.as_ref())
+                .is_some_and(|(a, b)| a == *b);
+        if !matches {
+            return false;
+        }
+        let declared = if mp.dir.is_absolute() {
+            mp.dir.clone()
+        } else {
+            cfg.root_pkg.pkg_root.join(&mp.dir)
+        };
+        !lexical_normalize(&declared).starts_with(&slot)
+    })
+}
+
+/// Fold `.` and `..` components textually, touching no filesystem state: the comparison
+/// partner for `fs::canonicalize` when deciding whether a raw path reaches its target
+/// without a symlink hop (equal = symlink-free; review cf31dd1e F5).
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// The nearest ancestor (the path itself included) holding a `.git` entry: the
@@ -990,38 +1086,32 @@ fn owner_marker_names_project(pkg_root: &Path, root_canon: &Path) -> bool {
     marker_names_root(pkg_root) || pkg_root.parent().is_some_and(marker_names_root)
 }
 
-/// The one remedy both non-owned-checkout refusals name (DA 3ff1014b F5): Lake, run
-/// from the PROJECT root, refreshes a dependency's artifacts through the project's
-/// own workspace and manifest. Running `lake` inside `.lake/packages/<dep>` instead
-/// resolves the dependency's own manifest and can fetch a nested `.lake/packages`
-/// with different pins.
-pub(crate) fn non_owned_dep_refresh_remedy(module: &str, project_root: &Path) -> String {
-    format!(
-        "run `lake build +{}` from the project root {}",
-        module,
-        project_root.display()
-    )
-}
-
-fn manifest_entry_is_path_dep(
-    cfg: &ProjectConfig,
-    pkg_name: &str,
-    pkg_base_name: &str,
+/// The remedy the non-owned-checkout refusal names. Review cf31dd1e F3: it depends on
+/// where the package lives. An entry under the project's own tree is refreshed through
+/// the PROJECT's workspace (running `lake` inside `.lake/packages/<dep>` resolves the
+/// dependency's own manifest and can fetch a nested `.lake/packages` with different
+/// pins; DA 3ff1014b F5). An OUT-OF-TREE checkout is the opposite case: `lake build +X`
+/// from this project would write into a checkout other projects may share — the very
+/// #434 write these refusals exist to stop — so the fix there is the checkout's own
+/// workspace, or the owner marker when the checkout really is this project's.
+pub(crate) fn non_owned_dep_refresh_remedy(
+    module: &str,
+    project_root: &Path,
     pkg_root: &Path,
-) -> bool {
-    let pkg_canon = pkg_root.canonicalize().ok();
-    cfg.manifest_packages.iter().any(|mp| {
-        mp.pkg_type == "path"
-            && (mp.name == pkg_name
-                || (!pkg_base_name.is_empty() && mp.name == pkg_base_name)
-                || mp.dir == pkg_root
-                || mp
-                    .dir
-                    .canonicalize()
-                    .ok()
-                    .zip(pkg_canon.as_ref())
-                    .is_some_and(|(a, b)| a == *b))
-    })
+) -> String {
+    if pkg_root.starts_with(project_root) {
+        format!(
+            "run `lake build +{}` from the project root {}",
+            module,
+            project_root.display()
+        )
+    } else {
+        format!(
+            "refresh it from that checkout's own workspace (`lake build` in {}), or, if this project truly owns it, mark it with a `.turbo-lean-packages-owner` file naming {}",
+            pkg_root.display(),
+            project_root.display()
+        )
+    }
 }
 
 /// A package root inside a *different* package's `.lake/packages` is a nested checkout
@@ -2651,6 +2741,7 @@ pub(super) fn run_audit_chunk_subprocess(
     is_untrusted: bool,
     skip_child_replay: bool,
     pinned_dir_raw_fd: Option<i32>,
+    audit_concurrency: usize,
 ) -> Result<()> {
     if mod_names.is_empty() || mod_names.iter().any(|m| m.trim().is_empty()) {
         anyhow::bail!("In-kernel `.olean` audit received an empty module name: fail-closed");
@@ -2664,14 +2755,18 @@ pub(super) fn run_audit_chunk_subprocess(
         is_untrusted,
     )?;
     // #435 review (finding 1): `--max-memory-mb` means the same thing on the audit path
-    // as on the replay path. This fallback runs one audit subprocess at a time per
-    // scheduler worker, so the per-process backstop is the budget's single-worker share
-    // (gated and headroomed by `per_worker_rlimit_mb`); untrusted audits keep the
-    // sandbox's own fixed RLIMIT_DATA instead.
-    if !is_untrusted {
-        if let Some(mb) = crate::zygote::WorkerBudget::from_env().per_worker_rlimit_mb(1) {
-            crate::zygote::WorkerBudget::apply_worker_rlimit(&mut cmd, mb);
-        }
+    // as on the replay path. Review bb7c0f2f F5: the cap is the share for the REAL
+    // audit concurrency (the scheduler's audit pool size, threaded in by the caller),
+    // not a hard-coded single-worker share that let each of several concurrent audits
+    // grow to a multiple of the whole budget; untrusted audits keep the sandbox's own
+    // fixed RLIMIT_DATA instead.
+    let applied_rlimit_mb = if is_untrusted {
+        None
+    } else {
+        crate::zygote::WorkerBudget::from_env().per_worker_rlimit_mb(audit_concurrency.max(1))
+    };
+    if let Some(mb) = applied_rlimit_mb {
+        crate::zygote::WorkerBudget::apply_worker_rlimit(&mut cmd, mb);
     }
     cmd.arg("--audit-modules");
     if skip_child_replay {
@@ -2686,9 +2781,29 @@ pub(super) fn run_audit_chunk_subprocess(
     let out =
         run_command_with_timeout_pinned_fd(&mut cmd, timeout, is_untrusted, pinned_dir_raw_fd);
     record_scheduler_test_event("audit_subprocess_end", mod_names);
-    match out.and_then(|o| parse_worker_audit_reply(&o, mod_names)) {
+    // Review bb7c0f2f F4: an allocation failure under the worker cap names the knob (so
+    // `error_names_memory_cap` can classify it), and a memory-capped failure is never
+    // bisected — the halving would redo full-closure loads under the same cap.
+    let attempt = out.and_then(|o| {
+        parse_worker_audit_reply(&o, mod_names).map_err(|e| {
+            let note = crate::zygote::WorkerBudget::memory_kill_note(
+                &o.status,
+                &String::from_utf8_lossy(&o.stderr),
+                applied_rlimit_mb,
+            );
+            if note.is_empty() {
+                e
+            } else {
+                e.context(note.trim_start().to_string())
+            }
+        })
+    });
+    match attempt {
         Ok(()) => Ok(()),
-        Err(_) if mod_names.len() > 1 => {
+        Err(e)
+            if mod_names.len() > 1
+                && !crate::zygote::WorkerBudget::error_names_memory_cap(&e) =>
+        {
             let mid = mod_names.len() / 2;
             run_audit_chunk_subprocess(
                 store_root,
@@ -2699,6 +2814,7 @@ pub(super) fn run_audit_chunk_subprocess(
                 is_untrusted,
                 skip_child_replay,
                 pinned_dir_raw_fd,
+                audit_concurrency,
             )?;
             run_audit_chunk_subprocess(
                 store_root,
@@ -2709,6 +2825,7 @@ pub(super) fn run_audit_chunk_subprocess(
                 is_untrusted,
                 skip_child_replay,
                 pinned_dir_raw_fd,
+                audit_concurrency,
             )
         }
         Err(e) => Err(e),
@@ -2731,6 +2848,7 @@ pub(super) fn run_audit_or_replay_batch_worker_bound(
     snap: &std::sync::Arc<crate::zygote::ClosureSnapshot>,
     live_lean_path_env: &str,
     is_untrusted: bool,
+    audit_concurrency: usize,
 ) -> Result<AuditBatchWorkerOutcome> {
     let (snap_lp, snap_dir) =
         crate::zygote::ensure_bound_audit_closure(snap, "sched_audit_before_replay")?;
@@ -2849,7 +2967,9 @@ pub(super) fn run_audit_or_replay_batch_worker_bound(
                 return Err(e);
             }
             // Any other failure falls through to the audit-chunk path below, whose
-            // workers run under the same budget-derived rlimit.
+            // workers run under the same budget-derived rlimit; the per-dependency
+            // replay fallback further down runs capped under the replay timeout too
+            // (review bb7c0f2f F3).
             Err(_) => {}
         }
     } else if !is_untrusted && need_replay_dep.is_empty() && !replay_sorted.is_empty() {
@@ -2892,6 +3012,7 @@ pub(super) fn run_audit_or_replay_batch_worker_bound(
             is_untrusted,
             chunk_skip_replay,
             pinned_fd,
+            audit_concurrency,
         ) {
             Ok(()) => {
                 let _ = crate::zygote::ensure_bound_audit_closure(snap, "sched_audit_after_chunk")?;
@@ -2932,6 +3053,7 @@ pub(super) fn run_audit_or_replay_batch_worker_bound(
                                 is_untrusted,
                                 single_skip_replay,
                                 pinned_fd,
+                                audit_concurrency,
                             )?;
                             let _ = crate::zygote::ensure_bound_audit_closure(
                                 snap,
@@ -2995,19 +3117,45 @@ pub(super) fn run_audit_or_replay_batch_worker_bound(
         record_scheduler_test_event("replay_subprocess_start", std::slice::from_ref(m));
         let res = (|| -> Result<()> {
             let _ = crate::zygote::ensure_bound_audit_closure(snap, "sched_replay_before_single")?;
-            let (mut cmd, timeout) =
+            let (mut cmd, _audit_timeout) =
                 crate::zygote::kernel_reader_command(store_root, cfg, &snap_lp, &[], false)?;
+            // Review bb7c0f2f F3: this per-dependency fallback redoes the union replay's
+            // work, so it runs under the same budget-derived rlimit, the REPLAY timeout
+            // knob (not the audit one), and its failure carries the memory-cap note —
+            // this was the one path that still ran uncapped after #435.
+            let dep_rlimit_mb = crate::zygote::WorkerBudget::from_env()
+                .per_worker_rlimit_mb(audit_concurrency.max(1));
+            if let Some(mb) = dep_rlimit_mb {
+                crate::zygote::WorkerBudget::apply_worker_rlimit(&mut cmd, mb);
+            }
+            let dep_timeout =
+                std::time::Duration::from_millis(crate::zygote::replay_timeout_ms(false));
             cmd.args(["--kernel-replay-module", m.as_str()]);
-            let out = run_command_with_timeout_pinned_fd(&mut cmd, timeout, false, pinned_fd)
-                .context(
-                    "Failed to execute independent kernel replay (`--kernel-replay-module`)",
-                )?;
+            let out = run_command_with_timeout_pinned_fd(&mut cmd, dep_timeout, false, pinned_fd)
+                .map_err(|e| {
+                    if e.downcast_ref::<CommandTimedOut>().is_some() {
+                        e.context(format!(
+                            "independent kernel replay of `{}` exceeded its {}s budget (raise `[replay] timeout_secs` in turbo-lean.toml or `TURBO_LEAN_REPLAY_TIMEOUT_SECS`)",
+                            m,
+                            dep_timeout.as_secs()
+                        ))
+                    } else {
+                        e.context(
+                            "Failed to execute independent kernel replay (`--kernel-replay-module`)",
+                        )
+                    }
+                })?;
             anyhow::ensure!(
                 out.status.success(),
-                "[TurboLean.KernelReplay] independent kernel re-check of dependency `{}` failed (exit={}):\n{}",
+                "[TurboLean.KernelReplay] independent kernel re-check of dependency `{}` failed (exit={}):\n{}{}",
                 m,
                 out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
+                String::from_utf8_lossy(&out.stderr).trim(),
+                crate::zygote::WorkerBudget::memory_kill_note(
+                    &out.status,
+                    &String::from_utf8_lossy(&out.stderr),
+                    dep_rlimit_mb
+                )
             );
             let _ = crate::zygote::ensure_bound_audit_closure(snap, "sched_replay_after_single")?;
             Ok(())
@@ -3043,6 +3191,7 @@ pub(super) fn run_audit_or_replay_batch_worker(
     mod_names: &[String],
     lean_path_env: &str,
     is_untrusted: bool,
+    audit_concurrency: usize,
 ) -> Result<AuditBatchWorkerOutcome> {
     if mod_names.is_empty() {
         return Ok(HashMap::new());
@@ -3061,6 +3210,7 @@ pub(super) fn run_audit_or_replay_batch_worker(
                 &snap,
                 lean_path_env,
                 is_untrusted,
+                audit_concurrency,
             )
         }
         Err(batch_err) if mod_names.len() == 1 => {
@@ -3087,6 +3237,7 @@ pub(super) fn run_audit_or_replay_batch_worker(
                             &snap,
                             lean_path_env,
                             is_untrusted,
+                            audit_concurrency,
                         ) {
                             Ok(mut sub) => {
                                 if let Some(v) = sub.remove(m) {
@@ -3415,6 +3566,73 @@ mod host_effect_taint_tests {
             dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
             "an editable sibling path dependency's targets are project-driven \
              (finding 6)"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// Review cf31dd1e F2: the editable-sibling grant must not depend on whether the
+    /// PROJECT is a git checkout. The previous `(None, Some(_)) => false` arm silently
+    /// un-owned a plain-directory sibling the moment the project was in git — the
+    /// ordinary finding-6 layout — so this is the sibling test again with
+    /// `git init` run on the project side.
+    #[test]
+    fn host_effects_plain_sibling_of_git_project_stays_project_owned() -> Result<()> {
+        let dir = temp_dir("sibling_git_proj");
+        let proj = dir.join("proj");
+        let dep = dir.join("lintlib");
+        fs::create_dir_all(&proj)?;
+        fs::create_dir_all(&dep)?;
+        let tc = include_str!("../../../../lean/lean-toolchain");
+        fs::write(dep.join("lean-toolchain"), tc)?;
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"lintlib\"\ndefaultTargets = [\"LintLib\"]\n[[lean_lib]]\nname = \"LintLib\"\n",
+        )?;
+        fs::write(dep.join("LintLib.lean"), LINTER_SHAPE)?;
+        fs::write(proj.join("lean-toolchain"), tc)?;
+        fs::write(
+            proj.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage proj where\nrequire lintlib from \"../lintlib\"\n@[default_target]\nlean_lib Proj where\n",
+        )?;
+        fs::write(proj.join("Proj.lean"), "import LintLib\ndef p : Nat := 1\n")?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [{
+                    "type": "path",
+                    "name": "lintlib",
+                    "dir": "../lintlib",
+                    "manifestFile": "lake-manifest.json",
+                    "inherited": false,
+                    "configFile": "lakefile.toml"
+                }]
+            }))?,
+        )?;
+        // The one difference from the sibling test above: the PROJECT is a git repo;
+        // the sibling stays a plain directory with no `.git` anywhere above it.
+        git_init_commit(&proj)?;
+        let canon = fs::canonicalize(&proj)?;
+        reset_lake_inputs_tag_memo();
+        let cfg = resolve_project_config(&canon)?;
+        let dep_pkg = cfg
+            .dep_pkgs
+            .iter()
+            .find(|dp| dp.name == "lintlib")
+            .expect("sibling lintlib dependency resolves");
+        let spec = resolve_module_in_package(dep_pkg, false, "LintLib")
+            .expect("LintLib module resolves in sibling lintlib");
+        assert!(
+            spec_artifacts_purgeable_from_project_root(&cfg, &spec),
+            "a plain-directory sibling path dependency stays project state when the \
+             project itself is a git checkout (review cf31dd1e F2)"
+        );
+        assert!(
+            dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
+            "a plain-directory sibling's targets stay project-driven when the project \
+             is a git checkout (review cf31dd1e F2)"
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())
