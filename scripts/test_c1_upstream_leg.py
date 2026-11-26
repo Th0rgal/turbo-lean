@@ -52,6 +52,50 @@ class C1UpstreamClassificationTest(unittest.TestCase):
                 suite.classify_c1_upstream_rejection(rc, stderr), "frontend_error", (rc, stderr)
             )
 
+    def test_mixed_output_disqualifiers_override_refusal_markers(self):
+        # F1 (round 2): a disqualifying fatal shape anywhere in stderr OR
+        # stdout makes the outcome frontend_error even when a deliberate
+        # refusal marker is also present, and returncode >= 128 is a signal
+        # death whatever the output says.
+        mixed_stderr = (
+            "[lean-native] Unsupported non-scalar parameter `a` of `f` type `Array.{0} Nat`\n"
+            "[lean-native] internal bridge error: unintercepted isShared\n"
+        )
+        self.assertEqual(suite.classify_c1_upstream_rejection(1, mixed_stderr), "frontend_error")
+        panic_stderr = (
+            "[lean-native] unsupported string literal\n"
+            "PANIC at Lean.Compiler.LCNF.toDecl Lean/Compiler/LCNF.lean:10:2: oops\n"
+        )
+        self.assertEqual(suite.classify_c1_upstream_rejection(1, panic_stderr), "frontend_error")
+        elab_mixed = (
+            "[lean-native] Unsupported partial application (`pap f`) in Stage 1B\n"
+            "Elaboration failed for /x/y.lean\n"
+        )
+        self.assertEqual(suite.classify_c1_upstream_rejection(1, elab_mixed), "frontend_error")
+        self.assertEqual(
+            suite.classify_c1_upstream_rejection(1, "uncaught exception: out of memory"),
+            "frontend_error",
+        )
+        # disqualifier on stdout beside a clean refusal on stderr
+        self.assertEqual(
+            suite.classify_c1_upstream_rejection(
+                1, "[lean-native] unsupported string literal", "PANIC at f F.lean:1:1: x"
+            ),
+            "frontend_error",
+        )
+        # benign program stdout must NOT disqualify a clean refusal
+        self.assertEqual(
+            suite.classify_c1_upstream_rejection(
+                1, "[lean-native] unsupported string literal", ">> [10] 40\n>> [10] 50\n"
+            ),
+            "rejected_fail_closed",
+        )
+        # 128+N shell-encoded signal death with a refusal marker present
+        self.assertEqual(
+            suite.classify_c1_upstream_rejection(134, "[lean-native] unsupported string literal"),
+            "frontend_error",
+        )
+
     def test_canary_fixture_exists_and_is_scalar_subset(self):
         src = suite.C1_UPSTREAM_CANARY
         self.assertTrue(src.is_file(), f"canary fixture missing: {src}")
@@ -62,14 +106,26 @@ class C1UpstreamClassificationTest(unittest.TestCase):
 
 
 class C1ToolchainPinTest(unittest.TestCase):
-    def test_manifest_toolchain_must_match_repo_pin(self):
-        # R2: a drifted C1_UPSTREAM_TOOLCHAIN fails the suite at startup.
+    def test_mismatch_fails_only_the_opted_in_leg(self):
+        # F5 (round 2, re-pins the round-1 behavior): a C1_UPSTREAM_TOOLCHAIN
+        # drift no longer stops main() for unrelated tiers; the opted-in leg
+        # fails closed with a named status, before any provisioning.
         with mock.patch.object(c1_corpus, "C1_UPSTREAM_TOOLCHAIN", "leanprover/lean4:v9.99.9"):
-            with self.assertRaises(SystemExit):
-                suite.assert_toolchain_pins_consistent()
+            suite.assert_toolchain_pins_consistent()  # must not raise
+            with mock.patch.object(
+                suite,
+                "ensure_c1_upstream_corpus",
+                side_effect=AssertionError("provisioning must not run on a pin mismatch"),
+            ):
+                sub = suite.run_c1_upstream_corpus(enabled=True)
+                self.assertIs(sub.get("ok"), False)
+                self.assertEqual(sub.get("status"), "failed_toolchain_pin_mismatch")
+                disabled = suite.run_c1_upstream_corpus(enabled=False)
+                self.assertIs(disabled.get("optedIn"), False)
 
     def test_consistent_pins_pass(self):
         suite.assert_toolchain_pins_consistent()
+        self.assertEqual(c1_corpus.C1_UPSTREAM_TOOLCHAIN, suite.fuzz.repo_pinned_toolchain())
 
 
 class C1UpstreamExceptionWrapperTest(unittest.TestCase):
