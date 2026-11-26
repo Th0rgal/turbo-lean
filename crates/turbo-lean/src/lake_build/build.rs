@@ -962,9 +962,12 @@ fn replay_project_cas_expr_shards_inner(
     scoped_files: Option<&[PathBuf]>,
     fail_closed: bool,
 ) -> Result<CasExprReplayStats> {
+    // `Some(scope)` is exact: an empty scope replays nothing (a target cone that resolved
+    // to no files must not silently widen to the whole project). `None` means the whole
+    // project.
     let lean_files: Vec<PathBuf> = match scoped_files {
-        Some(files) if !files.is_empty() => files.to_vec(),
-        _ => collect_lean_files(canon_dir),
+        Some(files) => files.to_vec(),
+        None => collect_lean_files(canon_dir),
     };
     let (split_entries, _) = load_and_split_files_cached(store, &lean_files)?;
     let _ = crate::module_builder::try_project_lake_inputs_tag(canon_dir)?;
@@ -1023,6 +1026,8 @@ fn replay_project_cas_expr_shards_inner(
 
 /// Fail-closed CAS proof replay behind the explicit `--replay-cas-expr` flag: a missing or
 /// corrupted blob is a build error. Returns the number of replayed shards.
+/// `scoped_files`: `Some` is the exact file set (empty replays nothing); `None` is the
+/// whole project.
 pub fn replay_project_cas_expr_shards(
     store: &mut TurboStore,
     canon_dir: &Path,
@@ -1043,7 +1048,10 @@ pub fn replay_project_cas_expr_shards(
 
 /// Best-effort CAS proof replay for the G2b warm-hit default: a missing or corrupted blob
 /// is counted and skipped (the build transparently keeps its already-materialized
-/// baseline), never a failure.
+/// baseline). Infrastructure errors (a split-cache or config read failing) still
+/// propagate; `run_cas_expr_replay_for_build` contains them so a warm build never fails
+/// through the default. `scoped_files`: `Some` is the exact file set (empty replays
+/// nothing); `None` is the whole project.
 pub fn replay_project_cas_expr_shards_best_effort(
     store: &mut TurboStore,
     canon_dir: &Path,
@@ -1070,13 +1078,23 @@ pub(crate) fn warm_cas_replay_disabled() -> bool {
 }
 
 /// G2b decision: CAS proof replay runs by default exactly on a warm (cache-hit) build
-/// path, unless the explicit fail-closed flag already runs it or the operator opted out.
-pub(crate) fn should_replay_cas_expr_on_warm_hit(
-    explicit_replay: bool,
-    cache_hit: bool,
-    opt_out: bool,
+/// path, unless the operator opted out. The explicit fail-closed flag never reaches this
+/// decision: the selector's early return owns it, so there is no dead parameter here.
+pub(crate) fn should_replay_cas_expr_on_warm_hit(cache_hit: bool, opt_out: bool) -> bool {
+    cache_hit && !opt_out
+}
+
+/// G2b (review finding 4): the leader / no-singleflight branch of
+/// `run_build_command_with_cas_replay` is not always cold. It is warm when the project's
+/// oleans were already up to date (no build ran), or when the native build compiled
+/// nothing and served every module from cache or up-to-date reuse.
+pub(crate) fn leader_branch_cache_hit(
+    oleans_up_to_date: bool,
+    report: &crate::module_builder::NativeBuildReport,
 ) -> bool {
-    !explicit_replay && cache_hit && !opt_out
+    oleans_up_to_date
+        || (report.modules_compiled == 0
+            && (report.modules_cached > 0 || report.modules_up_to_date_reused > 0))
 }
 
 /// What one `run_build_command_with_cas_replay` branch did about CAS expr replay (G2b).
@@ -1089,7 +1107,9 @@ pub(crate) struct CasExprBuildReplay {
     /// tamper evidence, counted on its own and warned about, never folded into
     /// `missing`.
     pub(crate) invalid: usize,
-    /// `"explicit"` (fail-closed flag), `"warm_default"` (G2b), or `"off"`.
+    /// `"explicit"` (fail-closed flag), `"warm_default"` (G2b), `"warm_default_error"`
+    /// (an internal error during the warm default, contained so the warm build goes on),
+    /// or `"off"`.
     pub(crate) mode: &'static str,
 }
 
@@ -1120,14 +1140,30 @@ pub(crate) fn run_cas_expr_replay_for_build(
             mode: "explicit",
         });
     }
-    if should_replay_cas_expr_on_warm_hit(explicit_replay, cache_hit, warm_cas_replay_disabled()) {
-        let stats = replay_project_cas_expr_shards_best_effort(
+    if should_replay_cas_expr_on_warm_hit(cache_hit, warm_cas_replay_disabled()) {
+        // Review finding 1: an internal error here (a split-cache or config read failing)
+        // must never fail a warm build whose outputs are already materialized. Contain it
+        // as a mode instead of propagating through `?`.
+        let stats = match replay_project_cas_expr_shards_best_effort(
             store,
             canon_dir,
             toolchain,
             trust_domain,
             scoped_files,
-        )?;
+        ) {
+            Ok(stats) => stats,
+            Err(err) => {
+                eprintln!(
+                    "[turbo-lean][warn] warm CAS replay skipped on an internal error (the warm build goes on): {err:#}"
+                );
+                return Ok(CasExprBuildReplay {
+                    replayed: 0,
+                    missing: 0,
+                    invalid: 0,
+                    mode: "warm_default_error",
+                });
+            }
+        };
         if stats.invalid > 0 {
             eprintln!(
                 "[turbo-lean][warn] warm CAS replay: {} corrupted or invalid expr_shard blob(s) skipped (tamper/corruption evidence; run `turbo-lean build --replay-cas-expr` to fail closed)",
@@ -1232,7 +1268,8 @@ pub fn run_build_command_with_cas_replay(
             };
             let cache_hit = build_report.modules_compiled == 0
                 && (build_report.modules_cached > 0 || build_report.modules_up_to_date_reused > 0);
-            // G2b: on a warm target-cone hit, CAS proof replay runs by default (best-effort).
+            // G2b: on a warm target-cone hit, CAS proof replay runs by default
+            // (best-effort). The cone is the exact scope: an empty cone replays nothing.
             let cas_replay = run_cas_expr_replay_for_build(
                 store,
                 &canon_dir,
@@ -1594,13 +1631,17 @@ pub fn run_build_command_with_cas_replay(
             } else {
                 0
             };
-            // G2b: a leader (cold) build just ran elaboration, so there is nothing to
-            // skip; replay here stays behind the explicit fail-closed flag.
+            // G2b (review finding 4): this branch is not always cold — oleans can already
+            // be up to date (no build ran), the whole report can come from cache/reuse,
+            // and an external-dep project takes this branch on every build. Compute the
+            // real cache-hit instead of hard-coding cold. A target-scoped build replays
+            // exactly its cone (an empty cone replays nothing); an unscoped build replays
+            // the whole project.
             let cas_replay = {
-                let scoped = if !targets.is_empty() && !build_report.cone_source_paths.is_empty() {
-                    Some(build_report.cone_source_paths.as_slice())
-                } else {
+                let scoped = if targets.is_empty() {
                     None
+                } else {
+                    Some(build_report.cone_source_paths.as_slice())
                 };
                 run_cas_expr_replay_for_build(
                     store,
@@ -1609,7 +1650,7 @@ pub fn run_build_command_with_cas_replay(
                     &trust_domain,
                     scoped,
                     replay_cas_expr,
-                    false,
+                    leader_branch_cache_hit(oleans_up_to_date, &build_report),
                 )?
             };
             let shards_ms = t_shards.elapsed().as_millis();
