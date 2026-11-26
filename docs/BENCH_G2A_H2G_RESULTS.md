@@ -142,7 +142,7 @@ opt-in (`TURBO_LEAN_WARM_CAS_REPLAY=1` enabled; the opt-out still forced off;
 the replay path was kept unchanged). The forward options were a
 `build`-shaped warm loop or `check`-path wiring measured on a quiet node, or
 deleting the path, the leaf's other branch; the next section took the first
-and it ended on the second. With the revert the telemetry mode strings were
+and the leaf ended on its deleted branch. With the revert the telemetry mode strings were
 renamed (`warm_default` to `warm_opt_in`, `warm_default_error` to
 `warm_opt_in_error`), a telemetry contract change; no external consumer of
 the old strings was found (pr_verify and the integration tests read zero
@@ -181,7 +181,7 @@ artifact:
 ```
 python3 scripts/bench_build_loop.py --turbo-lean-bin target/release/turbo-lean \
     --machine-label g2b-build-192c --allow-busy-node \
-    --out scripts/bench_build_loop_g2b.json
+    --out <results.json>
 ```
 
 Warm cache-hit builds, 20 measured calls per side:
