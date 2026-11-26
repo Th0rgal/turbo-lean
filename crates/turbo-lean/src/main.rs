@@ -75,7 +75,7 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
-    /// Optional memory budget cap in MiB (sets TURBO_LEAN_MAX_MEMORY_MB for hardware-adaptive governor)
+    /// Memory budget in MiB (sets TURBO_LEAN_MAX_MEMORY_MB): sizes worker parallelism, SHM quotas and replay batches; when a worker's share of it reaches the 2 GiB per-worker estimate, the share is also enforced as a hard per-worker RLIMIT_DATA with 2x headroom (the limit meters virtual writable memory, not RSS); smaller budgets stay advisory
     #[arg(long, global = true)]
     max_memory_mb: Option<u64>,
 

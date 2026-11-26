@@ -810,6 +810,14 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
                 .iter()
                 .all(|m| snap.entries.get(m).and_then(|e| e.as_ref()).is_some())
     };
+    // #435 review (finding 1): thread the budget-derived hard cap to the audit workers.
+    // The sequential branches run one audit subprocess at a time, so their per-process
+    // backstop is the budget's single-worker share.
+    let solo_audit_rlimit_mb = if is_untrusted {
+        None
+    } else {
+        WorkerBudget::from_env().per_worker_rlimit_mb(1)
+    };
     if is_untrusted || chunks.len() <= 1 {
         for chunk in chunks {
             let (chunk_lp, _) = ensure_bound_audit_closure(&snap, "audit_before_chunk")?;
@@ -823,6 +831,7 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
                 allow_sorry_axiom,
                 pre_replayed,
                 pinned_fd,
+                solo_audit_rlimit_mb,
             )?;
             let _ = ensure_bound_audit_closure(&snap, "audit_after_chunk")?;
             if should_record_chunk(chunk) {
@@ -854,6 +863,8 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
             }
         },
     );
+    // #435 review (finding 1): each fan-out worker's hard cap is its share of the budget.
+    let audit_rlimit_mb = WorkerBudget::from_env().per_worker_rlimit_mb(parallelism);
     if parallelism <= 1 {
         for chunk in chunks {
             let (chunk_lp, _) = ensure_bound_audit_closure(&snap, "audit_before_chunk")?;
@@ -867,6 +878,7 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
                 allow_sorry_axiom,
                 pre_replayed,
                 pinned_fd,
+                audit_rlimit_mb,
             )?;
             let _ = ensure_bound_audit_closure(&snap, "audit_after_chunk")?;
             if should_record_chunk(chunk) {
@@ -913,6 +925,7 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
                             allow_sorry_axiom,
                             pre_replayed,
                             pinned_fd,
+                            audit_rlimit_mb,
                         )?;
                         let _ = ensure_bound_audit_closure(&snap, "audit_after_chunk")?;
                         Ok(())
@@ -1026,6 +1039,8 @@ pub(crate) fn replay_and_audit_modules_with_zygote_snapshot(
                     .unwrap_or(4)
             },
         );
+        // #435 review (finding 1): each fan-out worker's hard cap is its budget share.
+        let audit_rlimit_mb = WorkerBudget::from_env().per_worker_rlimit_mb(parallelism);
         if parallelism <= 1 {
             for chunk in chunks {
                 let (chunk_lp, _) =
@@ -1040,6 +1055,7 @@ pub(crate) fn replay_and_audit_modules_with_zygote_snapshot(
                     false,
                     true,
                     pinned_fd,
+                    audit_rlimit_mb,
                 )?;
                 let _ = ensure_bound_audit_closure(&snap, "replay_and_audit_after_chunk")?;
             }
@@ -1072,6 +1088,7 @@ pub(crate) fn replay_and_audit_modules_with_zygote_snapshot(
                                         false,
                                         true,
                                         pinned_fd,
+                                        audit_rlimit_mb,
                                     )?;
                                     let _ = ensure_bound_audit_closure(
                                         &snap,
@@ -1695,12 +1712,21 @@ pub(super) fn audit_compiled_module_batch_exec_pinned(
     allow_sorry_axiom: bool,
     skip_child_replay: bool,
     pinned_dir_raw_fd: Option<i32>,
+    per_worker_rlimit_mb: Option<u64>,
 ) -> Result<()> {
     if mod_names.is_empty() || mod_names.iter().any(|m| m.trim().is_empty()) {
         anyhow::bail!("In-kernel `.olean` audit received an empty module name: fail-closed");
     }
     let (mut cmd, timeout) =
         kernel_reader_command(store_root, cfg, lean_path_env, extra_ro_binds, is_untrusted)?;
+    // #435 review (finding 1): the budget-derived hard cap reaches `--audit-modules`
+    // workers too, so `--max-memory-mb` means the same thing on the audit path as on the
+    // replay path. Untrusted audits keep the sandbox's own fixed RLIMIT_DATA instead.
+    if !is_untrusted {
+        if let Some(mb) = per_worker_rlimit_mb {
+            WorkerBudget::apply_worker_rlimit(&mut cmd, mb);
+        }
+    }
     if allow_sorry_axiom && !is_untrusted {
         let mut allowed = crate::splitter::allowed_axioms();
         if !allowed.iter().any(|a| a == "sorryAx") {
@@ -1742,6 +1768,7 @@ pub(super) fn audit_compiled_module_batch_exec_pinned(
                 allow_sorry_axiom,
                 skip_child_replay,
                 pinned_dir_raw_fd,
+                per_worker_rlimit_mb,
             )?;
             audit_compiled_module_batch_exec_pinned(
                 store_root,
@@ -1753,6 +1780,7 @@ pub(super) fn audit_compiled_module_batch_exec_pinned(
                 allow_sorry_axiom,
                 skip_child_replay,
                 pinned_dir_raw_fd,
+                per_worker_rlimit_mb,
             )
         }
         Err(e) => Err(e),

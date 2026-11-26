@@ -2579,6 +2579,16 @@ pub(super) fn run_audit_chunk_subprocess(
         extra_ro_binds,
         is_untrusted,
     )?;
+    // #435 review (finding 1): `--max-memory-mb` means the same thing on the audit path
+    // as on the replay path. This fallback runs one audit subprocess at a time per
+    // scheduler worker, so the per-process backstop is the budget's single-worker share
+    // (gated and headroomed by `per_worker_rlimit_mb`); untrusted audits keep the
+    // sandbox's own fixed RLIMIT_DATA instead.
+    if !is_untrusted {
+        if let Some(mb) = crate::zygote::WorkerBudget::from_env().per_worker_rlimit_mb(1) {
+            crate::zygote::WorkerBudget::apply_worker_rlimit(&mut cmd, mb);
+        }
+    }
     cmd.arg("--audit-modules");
     if skip_child_replay {
         cmd.arg("--skip-child-replay");
@@ -2714,7 +2724,7 @@ pub(super) fn run_audit_or_replay_batch_worker_bound(
         union_replay.extend(need_replay_dep.iter().cloned());
         union_replay.sort();
         union_replay.dedup();
-        if crate::zygote::kernel_replay_modules_exec_pinned(
+        match crate::zygote::kernel_replay_modules_exec_pinned(
             store_root,
             cfg,
             &union_replay,
@@ -2722,26 +2732,41 @@ pub(super) fn run_audit_or_replay_batch_worker_bound(
             &[],
             false,
             pinned_fd,
-        )
-        .is_ok()
-        {
-            let _ = crate::zygote::ensure_bound_audit_closure(snap, "sched_audit_after_replay")?;
-            pre_replayed = true;
-            for m in &replay_sorted {
-                let record_rep = !snap_replayed.contains(m);
-                per_mod.insert(
-                    m.clone(),
-                    (
-                        Ok(()),
-                        Some(ModuleAuditAuthority::Snapshot((
-                            std::sync::Arc::clone(snap),
-                            record_rep,
-                            false,
-                        ))),
-                    ),
-                );
+        ) {
+            Ok(()) => {
+                let _ =
+                    crate::zygote::ensure_bound_audit_closure(snap, "sched_audit_after_replay")?;
+                pre_replayed = true;
+                for m in &replay_sorted {
+                    let record_rep = !snap_replayed.contains(m);
+                    per_mod.insert(
+                        m.clone(),
+                        (
+                            Ok(()),
+                            Some(ModuleAuditAuthority::Snapshot((
+                                std::sync::Arc::clone(snap),
+                                record_rep,
+                                false,
+                            ))),
+                        ),
+                    );
+                }
+                replay_sorted.clear();
             }
-            replay_sorted.clear();
+            // #435/#437 review (finding 1): a capped replay that timed out or failed
+            // under the per-worker memory cap carries diagnostics naming the knob to
+            // raise (`[replay] timeout_secs`, `--max-memory-mb`). Return them to the
+            // caller instead of silently redoing the whole replay through the
+            // audit-chunk fallback.
+            Err(e)
+                if e.downcast_ref::<CommandTimedOut>().is_some()
+                    || crate::zygote::WorkerBudget::error_names_memory_cap(&e) =>
+            {
+                return Err(e);
+            }
+            // Any other failure falls through to the audit-chunk path below, whose
+            // workers run under the same budget-derived rlimit.
+            Err(_) => {}
         }
     } else if !is_untrusted && need_replay_dep.is_empty() && !replay_sorted.is_empty() {
         for m in &replay_sorted {

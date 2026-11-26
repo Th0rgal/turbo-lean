@@ -192,8 +192,10 @@ use super::*;
         let mut capped_n = 0usize;
         let mut uncapped_n = 0usize;
         for (key, workers) in pool.iter().filter(|(key, _)| key.0.contains(&policy_tag)) {
-            // --max-memory-mb 8192 over a jobs=2 fan-out = 4096 MiB per worker.
-            if key.2.ends_with("#rlimit_mb=4096") {
+            // --max-memory-mb 8192 over a jobs=2 fan-out = a 4096 MiB share per worker,
+            // enforced as RLIMIT_DATA with x2 headroom (the limit meters virtual writable
+            // mappings, not RSS) = 8192 MiB.
+            if key.2.ends_with("#rlimit_mb=8192") {
                 capped_n += workers.len();
             } else {
                 uncapped_n += workers.len();
@@ -2243,8 +2245,14 @@ use super::*;
             explicit_over_budget.effective_parallelism(64, 2048, || unreachable!()),
             2
         );
-        assert_eq!(capped.per_worker_rlimit_mb(2), Some(2048));
-        assert_eq!(capped.per_worker_rlimit_mb(64), Some(512)); // floored share
+        // #435 review (finding 2): `RLIMIT_DATA` meters writable private VIRTUAL mappings
+        // (heap, malloc arenas, pthread stacks), not RSS, so the hard cap binds only when
+        // the per-worker share is at least the worker RSS estimate, and then with x2
+        // headroom over the share; a tighter share stays advisory (no rlimit).
+        assert_eq!(capped.per_worker_share_mb(2), Some(2048));
+        assert_eq!(capped.per_worker_rlimit_mb(2), Some(4096)); // 2048 MiB share x2 headroom
+        assert_eq!(capped.per_worker_share_mb(64), Some(512)); // floored share
+        assert_eq!(capped.per_worker_rlimit_mb(64), None); // sub-estimate share: advisory only
         assert_eq!(capped.replay_batch_cap(32, 2), 8); // 2 GiB per worker: shrink batches
         assert_eq!(capped.replay_batch_cap(32, 4), 1); // 1 GiB per worker: single-module slices
 
@@ -2261,8 +2269,9 @@ use super::*;
     fn test_worker_budget_rlimit_reaches_the_worker_process() {
         // #435 acceptance: the per-worker memory cap is a real RLIMIT_DATA on the spawned
         // worker, not an advisory governor hint (`ulimit -d` reports it in KiB). The
-        // address space stays uncapped by default: the worker's mmapped `.olean` closure
-        // and its 256 MiB Lean stack live in AS but not in the RSS-sized budget.
+        // address space stays uncapped by default: the worker's mmapped (file-backed)
+        // `.olean` closure lives in AS but not under RLIMIT_DATA, which meters writable
+        // private mappings (heap, malloc arenas, pthread stacks).
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "ulimit -d; ulimit -v"]);
         WorkerBudget::apply_worker_rlimit(&mut cmd, 512);
@@ -2382,6 +2391,40 @@ use super::*;
             "{err:#}"
         );
         assert!(err.to_string().contains("timed out after"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_memory_cap_error_classification_for_scheduler_fallback() {
+        // #435 review (finding 1): the scheduler returns a capped replay's failure to its
+        // caller (instead of silently redoing the work through the audit fallback) when
+        // the error is a typed timeout or carries the memory-cap attribution; this pins
+        // the classification helper against the exact phrases `memory_kill_note` writes.
+        use std::os::unix::process::ExitStatusExt;
+        let unrelated = anyhow::anyhow!("plain replay failure, no cap context");
+        assert!(!WorkerBudget::error_names_memory_cap(&unrelated));
+        let definite = anyhow::anyhow!(
+            "replay failed:{}",
+            WorkerBudget::memory_kill_note(
+                &std::process::ExitStatus::from_raw(1 << 8),
+                "terminate called after throwing an instance of 'std::bad_alloc'",
+                Some(512),
+            )
+        );
+        assert!(WorkerBudget::error_names_memory_cap(&definite));
+        let maybe = anyhow::anyhow!(
+            "replay failed:{}",
+            WorkerBudget::memory_kill_note(
+                &std::process::ExitStatus::from_raw(libc::SIGKILL),
+                "",
+                Some(512),
+            )
+        );
+        assert!(WorkerBudget::error_names_memory_cap(&maybe));
+        // The scheduler sees contexts stacked on the root error; the attribution stays
+        // visible through the chain format.
+        let wrapped = definite.context("scheduler pre-replay");
+        assert!(WorkerBudget::error_names_memory_cap(&wrapped));
     }
 
     #[test]
