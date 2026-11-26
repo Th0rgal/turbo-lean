@@ -52,7 +52,9 @@ theorem lookupFuncRec?_mem : ∀ (Φ : List LNIRDecl) (fn : String) (ld : LNIRDe
     (same `evalExpr`, same `evalSeqLoop`/`evalParFor` helpers, `budget` carried only as
     `evalParFor`'s evaluator budget, exactly where `evalCode` passes its `fuel`), with
     ONE new rule: a non-extern `.call` whose name `lookupFuncRec? Φ` resolves runs — if
-    the level below exists (`callee? = some`) — the callee body under `callee?` with the
+    the level below exists (`callee? = some`) and the argument count matches the callee's
+    parameters (else `.typeError "call arity mismatch"`, as L2's `evalCodeF`) — the callee
+    body under `callee?` with the
     declaration-entry binding convention, then the continuation at THIS level. At the
     spent level (`callee? = none`) a resolved call is `.error .fuelExhausted` BEFORE its
     arguments are read: an evaluator budget, never source UB. An extern call, a lookup
@@ -70,11 +72,15 @@ def evalCodeRAux (Φ : List LNIRDecl) (budget : Nat)
         | some callee =>
           match evalVarList env args with
           | .ok vals =>
-            match callee
-                ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
-                st ld.body with
-            | .ok (v, st') => evalCodeRAux Φ budget callee? (env.bind dst v) st' k
-            | .error err => .error err
+            -- Strict arity, as L2's `evalCodeF` (review F4 of both lanes): the source
+            -- side's `bindParams` refuses a count mismatch, so this side does too.
+            if vals.length = ld.params.length then
+              match callee
+                  ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
+                  st ld.body with
+              | .ok (v, st') => evalCodeRAux Φ budget callee? (env.bind dst v) st' k
+              | .error err => .error err
+            else .error (.typeError "call arity mismatch")
           | .error err => .error err
       | none =>
         match evalExpr env st (.call fn args retTy false) with
