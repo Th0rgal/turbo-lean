@@ -602,21 +602,54 @@ def CodeRefinesR (Φ : List LNIRDecl) (src tgt : LNIRCode) : Prop :=
 
 /-! ### Helpers on the LNIR side -/
 
-/-- The non-call `.letBind` arm of `evalCodeRAux` is `evalCode`'s: when the bound
-    expression is not a non-extern call, the environment is never consulted. -/
-theorem evalCodeRAux_letBind_of_not_call {Φ : List LNIRDecl} {budget : Nat}
-    {callee? : Option (VarEnv → HeapState → LNIRCode → Except UBError (Val × HeapState))}
-    {val : LNIRExpr} (hnc : ∀ fn args retTy, val ≠ .call fn args retTy false)
-    (env : VarEnv) (st : HeapState) (dst : VarId) (ty : LNIRType) (k : LNIRCode) :
+/-- The value one level of `evalCodeR` binds for `.letBind _ _ val _`, before its
+    continuation runs: a non-extern call that `Φ` resolves runs its callee in the slot
+    below (and is the budget error at the spent level), every other expression is
+    `evalExpr`'s. -/
+def letHeadR (Φ : List LNIRDecl)
+    (callee? : Option (VarEnv → HeapState → LNIRCode → Except UBError (Val × HeapState)))
+    (env : VarEnv) (st : HeapState) (val : LNIRExpr) : Except UBError (Val × HeapState) :=
+  match val with
+  | .call fn args retTy false =>
+    match lookupFuncRec? Φ fn with
+    | some ld =>
+      match callee? with
+      | none => .error .fuelExhausted
+      | some callee =>
+        match evalVarList env args with
+        | .ok vals =>
+          callee ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
+            st ld.body
+        | .error err => .error err
+    | none => evalExpr env st (.call fn args retTy false)
+  | _ => evalExpr env st val
+
+/-- Every `.letBind` arm of `evalCodeRAux` runs `letHeadR` and continues on its value. -/
+theorem evalCodeRAux_letBind (Φ : List LNIRDecl) (budget : Nat)
+    (callee? : Option (VarEnv → HeapState → LNIRCode → Except UBError (Val × HeapState)))
+    (env : VarEnv) (st : HeapState) (dst : VarId) (ty : LNIRType) (val : LNIRExpr)
+    (k : LNIRCode) :
     evalCodeRAux Φ budget callee? env st (.letBind dst ty val k) =
-      match evalExpr env st val with
+      match letHeadR Φ callee? env st val with
       | .ok (v, st') => evalCodeRAux Φ budget callee? (env.bind dst v) st' k
       | .error err => .error err := by
   cases val <;> try rfl
   case call fn args retTy isExt =>
     cases isExt
-    · exact absurd rfl (hnc fn args retTy)
+    · dsimp only [evalCodeRAux, letHeadR]
+      cases lookupFuncRec? Φ fn <;> try rfl
+      cases callee? <;> try rfl
+      dsimp only
+      cases evalVarList env args <;> rfl
     · rfl
+
+/-- With no environment the let head is `evalExpr`'s, whatever the callee slot holds. -/
+theorem letHeadR_nil
+    (callee? : Option (VarEnv → HeapState → LNIRCode → Except UBError (Val × HeapState)))
+    (env : VarEnv) (st : HeapState) (val : LNIRExpr) :
+    letHeadR [] callee? env st val = evalExpr env st val := by
+  unfold letHeadR
+  split <;> rfl
 
 /-- Pointwise transport through the `seqFor` loop closure: a step evaluator that
     reproduces every successful step of another reproduces every successful loop. -/
@@ -749,57 +782,24 @@ theorem evalRealLCNFDeclR_nil (fuel : Nat) (ctx : RealBridgeCtx)
 
 /-! ### Part I — fuel monotonicity of the recursion-capable evaluator -/
 
-/-- One level of `evalCodeR` is monotone in its budget and in its callee slot: a slot
-    that reproduces every successful callee run of another, at a budget one larger,
-    reproduces every successful run of the level. -/
-theorem evalCodeRAux_fuel_mono (Φ : List LNIRDecl) (budget : Nat)
+/-- One level of `evalCodeR` simulates another whose let heads reproduce its successful
+    let heads, at a budget at least as large: every arm but `.letBind` is `evalCode`'s and
+    reads the budget only as `evalParFor`'s length bound. Fuel monotonicity and
+    environment extension are its two instances. -/
+theorem evalCodeRAux_sim (Φ1 Φ2 : List LNIRDecl) (b1 b2 : Nat) (hb : b1 ≤ b2)
     (c1 c2 : Option (VarEnv → HeapState → LNIRCode → Except UBError (Val × HeapState)))
-    (hc : ∀ f1, c1 = some f1 → ∃ f2, c2 = some f2 ∧
-      ∀ env st code r, f1 env st code = .ok r → f2 env st code = .ok r) :
-    ∀ (c : LNIRCode) (env : VarEnv) (st : HeapState) (v : Val) (st' : HeapState),
-      evalCodeRAux Φ budget c1 env st c = .ok (v, st') →
-      evalCodeRAux Φ (budget + 1) c2 env st c = .ok (v, st')
-  | .letBind dst ty val k, env, st, v, st', h => by
-    by_cases hcall : ∃ fn args retTy, val = .call fn args retTy false
-    · obtain ⟨fn, args, retTy, rfl⟩ := hcall
-      dsimp only [evalCodeRAux] at h ⊢
-      cases hlk : lookupFuncRec? Φ fn with
-      | none =>
-        rw [hlk] at h; dsimp only at h ⊢
-        cases he : evalExpr env st (.call fn args retTy false) with
-        | error _ => rw [he] at h; exact nomatch h
-        | ok p =>
-          rw [he] at h; dsimp only at h ⊢
-          exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc k (env.bind dst p.1) p.2 v st' h
-      | some ld =>
-        rw [hlk] at h; dsimp only at h ⊢
-        cases hc1 : c1 with
-        | none => rw [hc1] at h; exact nomatch h
-        | some f1 =>
-          obtain ⟨f2, hc2, hf⟩ := hc f1 hc1
-          have ihk := evalCodeRAux_fuel_mono Φ budget c1 c2 hc k
-          rw [hc1] at h ihk
-          rw [hc2] at ihk ⊢
-          dsimp only at h ⊢
-          cases hvl : evalVarList env args with
-          | error _ => rw [hvl] at h; exact nomatch h
-          | ok vals =>
-            rw [hvl] at h; dsimp only at h ⊢
-            cases hb : f1 ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val)
-                VarEnv.empty) st ld.body with
-            | error _ => rw [hb] at h; exact nomatch h
-            | ok q =>
-              rw [hb] at h; rw [hf _ _ _ q hb]; dsimp only at h ⊢
-              exact ihk (env.bind dst q.1) q.2 v st' h
-    · have hnc : ∀ fn args retTy, val ≠ .call fn args retTy false :=
-        fun fn args retTy heq => hcall ⟨fn, args, retTy, heq⟩
-      rw [evalCodeRAux_letBind_of_not_call hnc] at h ⊢
-      cases he : evalExpr env st val with
-      | error _ => rw [he] at h; exact nomatch h
-      | ok p =>
-        rw [he] at h; dsimp only at h ⊢
-        exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc k (env.bind dst p.1) p.2 v st' h
-  | .rawStore pv iv vv elemTy k, env, st, v, st', h => by
+    (hhead : ∀ env st val r, letHeadR Φ1 c1 env st val = .ok r →
+      letHeadR Φ2 c2 env st val = .ok r) :
+    ∀ (c : LNIRCode) (env : VarEnv) (st : HeapState) (r : Val × HeapState),
+      evalCodeRAux Φ1 b1 c1 env st c = .ok r → evalCodeRAux Φ2 b2 c2 env st c = .ok r
+  | .letBind dst ty val k, env, st, r, h => by
+    rw [evalCodeRAux_letBind] at h ⊢
+    cases hh : letHeadR Φ1 c1 env st val with
+    | error _ => rw [hh] at h; exact nomatch h
+    | ok p =>
+      rw [hh] at h; rw [hhead env st val p hh]; dsimp only at h ⊢
+      exact evalCodeRAux_sim Φ1 Φ2 b1 b2 hb c1 c2 hhead k (env.bind dst p.1) p.2 r h
+  | .rawStore pv iv vv elemTy k, env, st, r, h => by
     dsimp only [evalCodeRAux] at h ⊢
     cases hp : env pv <;> cases hi : env iv <;>
       cases hv : env vv <;> simp only [hp, hi, hv] at h <;> try contradiction
@@ -811,30 +811,30 @@ theorem evalCodeRAux_fuel_mono (Φ : List LNIRDecl) (budget : Nat)
       cases hw : st.writeElemExclusive bufId idx.toNat (maskElemVal elemTy val) <;>
         simp only [hw] at h ⊢
       · contradiction
-      · rename_i st1; exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc k env st1 v st' h)
-  | .incRef ov cnt k, env, st, v, st', h => by
+      · rename_i st1; exact evalCodeRAux_sim Φ1 Φ2 b1 b2 hb c1 c2 hhead k env st1 r h)
+  | .incRef ov cnt k, env, st, r, h => by
     dsimp only [evalCodeRAux] at h ⊢
     cases he : st.evalIncRef env ov cnt with
     | error _ => rw [he] at h; exact nomatch h
-    | ok st1 => rw [he] at h; exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc k env st1 v st' h
-  | .decRef ov cnt k, env, st, v, st', h => by
+    | ok st1 => rw [he] at h; exact evalCodeRAux_sim Φ1 Φ2 b1 b2 hb c1 c2 hhead k env st1 r h
+  | .decRef ov cnt k, env, st, r, h => by
     dsimp only [evalCodeRAux] at h ⊢
     cases he : st.evalDecRef env ov cnt with
     | error _ => rw [he] at h; exact nomatch h
-    | ok st1 => rw [he] at h; exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc k env st1 v st' h
-  | .ite cv t e, env, st, v, st', h => by
+    | ok st1 => rw [he] at h; exact evalCodeRAux_sim Φ1 Φ2 b1 b2 hb c1 c2 hhead k env st1 r h
+  | .ite cv t e, env, st, r, h => by
     dsimp only [evalCodeRAux] at h ⊢
     cases hcv : env cv <;> rw [hcv] at h
     · exact nomatch h
     · rename_i vc; cases vc with
-      | bool b => cases b <;> exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc _ env st v st' h
+      | bool b => cases b <;> exact evalCodeRAux_sim Φ1 Φ2 b1 b2 hb c1 c2 hhead _ env st r h
       | u64 n => by_cases hn : n != 0 <;> simp only [hn, ↓reduceIte, Bool.false_eq_true] at h ⊢ <;>
-          exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc _ env st v st' h
+          exact evalCodeRAux_sim Φ1 Φ2 b1 b2 hb c1 c2 hhead _ env st r h
       | u256 w => by_cases hw : w != UInt256.zero <;>
           simp only [hw, ↓reduceIte, Bool.false_eq_true] at h ⊢ <;>
-          exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc _ env st v st' h
+          exact evalCodeRAux_sim Φ1 Φ2 b1 b2 hb c1 c2 hhead _ env st r h
       | _ => exact nomatch h
-  | .seqFor idxVar loVar hiVar accVar accInit _ stepBody k, env, st, v, st', h => by
+  | .seqFor idxVar loVar hiVar accVar accInit _ stepBody k, env, st, r, h => by
     dsimp only [evalCodeRAux] at h ⊢
     cases hlo : env loVar <;> cases hhi : env hiVar <;>
       cases hain : env accInit <;> simp only [hlo, hhi, hain] at h <;> try contradiction
@@ -843,44 +843,65 @@ theorem evalCodeRAux_fuel_mono (Φ : List LNIRDecl) (budget : Nat)
       simp only at h ⊢ <;> try contradiction
     rename_i lo hi
     have hloop := evalSeqLoop_mono_of_step_mono
-      (fun se ss => evalCodeRAux Φ budget c1 se ss stepBody)
-      (fun se ss => evalCodeRAux Φ (budget + 1) c2 se ss stepBody)
-      (fun se ss r hr => by
-        obtain ⟨a, b⟩ := r
-        exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc stepBody se ss a b hr)
+      (fun se ss => evalCodeRAux Φ1 b1 c1 se ss stepBody)
+      (fun se ss => evalCodeRAux Φ2 b2 c2 se ss stepBody)
+      (fun se ss r' hr => evalCodeRAux_sim Φ1 Φ2 b1 b2 hb c1 c2 hhead stepBody se ss r' hr)
       idxVar accVar
     cases hl : evalSeqLoop (hi.toNat - lo.toNat) lo.toNat idxVar accVar initVal env st
-        (fun se ss => evalCodeRAux Φ budget c1 se ss stepBody) with
+        (fun se ss => evalCodeRAux Φ1 b1 c1 se ss stepBody) with
     | error _ => rw [hl] at h; exact nomatch h
     | ok pr =>
       rw [hl] at h; rw [hloop _ _ _ _ _ pr hl]
-      exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc k (env.bind accVar pr.1) pr.2 v st' h
-  | .parFor outVar lenVar inputs elemTy kernel k, env, st, v, st', h => by
+      exact evalCodeRAux_sim Φ1 Φ2 b1 b2 hb c1 c2 hhead k (env.bind accVar pr.1) pr.2 r h
+  | .parFor outVar lenVar inputs elemTy kernel k, env, st, r, h => by
     dsimp only [evalCodeRAux] at h ⊢
-    cases hp : evalParFor budget env st lenVar inputs kernel elemTy with
+    cases hp : evalParFor b1 env st lenVar inputs kernel elemTy with
     | error _ => rw [hp] at h; exact nomatch h
     | ok pr =>
       rw [hp] at h
-      rw [evalParFor_fuel_mono budget (budget + 1) (Nat.le_succ _) env st lenVar inputs kernel
-        elemTy pr hp]
-      exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc k (env.bind outVar pr.1) pr.2 v st' h
-  | .ret _, _, _, _, _, h => by
+      rw [evalParFor_fuel_mono b1 b2 hb env st lenVar inputs kernel elemTy pr hp]
+      exact evalCodeRAux_sim Φ1 Φ2 b1 b2 hb c1 c2 hhead k (env.bind outVar pr.1) pr.2 r h
+  | .ret _, _, _, _, h => by
     dsimp only [evalCodeRAux] at h ⊢; exact h
-  | .unreachable, _, _, _, _, h => by
+  | .unreachable, _, _, _, h => by
     dsimp only [evalCodeRAux] at h ⊢; exact h
+
+/-- A callee slot that reproduces every successful callee run of another reproduces every
+    successful let head of the same environment. -/
+theorem letHeadR_mono (Φ : List LNIRDecl)
+    (c1 c2 : Option (VarEnv → HeapState → LNIRCode → Except UBError (Val × HeapState)))
+    (hc : ∀ f1, c1 = some f1 → ∃ f2, c2 = some f2 ∧
+      ∀ env st code r, f1 env st code = .ok r → f2 env st code = .ok r)
+    (env : VarEnv) (st : HeapState) (val : LNIRExpr) (r : Val × HeapState)
+    (h : letHeadR Φ c1 env st val = .ok r) : letHeadR Φ c2 env st val = .ok r := by
+  cases val <;> try exact h
+  case call fn args retTy isExt =>
+    cases isExt
+    · dsimp only [letHeadR] at h ⊢
+      cases hlk : lookupFuncRec? Φ fn with
+      | none => rw [hlk] at h; exact h
+      | some ld =>
+        rw [hlk] at h
+        cases hc1 : c1 with
+        | none => rw [hc1] at h; exact nomatch h
+        | some f1 =>
+          obtain ⟨f2, hc2, hf⟩ := hc f1 hc1
+          rw [hc1] at h; rw [hc2]; dsimp only at h ⊢
+          cases hvl : evalVarList env args with
+          | error _ => rw [hvl] at h; exact nomatch h
+          | ok vals => rw [hvl] at h; exact hf _ _ _ r h
+    · exact h
 
 theorem evalCodeR_fuel_mono (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
     (st : HeapState) (c : LNIRCode) (v : Val) (st' : HeapState) :
     evalCodeR Φ fuel env st c = .ok (v, st') → evalCodeR Φ (fuel + 1) env st c = .ok (v, st') := by
   induction fuel generalizing env st c v st' with
   | zero =>
-    intro h
-    exact evalCodeRAux_fuel_mono Φ 0 none (some (evalCodeR Φ 0)) (fun _ h1 => nomatch h1)
-      c env st v st' h
+    exact evalCodeRAux_sim Φ Φ 0 1 (Nat.zero_le 1) none (some (evalCodeR Φ 0))
+      (letHeadR_mono Φ none _ (fun _ h1 => nomatch h1)) c env st (v, st')
   | succ n ih =>
-    intro h
-    refine evalCodeRAux_fuel_mono Φ (n + 1) (some (evalCodeR Φ n)) (some (evalCodeR Φ (n + 1)))
-      ?_ c env st v st' h
+    refine evalCodeRAux_sim Φ Φ (n + 1) (n + 1 + 1) (Nat.le_succ _) (some (evalCodeR Φ n))
+      (some (evalCodeR Φ (n + 1))) (letHeadR_mono Φ _ _ ?_) c env st (v, st')
     intro f1 h1
     injection h1 with h1
     subst h1
@@ -1002,120 +1023,44 @@ theorem evalExpr_call_ok_reserved (env : VarEnv) (st : HeapState) (fn : String)
       · simp only [↓reduceIte] at h
         all_goals exact nomatch h
 
-/-- One level of the call-free evaluator embeds into every level of the
-    recursion-capable one under an environment of unreserved names: every call the old
-    evaluator succeeds on names a reserved intrinsic, so no environment entry captures
-    it, and every other clause is the same clause. -/
-theorem evalCodeRAux_extend_of_ok (Φ : List LNIRDecl)
-    (hfresh : ∀ ld ∈ Φ, reservedRuntimeCallee ld.name = false) (budget : Nat)
-    (callee? : Option (VarEnv → HeapState → LNIRCode → Except UBError (Val × HeapState))) :
-    ∀ (c : LNIRCode) (env : VarEnv) (st : HeapState) (v : Val) (st' : HeapState),
-      evalCode budget env st c = .ok (v, st') →
-      evalCodeRAux Φ budget callee? env st c = .ok (v, st')
-  | .letBind dst ty val k, env, st, v, st', h => by
-    dsimp only [evalCode] at h
-    cases he : evalExpr env st val with
-    | error _ => rw [he] at h; exact nomatch h
-    | ok p =>
-      rw [he] at h
-      have ihk := evalCodeRAux_extend_of_ok Φ hfresh budget callee? k (env.bind dst p.1) p.2
-        v st' h
-      by_cases hcall : ∃ fn args retTy, val = .call fn args retTy false
-      · obtain ⟨fn, args, retTy, rfl⟩ := hcall
-        have hmiss : lookupFuncRec? Φ fn = none := by
-          cases hlk : lookupFuncRec? Φ fn with
-          | none => rfl
-          | some ld =>
-            obtain ⟨hm, hn⟩ := lookupFuncRec?_mem Φ fn ld hlk
-            have h1 := hfresh ld hm
-            rw [hn, evalExpr_call_ok_reserved env st fn args retTy false p he] at h1
-            exact nomatch h1
-        dsimp only [evalCodeRAux]
-        rw [hmiss]; dsimp only
-        rw [he]; exact ihk
-      · have hnc : ∀ fn args retTy, val ≠ .call fn args retTy false :=
-          fun fn args retTy heq => hcall ⟨fn, args, retTy, heq⟩
-        rw [evalCodeRAux_letBind_of_not_call hnc, he]
-        exact ihk
-  | .rawStore pv iv vv elemTy k, env, st, v, st', h => by
-    dsimp only [evalCode] at h; dsimp only [evalCodeRAux]
-    cases hp : env pv <;> cases hi : env iv <;>
-      cases hv : env vv <;> simp only [hp, hi, hv] at h <;> try contradiction
-    rename_i vp vi vv0
-    cases vp <;> cases vi <;>
-      cases vv0 <;> simp only at h ⊢ <;> try contradiction
-    all_goals (
-      rename_i bufId idx val
-      cases hw : st.writeElemExclusive bufId idx.toNat (maskElemVal elemTy val) <;>
-        simp only [hw] at h ⊢
-      · contradiction
-      · rename_i st1; exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? k env st1 v st' h)
-  | .incRef ov cnt k, env, st, v, st', h => by
-    dsimp only [evalCode] at h; dsimp only [evalCodeRAux]
-    cases he : st.evalIncRef env ov cnt with
-    | error _ => rw [he] at h; exact nomatch h
-    | ok st1 =>
-      rw [he] at h; exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? k env st1 v st' h
-  | .decRef ov cnt k, env, st, v, st', h => by
-    dsimp only [evalCode] at h; dsimp only [evalCodeRAux]
-    cases he : st.evalDecRef env ov cnt with
-    | error _ => rw [he] at h; exact nomatch h
-    | ok st1 =>
-      rw [he] at h; exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? k env st1 v st' h
-  | .ite cv t e, env, st, v, st', h => by
-    dsimp only [evalCode] at h; dsimp only [evalCodeRAux]
-    cases hcv : env cv <;> rw [hcv] at h
-    · exact nomatch h
-    · rename_i vc; cases vc with
-      | bool b => cases b <;> exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? _ env st v st' h
-      | u64 n => by_cases hn : n != 0 <;> simp only [hn, ↓reduceIte, Bool.false_eq_true] at h ⊢ <;>
-          exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? _ env st v st' h
-      | u256 w => by_cases hw : w != UInt256.zero <;>
-          simp only [hw, ↓reduceIte, Bool.false_eq_true] at h ⊢ <;>
-          exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? _ env st v st' h
-      | _ => exact nomatch h
-  | .seqFor idxVar loVar hiVar accVar accInit _ stepBody k, env, st, v, st', h => by
-    dsimp only [evalCode] at h; dsimp only [evalCodeRAux]
-    cases hlo : env loVar <;> cases hhi : env hiVar <;>
-      cases hain : env accInit <;> simp only [hlo, hhi, hain] at h <;> try contradiction
-    rename_i vlo vhi initVal
-    cases vlo <;> cases vhi <;>
-      simp only at h ⊢ <;> try contradiction
-    rename_i lo hi
-    have hloop := evalSeqLoop_mono_of_step_mono
-      (fun se ss => evalCode budget se ss stepBody)
-      (fun se ss => evalCodeRAux Φ budget callee? se ss stepBody)
-      (fun se ss r hr => by
-        obtain ⟨a, b⟩ := r
-        exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? stepBody se ss a b hr)
-      idxVar accVar
-    cases hl : evalSeqLoop (hi.toNat - lo.toNat) lo.toNat idxVar accVar initVal env st
-        (fun se ss => evalCode budget se ss stepBody) with
-    | error _ => rw [hl] at h; exact nomatch h
-    | ok pr =>
-      rw [hl] at h; rw [hloop _ _ _ _ _ pr hl]
-      exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? k (env.bind accVar pr.1) pr.2 v st' h
-  | .parFor outVar lenVar inputs elemTy kernel k, env, st, v, st', h => by
-    dsimp only [evalCode] at h; dsimp only [evalCodeRAux]
-    cases hp : evalParFor budget env st lenVar inputs kernel elemTy with
-    | error _ => rw [hp] at h; exact nomatch h
-    | ok pr =>
-      rw [hp] at h
-      exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? k (env.bind outVar pr.1) pr.2 v st' h
-  | .ret _, _, _, _, _, h => by
-    dsimp only [evalCode] at h; dsimp only [evalCodeRAux]; exact h
-  | .unreachable, _, _, _, _, h => by
-    dsimp only [evalCode] at h; dsimp only [evalCodeRAux]; exact h
+/-- Under an environment of unreserved names every successful `evalExpr` is the let head,
+    whatever the callee slot holds: a call `evalExpr` succeeds on names a reserved
+    intrinsic, which no entry captures. -/
+theorem letHeadR_of_evalExpr_ok (Φ : List LNIRDecl)
+    (hfresh : ∀ ld ∈ Φ, reservedRuntimeCallee ld.name = false)
+    (callee? : Option (VarEnv → HeapState → LNIRCode → Except UBError (Val × HeapState)))
+    (env : VarEnv) (st : HeapState) (val : LNIRExpr) (r : Val × HeapState)
+    (h : evalExpr env st val = .ok r) : letHeadR Φ callee? env st val = .ok r := by
+  cases val <;> try exact h
+  case call fn args retTy isExt =>
+    cases isExt
+    · have hmiss : lookupFuncRec? Φ fn = none := by
+        cases hlk : lookupFuncRec? Φ fn with
+        | none => rfl
+        | some ld =>
+          obtain ⟨hm, hn⟩ := lookupFuncRec?_mem Φ fn ld hlk
+          have h1 := hfresh ld hm
+          rw [hn, evalExpr_call_ok_reserved env st fn args retTy false r h] at h1
+          exact nomatch h1
+      dsimp only [letHeadR]
+      rw [hmiss]
+      exact h
+    · exact h
 
 theorem evalCodeR_extend_of_ok (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
     (st : HeapState) (c : LNIRCode) (v : Val) (st' : HeapState)
     (hfresh : ∀ ld ∈ Φ, reservedRuntimeCallee ld.name = false)
     (h : evalCode fuel env st c = .ok (v, st')) :
     evalCodeR Φ fuel env st c = .ok (v, st') := by
+  rw [← evalCodeRAux_nil fuel none] at h
+  have hhead : ∀ c2 env st val r, letHeadR [] none env st val = .ok r →
+      letHeadR Φ c2 env st val = .ok r := fun c2 env st val r hr =>
+    letHeadR_of_evalExpr_ok Φ hfresh c2 env st val r (by rwa [letHeadR_nil] at hr)
   cases fuel with
-  | zero => exact evalCodeRAux_extend_of_ok Φ hfresh 0 none c env st v st' h
+  | zero => exact evalCodeRAux_sim [] Φ 0 0 (Nat.le_refl 0) none none (hhead none) c env st _ h
   | succ n =>
-    exact evalCodeRAux_extend_of_ok Φ hfresh (n + 1) (some (evalCodeR Φ n)) c env st v st' h
+    exact evalCodeRAux_sim [] Φ (n + 1) (n + 1) (Nat.le_refl _) none (some (evalCodeR Φ n))
+      (hhead _) c env st _ h
 
 theorem DeclEnvLowersR.fresh
     (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) (Φ : List LNIRDecl)
