@@ -134,11 +134,29 @@ because the semantics it described were wrong. Its continuation was
 (lowerGroundImpureTypeWith ctx decl.type) then lowerGroundImpureTypeWith ctx decl.type
 else .i64))) st' (.inl k)` and is now
 `evalStepR Δ fuel ctx (env.bind decl.fvarId v none (some (lowerGroundImpureTypeWith ctx
-decl.type))) st' (.inl k)`. Nothing else moves: `evalStepR_nil` never reaches the arm (an
-empty `Δ` misses), `evalStepR_fuel_mono` does not inspect the binding, and every earlier
-guard's call result is `UInt64`, whose lowered type the old rule kept. Rejected: keeping
-the `.i64` binding with a warning, which would have certified a step rule that leaks
-objects on heap-typed local calls to keep a refutation of the headline standing.
+decl.type))) st' (.inl k)`. Nothing else moved, and the build of the amendment's commit
+checked it: `evalStepR_nil` never reaches the arm (an empty `Δ` misses),
+`evalStepR_fuel_mono`'s unchanged proof script re-ran green against the new rule, and
+every earlier guard's call result is `UInt64`, whose lowered type the old rule kept.
+Rejected: keeping the `.i64` binding with a warning, which would have certified a step
+rule that leaks objects on heap-typed local calls to keep a refutation of the headline
+standing.
+
+Amendment 4 (gap-l3, 2026-11-26; review de0391f1 of fcc0b33f, three rows):
+
+- `DeclEnvLowersPosR` drops its per-entry clause `ctx.findLocalCallee? sd.name = some
+  ld.name` (each entry's own context knows its own name). No proof used it, the maps-to
+  half is already in the per-entry `CtxMapsEnvR`, L2's `DeclEnvLowers` has no such
+  clause, and it excluded the suite's own even/odd environment, whose contexts know only
+  their partner, contradicting F1's reason for rejecting the strong equality. A Part II
+  case that needs a name to be present states it where it is used.
+- The arity guard gains the too-few direction with the exact error: a two-parameter
+  callee whose body reads only the first parameter, called with one argument, must end
+  on "call arity mismatch". A `≤` mutant of the check passed the two earlier guards.
+- `evalStepR_fuel_mono` keeps its lockstep search; its docstring says how the script
+  fails when `evalStepR` changes, and amendment 3's claim that the rule change left it
+  untouched is a checked fact. `evalExpr_call_ok_reserved` and `lookupDeclRec?_align`
+  use `simp only`, like the rest of the file.
 
 ### What the AST actually carries for recursion and loops (read first, stated only if it exists)
 
@@ -297,14 +315,13 @@ def CtxMapsEnvR (ctx : RealBridgeCtx) :
       (∀ m, ctx.findLocalCallee? sd.name = some m → m = ld.name) ∧ CtxMapsEnvR ctx Δ Φ
   | _, _ => False
 
-/-- The positional clauses: each entry's own context maps its own declaration's name to
-    its LNIR name, the lowering hypothesis holds at the entry's own fuel, lowered names
-    are unreserved, and no later lowered name repeats an earlier one. -/
+/-- The positional clauses: the lowering hypothesis holds at the entry's own context and
+    fuel, lowered names are unreserved, and no later lowered name repeats an earlier one.
+    Whether a context knows a name is left to the coherence clause (amendment 4). -/
 def DeclEnvLowersPosR :
     List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat) → List LNIRDecl → Prop
   | [], [] => True
   | (sd, ctx, fuel) :: Δ, ld :: Φ =>
-      ctx.findLocalCallee? sd.name = some ld.name ∧
       lowerRealLCNFDecl fuel ctx sd ld.name = .ok ld ∧
       reservedRuntimeCallee ld.name = false ∧
       (∀ ld' ∈ Φ, ld'.name ≠ ld.name) ∧
@@ -781,17 +798,17 @@ def CtxMapsEnvR (ctx : RealBridgeCtx) :
       (∀ m, ctx.findLocalCallee? sd.name = some m → m = ld.name) ∧ CtxMapsEnvR ctx Δ Φ
   | _, _ => False
 
-/-- The positional clauses of `DeclEnvLowersR`: each entry's own context maps its own
-    declaration's name to its LNIR name, the lowering hypothesis holds at the entry's own
-    fuel, lowered names are unreserved, and no later lowered name repeats an earlier one.
-    A recursive `Prop` (strict-proofs scope admits no new `inductive` under `Proofs/`, the
-    shape L2's `DeclEnvLowers` takes for the same reason); length-mismatched lists relate
-    never. -/
+/-- The positional clauses of `DeclEnvLowersR`: the lowering hypothesis holds at the
+    entry's own context and fuel, lowered names are unreserved, and no later lowered name
+    repeats an earlier one. Whether a context knows a name is left to the coherence clause
+    (`CtxMapsEnvR`; amendment 4 dropped a per-entry "knows its own name" clause no proof
+    used). A recursive `Prop` (strict-proofs scope admits no new `inductive` under
+    `Proofs/`, the shape L2's `DeclEnvLowers` takes for the same reason);
+    length-mismatched lists relate never. -/
 def DeclEnvLowersPosR :
     List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat) → List LNIRDecl → Prop
   | [], [] => True
   | (sd, ctx, fuel) :: Δ, ld :: Φ =>
-      ctx.findLocalCallee? sd.name = some ld.name ∧
       lowerRealLCNFDecl fuel ctx sd ld.name = .ok ld ∧
       reservedRuntimeCallee ld.name = false ∧
       (∀ ld' ∈ Φ, ld'.name ≠ ld.name) ∧
@@ -1165,7 +1182,10 @@ theorem hasJmpToPure_false_succ :
     the hypothesis, replay its equation into the goal); the discriminants agree except at
     the two places that read the budget — the resolved callee's run, upgraded by the
     induction hypothesis, and the recursive-join-point gate, upgraded by
-    `hasJmpToPure_false_succ`. -/
+    `hasJmpToPure_false_succ`. The script searches the unfolding rather than naming arms,
+    so it re-checks itself on every change to `evalStepR`: a new discriminant that reads
+    the budget makes it fail at build time with a leftover goal, never silently, and that
+    arm then needs its own case (amendment 3's rule change re-ran it green unchanged). -/
 theorem evalStepR_fuel_mono (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx)) :
     ∀ (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
       (target : Lean.Compiler.LCNF.Code .impure ⊕
@@ -1285,10 +1305,11 @@ theorem evalExpr_call_ok_reserved (env : VarEnv) (st : HeapState) (fn : String)
       have hnone := FuncEnv.callTarget?_of_evalExpr_ok
         (Φ := [({ name := fn, params := [], retTy := retTy, body := .unreachable }, 0)])
         (fun p hp => by rw [List.mem_singleton] at hp; subst hp; exact hres) h
-      simp [LeanNative.Semantics.FuncEnv.callTarget?, LeanNative.Semantics.FuncEnv.lookup?] at hnone
+      simp only [FuncEnv.callTarget?, FuncEnv.lookup?, BEq.rfl, ↓reduceIte, Option.map_some,
+        reduceCtorEq] at hnone
   · -- `evalExpr` refuses every extern call.
     dsimp only [evalExpr] at h
-    cases hvl : evalVarList env args <;> rw [hvl] at h <;> simp at h
+    cases hvl : evalVarList env args <;> rw [hvl] at h <;> simp only [↓reduceIte, reduceCtorEq] at h
 
 /-- Under an environment of unreserved names every successful `evalExpr` is the let head,
     whatever the callee slot holds: a call `evalExpr` succeeds on names a reserved
@@ -1337,7 +1358,7 @@ theorem DeclEnvLowersPosR.fresh :
   | [], _ :: _, h, _, _ => nomatch h
   | _ :: _, [], h, _, _ => nomatch h
   | (_, _, _) :: Δ, _ :: Φ, h, ld, hm => by
-    obtain ⟨_, _, hres, _, htail⟩ := h
+    obtain ⟨_, hres, _, htail⟩ := h
     cases hm with
     | head => exact hres
     | tail _ hm => exact DeclEnvLowersPosR.fresh Δ Φ htail ld hm
@@ -1365,7 +1386,7 @@ theorem lookupDeclRec?_align :
   | [], _ :: _, h, _, _, _, _, _, _, _, _ => nomatch h
   | _ :: _, [], h, _, _, _, _, _, _, _, _ => nomatch h
   | (sd0, c0, f0) :: Δ, ld0 :: Φ, hpos, ctx, fn, sym, sd, sdCtx, hmap, hsym, hlk => by
-    obtain ⟨_, hlow, _, hfresh, hpos'⟩ := hpos
+    obtain ⟨hlow, _, hfresh, hpos'⟩ := hpos
     obtain ⟨hhead, hmap'⟩ := hmap
     simp only [declEnvR, List.map_cons] at hlk
     dsimp only [lookupDeclRec?] at hlk
@@ -1375,7 +1396,7 @@ theorem lookupDeclRec?_align :
       cases hlk
       have hsym0 : sym = ld0.name := hhead sym (by rw [eq_of_beq hb]; exact hsym)
       refine ⟨f0, ld0, List.mem_cons_self .., ?_, hlow⟩
-      simp [lookupFuncRec?, hsym0]
+      simp only [lookupFuncRec?, hsym0, BEq.rfl, ↓reduceIte]
     · obtain ⟨fuelD, ld, hmem, hlkΦ, hlow'⟩ :=
         lookupDeclRec?_align Δ Φ hpos' ctx fn sym sd sdCtx hmap' hsym hlk
       refine ⟨fuelD, ld, List.mem_cons_of_mem _ hmem, ?_, hlow'⟩
