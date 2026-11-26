@@ -1,6 +1,4 @@
 import LeanNative.Proofs.RealLCNFBridge.CtorScalarCall
-import LeanNative.Proofs.SymbolicTVRefinesSoundness
-import LeanNative.IR.BridgeHelpers.RealBridgeCtxAndSlices
 
 namespace LeanNative.Proofs
 
@@ -10,94 +8,71 @@ open LeanNative.IR.RealLCNFSemantics
 open LeanNative.Semantics
 
 /-!
-## L1 contract (roadmap/HORIZONS.md, H1 rung L1 "Single path") — w-l1
+## L1 contract (roadmap/HORIZONS.md, H1 rung L1 "Single path") — w-l1, updated w-l1 r1
 
 Authoritative row (`roadmap/HORIZONS.md`): "L1 Single path — The pure lowering and dead
 helpers are gone. The theorem is stated for the context the driver builds, with no unproved
 post-pass (each one is proved, validated by a proved checker, or removed)." Accept:
 "one lowering callee; `ΔLOC < 0`".
 
-This section is the contract-first statement of the exact signatures L1 proves in this
-leaf. It is a contract section rather than `sorry` skeletons because the repo gates hold
-`0 sorryAx` on every commit (Contract V5 check 2; `VALIDATION_CONTRACTS.md` V1 admits
-`sorry` placeholders only during task setup, which the per-commit axiom gate here does
-not). The theorems land proved, verbatim, in the follow-up commits of this same leaf.
-The L2 lane (calls) builds against these names and binder shapes; L2 adds a function
-environment to both semantics and restates them with that one extra binder — the names
-below stay.
+State after round 1 (fix round, review a094d3a9, F5 ruling): the driver applies NO
+post-pass to the lowered body at all — the rung's "or removed" option. Round 0 had gated a
+`compressScalarCode` candidate behind the kernel-proved `runSymbolicValidatedDecl` checker;
+the review showed the producer's candidates provably never pass that gate (straight-line
+candidates are byte-identical and early-return; `ite` candidates return a fresh variable,
+a shape the checker rejects; the tuple branch sat behind `codeContainsTupleOp`), so the
+producer, the gate and their theorems were removed rather than kept as dead passes run
+per declaration.
 
-### New definition (driver post-pass, gated by a kernel-proved checker)
+### The theorem of record
 
-In `lean/LeanNative/IR/BridgeHelpers/RealBridgeCtxAndSlices.lean`, namespace
-`LeanNative.IR`:
-
-```
-def applyValidatedCompression (d : LNIRDecl) (cand : LNIRCode) : LNIRDecl
-```
-
-Semantics: accept the (untrusted) scalar-compression candidate `cand` for `d.body` only
-when the total, kernel-proved refinement checker admits it —
-`LeanNative.Proofs.runSymbolicValidatedDecl` (`SymbolicTVRefinesDefs.lean`, the
-Contract-V2 `VerifiedTVPassContract` gate, backed by `symbolicValidatedDeclOpt_sound`);
-otherwise return `d` unchanged. On acceptance, `retTy` is recomputed from
-`inferReturnedType cand` (tuple case), `assurance := AssuranceLevel.combine d.assurance
-.translationValidated`, `isGpuCand` is recomputed, and `params` are never changed.
-`ingestImpureDeclViaReal` replaces its inline `validateTranslationDecl`-gated compression
-block with this function: the old gate is Alive2-style screening whose soundness statement
-(`validateTranslationDeclSound`) speaks about symbolic summaries and sampled concrete
-refinement, not `CodeRefines`; the new gate has the kernel theorem. The
-`gateCodeWithSymbolicTV` screen inside the candidate producer (`compressScalarCode`)
-stays — producers are untrusted proposals.
-
-### Theorem 1 — the post-pass refines (kills the drop-the-gate mutant)
-
-In this file, namespace `LeanNative.Proofs`:
-
-```
-theorem applyValidatedCompression_refines (d : LNIRDecl) (cand : LNIRCode) :
-    (applyValidatedCompression d cand).params = d.params ∧
-    CodeRefines d.body (applyValidatedCompression d cand).body
-```
-
-### Theorem 2 — the driver-shaped end-to-end statement (the L1 headline)
+`lowerRealLCNFDecl_sound` (this file) is the statement of record. The driver
+(`ingestImpureDeclViaReal`) calls exactly one lowering function and applies no body
+transformation afterwards, so the driver-named form is a restatement under the name this
+contract exports:
 
 ```
 theorem lowerRealLCNFDecl_driver_sound (fuel : Nat) (ctx : RealBridgeCtx)
     (decl : Lean.Compiler.LCNF.Decl .impure) (args : List Val) (hst hst' : HeapState)
-    (v : Val) (d : LNIRDecl) (mangled : String) (cand : LNIRCode)
+    (v : Val) (d : LNIRDecl) (mangled : String)
     (h_lower : lowerRealLCNFDecl fuel ctx decl mangled = .ok d)
     (h_eval : evalRealLCNFDecl fuel ctx decl args hst = .ok (v, hst')) :
-    evalCode fuel
-      (((applyValidatedCompression d cand).params.zip args).foldl
-        (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
-      hst (applyValidatedCompression d cand).body = .ok (v, hst')
+    evalCode fuel ((d.params.zip args).foldl
+      (fun acc (p, val) => acc.bind p.id val) VarEnv.empty) hst d.body = .ok (v, hst')
 ```
 
-`ctx` is universally quantified, so the statement covers exactly the context the driver
-builds (`buildRealBridgeCtxM` output — `evalRealLCNFDecl` reads the same `ctx`, which is
-what ties the hypothesis to the driver's run), and `cand` is universally quantified, so it
-covers every candidate the producer proposes. The object of the theorem is the emitted
-declaration — base or compressed — not the pre-post-pass intermediate. The shape is
-forward simulation on successful runs, as HORIZONS states the honest H1 shape.
+`ctx` is universally quantified and `evalRealLCNFDecl` reads the same `ctx`, which ties
+the statement to the context the driver builds (`buildRealBridgeCtxM` output). The shape
+is forward simulation on successful runs, HORIZONS's honest H1 shape. The L2 lane (calls)
+builds against these names: L2 adds a function environment to both semantics and restates
+them with that one extra binder. The round-0 `cand : LNIRCode` binder is gone with the
+post-pass.
 
 ### Removals (the other half of the rung)
 
-1. The second, unproved lowering is deleted from `lean/LeanNative/IR/Bridge.lean`:
-   `lowerPureCode`, `lowerPureAlts`, `lowerPureLetValue`, `lowerNamedCall`,
-   `lowerFVarCall`, `lowerTagBranch`, `lowerImpureLetValue`, `lowerImpureCode`,
-   `ingestLCNFDeclGenericWithState`, `ingestLCNFDeclGeneric`, `ingestLCNFMonoDecl`.
-   A declaration with no impure LCNF form is `Unsupported` on the proved path:
-   `ingestModuleDeclsWith` drops its mono arm (the `ingestMono` parameter leaves its
-   signature) and such declarations are left to the stock backend.
-2. Helpers that this deletion strands (the `lowerPureCode`-only cascade and the
-   already-dead set the roadmap counted at about 250 LOC) are deleted in this leaf; the
-   name inventory in `lean/LeanNative/Tests/BridgeHelpersSplitPin.lean` is updated in the
-   same commit as each deletion, with zero-reference evidence in the commit message.
-3. The axiom audit keeps `lowerRealLCNFCode_sound` / `lowerRealLCNFDecl_sound` in its
-   required set; the two theorems above are added to
-   `lean/LeanNative/Proofs/AxiomAudit.lean`'s audited list.
+1. Round 0: the second, unproved lowering (`lowerPureCode` and its `BridgeM` helper
+   cascade), the mono ingest arm, and the `BridgeM` heap path, deleted from
+   `lean/LeanNative/IR/Bridge.lean` and the helper split.
+2. Round 1 (review a094d3a9 F5/F8): the compression post-pass — `applyValidatedCompression`,
+   `compressedBodyRetTy`, the producer file `ScalarDagAndJoinPoints.lean`
+   (`compressScalarCode`, `gateCodeWithSymbolicTV` and their collectors), the dead state
+   converters (`bridgeStateToRealM`, `syncRealToBridgeStateM`), and the `BridgeState`
+   fields only those read. Zero-reference sweeps with planted positive controls are in
+   the w-l1 commit messages; `lean/LeanNative/Tests/BridgeHelpersSplitPin.lean` pins the
+   surviving inventory.
+3. A declaration explicitly requested with compiled code (a base or mono form) but no
+   impure LCNF form fails closed by name — `ingestModuleDeclsWith` throws
+   `[lean-native] Unsupported declaration ...: no impure LCNF form` — instead of being
+   dropped silently; a non-code constant is skipped silently (review a094d3a9 F4,
+   red-first; regression in `Tests/RealLCNFBridgeTests.lean`).
+4. The axiom audit keeps `lowerRealLCNFCode_sound` / `lowerRealLCNFDecl_sound` /
+   `lowerRealLCNFDecl_driver_sound` in its required set
+   (`lean/LeanNative/Proofs/AxiomAudit.lean`, exact count pinned).
 
 ### Named exclusions (recorded, not silently kept)
+
+Steps around the proved lowering that the theorem does not cover, each named so a reader
+does not infer coverage:
 
 - `tryLowerGfSimdIntrinsic` — a named intrinsic substitution keyed on the declaration
   name; it inspects no `Code`, so it is not an LCNF lowering, and it sits outside the
@@ -107,12 +82,17 @@ forward simulation on successful runs, as HORIZONS states the honest H1 shape.
   under `TargetArch.isFreestandingEmbedded`, the unverified non-LLVM tier (HORIZONS H1
   rule: unverified backends get no features until H3). On the proved path the lowerer
   receives the driver's LCNF unchanged.
+- `attachBaseDeclFactsM` — attaches `retainedFacts` metadata to the emitted declaration,
+  matching base-declaration parameters to LNIR parameters by position; it changes neither
+  `body` nor `params`, but downstream Transform passes may consume the facts.
+- `normalizeAndInlineLocalDefs` and `filterNonInternalHelperDecls` — module-level rewrite
+  and filtering in `ingestModuleDeclsWith`, checked by executable regressions
+  (`Tests/RealLCNFBridgeTests.lean`), not proved.
 
 ### Acceptance (quoted) and gates
 
-- "one lowering callee": after the removals, `lowerRealLCNFDecl` (via
-  `lowerRealLCNFCode` / `lowerImpureStepPure`) is the only `LCNF → LNIR` lowering callee
-  in the tree.
+- "one lowering callee": `lowerRealLCNFDecl` (via `lowerRealLCNFCode` /
+  `lowerImpureStepPure`) is the only `LCNF → LNIR` lowering callee in the tree.
 - "`ΔLOC < 0`" over the leaf.
 - Gates: `(cd lean && lake build TurboLean LeanNative)`;
   `turbo-lean --json audit-spec lean/TurboLean/Spec.lean` (98/98) and
@@ -120,10 +100,9 @@ forward simulation on successful runs, as HORIZONS states the honest H1 shape.
   `turbo-lean --json audit-spec --policy strict-proofs lean/LeanNative/Proofs/
   lean/LeanNative/Transform/ lean/TurboLean/ConLeche.lean lean/TurboLean/ElabAudit.lean`
   (ok; 0 vacuous, 0 trivial, 0 stub_defs, 0 forbidden_scope_decls);
-  `python3 scripts/sync_docs_inventory.py --check`. Executable mutant-kill guards for the
-  gate land in `lean/LeanNative/Tests/RealLCNFBridgeTests.lean`: a wrong-value candidate
-  is rejected, an equivalent candidate is accepted with `.translationValidated`, an
-  ill-typed candidate is rejected.
+  `python3 scripts/sync_docs_inventory.py --check`;
+  `scripts/contract.d/40_verified_pass_hygiene.sh` under the contract runner
+  (`CORE_BIN` exported).
 -/
 
 private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx) :
@@ -623,51 +602,19 @@ theorem lowerRealLCNFDecl_sound (fuel : Nat) (ctx : RealBridgeCtx)
           hlc h_eval
 
 
-private theorem runSymbolicValidatedDecl_some_eq (propose : LNIRDecl → LNIRDecl)
-    (d d' : LNIRDecl) (h : runSymbolicValidatedDecl propose d = some d') :
-    d' = propose d := by
-  unfold runSymbolicValidatedDecl at h
-  dsimp only at h
-  cases hgate : (d.checkElemTypes.isNone && (propose d).checkElemTypes.isNone &&
-      symbolicCodeRefines d.body (propose d).body)
-  · rw [hgate] at h; cases h
-  · rw [hgate] at h
-    simp only [↓reduceIte, Option.some.injEq] at h
-    exact h.symm
-
-/-- L1 (`roadmap/HORIZONS.md` rung L1): the driver post-pass never changes the parameter
-    list, and its output body refines the proved lowering's body — a compression candidate
-    is taken only through the kernel-proved `runSymbolicValidatedDecl` gate. -/
-theorem applyValidatedCompression_refines (d : LNIRDecl) (cand : LNIRCode) :
-    (applyValidatedCompression d cand).params = d.params ∧
-    CodeRefines d.body (applyValidatedCompression d cand).body := by
-  unfold LeanNative.IR.applyValidatedCompression
-  split
-  · exact ⟨rfl, CodeRefines.refl d.body⟩
-  · split
-    next d' hrun =>
-      have he := runSymbolicValidatedDecl_some_eq _ d d' hrun
-      subst he
-      exact ⟨rfl, symbolicValidatedDeclOpt_sound _ d _ hrun⟩
-    next => exact ⟨rfl, CodeRefines.refl d.body⟩
-
-/-- L1 headline (`roadmap/HORIZONS.md` rung L1): soundness of the lowering pipeline the
-    driver runs — `lowerRealLCNFDecl` composed with the checker-gated compression post-pass
-    (`applyValidatedCompression`) — stated for every context the driver builds
-    (`evalRealLCNFDecl` reads the same `ctx`) and every candidate the producer proposes.
-    Forward simulation on successful runs. -/
+/-- L1 (`roadmap/HORIZONS.md` rung L1, round 1): the driver-named soundness statement.
+    `ingestImpureDeclViaReal` calls exactly one lowering function and applies no body
+    transformation afterwards (the round-0 checker-gated compression was removed — review
+    a094d3a9 F5: its candidates provably never passed the kernel-proved gate), so the
+    driver pipeline's statement is `lowerRealLCNFDecl_sound` itself, restated under the
+    name the L1 contract exports to the L2 lane. -/
 theorem lowerRealLCNFDecl_driver_sound (fuel : Nat) (ctx : RealBridgeCtx)
     (decl : Lean.Compiler.LCNF.Decl .impure) (args : List Val) (hst hst' : HeapState)
-    (v : Val) (d : LNIRDecl) (mangled : String) (cand : LNIRCode)
+    (v : Val) (d : LNIRDecl) (mangled : String)
     (h_lower : lowerRealLCNFDecl fuel ctx decl mangled = .ok d)
     (h_eval : evalRealLCNFDecl fuel ctx decl args hst = .ok (v, hst')) :
-    evalCode fuel
-      (((applyValidatedCompression d cand).params.zip args).foldl
-        (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
-      hst (applyValidatedCompression d cand).body = .ok (v, hst') := by
-  obtain ⟨hp, href⟩ := applyValidatedCompression_refines d cand
-  rw [hp]
-  exact href fuel _ hst v hst'
-    (lowerRealLCNFDecl_sound fuel ctx decl args hst hst' v d mangled h_lower h_eval)
+    evalCode fuel ((d.params.zip args).foldl
+      (fun acc (p, val) => acc.bind p.id val) VarEnv.empty) hst d.body = .ok (v, hst') :=
+  lowerRealLCNFDecl_sound fuel ctx decl args hst hst' v d mangled h_lower h_eval
 
 end LeanNative.Proofs

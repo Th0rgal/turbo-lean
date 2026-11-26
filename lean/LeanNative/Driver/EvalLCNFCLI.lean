@@ -1221,8 +1221,6 @@ partial def codeHasAnyHeapMutation (code : Code .impure) : Bool :=
 def buildEvalBridgeCtxM (decl : Decl .impure) (paramDoms : List GroundDomType)
     (localDeclNames : Array Name) (arch : TargetArch) (allowStage1DHeap : Bool) :
     CoreM (RealBridgeCtx × List GroundDomType) := do
-  let env ← getEnv
-  let metaInfo := getLCNFDeclMetadata env decl.name
   let mut adjustedParamDoms : List GroundDomType := []
   let mut useHeap := allowStage1DHeap
   let mut paramTypeMap : List (FVarId × LNIRType) := []
@@ -1254,8 +1252,6 @@ def buildEvalBridgeCtxM (decl : Decl .impure) (paramDoms : List GroundDomType)
       adjustedParamDoms := adjustedParamDoms ++ [dom]
       paramTypeMap := paramTypeMap ++ [(p.fvarId, dom.toLNIRType)]
   let initSt : BridgeState := {
-    mangledSymbol := metaInfo.mangledSymbol
-    isSimpleGround := metaInfo.isSimpleGround
     selfDeclName := decl.name
     localDeclNames := localDeclNames
     arch := arch

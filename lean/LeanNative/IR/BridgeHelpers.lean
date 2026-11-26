@@ -1,6 +1,5 @@
 import LeanNative.IR.BridgeHelpers.TypesAndSigs
 import LeanNative.IR.BridgeHelpers.StateAndIntrinsics
-import LeanNative.IR.BridgeHelpers.ScalarDagAndJoinPoints
 import LeanNative.IR.BridgeHelpers.HeapAndConstructors
 import LeanNative.IR.BridgeHelpers.RealBridgeCtxAndSlices
 import LeanNative.IR.BridgeHelpers.DeclIngestAndValidation

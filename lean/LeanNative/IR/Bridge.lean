@@ -28,14 +28,13 @@ def ingestModuleDecls (declNames : Array Lean.Name) (moduleName : String := "Lea
     (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : Lean.CoreM LNIRModule :=
   ingestModuleDeclsWith (fun d ns a => ingestLCNFImpureDecl d ns a allowRcAdt) declNames moduleName arch
 
-/-- Ingest every local declaration with an impure LCNF form in the current environment. -/
+/-- Ingest every local declaration with an impure LCNF form in the current environment.
+    L1 r1 (review a094d3a9 F8): the sweep no longer collects non-impure environment
+    constants — they only fed the deleted mono lowering arm. -/
 def ingestAllLocalDecls (moduleName : String := "LeanNative.Ingested")
     (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : Lean.CoreM LNIRModule := do
   let impureNames ← Lean.Compiler.LCNF.getLocalImpureDecls
   let env ← getEnv
-  let filteredImpure := impureNames.filter (fun n => !isCompilerGeneratedAuxDecl env n)
-  let extraNames := env.constants.map₂.foldl (fun acc name _ =>
-    if impureNames.contains name || isCompilerGeneratedAuxDecl env name then acc else acc.push name) #[]
-  ingestModuleDecls (filteredImpure ++ extraNames) moduleName arch allowRcAdt
+  ingestModuleDecls (impureNames.filter (fun n => !isCompilerGeneratedAuxDecl env n)) moduleName arch allowRcAdt
 
 end LeanNative.IR

@@ -146,7 +146,8 @@ def expandCompilerAuxDecls (declNames : Array Lean.Name) : Lean.CoreM (Array Lea
   for name in declNames do
     let red := Lean.Name.str name "_redArg"
     if !out.contains red then
-      if (← Lean.Compiler.LCNF.getLocalImpureDecl? red).isSome || (← Lean.Compiler.LCNF.getMonoDecl? red).isSome then
+      -- L1 r1 (review a094d3a9 F8): mono-only `_redArg` forms fed the deleted mono arm.
+      if (← Lean.Compiler.LCNF.getLocalImpureDecl? red).isSome then
         out := out.push red
   return out
 
@@ -165,8 +166,14 @@ def ingestModuleDeclsWith (ingestImpure : Lean.Compiler.LCNF.Decl .impure → Ar
       let d ← ingestImpure impureDecl declNames arch
       decls := decls ++ [d]
       rawPairs := rawPairs ++ [(name, d.name)]
-    -- L1: a declaration with no impure LCNF form is `Unsupported` on the proved path
-    -- (the `lowerPureCode` mono lowering is gone); it stays with the stock backend.
+    else if (← Lean.Compiler.LCNF.getMonoDecl? name).isSome ||
+        (← Lean.Compiler.LCNF.getBaseDecl? name).isSome then
+      -- L1 r1 (review a094d3a9 F4, red-first): an explicitly requested declaration with
+      -- compiled code but no impure LCNF form fails closed by name instead of being
+      -- dropped silently. The stock backend compiles it; the proved Stage 1B path lowers
+      -- impure LCNF only.
+      Lean.throwError s!"[lean-native] Unsupported declaration `{name}`: no impure LCNF form"
+    -- a non-code constant (theorem, type, projection) is skipped silently
   if declsHaveMutualCycle callGraph then
     Lean.throwError s!"[lean-native] unsupported self-tail recursion / mutual recursion in {moduleName}: no qualified loop lowering"
   let rawMod : LNIRModule := { moduleName := moduleName, decls := decls }
