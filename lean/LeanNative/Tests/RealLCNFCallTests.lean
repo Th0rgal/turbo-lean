@@ -75,8 +75,10 @@ private def runCodeF (Φ : FuncEnv) (body : LNIRCode) (arg : Val) : Except UBErr
 --    succeeds (guard 1); the LNIR fuel is pass-through (loops only), so the per-entry
 --    fuel pin lives on the source side below.
 
--- 4. Self/backward call misses the stratified environment: the callee body runs under
---    the strict suffix, so `g_self` calling itself errors like the old semantics.
+-- 4. Stratified self-call, depth-1: `g_self` IS the single entry, so evaluating its
+--    body under the full Φ resolves the self-call ONCE against its own entry; the
+--    unrolled body runs under the strict suffix ([]), where the nested self-call
+--    misses and falls to `evalExpr`, which errors on the unknown symbol.
 private def selfL : LNIRDecl :=
   { name := "g_self"
     params := [{ id := 0, name := "x", ty := .i64 }]
@@ -184,7 +186,52 @@ private def ctxC : RealBridgeCtx := { arch := .x86_64 }
 #guard declProducesF [(declB, ctxB, 32), (declC, ctxC, 32)] ctxTop declA [.u64 5] (.u64 16)
 #guard (evalRealLCNFDeclF [(declB, ctxTop, 32), (declC, ctxC, 32)] 32 ctxTop declA [.u64 5]).isOk == false
 
--- 4. A self-call errors under the stratified environment (strict suffix for the callee).
+-- 3c. Per-entry CONTEXT, `ctorLayouts` clause (review F1's cited failure, pinned): the
+--     callee `uset`s/`uproj`s a constructor only ITS entry's `ctorLayouts` knows. With
+--     the layout, logical index 1 (= objSlots) resolves to usize slot 0 and the run
+--     returns the written value; with the callee entry carrying a context that knows
+--     the constructor NAME but no layout (the pre-F1 caller-context shape), the slot
+--     lookup misses `findLayout?` and falls back to the raw index 1, which is out of
+--     bounds for the 1-scalar-slot object, so the run errors.
+private def boxSpec : RcCtorLayoutSpec :=
+  { ctorName := `l2_box, cidx := 0, objSlots := 1, usizeSlots := 1, scalarSlots := [] }
+
+/-- `l2_u o y`: write `y` into `o`'s usize slot (logical index 1), read it back. -/
+private def calleeU : Decl .impure :=
+  let u64 := ImpureType.uint64
+  mkDecl `l2_u #[mkParam 60 u64, mkParam 61 u64] u64 <|
+    .uset (fv 60) 1 (fv 61) (
+      .let (mkLet 62 u64 (.uproj 1 (fv 60) rfl)) <|
+      .return (fv 62)) rfl
+
+private def callerU : Decl .impure :=
+  let u64 := ImpureType.uint64
+  mkDecl `l2_uc #[mkParam 65 u64, mkParam 66 u64] u64 <|
+    .let (mkLet 67 u64 (.fap `l2_u #[.fvar (fv 65), .fvar (fv 66)] rfl)) <|
+    .return (fv 67)
+
+private def ctxUTop : RealBridgeCtx := { arch := .x86_64, localCallees := [(`l2_u, "u_sym")] }
+/-- The callee's OWN context: the layout plus the known-constructor binding for its param. -/
+private def ctxU : RealBridgeCtx :=
+  { arch := .x86_64, ctorLayouts := [(`l2_box, boxSpec)], knownFVarCtors := [(fv 60, `l2_box)] }
+/-- Negative control: the constructor NAME is known but no layout — `findLayout?` misses. -/
+private def ctxUNoLayout : RealBridgeCtx :=
+  { arch := .x86_64, knownFVarCtors := [(fv 60, `l2_box)] }
+
+/-- One heap constructor with 1 object field and 1 scalar slot, allocated up front. -/
+private def heapU : Nat × HeapState := HeapState.empty.allocHeapCtor 0 [.u64 7] [.u64 0]
+
+#guard (match evalRealLCNFDeclF [(calleeU, ctxU, 32)] 32 ctxUTop callerU
+          [.objPtr heapU.1, .u64 42] heapU.2 with
+        | .ok (v, _) => v == .u64 42
+        | .error _ => false)
+#guard (evalRealLCNFDeclF [(calleeU, ctxUNoLayout, 32)] 32 ctxUTop callerU
+          [.objPtr heapU.1, .u64 42] heapU.2).isOk == false
+
+-- 4. Stratified self-call, depth-1: `l2_self` is in Δ, so the top-level run resolves
+--    its self-call once against its own entry; the unrolled body runs under the strict
+--    suffix ([]), where the nested call misses and keeps the old `.unsupportedCall`
+--    error, which propagates out through the resolved outer call.
 private def selfS : Decl .impure :=
   let u64 := ImpureType.uint64
   mkDecl `l2_self #[mkParam 20 u64] u64 <|

@@ -644,9 +644,11 @@ namespace FuncEnv
 
 /-- First entry whose declaration is named `fn`, paired with the STRICT SUFFIX of the
     environment after it. The callee body evaluates under that suffix, so the
-    environment is stratified: a call resolves only against strictly later entries, and
-    in the environments `DeclEnvLowers` admits (pairwise-fresh names) a self or backward
-    call therefore misses and keeps the old `evalExpr` behavior. -/
+    environment is stratified: INSIDE an environment-run callee, a self or backward call
+    misses under the pairwise-fresh names `DeclEnvLowers` admits and keeps the old
+    `evalExpr` behavior. A body evaluated under the FULL `Φ` whose own declaration is an
+    entry of `Φ` (the top-level shape) resolves its self-call ONCE against that entry;
+    the unrolled occurrence then misses — depth-1 unrolling. -/
 def lookup? : FuncEnv → String → Option ((LNIRDecl × Nat) × FuncEnv)
   | [], _ => none
   | p :: Φ, fn => if p.1.name == fn then some (p, Φ) else lookup? Φ fn
@@ -719,7 +721,9 @@ set_option linter.unusedVariables false in
     convention of `lowerRealLCNFDecl_sound`'s conclusion, and errors on an argument-count
     mismatch (the source side's `bindParams` is strict). An extern call or a lookup miss
     delegates to `evalExpr` exactly as `evalCode` does; under the pairwise-fresh
-    environments `DeclEnvLowers` admits, a self or backward call is such a miss. -/
+    environments `DeclEnvLowers` admits, a self or backward call INSIDE an
+    environment-run callee is such a miss (a top-level body whose own declaration is in
+    `Φ` first resolves once — see `FuncEnv.lookup?`). -/
 def evalCodeF : FuncEnv → Nat → VarEnv → HeapState → LNIRCode → Except UBError (Val × HeapState)
   | Φ, fuel, env, st, .letBind dst _ty val k =>
     match hc : FuncEnv.callTarget? Φ val with

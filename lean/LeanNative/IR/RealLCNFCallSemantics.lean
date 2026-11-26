@@ -27,9 +27,14 @@ map the lowerer consulted when it emitted the call) and `fn` bound in `Δ` runs 
 declaration under the entry's own context and fuel and the strict suffix. On a lookup
 miss the arm keeps the old `.error (.unsupportedCall fn.toString)` byte for byte, so
 `Δ = []` is the old semantics (`evalStepF_nil`, proved in `LowerCalls.lean`). The
-environment is stratified: a call resolves only against strictly later entries, and in
-the environments `DeclEnvLowers` admits (pairwise-fresh names) a self or backward call
-misses; with duplicate names in `Δ` a self-call can resolve once against a later entry.
+environment is stratified: a callee body runs under the STRICT SUFFIX after its entry,
+so inside an environment-run callee a self or backward call misses under the
+pairwise-fresh names `DeclEnvLowers` admits. A TOP-LEVEL declaration that is itself an
+entry of `Δ` is different: `evalRealLCNFDeclF` runs its body under the FULL `Δ`, so its
+self-call RESOLVES ONCE against its own entry, and only the nested occurrence (now
+under the strict suffix) misses — depth-1 unrolling, not an immediate miss. The
+soundness proofs need no decl-not-in-environment hypothesis: they induct on the
+environment structure, and both evaluators unroll the same way.
 Termination is lexicographic on `(Δ.length, fuel)`: every mirrored recursion keeps `Δ`
 and decrements the ambient fuel, and the call rule strictly shrinks the environment.
 -/
@@ -208,8 +213,13 @@ def evalStepF (Δ : DeclEnv) (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st
                 match evalStepF Δ' fuelD ctxD envCallee st (.inl c) with
                 | .error e => .error e
                 | .ok (v, st') =>
-                  let storedTy := if isUnboxedScalarOrTuple rawTy then rawTy else .i64
-                  evalStepF Δ fuel ctx (env.bind decl.fvarId v none (some storedTy)) st' (.inl k)
+                  -- The continuation binds the call result at the DECLARED lowered type
+                  -- `rawTy`: the resolved-call lowering allocates its destination at
+                  -- exactly that type (`RealLCNFBridge.lean:726`), and
+                  -- `BridgeStateInv.fvar_ty` relates the two sides by pointwise
+                  -- equality, so the `.i64` fallback the unresolved-`fap` arm uses
+                  -- would desynchronize them for heap-typed call results.
+                  evalStepF Δ fuel ctx (env.bind decl.fvarId v none (some rawTy)) st' (.inl k)
         | none =>
           match evalLetValue ctx env st decl.value rawTy with
           | .ok (v, st', ctor?) =>
