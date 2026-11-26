@@ -23,7 +23,8 @@ Contract: `lean/LeanNative/Proofs/LowerRec.lean` (Part I, "Executable guards"). 
    equality).
 5. An `evalCodeR` run of the LOWERED self-call body under `Φ = [d]` produces the source
    result; the LNIR call budget counts call DEPTH, so too little fuel is
-   `.error .fuelExhausted` and the empty environment keeps the old refusal.
+   `.error .fuelExhausted`, an argument-count mismatch errors (strict arity, as L2's
+   `evalCodeF`), and the empty environment keeps the old refusal.
 -/
 
 namespace LeanNative.Tests.RealLCNFRecTests
@@ -192,6 +193,16 @@ private def runLoweredSum (Φ : List LNIRDecl) (fuel : Nat) (d : LNIRDecl) (n ac
 #guard (match loweredSum? with
         | some d => isFuelExhausted (runLoweredSum [d] 3 d 4 0)
         | none => false)
+-- Strict arity, as L2's `evalCodeF`: TWO arguments to a one-parameter callee error
+-- instead of the extra one being dropped. A too-many pin on purpose: an empty argument
+-- list errors through the unbound parameter either way, so a deleted check survives it.
+private def idL : LNIRDecl :=
+  { name := "id_sym", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
+    body := .ret 0 }
+#guard (evalCodeR [idL] 8 (VarEnv.empty.bind 0 (.u64 5)) HeapState.empty
+          (.letBind 1 .i64 (.call "id_sym" [0, 0] .i64 false) (.ret 1))).isOk == false
+#guard okValue? (evalCodeR [idL] 8 (VarEnv.empty.bind 0 (.u64 5)) HeapState.empty
+          (.letBind 1 .i64 (.call "id_sym" [0] .i64 false) (.ret 1))) == some (.u64 5)
 -- `Φ = []` is `evalCode`, which refuses the unknown symbol.
 #guard (match loweredSum? with
         | some d =>

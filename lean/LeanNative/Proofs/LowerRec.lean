@@ -130,7 +130,9 @@ rule: on `.letBind dst ty (.call fn args retTy false) k` with
 
 - at fuel `0`: `.error .fuelExhausted` (the budget check comes FIRST, before `args` are
   read — the evaluator budget shape of `evalParFor`, never source UB);
-- at fuel `fuel' + 1`: `evalVarList env args`, then the callee body
+- at fuel `fuel' + 1`: `evalVarList env args`; an argument count other than
+  `ld.params.length` is `.error (.typeError "call arity mismatch")` (amendment 2, below);
+  otherwise the callee body
   `evalCodeR Φ fuel' ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val)
   VarEnv.empty) st ld.body` — the declaration-entry binding convention of
   `lowerRealLCNFDecl_sound` — and on `.ok (v, st')` the continuation
@@ -284,11 +286,13 @@ theorem evalCodeR_call_unfold (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
       match evalVarList env args with
       | .error e => .error e
       | .ok vals =>
-        match evalCodeR Φ fuel
-            ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
-            st ld.body with
-        | .error e => .error e
-        | .ok (v, st') => evalCodeR Φ (fuel + 1) (env.bind dst v) st' k
+        if vals.length = ld.params.length then
+          match evalCodeR Φ fuel
+              ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
+              st ld.body with
+          | .error e => .error e
+          | .ok (v, st') => evalCodeR Φ (fuel + 1) (env.bind dst v) st' k
+        else .error (.typeError "call arity mismatch")
 
 theorem evalStepR_localCall_unfold (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx))
     (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
@@ -678,8 +682,10 @@ def letHeadR (Φ : List LNIRDecl)
       | some callee =>
         match evalVarList env args with
         | .ok vals =>
-          callee ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
-            st ld.body
+          if vals.length = ld.params.length then
+            callee ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
+              st ld.body
+          else .error (.typeError "call arity mismatch")
         | .error err => .error err
     | none => evalExpr env st (.call fn args retTy false)
   | _ => evalExpr env st val
@@ -700,7 +706,11 @@ theorem evalCodeRAux_letBind (Φ : List LNIRDecl) (budget : Nat)
       cases lookupFuncRec? Φ fn <;> try rfl
       cases callee? <;> try rfl
       dsimp only
-      cases evalVarList env args <;> rfl
+      cases evalVarList env args with
+      | error _ => rfl
+      | ok vals =>
+        dsimp only
+        split <;> rfl
     · rfl
 
 /-- With no environment the let head is `evalExpr`'s, whatever the callee slot holds. -/
@@ -949,7 +959,11 @@ theorem letHeadR_mono (Φ : List LNIRDecl)
           rw [hc1] at h; rw [hc2]; dsimp only at h ⊢
           cases hvl : evalVarList env args with
           | error _ => rw [hvl] at h; exact nomatch h
-          | ok vals => rw [hvl] at h; exact hf _ _ _ r h
+          | ok vals =>
+            rw [hvl] at h; dsimp only at h ⊢
+            by_cases hl : vals.length = ld.params.length
+            · simp only [hl, ↓reduceIte] at h ⊢; exact hf _ _ _ r h
+            · simp only [hl, ↓reduceIte] at h; exact nomatch h
     · exact h
 
 theorem evalCodeR_fuel_mono (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
@@ -986,11 +1000,13 @@ theorem evalCodeR_call_unfold (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
       match evalVarList env args with
       | .error e => .error e
       | .ok vals =>
-        match evalCodeR Φ fuel
-            ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
-            st ld.body with
-        | .error e => .error e
-        | .ok (v, st') => evalCodeR Φ (fuel + 1) (env.bind dst v) st' k := by
+        if vals.length = ld.params.length then
+          match evalCodeR Φ fuel
+              ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
+              st ld.body with
+          | .error e => .error e
+          | .ok (v, st') => evalCodeR Φ (fuel + 1) (env.bind dst v) st' k
+        else .error (.typeError "call arity mismatch") := by
   show evalCodeRAux Φ (fuel + 1) (some (evalCodeR Φ fuel)) env st
     (.letBind dst ty (.call fn args retTy false) k) = _
   dsimp only [evalCodeRAux]
@@ -1000,10 +1016,13 @@ theorem evalCodeR_call_unfold (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
   | error e => rfl
   | ok vals =>
     dsimp only
-    cases evalCodeR Φ fuel ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val)
-        VarEnv.empty) st ld.body with
-    | error e => rfl
-    | ok p => rfl
+    by_cases hl : vals.length = ld.params.length
+    · simp only [hl, ↓reduceIte]
+      cases evalCodeR Φ fuel ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val)
+          VarEnv.empty) st ld.body with
+      | error e => rfl
+      | ok p => rfl
+    · simp only [hl, ↓reduceIte]
 
 theorem evalStepR_localCall_unfold (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx))
     (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
