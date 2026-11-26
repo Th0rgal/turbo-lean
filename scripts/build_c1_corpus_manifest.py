@@ -10,7 +10,8 @@ The blocking `--tier C1` corpus was eight authored 3-way fixtures
 (`C1_CORPUS_TESTS`); the roadmap asks for 250 upstream `leanprover/lean4`
 run-suite programs chosen by the LCNF coverage matrix
 (`scripts/lcnf_coverage.py`, committed results
-`scripts/lcnf_coverage_results.json` @ `measured_source_commit 2d18487b`).
+`scripts/lcnf_coverage_results.json`; `--write` records the results'
+`measured_source_commit` under the manifest's `matrixSource`).
 Nothing upstream is vendored: the corpus is provisioned at suite runtime
 exactly like the Tier C2 external arm (pinned `repo_url` + `commit_sha`,
 `git fetch --depth 1` into the `TURBO_LEAN_HOME` cache, stamp file,
@@ -48,6 +49,16 @@ Honesty rules (matching `scripts/lcnf_coverage.py`)
   elaboration outright at the pin (measured 2026-11-26: the five
   tests/elab/bv_*.lean importing Std.Tactic.BVDecide), which the hardened leg
   records as `frontend_error`, never as an expected rejection.
+- `matrixSource.measuredSourceCommit` is read from the committed results when
+  `--write` runs, never typed by hand (a hand-copied value went stale through
+  two re-measurements). It names the measurement that was committed when the
+  manifest was written. The selection depends only on the matrix rows'
+  statuses, which `detectorDigest` and the matrix self-test pin, so a later
+  re-measure that leaves those rows alone does not invalidate the manifest:
+  the gate checks the field's shape, not its equality with the current
+  results, and the value can trail the newest results until the next
+  `--write`. Requiring equality would force a pinned lean4 checkout on every
+  results refresh for a field the selection never reads.
 """
 from __future__ import annotations
 
@@ -65,6 +76,9 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = ROOT / "scripts" / "c1_corpus_manifest.json"
 SCHEMA_VERSION = "turbo-lean-c1-corpus-v1"
+# The coverage matrix the target set comes from (`matrixSource` in the manifest).
+MATRIX_SPEC = "scripts/lcnf_coverage.py"
+MATRIX_RESULTS = "scripts/lcnf_coverage_results.json"
 
 # The pin. The tag's toolchain matches the repo pin (lean/lean-toolchain =
 # leanprover/lean4:v4.35.0), so corpus programs elaborate under the same
@@ -293,12 +307,29 @@ def select_programs(
     return sorted(chosen.values(), key=lambda c: c["path"]), attained
 
 
+def committed_matrix_measured_commit(results_path: Path = ROOT / MATRIX_RESULTS) -> str:
+    """The `measured_source_commit` of the committed LCNF coverage results, recorded
+    as the manifest's `matrixSource.measuredSourceCommit` by `--write`. Fails closed:
+    an unreadable results file or a value that is not a 40-hex sha raises, so the
+    manifest never records a provenance this run did not read."""
+    try:
+        doc = json.loads(results_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as err:
+        raise RuntimeError(f"cannot read {results_path}: {err}") from err
+    commit = doc.get("measured_source_commit") if isinstance(doc, dict) else None
+    if not (isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit)):
+        raise RuntimeError(f"{results_path} has no 40-hex measured_source_commit (got {commit!r})")
+    return commit
+
+
 def build_manifest(
     corpus_root: Path,
     program_count: int = PROGRAM_COUNT,
     quotas: dict[str, int] | None = None,
+    results_path: Path = ROOT / MATRIX_RESULTS,
 ) -> dict[str, Any]:
     quotas = quotas if quotas is not None else {name: q for name, _p, q in EMPHASIS_SPEC}
+    measured_commit = committed_matrix_measured_commit(results_path)
     programs, attained = select_programs(enumerate_candidates(corpus_root), program_count, quotas)
     emphasis_counts = {
         name: sum(1 for c in programs if name in c["emphasis"]) for name, _p, _q in EMPHASIS_SPEC
@@ -315,9 +346,9 @@ def build_manifest(
         "originNote": ORIGIN_NOTE,
         "categoriesNote": CATEGORIES_NOTE,
         "matrixSource": {
-            "spec": "scripts/lcnf_coverage.py",
-            "committedResults": "scripts/lcnf_coverage_results.json",
-            "measuredSourceCommit": "2d18487bfecacada542884c868953424bfc75161",
+            "spec": MATRIX_SPEC,
+            "committedResults": MATRIX_RESULTS,
+            "measuredSourceCommit": measured_commit,
         },
         "targetConstructs": dict(TARGET_STATUS),
         "excludedTargets": dict(EXCLUDED_TARGETS),
@@ -364,6 +395,21 @@ def verify_manifest(
     ):
         if pin.get(key) != want:
             reasons.append(f"pin.{key} is {pin.get(key)!r}, expected {want!r}")
+    source = manifest.get("matrixSource")
+    measured = source.get("measuredSourceCommit") if isinstance(source, dict) else None
+    if not (
+        isinstance(source, dict)
+        and source.get("spec") == MATRIX_SPEC
+        and source.get("committedResults") == MATRIX_RESULTS
+        and isinstance(measured, str)
+        and re.fullmatch(r"[0-9a-f]{40}", measured)
+    ):
+        # Shape only, never equality with the current results (see the module
+        # docstring): the selection does not read the results' counts.
+        reasons.append(
+            f"matrixSource must name {MATRIX_SPEC}, {MATRIX_RESULTS} and a 40-hex "
+            "measuredSourceCommit; regenerate with --write"
+        )
     if manifest.get("targetConstructs") != dict(TARGET_STATUS):
         reasons.append("targetConstructs do not match the matrix target rows this script pins")
     if set(manifest.get("excludedTargets", {})) != set(EXCLUDED_TARGETS):
@@ -714,6 +760,55 @@ class C1CorpusManifestSelfTest(unittest.TestCase):
             a = self._small_manifest(Path(tmp))
             b = self._small_manifest(Path(tmp))
             self.assertEqual(json.dumps(a, sort_keys=True), json.dumps(b, sort_keys=True))
+
+    def test_matrix_source_is_read_from_the_committed_results(self):
+        # The provenance is read when the manifest is built, never a literal: a
+        # planted results file's commit lands in the manifest, a malformed one
+        # refuses the build, and the gate rejects a malformed field while
+        # accepting any well-formed commit (shape, not equality).
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="c1x_src_") as tmp:
+            root = self._synth_corpus(Path(tmp))
+            quotas = {name: 1 for name, _p, _q in EMPHASIS_SPEC}
+            n = len(_SYNTH_FILES)
+            results = Path(tmp) / "results.json"
+            planted = "ab" * 20
+            results.write_text(json.dumps({"measured_source_commit": planted}), encoding="utf-8")
+            manifest = build_manifest(root, program_count=n, quotas=quotas, results_path=results)
+            self.assertEqual(manifest["matrixSource"]["measuredSourceCommit"], planted)
+            self.assertEqual(
+                build_manifest(root, program_count=n, quotas=quotas)["matrixSource"]["measuredSourceCommit"],
+                committed_matrix_measured_commit(),
+            )
+            for bad in ({"measured_source_commit": "2d18487b"}, {"measured_source_commit": None}, {}):
+                results.write_text(json.dumps(bad), encoding="utf-8")
+                with self.assertRaises(RuntimeError):
+                    build_manifest(root, program_count=n, quotas=quotas, results_path=results)
+            results.write_text("not json", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                build_manifest(root, program_count=n, quotas=quotas, results_path=results)
+
+            mp = Path(tmp) / "manifest.json"
+            mp.write_text(json.dumps(manifest), encoding="utf-8")
+            green = verify_manifest(mp, expect_program_count=n)
+            self.assertTrue(green["ok"], green["reasons"])
+            for field, value in (
+                ("measuredSourceCommit", "2d18487b"),
+                ("measuredSourceCommit", None),
+                ("spec", "scripts/other.py"),
+                ("committedResults", "scripts/other.json"),
+            ):
+                bad = json.loads(json.dumps(manifest))
+                bad["matrixSource"][field] = value
+                mp.write_text(json.dumps(bad), encoding="utf-8")
+                red = verify_manifest(mp, expect_program_count=n)
+                self.assertFalse(red["ok"], (field, value))
+                self.assertTrue(any("matrixSource" in r for r in red["reasons"]), red["reasons"])
+            missing = json.loads(json.dumps(manifest))
+            del missing["matrixSource"]
+            mp.write_text(json.dumps(missing), encoding="utf-8")
+            self.assertFalse(verify_manifest(mp, expect_program_count=n)["ok"])
 
 
 def main() -> int:
