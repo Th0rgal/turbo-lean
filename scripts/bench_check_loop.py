@@ -510,11 +510,20 @@ def host_matches(base, res) -> bool:
     if bf and rf:
         if bf != rf:
             return False
+    elif bf or rf:
+        # A fingerprint on exactly one side is always a mismatch: the
+        # fingerprinted side proves machine-id identity is available, and a
+        # bare hostname on the other side cannot verify the same machine.
+        # The unfingerprinted side may be either shape — a legacy schema-1
+        # entry with no host_fingerprint key at all, or a current entry
+        # recording None because the machine exposes no machine-id — and
+        # both read the same here. The migration path is --rebaseline.
+        return False
     elif bh.get("hostname") != rh.get("hostname"):
-        # Legacy unlabeled entries carry no fingerprint, and their hostname
-        # is the real node name, so hostnames are compared as before. An old
-        # baseline (real hostname) against a new labeled run therefore
-        # mismatches; the migration path is --rebaseline.
+        # Neither side has a fingerprint (the key is absent on a legacy
+        # schema-1 entry; a current entry without a machine-id records
+        # None), so hostnames are compared as before. Unlabeled entries'
+        # hostname is the real node name.
         return False
     # The label narrows the match further: both-fingerprints is already
     # required above whenever a label is present, so a shared label never

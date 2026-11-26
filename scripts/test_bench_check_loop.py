@@ -1614,13 +1614,33 @@ class HostFingerprint(unittest.TestCase):
         self.assertFalse(mod.host_matches(self._host("uruk", None, None),
                                           self._host("gilgamesh", None, None)))
 
-    def test_one_sided_fingerprint_falls_back_to_hostname_compare(self):
+    def test_unfingerprinted_baseline_never_matches_a_labeled_run(self):
         # An old baseline (real hostname, no fingerprint) against a new labeled
-        # run compares hostnames and mismatches; the migration is --rebaseline.
+        # run mismatches twice over: the label requires both fingerprints, and
+        # a one-sided fingerprint is always a mismatch. Migration: --rebaseline.
         mod = load_script()
         self.assertFalse(mod.host_matches(self._host("uruk", None, None),
                                           self._host("g2a-ro-192c", "g2a-ro-192c",
                                                      "a" * 64)))
+
+    def test_fingerprint_on_one_side_only_is_always_a_mismatch(self):
+        # A key PRESENT but None (a new-schema entry from a machine-id-less
+        # host) against a real fingerprint must mismatch even with equal
+        # hostnames and no labels: the None side's hostname proves nothing
+        # about the machine. A key ABSENT on both sides is the schema-1
+        # legacy case, where the hostname fallback still applies.
+        mod = load_script()
+        with_fp = {"host": {"hostname": "box", "machine_label": None,
+                            "host_fingerprint": "a" * 64}}
+        none_fp = {"host": {"hostname": "box", "machine_label": None,
+                            "host_fingerprint": None}}
+        legacy = {"host": {"hostname": "box", "machine_label": None}}
+        self.assertFalse(mod.host_matches(with_fp, none_fp))
+        self.assertFalse(mod.host_matches(none_fp, with_fp))
+        self.assertFalse(mod.host_matches(legacy, with_fp))
+        # Legacy-vs-legacy and legacy-vs-present-None keep the fallback.
+        self.assertTrue(mod.host_matches(legacy, dict(legacy)))
+        self.assertTrue(mod.host_matches(legacy, none_fp))
 
     def test_label_requires_fingerprints_on_both_sides(self):
         # host_id writes the label into hostname and records no fingerprint
