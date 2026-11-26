@@ -401,7 +401,13 @@ class Comparison(unittest.TestCase):
         self.assertEqual(verdict2["verdict"], "regression")
 
     def test_host_mismatch_is_skipped_never_pass(self):
-        verdict = self.mod.compare_run(self._baseline(), self._results(host="other-runner"))
+        # A different machine differs in FINGERPRINT: a changed hostname with
+        # the same fingerprint and label is the same machine relabeled, which
+        # compares (fingerprint-first identity). So the mismatch fixture
+        # changes the fingerprint too, modeling a real other machine.
+        res = self._results(host="other-runner")
+        res["host"]["host_fingerprint"] = "d" * 64
+        verdict = self.mod.compare_run(self._baseline(), res)
         self.assertEqual(verdict["verdict"], "comparison_skipped_host_mismatch")
         self.assertNotEqual(verdict["verdict"], "pass")
 
