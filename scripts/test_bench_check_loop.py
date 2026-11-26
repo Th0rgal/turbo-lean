@@ -12,6 +12,7 @@ import importlib.util
 import json
 import math
 import os
+import platform
 import subprocess
 import sys
 import tempfile
@@ -1438,6 +1439,57 @@ class CliFlags(unittest.TestCase):
         self.assertEqual(ids, ["batteries_list_lemmas_top", "batteries_unionfind_top"])
         everything = type("A", (), {"only_workloads": None})()
         self.assertEqual(len(mod.selected_workloads(everything)), len(mod.WORKLOADS))
+
+
+class PeakRssRecording(unittest.TestCase):
+    def test_mode_result_records_per_trial_peak_rss(self):
+        mod = load_script()
+        m = mod.mode_result([100.0, 110.0], [0.99, 0.99],
+                            ["theorem_cache_hit"] * 2, rss_mbs=[812, 815])
+        self.assertEqual(m["peak_rss_mb_trials"], [812, 815])
+
+    def test_mode_result_without_rss_values_has_no_rss_key(self):
+        mod = load_script()
+        self.assertNotIn("peak_rss_mb_trials",
+                         mod.mode_result([100.0], [0.99], ["theorem_cache_hit"]))
+        self.assertNotIn("peak_rss_mb_trials",
+                         mod.mode_result([100.0], [0.99], ["theorem_cache_hit"],
+                                         rss_mbs=[None]))
+
+    def test_split_trials_extracts_peak_rss_per_healthy_trial(self):
+        mod = load_script()
+        def trial(status, rss, exit_code=0):
+            return {"exit_code": exit_code, "external_wall_ms": 100.0,
+                    "json": {"status": status, "peak_rss_mb": rss},
+                    "stderr": "", "psi_before": {}, "psi_after": {}}
+        trials = [trial("theorem_cache_hit", 801),
+                  trial("failed", 999, exit_code=1),   # excluded like its timing
+                  trial("theorem_cache_hit", 803)]
+        out = mod.Runner.split_trials(trials)
+        rss_mbs = out[-2]  # before the trailing failed count
+        self.assertEqual(rss_mbs, [801, 803])
+
+
+class HostIdLabel(unittest.TestCase):
+    def test_host_id_with_label_records_label_as_hostname(self):
+        mod = load_script()
+        h = mod.host_id("g2a-ro-192c")
+        self.assertEqual(h["hostname"], "g2a-ro-192c")
+        self.assertEqual(h["machine_label"], "g2a-ro-192c")
+
+    def test_host_id_with_label_keeps_node_name_out_of_host_block(self):
+        mod = load_script()
+        label = "g2a-ro-192c"
+        node = platform.node()
+        if not node or node in label:
+            self.skipTest("node name empty or a substring of the label")
+        self.assertNotIn(node, json.dumps(mod.host_id(label)))
+
+    def test_host_id_without_label_records_node_name(self):
+        mod = load_script()
+        h = mod.host_id(None)
+        self.assertEqual(h["hostname"], platform.node())
+        self.assertIsNone(h["machine_label"])
 
 
 if __name__ == "__main__":

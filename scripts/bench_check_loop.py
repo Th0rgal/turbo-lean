@@ -226,7 +226,7 @@ def empty_run_result(workloads, trials):
 
 def mode_result(runs_ms, coverage_ratios, statuses, extra=None, phase_dicts=None,
                 psi_lists=None, failed_trials=0, tool_coverage=None,
-                fission_dicts=None):
+                fission_dicts=None, rss_mbs=None):
     xs = list(runs_ms)
     out = {
         "runs_ms": [round(x, 1) for x in xs],
@@ -239,6 +239,11 @@ def mode_result(runs_ms, coverage_ratios, statuses, extra=None, phase_dicts=None
         "coverage_ratio_external_min": round(min(coverage_ratios), 4) if coverage_ratios else None,
         "statuses_observed": sorted(set(statuses)),
     }
+    # Per-trial peak RSS as the tool reported it (`peak_rss_mb` in its check
+    # JSON), in trial order, so a monotonic riser across trials stays visible.
+    # Absent values stay absent rather than 0: a missing reading is not 0 MB.
+    if rss_mbs is not None and any(v is not None for v in rss_mbs):
+        out["peak_rss_mb_trials"] = list(rss_mbs)
     # G2a (roadmap/HORIZONS.md): a `theorem_cache_hit` call replayed the
     # declaration's proof from the theorem CAS with no elaboration; a
     # `theorem_verified` call ran elaboration (a CAS miss for its target).
@@ -733,7 +738,10 @@ def host_id(machine_label):
     except OSError:
         pass
     return {
-        "hostname": platform.node(),
+        # With a label the label IS the recorded hostname: the live node name
+        # stays out of the JSON entirely (the label exists so results never
+        # carry the machine's real name; see g2a-workloads/DIAG-warm-modes.md).
+        "hostname": machine_label if machine_label else platform.node(),
         "machine_label": machine_label,
         "kernel": f"{platform.system()} {platform.release()}",
         "cpu_model": cpu_model,
@@ -1056,7 +1064,7 @@ class Runner:
         from the median and counted in `failed_trials`.
         """
         runs, covs, tool_covs, statuses, phases, psis = [], [], [], [], [], []
-        fissions, failed = [], 0
+        fissions, rsss, failed = [], [], 0
         for r in trial_results:
             if trial_failed(r):
                 failed += 1
@@ -1064,6 +1072,7 @@ class Runner:
             j = r.get("json") or {}
             fissions.append({k: j.get(k) for k in (
                 "fission_cached_subshards", "fission_verified_subshards")})
+            rsss.append(j.get("peak_rss_mb"))
             runs.append(r["external_wall_ms"])
             statuses.append(str((r.get("json") or {}).get("status") or f"exit_{r['exit_code']}"))
             pt = (r.get("json") or {}).get("phase_timings") or {}
@@ -1074,7 +1083,7 @@ class Runner:
             tool_covs.append(pt.get("coverage_ratio") or 0.0)
             phases.append(pt.get("phases_ms") or {})
             psis.append([r.get("psi_before") or {}, r.get("psi_after") or {}])
-        return runs, covs, tool_covs, statuses, phases, psis, fissions, failed
+        return runs, covs, tool_covs, statuses, phases, psis, fissions, rsss, failed
 
     def run_cold_mode(self, w):
         trial_results = []
@@ -1089,11 +1098,11 @@ class Runner:
             shutil.rmtree(d, ignore_errors=True)
             if i >= self.warmups:
                 trial_results.append(r)
-        runs, covs, tool_covs, statuses, phases, psis, fissions, failed = \
+        runs, covs, tool_covs, statuses, phases, psis, fissions, rsss, failed = \
             self.split_trials(trial_results)
         return mode_result(runs, covs, statuses, phase_dicts=phases, psi_lists=psis,
                            failed_trials=failed, tool_coverage=tool_covs,
-                           fission_dicts=fissions)
+                           fission_dicts=fissions, rss_mbs=rsss)
 
     def run_warm_modes(self, w):
         d = self.wl_scratch(w["id"]) / "warm"
@@ -1111,10 +1120,11 @@ class Runner:
             for _ in range(self.trials):
                 hit_trials.append(self.run_check(w, cache, home, staging, no_daemon=False))
             runs, covs, tool_covs, hit_status, hit_phases, hit_psis, hit_fissions, \
-                hit_failed = self.split_trials(hit_trials)
+                hit_rsss, hit_failed = self.split_trials(hit_trials)
             warm_cache = mode_result(runs, covs, hit_status, phase_dicts=hit_phases,
                                      psi_lists=hit_psis, failed_trials=hit_failed,
-                                     tool_coverage=tool_covs, fission_dicts=hit_fissions)
+                                     tool_coverage=tool_covs, fission_dicts=hit_fissions,
+                                     rss_mbs=hit_rsss)
             if not all(s == "theorem_cache_hit" for s in hit_status):
                 warm_cache["cache_hit_assert_failed"] = hit_status
             edit_runs, edit_covs, edit_status, edit_phases, edit_psis = [], [], [], [], []
@@ -1139,10 +1149,11 @@ class Runner:
             finally:
                 self.clear_edit(src_path, original)
             runs, covs, tool_covs, edit_status, edit_phases, edit_psis, edit_fissions, \
-                edit_failed = self.split_trials(edit_trials)
+                edit_rsss, edit_failed = self.split_trials(edit_trials)
             warm_edit = mode_result(runs, covs, edit_status, phase_dicts=edit_phases,
                                     psi_lists=edit_psis, failed_trials=edit_failed,
-                                    tool_coverage=tool_covs, fission_dicts=edit_fissions)
+                                    tool_coverage=tool_covs, fission_dicts=edit_fissions,
+                                    rss_mbs=edit_rsss)
             if not all(s == "theorem_verified" for s in edit_status):
                 warm_edit["verified_assert_failed"] = edit_status
             return warm_cache, warm_edit
@@ -1379,8 +1390,10 @@ def main(argv=None):
     ap.add_argument("--no-baseline", action="store_true", help="never compare")
     ap.add_argument("--rebaseline", action="store_true",
                     help="this run becomes the new baseline JSON (written to --out)")
-    ap.add_argument("--machine-label", help="label for this machine/condition; a baseline "
-                                            "from a different label is never compared")
+    ap.add_argument("--machine-label", help="label for this machine/condition; also "
+                                            "recorded as the host hostname field in place "
+                                            "of the live node name; a baseline from a "
+                                            "different label is never compared")
     ap.add_argument("--skip-rev-check", action="store_true",
                     help="do not enforce pinned Batteries/PFR revs (recorded honestly)")
     ap.add_argument("--allow-busy-node", action="store_true",
