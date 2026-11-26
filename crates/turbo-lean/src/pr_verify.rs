@@ -4481,9 +4481,18 @@ pub fn run_ci_verify_command(
         let search_paths: Vec<PathBuf> = std::env::split_paths(&lp)
             .filter(|p| !p.as_os_str().is_empty())
             .collect();
-        let bin = crate::kernel::discover_con_leche_binary(Some(&canon_dir))?;
+        // G1c r2 + DA 388e906a F2: execution runs EXACTLY the binary selection resolved and
+        // stored in the provenance. No second discovery after the build, which could otherwise
+        // pick up a binary created mid-flow.
+        let Some((bin, bin_provenance)) = kernel_prov.con_leche_binary.clone() else {
+            anyhow::bail!(
+                "Kernel routing invariant violated: `{}` resolved without a resolved `con-leche` binary (fail-closed)",
+                kernel_prov.kernel_engine.as_str()
+            );
+        };
         let rep = crate::kernel::verify_olean_modules_with_con_leche(
             &bin,
+            bin_provenance,
             &search_paths,
             &root_mods,
             &[],
@@ -7976,9 +7985,18 @@ fn certify_head_statement_modules_and_replay(
             let search_paths: Vec<PathBuf> = std::env::split_paths(&search_path_str)
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect();
-            let bin = crate::kernel::discover_con_leche_binary(Some(head_project))?;
+            // G1c r2 + DA 388e906a F2: execution runs EXACTLY the binary selection resolved
+            // and stored in the provenance. No second discovery after the build, which could
+            // otherwise pick up a binary created mid-flow.
+            let Some((bin, bin_provenance)) = prov.con_leche_binary.clone() else {
+                anyhow::bail!(
+                    "Kernel routing invariant violated: `{}` resolved without a resolved `con-leche` binary (fail-closed)",
+                    prov.kernel_engine.as_str()
+                );
+            };
             let rep = crate::kernel::verify_olean_modules_with_con_leche(
                 &bin,
+                bin_provenance,
                 &search_paths,
                 &all_mods,
                 &[],

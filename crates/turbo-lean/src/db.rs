@@ -398,7 +398,6 @@ const KERNEL_AUDITED_OLEANS_AUTH_DDL: &str = "
         replay_version INTEGER NOT NULL,
         toolchain_hash TEXT NOT NULL,
         policy_digest TEXT NOT NULL,
-        csimp_posture_digest TEXT NOT NULL DEFAULT '',
         module_name TEXT NOT NULL DEFAULT '',
         audit_mac TEXT NOT NULL,
         verified_at INTEGER NOT NULL,
@@ -498,7 +497,6 @@ fn compute_kernel_audit_mac(
     replay_version: u32,
     toolchain_hash: &str,
     policy_digest: &str,
-    csimp_posture_digest: &str,
 ) -> String {
     let epoch = crate::TURBO_LEAN_BUILD_EPOCH;
     let mut msg = Vec::with_capacity(
@@ -506,10 +504,12 @@ fn compute_kernel_audit_mac(
             + artifact_digest.len()
             + environment_digest.len()
             + toolchain_hash.len()
-            + policy_digest.len()
-            + csimp_posture_digest.len(),
+            + policy_digest.len(),
     );
-    msg.extend_from_slice(b"turbo-lean-verifier-audit-mac-v3\n");
+    // G1a r2: domain v4 over the five remaining fields; the csimp posture digest left the
+    // message (it keyed nothing, and (artifact, environment, policy) already binds every byte
+    // it was derived from).
+    msg.extend_from_slice(b"turbo-lean-verifier-audit-mac-v4\n");
     msg.extend_from_slice(&(epoch.len() as u64).to_le_bytes());
     msg.extend_from_slice(epoch.as_bytes());
     msg.extend_from_slice(&(artifact_digest.len() as u64).to_le_bytes());
@@ -521,8 +521,6 @@ fn compute_kernel_audit_mac(
     msg.extend_from_slice(toolchain_hash.as_bytes());
     msg.extend_from_slice(&(policy_digest.len() as u64).to_le_bytes());
     msg.extend_from_slice(policy_digest.as_bytes());
-    msg.extend_from_slice(&(csimp_posture_digest.len() as u64).to_le_bytes());
-    msg.extend_from_slice(csimp_posture_digest.as_bytes());
     blake3::keyed_hash(key, &msg).to_hex().to_string()
 }
 
@@ -859,10 +857,28 @@ impl TurboStore {
                 if uver < 9 {
                     // G1a: `kernel_audited_oleans_auth` gained the MAC-attested
                     // `csimp_posture_digest` column; audited rows are re-derivable, so the table
-                    // is rebuilt rather than migrated in place.
-                    let _ = conn.execute("DROP TABLE IF EXISTS kernel_audited_oleans_auth", []);
+                    // is rebuilt rather than migrated in place. The DROP, CREATE and version
+                    // bump run in ONE transaction with the error propagated (review 22ae951a
+                    // F5): a DROP that failed (e.g. busy past the timeout) with a succeeding
+                    // CREATE IF NOT EXISTS used to leave the old 8-column table at
+                    // user_version 9, after which every audited-authority write failed hard on
+                    // the missing column, permanently. A failed migration now leaves the store
+                    // at the old version and retries on the next open.
                     conn.execute_batch(&format!(
-                        "{}\nPRAGMA user_version = 9;",
+                        "BEGIN IMMEDIATE;\nDROP TABLE IF EXISTS kernel_audited_oleans_auth;\n{}\nPRAGMA user_version = 9;\nCOMMIT;",
+                        KERNEL_AUDITED_OLEANS_AUTH_DDL
+                    ))?;
+                }
+                if uver < 10 {
+                    // G1a r2 (review 22ae951a F2): the `csimp_posture_digest` column is dropped.
+                    // It was MAC-attested but part of no cache key (the lookup never received a
+                    // caller digest, the primary key omits it, the upsert overwrote it), and the
+                    // (artifact, environment, policy) key already binds every byte it was
+                    // derived from. The audit MAC domain bumps to v4 over the five remaining
+                    // fields; audited rows are re-derivable, so the table is rebuilt,
+                    // transactionally like v9 (review 22ae951a F5).
+                    conn.execute_batch(&format!(
+                        "BEGIN IMMEDIATE;\nDROP TABLE IF EXISTS kernel_audited_oleans_auth;\n{}\nPRAGMA user_version = 10;\nCOMMIT;",
                         KERNEL_AUDITED_OLEANS_AUTH_DDL
                     ))?;
                 }
@@ -920,7 +936,7 @@ impl TurboStore {
                      path_key TEXT PRIMARY KEY, mtime_sec INTEGER NOT NULL, mtime_nsec INTEGER NOT NULL,
                      size_bytes INTEGER NOT NULL, split_key TEXT NOT NULL, updated_at INTEGER NOT NULL
                  );
-                 PRAGMA user_version = 9;
+                 PRAGMA user_version = 10;
                  COMMIT;
                  PRAGMA wal_checkpoint(TRUNCATE);",
                 WORKTREE_LEASES_DDL,
@@ -3011,7 +3027,6 @@ impl TurboStore {
         replay_version: u32,
         toolchain_hash: &str,
         policy_digest: &str,
-        csimp_posture_digest: &str,
         module_name: &str,
         disallowed_roots: &[PathBuf],
     ) -> Result<()> {
@@ -3035,16 +3050,14 @@ impl TurboStore {
             replay_version,
             toolchain_hash,
             policy_digest,
-            csimp_posture_digest,
         );
         let now = now_unix();
         self.conn.execute(
             "INSERT INTO kernel_audited_oleans_auth (
-                artifact_digest, environment_digest, replay_version, toolchain_hash, policy_digest, csimp_posture_digest, module_name, audit_mac, verified_at
+                artifact_digest, environment_digest, replay_version, toolchain_hash, policy_digest, module_name, audit_mac, verified_at
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(artifact_digest, environment_digest, replay_version, toolchain_hash, policy_digest) DO UPDATE SET
-                csimp_posture_digest = excluded.csimp_posture_digest,
                 module_name = excluded.module_name,
                 audit_mac = excluded.audit_mac,
                 verified_at = excluded.verified_at",
@@ -3054,7 +3067,6 @@ impl TurboStore {
                 i64::from(replay_version),
                 toolchain_hash,
                 policy_digest,
-                csimp_posture_digest,
                 module_name,
                 audit_mac,
                 now
@@ -3080,13 +3092,13 @@ impl TurboStore {
             return false;
         }
         let Ok(mut stmt) = self.conn.prepare_cached(
-            "SELECT audit_mac, csimp_posture_digest FROM kernel_audited_oleans_auth
+            "SELECT audit_mac FROM kernel_audited_oleans_auth
              WHERE artifact_digest = ?1 AND environment_digest = ?2 AND replay_version = ?3 AND toolchain_hash = ?4 AND policy_digest = ?5
              LIMIT 1",
         ) else {
             return false;
         };
-        let Ok((stored_mac, stored_csimp_posture)) = stmt.query_row(
+        let Ok(stored_mac) = stmt.query_row(
             params![
                 artifact_digest,
                 environment_digest,
@@ -3094,12 +3106,12 @@ impl TurboStore {
                 toolchain_hash,
                 policy_digest
             ],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            |r| r.get::<_, String>(0),
         ) else {
             return false;
         };
-        // G1a: the stored csimp posture digest is key material; the MAC attests the recorded
-        // (policy, posture) pair, so a tampered or legacy posture column fails closed here.
+        // G1a r2: the MAC attests the five key fields (audit-mac-v4), so a tampered or
+        // legacy-domain row fails closed here.
         let expected_mac = compute_kernel_audit_mac(
             key,
             artifact_digest,
@@ -3107,7 +3119,6 @@ impl TurboStore {
             replay_version,
             toolchain_hash,
             policy_digest,
-            &stored_csimp_posture,
         );
         stored_mac.len() == expected_mac.len()
             && stored_mac
@@ -9179,7 +9190,7 @@ mod tests {
         let uv: i64 = store
             .conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
-        assert_eq!(uv, 9);
+        assert_eq!(uv, 10);
         assert!(!store.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
         assert!(store
             .record_kernel_replayed_olean("", "env1", 2, "tc1", "M", &[])
@@ -9242,7 +9253,7 @@ mod tests {
 
         let key = store.load_verified_replay_hmac_key(&[]).expect("hmac key");
         assert!(!store.has_kernel_audited_olean_with_key(&key, "dig1", "env1", 2, "tc1", "pol1"));
-        store.record_kernel_audited_olean("dig1", "env1", 2, "tc1", "pol1", "", "Root.Good", &[])?;
+        store.record_kernel_audited_olean("dig1", "env1", 2, "tc1", "pol1", "Root.Good", &[])?;
         assert!(store.has_kernel_audited_olean_with_key(&key, "dig1", "env1", 2, "tc1", "pol1"));
         assert!(!store.has_kernel_audited_olean_with_key(&key, "dig1", "env1", 2, "tc1", "pol2"));
         store.conn.execute(
@@ -9266,7 +9277,7 @@ mod tests {
     }
 
     #[test]
-    fn test_kernel_audited_record_binds_csimp_posture_digest() -> Result<()> {
+    fn test_kernel_audited_mac_binds_five_key_fields_and_fails_closed() -> Result<()> {
         let tmp_dir = std::env::temp_dir().join(format!(
             "turbo_lean_db_csimp_key_{}_{}",
             std::process::id(),
@@ -9277,33 +9288,28 @@ mod tests {
         fs::create_dir_all(&cache_dir)?;
         let store = TurboStore::open(Some(&cache_dir))?;
 
-        store.record_kernel_audited_olean("digA", "envA", 2, "tcA", "polA", "postureA", "Mod.A", &[])?;
+        store.record_kernel_audited_olean("digA", "envA", 2, "tcA", "polA", "Mod.A", &[])?;
         let key = store.load_verified_replay_hmac_key(&[]).expect("hmac key");
         assert!(store.has_kernel_audited_olean_with_key(&key, "digA", "envA", 2, "tcA", "polA"));
 
-        // Unchanged posture: re-recording keeps the same attested key material and still verifies.
-        store.record_kernel_audited_olean("digA", "envA", 2, "tcA", "polA", "postureA", "Mod.A", &[])?;
+        // Re-recording the same five key fields keeps the attested key material and verifies.
+        store.record_kernel_audited_olean("digA", "envA", 2, "tcA", "polA", "Mod.A", &[])?;
         assert!(store.has_kernel_audited_olean_with_key(&key, "digA", "envA", 2, "tcA", "polA"));
 
-        // Changed posture: the upsert re-attests the new digest and verifies as the new recording...
-        store.record_kernel_audited_olean("digA", "envA", 2, "tcA", "polA", "postureB", "Mod.A", &[])?;
-        assert!(store.has_kernel_audited_olean_with_key(&key, "digA", "envA", 2, "tcA", "polA"));
-
-        // ...and the posture digest is key material: rewriting the stored column alone (back to the
-        // previously valid value) breaks the MAC and fails closed.
+        // The stored MAC is load-bearing: rewriting it alone fails closed.
         store.conn.execute(
-            "UPDATE kernel_audited_oleans_auth SET csimp_posture_digest = 'postureA' WHERE artifact_digest = 'digA'",
+            "UPDATE kernel_audited_oleans_auth SET audit_mac = 'deadbeef' WHERE artifact_digest = 'digA'",
             [],
         )?;
         assert!(!store.has_kernel_audited_olean_with_key(&key, "digA", "envA", 2, "tcA", "polA"));
 
-        // Key-diff at the MAC level: a changed posture digest changes the key; an unchanged one
-        // does not.
-        let mac_a = compute_kernel_audit_mac(&key, "d", "e", 2, "t", "p", "postureA");
-        let mac_a_again = compute_kernel_audit_mac(&key, "d", "e", 2, "t", "p", "postureA");
-        let mac_b = compute_kernel_audit_mac(&key, "d", "e", 2, "t", "p", "postureB");
-        assert_eq!(mac_a, mac_a_again);
-        assert_ne!(mac_a, mac_b, "a changed csimp posture digest must change the audit MAC");
+        // Key-diff at the MAC level (G1a r2, audit-mac-v4 over the five remaining fields): a
+        // changed policy digest changes the MAC; unchanged inputs do not.
+        let mac_p = compute_kernel_audit_mac(&key, "d", "e", 2, "t", "p");
+        let mac_p_again = compute_kernel_audit_mac(&key, "d", "e", 2, "t", "p");
+        let mac_q = compute_kernel_audit_mac(&key, "d", "e", 2, "t", "q");
+        assert_eq!(mac_p, mac_p_again);
+        assert_ne!(mac_p, mac_q, "a changed policy digest must change the audit MAC");
 
         drop(store);
         let _ = fs::remove_dir_all(&tmp_dir);
@@ -9311,7 +9317,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sqlite_v7_to_v9_migration_clears_stale_epoch_state_and_binds_keys() -> Result<()> {
+    fn test_sqlite_v7_to_v10_migration_clears_stale_epoch_state_and_binds_keys() -> Result<()> {
         let tmp_dir = std::env::temp_dir().join(format!(
             "turbo_lean_db_v8_epoch_{}_{}",
             std::process::id(),
@@ -9335,7 +9341,6 @@ mod tests {
             2,
             "tc_v7",
             "pol_v7",
-            "",
             "Stale.Mod",
             &[],
         )?;
@@ -9347,7 +9352,7 @@ mod tests {
         let uv: i64 = migrated
             .conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
-        assert_eq!(uv, 9);
+        assert_eq!(uv, 10);
         assert!(migrated.get_lake_env("proj_v7")?.is_none());
         assert!(migrated
             .batch_get_file_splits(&["split_v7".to_string()])?

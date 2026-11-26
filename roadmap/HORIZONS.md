@@ -136,7 +136,7 @@ flowchart LR
     M1 --> G2a[G2a replay hit rate] --> G2b[G2b replay on by default]
     S2 --> G2b
     M1 --> H2G[H2.G GPU share]
-    P9[P9 land csimp scan + policy first] --> G1a[G1a csimp in cache keys]
+    P9[P9 land csimp scan + policy first] --> G1a[G1a csimp posture bound via existing keys]
     P9 --> G1c[G1c auto selects bundled kernel]
   end
   subgraph H1
@@ -187,7 +187,7 @@ flowchart LR
 | **P8** *(done `#459` `ae16815`)* | Git < 2.46 fails loudly (`#415`) | `trusted_tools.rs` | – | unit test | S |
 | **P9** | Land `#455`; import policy for `csimp` / `unsafe` decided before expensive work (`#411` `#412`). Measured passing-path cost of the early pass (one Batteries check, r1 binary): warm-store parity (median 2.42 s on vs 2.47 s off, n=10), cold audit +1.26 s median (6.63 s on vs 5.36 s off, n=3, fresh store per rep) | `kernel.rs`, worker audit | full `S3b` (`S3b-E` and `S3b-M`) | 140 Batteries calls pass | M |
 | **P10** | Content-hash freshness, `--frozen-cone` (`#339`) | `module_builder/freshness.rs` | S1 | hardlinked-cone fixture, 0 rebuilds | M |
-| **G1a** | `csimp` digest in action and cache keys | `db.rs` keys | P9 | key-diff test | S |
+| **G1a** | `csimp` posture bound through the keys the audited-authority rows already carry: a module's own csimp entries are bound by `artifact_digest` (its `.olean`+`.ilean` bytes) and its imports' entries by `environment_digest` (the transitive import environment), so the (artifact, environment, policy) key already binds every byte a stored posture digest would derive from, and no separate posture column is stored (G1a r2) | `db.rs` keys | P9 | key-diff test | S |
 | **G1b** *RO* *(done `#460` `ad54090`, model only)* | The M2 theorems hold over real `.olean`, or the docs say they are about a model. The `#460` proof covers the documented OLEN v1 model only; the proof against real `.olean` files is still open, so this leaf is not finished. w-g1b (2026-11-25): the con-leche verification-path tests now run over real `lean`-compiled `.olean` artifacts (pinned v4.35.0) instead of an empty or synthesized search path, and executable guards in `ConLeche.lean` pin that `parseOleanShard` rejects a real `.olean` header (`olean` `0x6F…`, not `OLEN` `0x4F4C454E`); the M2 theorems over real `.olean` bytes remain open | `ConLeche.lean` | – | contract script | L |
 | **G1c** | `--kernel auto` selects the bundled `con-leche` when the toolchain matches | `kernel.rs` | P9 | selection test | S |
 | **G2a** *RO* | CAS replay hit rate on recorded edit sequences | bench script | M1 | number recorded | S |

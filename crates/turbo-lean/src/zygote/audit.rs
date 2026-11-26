@@ -376,34 +376,6 @@ pub(crate) fn record_snapshot_modules_in_store(
     live_lean_path_env: &str,
     extra_root_lib: Option<&Path>,
 ) -> Result<()> {
-    record_snapshot_modules_in_store_with_posture(
-        store,
-        cfg,
-        snap,
-        replayed_mods,
-        audited_mods,
-        live_lean_path_env,
-        extra_root_lib,
-        None,
-    )
-}
-
-/// `record_snapshot_modules_in_store` with the early import-policy pre-pass's canonical transitive
-/// csimp posture digests (G1a): each audited root's digest is folded, MAC-attested, into its
-/// `kernel_audited_oleans_auth` row. Callers without a pre-pass (the replay-only and
-/// replay-and-audit entries, `module_builder::publish`) record an empty digest through the
-/// delegating wrapper above.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn record_snapshot_modules_in_store_with_posture(
-    store: &TurboStore,
-    cfg: &crate::module_builder::ProjectConfig,
-    snap: &ClosureSnapshot,
-    replayed_mods: &[String],
-    audited_mods: &[String],
-    live_lean_path_env: &str,
-    extra_root_lib: Option<&Path>,
-    csimp_posture_digests: Option<&std::collections::BTreeMap<String, String>>,
-) -> Result<()> {
     let (snap_lp, _) = ensure_bound_audit_closure(snap, "audit_record_authority")?;
     let parent_snap_lp = snapshot_parent_search_path(snap).unwrap_or(snap_lp);
     let live_batch = crate::module_builder::ReplayLookupBatchCache::new_with_extra_root_lib(
@@ -485,10 +457,6 @@ pub(crate) fn record_snapshot_modules_in_store_with_posture(
                 )
             })?;
         let policy_dig = compute_module_audit_policy_digest(cfg, m);
-        let posture_dig = csimp_posture_digests
-            .and_then(|d| d.get(m))
-            .map(String::as_str)
-            .unwrap_or("");
         ensure_bound_audit_closure(snap, "audit_record_audited_post")?;
         store.record_kernel_audited_olean(
             &dig,
@@ -496,7 +464,6 @@ pub(crate) fn record_snapshot_modules_in_store_with_posture(
             ZYGOTE_REPLAY_VERSION,
             &cfg.lean_githash,
             &policy_dig,
-            posture_dig,
             m,
             live_batch.disallowed_roots(),
         )?;
@@ -581,11 +548,11 @@ struct WirePostureReply {
     targets: Vec<WirePostureTarget>,
 }
 
-/// The early import-policy pre-pass result: the canonical transitive csimp posture digest of each
-/// audited root module (`kernel::compute_transitive_csimp_posture_digest`), for cache-key folding.
-pub(crate) struct ImportPolicyPrepass {
-    pub(crate) csimp_posture_digests: std::collections::BTreeMap<String, String>,
-}
+/// Marker that the early import-policy pre-pass ran and decided (allowed) the audited module
+/// set. G1a r2 (review 22ae951a F2): the pre-pass no longer computes per-root csimp posture
+/// digests for cache-key folding; the digest keyed nothing, and the (artifact, environment,
+/// policy) key already binds every byte it was derived from.
+pub(crate) struct ImportPolicyPrepass;
 
 /// Decide the imported-`.olean` policy (csimp / unsafe / implemented_by / axioms allowlists)
 /// before the expensive audit. `Ok(None)` means the pass did not decide (untrusted mode, the
@@ -738,24 +705,7 @@ fn early_import_policy_prepass(
             decision.violations.join("\n  ")
         );
     }
-    // The G1a cache-key digests are computed best-effort after the decision (the decision does
-    // not use them): a failed root scan logs and leaves that root's audited record with an
-    // empty posture digest instead of withdrawing the whole early decision.
-    let mut csimp_posture_digests = std::collections::BTreeMap::new();
-    for root in sorted_mods {
-        match crate::kernel::scan_transitive_csimp_posture(root, |m| Ok(scan_map.get(m).cloned()))
-        {
-            Ok(posture) => {
-                csimp_posture_digests.insert(root.clone(), posture.digest);
-            }
-            Err(e) => eprintln!(
-                "[turbo-lean] transitive csimp posture digest scan failed for `{root}` ({e:#}); its audited record carries an empty digest"
-            ),
-        }
-    }
-    Ok(Some(ImportPolicyPrepass {
-        csimp_posture_digests,
-    }))
+    Ok(Some(ImportPolicyPrepass))
 }
 
 pub(crate) fn audit_compiled_modules_with_zygote(
@@ -815,7 +765,7 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
     sorted.dedup();
     // P9: decide the import policy (csimp / unsafe / implemented_by / axioms allowlists) before
     // the expensive snapshot + whole-closure replay + per-declaration audit work below.
-    let early_posture = early_import_policy_prepass(
+    let _early_decision = early_import_policy_prepass(
         &store.root,
         cfg,
         &sorted,
@@ -823,9 +773,6 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
         extra_ro_binds,
         is_untrusted,
     )?;
-    // G1a: each audited root's canonical transitive csimp posture digest is folded, MAC-attested,
-    // into its `kernel_audited_oleans_auth` row (empty when the pre-pass did not decide).
-    let posture_digests = early_posture.as_ref().map(|p| &p.csimp_posture_digests);
     if is_untrusted {
         // Validate the caller's live search paths against the untrusted sandbox gate first, then
         // bind-mount only the immutable `ClosureSnapshot` directory inside `bwrap` so multi-module
@@ -895,7 +842,7 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
             )?;
             let _ = ensure_bound_audit_closure(&snap, "audit_after_chunk")?;
             if should_record_chunk(chunk) {
-                record_snapshot_modules_in_store_with_posture(
+                record_snapshot_modules_in_store(
                     store,
                     cfg,
                     &snap,
@@ -903,7 +850,6 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
                     chunk,
                     lean_path_env,
                     None,
-                    posture_digests,
                 )?;
             }
         }
@@ -940,7 +886,7 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
             )?;
             let _ = ensure_bound_audit_closure(&snap, "audit_after_chunk")?;
             if should_record_chunk(chunk) {
-                record_snapshot_modules_in_store_with_posture(
+                record_snapshot_modules_in_store(
                     store,
                     cfg,
                     &snap,
@@ -948,7 +894,6 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
                     chunk,
                     lean_path_env,
                     None,
-                    posture_digests,
                 )?;
             }
         }
@@ -995,7 +940,7 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
                             .lock()
                             .map_err(|_| anyhow::anyhow!("audit record mutex poisoned"))?;
                         let worker_store = TurboStore::open(Some(&store_root))?;
-                        record_snapshot_modules_in_store_with_posture(
+                        record_snapshot_modules_in_store(
                             &worker_store,
                             cfg,
                             &snap,
@@ -1003,7 +948,6 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
                             chunk,
                             lean_path_env,
                             None,
-                            posture_digests,
                         )?;
                     }
                     Ok(())
