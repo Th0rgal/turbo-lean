@@ -27,6 +27,11 @@ Contract: `lean/LeanNative/Proofs/LowerRec.lean` (Part I, "Executable guards"). 
    result; the LNIR call budget counts call DEPTH, so too little fuel is
    `.error .fuelExhausted`, an argument-count mismatch errors (strict arity, as L2's
    `evalCodeF`), and the empty environment keeps the old refusal.
+6. A HEAP-typed local-call result (contract amendment 3): a callee returns a fresh
+   object, the caller `dec`s it. The source R-run, L2's F-run and the lowered LNIR run
+   agree exactly on value and heap, so the object is freed on every side. Under the
+   pre-amendment rule, which stored the result at `.i64`, the source `dec` was a no-op
+   and these guards failed with the object live.
 7. Repeated names: with two LNIR entries named `f`, L2's strict-suffix lookup resolves
    the nested call to the second entry and returns its value, while the full-environment
    lookup re-resolves to the first entry and ends on the call budget at every fuel —
@@ -230,6 +235,66 @@ private def idL : LNIRDecl :=
               (fun acc (p, val) => acc.bind p.id val) VarEnv.empty) HeapState.empty d.body) &&
           (runLoweredSum [] 16 d 4 0).isOk == false
         | none => false)
+
+/-! ### 6. A heap-typed local-call result: every run frees the object the caller drops -/
+
+/-- `l3_mk x = ObjBox.left (box x)`: returns a fresh heap object. -/
+private def mkHeapDecl : Decl .impure :=
+  let obj := ImpureType.object
+  let u64 := ImpureType.uint64
+  let ci : CtorInfo := { name := `ObjBox.left, cidx := 0, size := 1, usize := 0, ssize := 0 }
+  mkDecl `l3_mk #[mkParam 1 u64] obj <|
+    .let (mkLet 3 obj (.box u64 (fv 1) rfl)) <|
+    .let (mkLet 4 obj (.ctor ci #[.fvar (fv 3)] rfl)) <|
+    .return (fv 4)
+
+/-- `l3_use x = let o := l3_mk x; dec o; 0`: the caller drops the object it received. -/
+private def useHeapDecl : Decl .impure :=
+  let obj := ImpureType.object
+  let u64 := ImpureType.uint64
+  mkDecl `l3_use #[mkParam 1 u64] u64 <|
+    .let (mkLet 2 obj (.fap `l3_mk #[.fvar (fv 1)] rfl)) <|
+    .dec (fv 2) 1 true false none (
+      .let (mkLet 5 u64 (.lit (.uint64 0))) <|
+      .return (fv 5)) rfl
+
+private def boxLayout : RcCtorLayoutSpec :=
+  { ctorName := `ObjBox.left, cidx := 0, objSlots := 1, usizeSlots := 0, scalarSlots := [] }
+
+/-- One context for both declarations: heap lowering on, the constructor's layout, and
+    the callee mapped as local. -/
+private def ctxHeap : RealBridgeCtx :=
+  { arch := .x86_64, allowStage1DHeap := true, ctorLayouts := [(`ObjBox.left, boxLayout)],
+    localCallees := [(`l3_mk, "mk_sym")] }
+
+/-- The source run under the recursion-capable semantics, the callee in `Δ`. -/
+private def heapRunR : Except UBError (Val × HeapState) :=
+  evalRealLCNFDeclR [(mkHeapDecl, ctxHeap)] 64 ctxHeap useHeapDecl [.u64 5]
+
+/-- The same module under L2's `evalStepF` (the callee's entry carries its fuel). -/
+private def heapRunF : Except UBError (Val × HeapState) :=
+  evalRealLCNFDeclF [(mkHeapDecl, ctxHeap, 64)] 64 ctxHeap useHeapDecl [.u64 5]
+
+/-- The lowered caller under `Φ = [the lowered callee]`, entered with the same argument. -/
+private def heapRunLowered : Except UBError (Val × HeapState) :=
+  match lowerRealLCNFDecl 64 ctxHeap mkHeapDecl "mk_sym",
+        lowerRealLCNFDecl 64 ctxHeap useHeapDecl "use_sym" with
+  | .ok dm, .ok du =>
+    evalCodeR [dm] 64 ((du.params.zip [Val.u64 5]).foldl
+      (fun acc (p, val) => acc.bind p.id val) VarEnv.empty) HeapState.empty du.body
+  | _, _ => .error (.typeError "fixture lowering failed")
+
+-- The caller's `dec` frees the object it received, so the source run ends with no live
+-- heap object. Before amendment 3 the local-call rule stored the result at `.i64`, the
+-- `dec` was a no-op on a non-heap variable, and this guard failed with the object live.
+#guard (match heapRunR with
+        | .ok (v, hst) => v == .u64 0 && hst.heapObjs.isEmpty
+        | .error _ => false)
+-- The lowered run frees it too, and agrees with the source run exactly (value and heap);
+-- so does L2's run of the same module.
+#guard heapRunLowered.isOk
+#guard exceptAgrees heapRunR heapRunLowered
+#guard exceptAgrees heapRunR heapRunF
 
 /-! ### 7. Repeated names: why the F-to-R embedding needs distinct names -/
 
