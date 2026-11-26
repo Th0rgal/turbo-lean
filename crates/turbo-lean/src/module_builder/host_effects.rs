@@ -2339,17 +2339,30 @@ pub(super) fn node_source_has_disallowed_elab_host_effects(
     node_source_host_effect_taint(cfg, node, src_raw).is_tainted()
 }
 
+/// The TRANSITIVE spread verdict per (package root, module), stamped with the memo
+/// window captured before its computation's reads (DA 71add786 finding 5; the
+/// stamping is finding 2's `CLEAN_GIT_PIN_MEMO` shape). Within one window the closure
+/// is walked once; a new window (one per CLI command and per serve / MCP request)
+/// recomputes, which is how an edit below an unchanged importer still flips its
+/// verdict in a long-lived daemon. One entry per module, overwritten per window;
+/// [`reset_lake_inputs_tag_memo`] clears it too.
+#[allow(clippy::type_complexity)]
+pub(super) static SPREAD_TRANSITIVE_VERDICTS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<(PathBuf, String), (u64, bool)>>,
+> = std::sync::OnceLock::new();
+
 /// Whether `spec`'s module, or anything below it in its *own* import graph, carries
 /// spreading host-effect taint. External `.olean` dependencies are not dag nodes, so
 /// spreading has to be chased through their source headers; one hop was not enough
 /// (`Dep.B` importing a host-reading `Dep.A` never marked the root). Lean import
 /// graphs are acyclic; a resolver cycle is cut by the in-progress memo entry. An
-/// unreadable source or broken header fails closed, as in the purge walk. Only the
-/// PER-FILE facts (the own-source spread verdict and the parsed header) are cached
-/// across calls, keyed by source content: the transitive verdict always recurses, so
-/// an edit below an unchanged importer still flips the importer's verdict in a
-/// long-lived daemon. The recursion costs one read and one hash per already-seen file
-/// per call and is bounded by the per-call `memo`.
+/// unreadable source or broken header fails closed, as in the purge walk. Two cache
+/// layers: PER-FILE facts (the own-source spread verdict and the parsed header) keyed
+/// by source content, and the TRANSITIVE verdict in
+/// [`SPREAD_TRANSITIVE_VERDICTS`], keyed by memo window — within one window the
+/// closure is walked once, and the next request's fresh window recomputes, so an edit
+/// below an unchanged importer still flips the importer's verdict in a long-lived
+/// daemon (every request resets the window at entry).
 pub(super) fn spec_spreads_host_effects_transitively(
     cfg: &ProjectConfig,
     spec: &DiscoveredModuleSpec,
@@ -2365,6 +2378,21 @@ pub(super) fn spec_spreads_host_effects_transitively(
     let key = (spec.pkg_root.clone(), spec.module_name.clone());
     if let Some(&v) = memo.get(&key) {
         return v;
+    }
+    // Captured before any reads: a verdict computed before a reset is stamped with
+    // the old window and never served to the new one (the finding 2 shape).
+    let window = current_memo_window();
+    let cached = SPREAD_TRANSITIVE_VERDICTS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .copied();
+    if let Some((w, v)) = cached {
+        if w == window {
+            memo.insert(key, v);
+            return v;
+        }
     }
     memo.insert(key.clone(), false);
     let v = match fs::read_to_string(&spec.src_path) {
@@ -2411,7 +2439,12 @@ pub(super) fn spec_spreads_host_effects_transitively(
                 })
         }
     };
-    memo.insert(key, v);
+    memo.insert(key.clone(), v);
+    SPREAD_TRANSITIVE_VERDICTS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, (window, v));
     v
 }
 
@@ -3799,6 +3832,8 @@ mod host_effect_taint_tests {
             "a clean two-module dependency must not spread"
         );
         fs::write(spec.pkg_root.join("LintLib/A.lean"), IMPORT_TIME_SHAPE)?;
+        // The daemon's next request resets the memo window at entry; model it.
+        reset_lake_inputs_tag_memo();
         let mut memo2 = HashMap::new();
         assert!(
             spec_spreads_host_effects_transitively(&cfg, &spec, &mut memo2),
@@ -3891,6 +3926,37 @@ mod host_effect_taint_tests {
             include_targets_tracked_at_pin(&canon, &[rel]),
             "a planted wrong answer stamped with a superseded window must be ignored: \
              the tracked file re-reads as tracked"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// The window-scoped transitive spread cache never serves a superseded window: a
+    /// planted wrong verdict stamped with an old window is ignored and the clean
+    /// closure recomputes (DA 71add786 finding 5's cache, finding 2's stamping).
+    #[test]
+    fn transitive_spread_cache_ignores_entries_from_a_superseded_window() -> Result<()> {
+        let (dir, cfg, spec) = dep_fixture_with(
+            "spread_stale_window",
+            "import LintLib.A\ndef l : Nat := 0\n",
+            false,
+            &[("LintLib/A.lean", "def a : Nat := 1\n")],
+        )?;
+        reset_lake_inputs_tag_memo();
+        let superseded = current_memo_window().wrapping_sub(1);
+        SPREAD_TRANSITIVE_VERDICTS
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                (spec.pkg_root.clone(), spec.module_name.clone()),
+                (superseded, true),
+            );
+        let mut memo = HashMap::new();
+        assert!(
+            !spec_spreads_host_effects_transitively(&cfg, &spec, &mut memo),
+            "a planted wrong verdict stamped with a superseded window must be \
+             ignored: the clean closure recomputes to non-spreading"
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())
