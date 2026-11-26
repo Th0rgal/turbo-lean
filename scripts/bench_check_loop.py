@@ -54,7 +54,7 @@ Python standard library only.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from typing import NamedTuple
 import hashlib
 import json
 import math
@@ -521,11 +521,14 @@ def toolchain_matches(base, res) -> bool:
             and bt == rt)
 
 
-@dataclass
-class TrialSplit:
+class TrialSplit(NamedTuple):
     """Per-mode series over the HEALTHY trials (in trial order), plus the
     count of failed ones. Named fields so a new series cannot silently
-    misalign the positional unpacking that a growing tuple invited."""
+    misalign positional use; a NamedTuple rather than a dataclass because
+    external tools load this script with spec_from_file_location without
+    registering it in sys.modules, and under `from __future__ import
+    annotations` a dataclass resolves its field strings through sys.modules
+    at class creation and dies there. Positional unpacking stays available."""
     runs: list
     covs: list
     tool_covs: list

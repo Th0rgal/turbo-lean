@@ -1540,6 +1540,23 @@ class PeakRssRecording(unittest.TestCase):
         self.assertEqual(ts.failed, 1)
 
 
+class ScriptLoadsUnregistered(unittest.TestCase):
+    def test_script_loads_without_sys_modules_registration(self):
+        # External tools load this script exactly like this, without first
+        # registering it in sys.modules; class creation must survive that
+        # (under future annotations a dataclass resolves its field strings
+        # through sys.modules and dies here with AttributeError).
+        spec = importlib.util.spec_from_file_location(
+            "bench_check_loop_unregistered", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        ts = mod.Runner.split_trials([])
+        self.assertEqual((ts.runs, ts.failed), ([], 0))
+        # Positional unpacking stays available to external callers.
+        runs, covs, tool_covs, statuses, phases, psis, fissions, rss, failed = ts
+        self.assertEqual((runs, failed), ([], 0))
+
+
 class HostFingerprint(unittest.TestCase):
     @staticmethod
     def _host(hostname, label, fp):
