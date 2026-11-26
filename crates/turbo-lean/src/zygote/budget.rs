@@ -149,6 +149,11 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
 /// bounded `.olean` closure slice; used to clamp parallelism under an explicit memory budget.
 pub(crate) const REPLAY_WORKER_EST_RSS_MB: u64 = 2048;
 
+/// Headroom multiplier for the hard per-worker `RLIMIT_DATA` over the budget share:
+/// `RLIMIT_DATA` limits writable private VIRTUAL memory, which runs ahead of the RSS the
+/// share was sized from (malloc arenas, pthread stacks, allocator slack).
+pub(crate) const RLIMIT_DATA_HEADROOM_MULT: u64 = 2;
+
 /// One resource budget that reaches every worker (#435): the effective job count
 /// (`check --jobs`, exported as `TURBO_LEAN_JOBS`) and the memory cap (`--max-memory-mb` /
 /// `TURBO_LEAN_MAX_MEMORY_MB`), carried as one object instead of ad hoc env reads at each
@@ -212,12 +217,29 @@ impl WorkerBudget {
         clamped.clamp(1, work_items.max(1))
     }
 
-    /// Per-worker address-space cap in MiB under an explicit budget: the budget divided
+    /// Per-worker share of the budget in MiB under an explicit budget: the budget divided
     /// across the workers, floored at 512 MiB so a wide run cannot starve every worker
-    /// below a workable Lean heap.
-    pub fn per_worker_rlimit_mb(&self, parallelism: usize) -> Option<u64> {
+    /// below a workable Lean heap. Advisory: it sizes replay batches (`replay_batch_cap`)
+    /// and feeds the hard cap below, but applies no limit by itself.
+    pub fn per_worker_share_mb(&self, parallelism: usize) -> Option<u64> {
         self.max_memory_mb
             .map(|mb| (mb / parallelism.max(1) as u64).max(512))
+    }
+
+    /// Hard per-worker `RLIMIT_DATA` in MiB under an explicit budget (#435 review,
+    /// finding 2). `RLIMIT_DATA` meters writable private VIRTUAL mappings — the heap,
+    /// malloc arenas and pthread stacks (a 256 MiB `LEAN_STACK_SIZE_KB` worker stack
+    /// counts against it) — not resident memory, so a cap equal to an RSS-sized share
+    /// would fail workers whose resident use fits the budget. The hard cap therefore
+    /// binds only when the per-worker share is at least the worker RSS estimate
+    /// (`REPLAY_WORKER_EST_RSS_MB`), and then with `RLIMIT_DATA_HEADROOM_MULT` headroom
+    /// over the share. A tighter budget (the governor documents 256 and 512 MiB values)
+    /// stays advisory: scheduling width, SHM quotas and batch sizing still honor it, but
+    /// no rlimit is applied, so trusted kernel replay does not fail outright under it.
+    pub fn per_worker_rlimit_mb(&self, parallelism: usize) -> Option<u64> {
+        self.per_worker_share_mb(parallelism)
+            .filter(|&mb| mb >= REPLAY_WORKER_EST_RSS_MB)
+            .map(|mb| mb.saturating_mul(RLIMIT_DATA_HEADROOM_MULT))
     }
 
     /// Shrink the replay closure batch cap when the per-worker budget is tight: one module
@@ -230,7 +252,7 @@ impl WorkerBudget {
     /// the peak; it trades process count for a chance at smaller import regions between
     /// batches.
     pub fn replay_batch_cap(&self, base_cap: usize, parallelism: usize) -> usize {
-        match self.per_worker_rlimit_mb(parallelism) {
+        match self.per_worker_share_mb(parallelism) {
             Some(mb) if mb < 2048 => 1,
             Some(mb) if mb < 4096 => base_cap.clamp(1, 8),
             _ => base_cap.max(1),
@@ -239,9 +261,12 @@ impl WorkerBudget {
 
     /// Apply the per-worker cap as a real `RLIMIT_DATA` on the spawned worker (#435):
     /// rlimits survive `exec`, so the cap also reaches a bwrap-wrapped worker, and it is
-    /// the same limit kind the untrusted sandbox already applies. `RLIMIT_AS` is
-    /// deliberately NOT capped by default: a replay worker's address space includes the
-    /// mmapped `.olean` closure and the 256 MiB `LEAN_STACK_SIZE_KB` stack, so an AS cap
+    /// the same limit kind the untrusted sandbox already applies. `RLIMIT_DATA` itself
+    /// meters writable private virtual mappings — heap, malloc arenas and pthread stacks
+    /// (the 256 MiB `LEAN_STACK_SIZE_KB` worker stack counts against it) — which is why
+    /// `per_worker_rlimit_mb` gates the cap on the worker RSS estimate and adds headroom.
+    /// `RLIMIT_AS` is deliberately NOT capped by default: a replay worker's address space
+    /// also includes the mmapped (read-only, file-backed) `.olean` closure, so an AS cap
     /// sized from an RSS budget fails replays whose mappings exceed it even though
     /// resident memory fits. `TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER=<n>` opts into
     /// `RLIMIT_AS = n ×` the cap. Fail-open inside the child: a worker that cannot lower
@@ -328,6 +353,15 @@ impl WorkerBudget {
             );
         }
         String::new()
+    }
+
+    /// True when `err`'s chain carries the memory-cap attribution `memory_kill_note`
+    /// writes (#435 review, finding 1): the scheduler uses it to surface a capped
+    /// replay's failure (whose text names the knob to raise) instead of silently redoing
+    /// the whole replay through the uncapped-looking audit fallback.
+    pub fn error_names_memory_cap(err: &anyhow::Error) -> bool {
+        let msg = format!("{err:#}");
+        msg.contains("per-worker cap of") || msg.contains("per-worker memory cap of")
     }
 }
 
@@ -497,27 +531,59 @@ pub(crate) fn invocation_timeout_ms() -> Option<u64> {
     })
 }
 
+/// The explicitly configured audit budget in milliseconds — ONE parser (#443 review,
+/// finding 3) shared by `audit_timeout_ms` and the shard auditor's unbounded-request
+/// check, so every spelling of `TURBO_LEAN_AUDIT_TIMEOUT_SECS` means the same thing on
+/// both paths. `None`: not configured (unset, or an unparsable value, which is no
+/// configuration at all). `Some(UNBOUNDED_TIMEOUT_MS)`: explicitly unbounded (`0` or an
+/// empty value, matching `eval --timeout-ms 0`). Otherwise the configured budget.
+pub(crate) fn explicit_audit_timeout_ms() -> Option<u64> {
+    let raw = std::env::var("TURBO_LEAN_AUDIT_TIMEOUT_SECS").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Some(UNBOUNDED_TIMEOUT_MS);
+    }
+    match trimmed.parse::<u64>() {
+        Ok(0) => Some(UNBOUNDED_TIMEOUT_MS),
+        Ok(secs) => Some(secs.saturating_mul(1000)),
+        Err(_) => None,
+    }
+}
+
+/// A derived request budget subtracts elapsed time from the 100-year sentinel
+/// (`remaining_timeout_ms` on `request_timeout_ms(0)`), so an unbounded budget is
+/// recognized by threshold, never by an exact match on `UNBOUNDED_TIMEOUT_MS`: anything
+/// at least half the sentinel (50 years) is an explicitly unbounded budget, never a real
+/// configuration (#443 review, finding 3).
+pub(crate) fn is_unbounded_timeout_ms(ms: u64) -> bool {
+    ms >= UNBOUNDED_TIMEOUT_MS / 2
+}
+
 /// Per-audit / `.olean`-reader budget in milliseconds (`TURBO_LEAN_AUDIT_TIMEOUT_SECS`, or
 /// `[audit] timeout_secs` in turbo-lean.toml; defaulting to 120 s in untrusted mode and
-/// 300 s in trusted mode).
+/// 300 s in trusted mode). `0` or an empty value is explicitly unbounded (#443); an
+/// unparsable value is ignored like an unset one.
 pub(crate) fn audit_timeout_ms(is_untrusted: bool) -> u64 {
-    std::env::var("TURBO_LEAN_AUDIT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(if is_untrusted { 120 } else { 300 })
-        .saturating_mul(1000)
+    explicit_audit_timeout_ms().unwrap_or(if is_untrusted { 120_000 } else { 300_000 })
 }
 
 /// Per kernel-replay-worker budget in milliseconds (`TURBO_LEAN_REPLAY_TIMEOUT_SECS`, or
 /// `[replay] timeout_secs` in turbo-lean.toml), defaulting to `audit_timeout_ms` (#437).
+/// In untrusted mode the result is clamped to [15, 600] s, the same bounds as untrusted
+/// compile timeouts (#443 review, finding 4), so a PR-supplied `[replay] timeout_secs`
+/// cannot hold a CI runner for hours.
 pub(crate) fn replay_timeout_ms(is_untrusted: bool) -> u64 {
-    std::env::var("TURBO_LEAN_REPLAY_TIMEOUT_SECS")
+    let ms = std::env::var("TURBO_LEAN_REPLAY_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&v| v > 0)
         .map(|secs| secs.saturating_mul(1000))
-        .unwrap_or_else(|| audit_timeout_ms(is_untrusted))
+        .unwrap_or_else(|| audit_timeout_ms(is_untrusted));
+    if is_untrusted {
+        ms.clamp(15_000, 600_000)
+    } else {
+        ms
+    }
 }
 
 /// Effective `.olean` declaration-identity reader budget in milliseconds: aligns with

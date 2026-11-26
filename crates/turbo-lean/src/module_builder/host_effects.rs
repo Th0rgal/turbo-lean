@@ -1874,9 +1874,11 @@ pub(super) type StagedModuleCompileOutput = (i64, String, TempDirGuard);
 ///
 /// With no explicit setting the trusted default is 1800 s — a flat 300 s killed legitimate
 /// proof-heavy modules that take over 400 s. The `last_duration_ms` parameter implements
-/// the adaptive `max(300 s, 3 × the last recorded compile duration)` policy (#437) for a
-/// caller that knows one; no production call site passes a duration yet (they all route
-/// through `module_compile_timeout_secs_from` with `None`) — the scheduler's cached action
+/// the adaptive `max(1800 s, 3 × the last recorded compile duration)` policy (#437,
+/// floored at the no-history default per the #437 review, finding 5, so having history
+/// never makes the budget stricter than having none) for a caller that knows one; no
+/// production call site passes a duration yet (they all route through
+/// `module_compile_timeout_secs_from` with `None`) — the scheduler's cached action
 /// durations (`get_cached_action_duration_ms`) are the intended source.
 pub(crate) fn module_compile_timeout_secs_with_history(
     raw_env: Option<&str>,
@@ -1890,7 +1892,7 @@ pub(crate) fn module_compile_timeout_secs_with_history(
         return configured.unwrap_or(300).clamp(15, 600);
     }
     configured.unwrap_or_else(|| match last_duration_ms {
-        Some(ms) => ms.div_ceil(1000).saturating_mul(3).max(300),
+        Some(ms) => ms.div_ceil(1000).saturating_mul(3).max(1800),
         None => 1800,
     })
 }
@@ -2622,6 +2624,16 @@ pub(super) fn run_audit_chunk_subprocess(
         extra_ro_binds,
         is_untrusted,
     )?;
+    // #435 review (finding 1): `--max-memory-mb` means the same thing on the audit path
+    // as on the replay path. This fallback runs one audit subprocess at a time per
+    // scheduler worker, so the per-process backstop is the budget's single-worker share
+    // (gated and headroomed by `per_worker_rlimit_mb`); untrusted audits keep the
+    // sandbox's own fixed RLIMIT_DATA instead.
+    if !is_untrusted {
+        if let Some(mb) = crate::zygote::WorkerBudget::from_env().per_worker_rlimit_mb(1) {
+            crate::zygote::WorkerBudget::apply_worker_rlimit(&mut cmd, mb);
+        }
+    }
     cmd.arg("--audit-modules");
     if skip_child_replay {
         cmd.arg("--skip-child-replay");
@@ -2757,7 +2769,7 @@ pub(super) fn run_audit_or_replay_batch_worker_bound(
         union_replay.extend(need_replay_dep.iter().cloned());
         union_replay.sort();
         union_replay.dedup();
-        if crate::zygote::kernel_replay_modules_exec_pinned(
+        match crate::zygote::kernel_replay_modules_exec_pinned(
             store_root,
             cfg,
             &union_replay,
@@ -2765,26 +2777,41 @@ pub(super) fn run_audit_or_replay_batch_worker_bound(
             &[],
             false,
             pinned_fd,
-        )
-        .is_ok()
-        {
-            let _ = crate::zygote::ensure_bound_audit_closure(snap, "sched_audit_after_replay")?;
-            pre_replayed = true;
-            for m in &replay_sorted {
-                let record_rep = !snap_replayed.contains(m);
-                per_mod.insert(
-                    m.clone(),
-                    (
-                        Ok(()),
-                        Some(ModuleAuditAuthority::Snapshot((
-                            std::sync::Arc::clone(snap),
-                            record_rep,
-                            false,
-                        ))),
-                    ),
-                );
+        ) {
+            Ok(()) => {
+                let _ =
+                    crate::zygote::ensure_bound_audit_closure(snap, "sched_audit_after_replay")?;
+                pre_replayed = true;
+                for m in &replay_sorted {
+                    let record_rep = !snap_replayed.contains(m);
+                    per_mod.insert(
+                        m.clone(),
+                        (
+                            Ok(()),
+                            Some(ModuleAuditAuthority::Snapshot((
+                                std::sync::Arc::clone(snap),
+                                record_rep,
+                                false,
+                            ))),
+                        ),
+                    );
+                }
+                replay_sorted.clear();
             }
-            replay_sorted.clear();
+            // #435/#437 review (finding 1): a capped replay that timed out or failed
+            // under the per-worker memory cap carries diagnostics naming the knob to
+            // raise (`[replay] timeout_secs`, `--max-memory-mb`). Return them to the
+            // caller instead of silently redoing the whole replay through the
+            // audit-chunk fallback.
+            Err(e)
+                if e.downcast_ref::<CommandTimedOut>().is_some()
+                    || crate::zygote::WorkerBudget::error_names_memory_cap(&e) =>
+            {
+                return Err(e);
+            }
+            // Any other failure falls through to the audit-chunk path below, whose
+            // workers run under the same budget-derived rlimit.
+            Err(_) => {}
         }
     } else if !is_untrusted && need_replay_dep.is_empty() && !replay_sorted.is_empty() {
         for m in &replay_sorted {

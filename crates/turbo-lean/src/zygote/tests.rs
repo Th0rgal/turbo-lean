@@ -21,6 +21,14 @@ use super::*;
             std::env::set_var(key, value);
             Self { key, prev }
         }
+
+        /// Remove the variable for the guard's lifetime, restoring any prior value on
+        /// drop (panic-safe like `set`).
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
     }
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
@@ -192,8 +200,10 @@ use super::*;
         let mut capped_n = 0usize;
         let mut uncapped_n = 0usize;
         for (key, workers) in pool.iter().filter(|(key, _)| key.0.contains(&policy_tag)) {
-            // --max-memory-mb 8192 over a jobs=2 fan-out = 4096 MiB per worker.
-            if key.2.ends_with("#rlimit_mb=4096") {
+            // --max-memory-mb 8192 over a jobs=2 fan-out = a 4096 MiB share per worker,
+            // enforced as RLIMIT_DATA with x2 headroom (the limit meters virtual writable
+            // mappings, not RSS) = 8192 MiB.
+            if key.2.ends_with("#rlimit_mb=8192") {
                 capped_n += workers.len();
             } else {
                 uncapped_n += workers.len();
@@ -2243,8 +2253,14 @@ use super::*;
             explicit_over_budget.effective_parallelism(64, 2048, || unreachable!()),
             2
         );
-        assert_eq!(capped.per_worker_rlimit_mb(2), Some(2048));
-        assert_eq!(capped.per_worker_rlimit_mb(64), Some(512)); // floored share
+        // #435 review (finding 2): `RLIMIT_DATA` meters writable private VIRTUAL mappings
+        // (heap, malloc arenas, pthread stacks), not RSS, so the hard cap binds only when
+        // the per-worker share is at least the worker RSS estimate, and then with x2
+        // headroom over the share; a tighter share stays advisory (no rlimit).
+        assert_eq!(capped.per_worker_share_mb(2), Some(2048));
+        assert_eq!(capped.per_worker_rlimit_mb(2), Some(4096)); // 2048 MiB share x2 headroom
+        assert_eq!(capped.per_worker_share_mb(64), Some(512)); // floored share
+        assert_eq!(capped.per_worker_rlimit_mb(64), None); // sub-estimate share: advisory only
         assert_eq!(capped.replay_batch_cap(32, 2), 8); // 2 GiB per worker: shrink batches
         assert_eq!(capped.replay_batch_cap(32, 4), 1); // 1 GiB per worker: single-module slices
 
@@ -2261,8 +2277,9 @@ use super::*;
     fn test_worker_budget_rlimit_reaches_the_worker_process() {
         // #435 acceptance: the per-worker memory cap is a real RLIMIT_DATA on the spawned
         // worker, not an advisory governor hint (`ulimit -d` reports it in KiB). The
-        // address space stays uncapped by default: the worker's mmapped `.olean` closure
-        // and its 256 MiB Lean stack live in AS but not in the RSS-sized budget.
+        // address space stays uncapped by default: the worker's mmapped (file-backed)
+        // `.olean` closure lives in AS but not under RLIMIT_DATA, which meters writable
+        // private mappings (heap, malloc arenas, pthread stacks).
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "ulimit -d; ulimit -v"]);
         WorkerBudget::apply_worker_rlimit(&mut cmd, 512);
@@ -2290,16 +2307,13 @@ use super::*;
             let _guard = crate::pack::tests::env_test_lock()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var_os("TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER");
-            std::env::set_var("TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER", "4");
+            // Review finding 6: a panic-safe guard, so a failing assert cannot leak the
+            // multiplier into later tests.
+            let _mult_guard = EnvVarGuard::set("TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER", "4");
             let mut cmd2 = Command::new("sh");
             cmd2.args(["-c", "ulimit -v"]);
             WorkerBudget::apply_worker_rlimit(&mut cmd2, 512);
             let out2 = cmd2.output().expect("spawn sh under the AS opt-in");
-            match prev {
-                Some(v) => std::env::set_var("TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER", v),
-                None => std::env::remove_var("TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER"),
-            }
             assert!(out2.status.success(), "{out2:?}");
             assert_eq!(
                 String::from_utf8_lossy(&out2.stdout).trim(),
@@ -2342,25 +2356,72 @@ use super::*;
         let _guard = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_replay = std::env::var_os("TURBO_LEAN_REPLAY_TIMEOUT_SECS");
-        let prev_audit = std::env::var_os("TURBO_LEAN_AUDIT_TIMEOUT_SECS");
-        std::env::remove_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS");
-        std::env::remove_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS");
+        // Review finding 6: panic-safe guards, so a failing assert cannot leak the
+        // overrides into later tests.
+        let _replay_guard = EnvVarGuard::unset("TURBO_LEAN_REPLAY_TIMEOUT_SECS");
+        let _audit_guard = EnvVarGuard::unset("TURBO_LEAN_AUDIT_TIMEOUT_SECS");
         // #437: the replay budget defaults to the audit budget ...
         assert_eq!(replay_timeout_ms(false), audit_timeout_ms(false));
         assert_eq!(replay_timeout_ms(true), audit_timeout_ms(true));
+        // #443 review (finding 3): `0` or an empty TURBO_LEAN_AUDIT_TIMEOUT_SECS is
+        // explicitly unbounded (matching `eval --timeout-ms 0`); an unparsable value is
+        // no configuration at all, so the defaults apply.
+        std::env::set_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "0");
+        assert_eq!(audit_timeout_ms(false), UNBOUNDED_TIMEOUT_MS);
+        std::env::set_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "");
+        assert_eq!(audit_timeout_ms(true), UNBOUNDED_TIMEOUT_MS);
+        std::env::set_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "soon");
+        assert_eq!(audit_timeout_ms(false), 300_000);
+        std::env::remove_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS");
         // ... and has its own knob (`[replay] timeout_secs` sets this environment key).
         std::env::set_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS", "3600");
         assert_eq!(replay_timeout_ms(false), 3_600_000);
-        assert_eq!(replay_timeout_ms(true), 3_600_000);
-        match prev_replay {
-            Some(v) => std::env::set_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS", v),
-            None => std::env::remove_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS"),
+        // #443 review (finding 4): untrusted replay is clamped to [15, 600] s like
+        // untrusted compile timeouts, so a PR-supplied `[replay] timeout_secs` cannot
+        // hold a CI runner for hours.
+        assert_eq!(replay_timeout_ms(true), 600_000);
+        std::env::set_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS", "5");
+        assert_eq!(replay_timeout_ms(false), 5_000);
+        assert_eq!(replay_timeout_ms(true), 15_000);
+    }
+
+    #[test]
+    fn test_explicit_audit_timeout_parser_and_unbounded_threshold() {
+        // #443 review (finding 3): one shared parser decides what an explicit
+        // TURBO_LEAN_AUDIT_TIMEOUT_SECS means, and the shard auditor's unbounded-request
+        // test is a threshold, so a derived budget (the sentinel minus elapsed time)
+        // stays unbounded instead of silently falling back to the 300 s default.
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        {
+            let _unset = EnvVarGuard::unset("TURBO_LEAN_AUDIT_TIMEOUT_SECS");
+            assert_eq!(explicit_audit_timeout_ms(), None);
         }
-        match prev_audit {
-            Some(v) => std::env::set_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS", v),
-            None => std::env::remove_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS"),
+        {
+            let _zero = EnvVarGuard::set("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "0");
+            assert_eq!(explicit_audit_timeout_ms(), Some(UNBOUNDED_TIMEOUT_MS));
         }
+        {
+            let _empty = EnvVarGuard::set("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "  ");
+            assert_eq!(explicit_audit_timeout_ms(), Some(UNBOUNDED_TIMEOUT_MS));
+        }
+        {
+            let _secs = EnvVarGuard::set("TURBO_LEAN_AUDIT_TIMEOUT_SECS", " 60 ");
+            assert_eq!(explicit_audit_timeout_ms(), Some(60_000));
+        }
+        {
+            let _garbage = EnvVarGuard::set("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "soon");
+            assert_eq!(explicit_audit_timeout_ms(), None);
+        }
+        assert!(is_unbounded_timeout_ms(UNBOUNDED_TIMEOUT_MS));
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+        assert!(is_unbounded_timeout_ms(remaining_timeout_ms(
+            request_timeout_ms(0),
+            long_ago
+        )));
+        assert!(!is_unbounded_timeout_ms(600_000));
+        assert!(!is_unbounded_timeout_ms(300_000));
     }
 
     #[test]
@@ -2385,14 +2446,48 @@ use super::*;
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_memory_cap_error_classification_for_scheduler_fallback() {
+        // #435 review (finding 1): the scheduler returns a capped replay's failure to its
+        // caller (instead of silently redoing the work through the audit fallback) when
+        // the error is a typed timeout or carries the memory-cap attribution; this pins
+        // the classification helper against the exact phrases `memory_kill_note` writes.
+        use std::os::unix::process::ExitStatusExt;
+        let unrelated = anyhow::anyhow!("plain replay failure, no cap context");
+        assert!(!WorkerBudget::error_names_memory_cap(&unrelated));
+        let definite = anyhow::anyhow!(
+            "replay failed:{}",
+            WorkerBudget::memory_kill_note(
+                &std::process::ExitStatus::from_raw(1 << 8),
+                "terminate called after throwing an instance of 'std::bad_alloc'",
+                Some(512),
+            )
+        );
+        assert!(WorkerBudget::error_names_memory_cap(&definite));
+        let maybe = anyhow::anyhow!(
+            "replay failed:{}",
+            WorkerBudget::memory_kill_note(
+                &std::process::ExitStatus::from_raw(libc::SIGKILL),
+                "",
+                Some(512),
+            )
+        );
+        assert!(WorkerBudget::error_names_memory_cap(&maybe));
+        // The scheduler sees contexts stacked on the root error; the attribution stays
+        // visible through the chain format.
+        let wrapped = definite.context("scheduler pre-replay");
+        assert!(WorkerBudget::error_names_memory_cap(&wrapped));
+    }
+
+    #[test]
     fn test_worker_budget_from_env_and_jobs_export() {
         let _guard = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_jobs = std::env::var_os("TURBO_LEAN_JOBS");
-        let prev_mem = std::env::var_os("TURBO_LEAN_MAX_MEMORY_MB");
-        std::env::remove_var("TURBO_LEAN_JOBS");
-        std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", "4096");
+        // Review finding 6: panic-safe guards, so a failing assert cannot leak the
+        // overrides into later tests.
+        let _jobs_guard = EnvVarGuard::unset("TURBO_LEAN_JOBS");
+        let _mem_guard = EnvVarGuard::set("TURBO_LEAN_MAX_MEMORY_MB", "4096");
         assert_eq!(
             WorkerBudget::from_env(),
             WorkerBudget {
@@ -2408,14 +2503,6 @@ use super::*;
         // ... but an explicit environment setting wins.
         WorkerBudget::export_effective_jobs(Some(7));
         assert_eq!(std::env::var("TURBO_LEAN_JOBS").as_deref(), Ok("3"));
-        match prev_jobs {
-            Some(v) => std::env::set_var("TURBO_LEAN_JOBS", v),
-            None => std::env::remove_var("TURBO_LEAN_JOBS"),
-        }
-        match prev_mem {
-            Some(v) => std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", v),
-            None => std::env::remove_var("TURBO_LEAN_MAX_MEMORY_MB"),
-        }
     }
 
     #[test]
