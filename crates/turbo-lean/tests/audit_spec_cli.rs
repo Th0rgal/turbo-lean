@@ -1821,6 +1821,12 @@ fn audit_spec_kernel_witness_replay_certifies_or_reports_unavailable() {
     // `kw_chk`'s conclusion unfolds to `p && !q = false`, whose textual form re-parses in
     // Lean with `=` tighter than `&&` (a type error): the kernel probe must therefore
     // replay the RAW conclusion and let the kernel delta-unfold `chk` itself.
+    // DELIBERATE BREAKAGE: the Rust `\` line continuations strip the proof indentation,
+    // so the tactic below sits at column 0 and the embedded audited block fails to
+    // re-elaborate (unsolved goals at 3:61, "expected command" at 4:0). The probe
+    // ladder then certifies through the self-contained fallback, which is what the
+    // `kernel_probe_shape == "self_contained"` assertion below pins; re-indenting the
+    // fixture flips that shape to "verbatim".
     let spec = fx.write(
         "KwReplay.lean",
         "theorem kw_succ_pred (n : Nat) (h : 1 ≤ n) : n - 1 + 1 = n := by omega\n\
@@ -1904,6 +1910,7 @@ fn audit_spec_kernel_witness_fallback_never_overrules_audited_semantics() {
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !lean_available {
+        eprintln!("skipping: no `lean` on PATH, nothing to replay");
         return;
     }
     let fx = AuditSpecFixture::new("kw_local_inst");
@@ -1944,6 +1951,7 @@ fn audit_spec_kernel_witness_axiom_globs_never_widen_certification() {
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !lean_available {
+        eprintln!("skipping: no `lean` on PATH, nothing to replay");
         return;
     }
     let fx = AuditSpecFixture::new("kw_axiom_glob");
@@ -1969,6 +1977,147 @@ fn audit_spec_kernel_witness_axiom_globs_never_widen_certification() {
     assert_ne!(
         json["kernel_witness"]["mode"].as_str(),
         Some("replayed"),
+        "{json}"
+    );
+    assert!(
+        json["kernel_witness"]["mode"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("unavailable(probe_runner("),
+        "the refusal must come from the in-kernel soundness auditor failing closed, \
+         not from a merely malformed probe or a missing store: {json}"
+    );
+}
+
+/// A2 r3 (#367): an unresolved import is no kernel verdict at all. The audited file's
+/// semantic context is unknown (the sibling here changes what `≤` means on `Nat`), so
+/// replay must say `unavailable(imports_unresolved)` and never let a reconstructed
+/// Init-only context certify the witnesses. This fixture is byte-identical to the
+/// review's example, which certified before the positive-evidence gate.
+#[test]
+fn audit_spec_kernel_witness_import_failure_is_unavailable_never_reconstructed() {
+    let lean_available = Command::new("lean")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !lean_available {
+        eprintln!("skipping: no `lean` on PATH, nothing to replay");
+        return;
+    }
+    let fx = AuditSpecFixture::new("kw_import_fail");
+    fx.write("Defs.lean", "instance : LE Nat := ⟨fun _ _ => False⟩\n");
+    let spec = fx.write(
+        "Spec.lean",
+        "import Defs\ntheorem kw_succ_pred (n : Nat) (h : 1 ≤ n) : n - 1 + 1 = n := nomatch h\n",
+    );
+    let out = fx
+        .cli("kw-import-fail")
+        .args(["--json", "audit-spec", "--kernel-witness"])
+        .arg(&spec)
+        .output()
+        .unwrap();
+    let json = assert_cli_ok(&out, "kernel_witness_import_failure");
+    let text = json.to_string();
+    assert!(
+        !text.contains("kernel_certified_"),
+        "an unresolved import means the audited semantics are unknown; nothing may be \
+         certified: {json}"
+    );
+    assert!(
+        json["kernel_witness"]["mode"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("unavailable(imports_unresolved"),
+        "a failed header must read as replay unavailability, not as a kernel verdict: {json}"
+    );
+}
+
+/// A2 r3 (#367): a `#exit` in the audited block stops Lean before the appended witness
+/// theorems, the probe compiles without them, and the runner's missing-theorem check
+/// fails closed as unavailability; the sentinel keeps the reconstructed fallback out.
+#[test]
+fn audit_spec_kernel_witness_hash_exit_never_reconstructs() {
+    let lean_available = Command::new("lean")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !lean_available {
+        eprintln!("skipping: no `lean` on PATH, nothing to replay");
+        return;
+    }
+    let fx = AuditSpecFixture::new("kw_hash_exit");
+    let spec = fx.write(
+        "KwExit.lean",
+        "theorem kw_succ_pred (n : Nat) (h : 1 ≤ n) : n - 1 + 1 = n := by omega\n#exit\n",
+    );
+    let out = fx
+        .cli("kw-hash-exit")
+        .args(["--json", "audit-spec", "--kernel-witness"])
+        .arg(&spec)
+        .output()
+        .unwrap();
+    let json = assert_cli_ok(&out, "kernel_witness_hash_exit");
+    let text = json.to_string();
+    assert!(
+        !text.contains("kernel_certified_"),
+        "a `#exit`-truncated probe never elaborated the witness theorems; nothing may \
+         be certified: {json}"
+    );
+    assert!(
+        json["kernel_witness"]["mode"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("unavailable("),
+        "{json}"
+    );
+}
+
+/// A2 r3 (#367): the hostile-command scan is the SOLE defence here. The audited
+/// block's column-0 tactic breaks in-block (the error-position gate would admit the
+/// fallback), the `notation` line never touches the candidates' semantics (a
+/// reconstructed probe would certify soundly), and the scan's deliberate file-global
+/// conservatism is what keeps the fallback out: deleting the scan turns this red,
+/// where the r2 local-instance case has the error-position gate as a second defence.
+#[test]
+fn audit_spec_kernel_witness_hostile_scan_is_sole_defence() {
+    let lean_available = Command::new("lean")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !lean_available {
+        eprintln!("skipping: no `lean` on PATH, nothing to replay");
+        return;
+    }
+    let fx = AuditSpecFixture::new("kw_hostile_only");
+    // DELIBERATE BREAKAGE: the Rust `\` continuations strip the proof indentation, so
+    // the tactic sits at column 0 and the embedded audited block fails to re-elaborate
+    // with every error inside the block (the kw_replay fixture's shape), while the
+    // appended witness theorems stay true under core semantics.
+    let spec = fx.write(
+        "KwHostileOnly.lean",
+        "notation \"⟪\" x \"⟫\" => Nat.succ x\n\
+         theorem kw_chk (p q : Bool) (h : p ≤ q) : (p && !q) = false := by\n\
+         revert h; cases p <;> cases q <;> decide\n",
+    );
+    let out = fx
+        .cli("kw-hostile-only")
+        .args(["--json", "audit-spec", "--kernel-witness"])
+        .arg(&spec)
+        .output()
+        .unwrap();
+    let json = assert_cli_ok(&out, "kernel_witness_hostile_only");
+    let text = json.to_string();
+    assert!(
+        !text.contains("kernel_certified_"),
+        "a file declaring notation disables the reconstructed fallback even when the \
+         error-position gate would admit it: {json}"
+    );
+    assert_eq!(
+        json["kernel_witness"]["mode"].as_str(),
+        Some("probe_rejected"),
         "{json}"
     );
 }
