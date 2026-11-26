@@ -1764,3 +1764,118 @@ name = "CasReplayPkg"
     assert_eq!(warm_json["cas_expr_replayed"].as_u64(), Some(1));
 }
 
+/// A2 (#367, Contract V3): every audited spec carries an honest `witness_provenance`
+/// field and the per-file report a `kernel_witness` summary; kernel replay stays OFF by
+/// default so the auditor never spawns a Lean toolchain unless asked to.
+#[test]
+fn audit_spec_kernel_witness_fields_present_and_off_by_default() {
+    let fx = AuditSpecFixture::new("kw_default_off");
+    let spec = fx.write(
+        "KwSpec.lean",
+        "theorem kw_succ_pred (n : Nat) (h : 1 ≤ n) : n - 1 + 1 = n := by omega\n",
+    );
+    let out = fx
+        .cli("kw-off")
+        .args(["--json", "audit-spec"])
+        .arg(&spec)
+        .output()
+        .unwrap();
+    let json = assert_cli_ok(&out, "kernel_witness_default_off");
+    let kw = json.get("kernel_witness").unwrap_or_else(|| {
+        panic!("audit-spec report must carry a `kernel_witness` summary object: {json}")
+    });
+    assert_eq!(
+        kw["mode"].as_str(),
+        Some("off"),
+        "kernel witness replay must be off by default: {json}"
+    );
+    let spec0 = &json["specs"][0];
+    assert_eq!(
+        spec0["witness_provenance"].as_str(),
+        Some("eval_concrete"),
+        "a spec with concrete eval witnesses on both sides must be labeled eval_concrete: {json}"
+    );
+    let pos = spec0["pos_witness"].as_str().unwrap_or("");
+    let neg = spec0["neg_witness"].as_str().unwrap_or("");
+    assert!(
+        pos.starts_with("satisfied_states="),
+        "default-off run must keep the eval-level positive witness label, got: {pos}"
+    );
+    assert!(
+        neg.starts_with("eval_refuted_postcondition("),
+        "default-off run must keep the eval-level negative witness label, got: {neg}"
+    );
+}
+
+/// A2 (#367, Contract V3): with `--kernel-witness`, concrete eval witnesses are replayed
+/// through the Lean kernel and the labels upgrade to `kernel_certified_*`; when no Lean
+/// toolchain resolves, the labels honestly stay at eval level and the summary says so.
+#[test]
+fn audit_spec_kernel_witness_replay_certifies_or_reports_unavailable() {
+    let lean_available = Command::new("lean")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let fx = AuditSpecFixture::new("kw_replay");
+    // `kw_chk`'s conclusion unfolds to `p && !q = false`, whose textual form re-parses in
+    // Lean with `=` tighter than `&&` (a type error): the kernel probe must therefore
+    // replay the RAW conclusion and let the kernel delta-unfold `chk` itself.
+    let spec = fx.write(
+        "KwReplay.lean",
+        "theorem kw_succ_pred (n : Nat) (h : 1 ≤ n) : n - 1 + 1 = n := by omega\n\
+         def chk (p q : Bool) : Bool := p && !q\n\
+         theorem kw_chk (p q : Bool) (h : p ≤ q) : chk p q = false := by\n\
+           revert h; cases p <;> cases q <;> decide\n",
+    );
+    let out = fx
+        .cli("kw-on")
+        .args(["--json", "audit-spec", "--kernel-witness"])
+        .arg(&spec)
+        .output()
+        .unwrap();
+    let json = assert_cli_ok(&out, "kernel_witness_replay");
+    let kw = &json["kernel_witness"];
+    let spec0 = &json["specs"][0];
+    let pos = spec0["pos_witness"].as_str().unwrap_or("");
+    let neg = spec0["neg_witness"].as_str().unwrap_or("");
+    if lean_available {
+        assert_eq!(kw["mode"].as_str(), Some("replayed"), "{json}");
+        assert!(kw["certified_pos"].as_u64() >= Some(1), "{json}");
+        assert!(kw["certified_neg"].as_u64() >= Some(1), "{json}");
+        assert!(
+            pos.starts_with("kernel_certified_satisfied_precondition("),
+            "kernel-replayed positive witness must carry the kernel_certified label, got: {pos}"
+        );
+        assert!(
+            neg.starts_with("kernel_certified_refuted_postcondition("),
+            "kernel-replayed negative witness must carry the kernel_certified label, got: {neg}"
+        );
+        assert_eq!(
+            spec0["witness_provenance"].as_str(),
+            Some("kernel_certified_two_sided"),
+            "{json}"
+        );
+        let chk_neg = json["specs"][1]["neg_witness"].as_str().unwrap_or("");
+        assert!(
+            chk_neg.starts_with("kernel_certified_refuted_postcondition("),
+            "a local-def conclusion must kernel-replay via its RAW text (kernel-side \
+             delta unfolding), got: {chk_neg}\n{json}"
+        );
+    } else {
+        assert!(
+            kw["mode"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("unavailable(no_lean_toolchain"),
+            "without a Lean toolchain the summary must name the missing toolchain, not a \
+             generic or infrastructure unavailability: {json}"
+        );
+        assert!(
+            pos.starts_with("satisfied_states=")
+                && neg.starts_with("eval_refuted_postcondition("),
+            "without a Lean toolchain the labels must honestly stay at eval level: {json}"
+        );
+    }
+}
+

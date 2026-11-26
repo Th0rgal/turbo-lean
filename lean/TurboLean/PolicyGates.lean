@@ -461,4 +461,34 @@ theorem cve_subspec_pos_ne_neg : cveSubspec.posWitness ≠ cveSubspec.negWitness
   intro h
   exact CveEntry.noConfusion h
 
+/- Stage C (#367, Contract V3): kernel witness replay harness for `audit-spec`.
+   `specAuditWitnessGate` certifies a 2-bit conjunction over caller-supplied flags; the
+   replay harness below is the Lean-side checker entrypoint that re-derives those two
+   flags by *evaluating* the audited spec's precondition at its positive witness and its
+   postcondition at its negative witness, so a `decide`-proved `specAuditWitnessReplay`
+   application is kernel evidence for the same gate (`specAuditWitnessReplay_eq_gate`).
+   The marker block below is inlined verbatim by the Rust auditor into generated
+   kernel-replay probe files (`crates/turbo-lean/src/audit_spec.rs` pins byte equality),
+   so it must stay self-contained (`Init` only, no references outside the block). -/
+-- TURBO_SPEC_AUDIT_KERNEL_WITNESS_HARNESS_BEGIN
+/-- Kernel witness replay harness: evaluate the audited spec's executable precondition
+    `pre` at the positive witness `pos` and its executable postcondition `concl` at the
+    negative witness `neg`; the replay holds exactly when the precondition is satisfiable
+    (non-vacuous) and the postcondition is refuted at `neg` (tight). -/
+@[inline]
+def specAuditWitnessReplay {α : Type} (pre concl : α → Bool) (pos neg : α) : Bool :=
+  pre pos && !concl neg
+-- TURBO_SPEC_AUDIT_KERNEL_WITNESS_HARNESS_END
+
+theorem specAuditWitnessReplay_eq_gate {α : Type} (pre concl : α → Bool) (pos neg : α) :
+    specAuditWitnessReplay pre concl pos neg = specAuditWitnessGate (pre pos) (!concl neg) := rfl
+
+theorem specAuditWitnessReplay_sound_pos {α : Type} (pre concl : α → Bool) (pos neg : α)
+    (h : specAuditWitnessReplay pre concl pos neg = true) : pre pos = true := by
+  revert h; unfold specAuditWitnessReplay; cases pre pos <;> simp
+
+theorem specAuditWitnessReplay_sound_neg {α : Type} (pre concl : α → Bool) (pos neg : α)
+    (h : specAuditWitnessReplay pre concl pos neg = true) : concl neg = false := by
+  revert h; unfold specAuditWitnessReplay; cases concl neg <;> simp
+
 end TurboLean.PolicyGates
