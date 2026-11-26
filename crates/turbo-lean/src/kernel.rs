@@ -891,7 +891,7 @@ fn split_lean_csimp_arrow(pair: &str) -> Vec<&str> {
 // |-------------------------------------------|--------------------------------------|-----------|
 // | csimp entry, strict proven theorem        | `[csimp] allow` glob (raw or user)   | allow/forbid |
 // | csimp entry, non-theorem or non-strict    | never allowlistable                  | forbid    |
-// | csimp entry owned by toolchain `Init.*`   | exempt unless it touches a target    | allow     |
+// | csimp entry a target neither owns nor touches | never considered (mirrors the non-import audit) | skipped |
 // | unsafe declaration (post structural exemptions) | `[unsafe] allow` on decl or wrapper | allow/forbid |
 // | unsafe `_unsafe_rec` twin                 | never allowlistable by name          | forbid (wrapper `[unsafe]` allow only) |
 // | unsafe inductive                          | never allowlistable                  | forbid    |
@@ -900,8 +900,11 @@ fn split_lean_csimp_arrow(pair: &str) -> Vec<&str> {
 // | custom axiom declaration                  | standard axioms + `[axioms] allow` (never `sorryAx` / `Lean.trustCompiler`) | allow/forbid |
 //
 // A forbidden outcome fails closed with a message naming the exact `turbo-lean.toml` knob; an
-// allowed outcome proceeds into the unchanged, authoritative in-kernel audit. The early pass can
-// therefore only add early refusals; it never admits anything the audit would refuse.
+// allowed outcome proceeds into the unchanged, authoritative in-kernel audit. The pass decides
+// exactly the entries that audit considers — for csimp, those a target module owns or touches
+// (`checkCSimpEntry` with `isImportAudit = false`); for the rest, the per-target candidates the
+// worker already passed through the audit's structural exemptions — so it refuses nothing the
+// audit would skip and admits nothing it would refuse.
 // -------------------------------------------------------------------------------------------
 
 pub const EARLY_IMPORT_POLICY_ENV: &str = "TURBO_LEAN_EARLY_IMPORT_POLICY";
@@ -933,8 +936,6 @@ pub struct PostureCsimpEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportPostureModule {
     pub module: String,
-    /// The module is `Init.*` inside the toolchain sysroot (the audit's baseline exemption).
-    pub init_sysroot: bool,
     pub imports: Vec<String>,
     pub csimp: Vec<PostureCsimpEntry>,
 }
@@ -1094,9 +1095,11 @@ pub fn decide_import_posture_policy(
     }
     for (owner, m) in modules {
         for e in &m.csimp {
-            let toolchain_baseline =
-                m.init_sysroot && !target_modules.contains(owner) && !e.touches_target;
-            if toolchain_baseline {
+            // Mirror of the authoritative audit that runs next (`checkCSimpEntry` with
+            // `isImportAudit = false` in `ZygoteWorker.lean`): a csimp entry that a target
+            // module neither owns nor touches is never considered by that audit, so it is
+            // never refused early either.
+            if !(target_modules.contains(owner) || e.touches_target) {
                 continue;
             }
             let allowed = e.strict
@@ -1140,12 +1143,10 @@ mod tests {
 
     fn csimp_posture_module(
         module: &str,
-        init_sysroot: bool,
         entries: &[(&str, &str, &str, &str, bool, bool)],
     ) -> ImportPostureModule {
         ImportPostureModule {
             module: module.to_string(),
-            init_sysroot,
             imports: Vec::new(),
             csimp: entries
                 .iter()
@@ -1175,13 +1176,18 @@ mod tests {
     }
 
     #[test]
-    fn test_import_policy_decision_table_csimp() {
+    fn test_import_policy_dependency_csimp_entries_follow_the_audited_set() {
+        // Mirror of the non-import audit that runs next (`checkCSimpEntry` with
+        // `isImportAudit = false`, `ZygoteWorker.lean`): a csimp entry that a target module
+        // neither owns nor touches is never considered by that audit, so the early pass must
+        // not refuse it either. Dependency shape: the target `Proj.Foo` imports the trusted
+        // dependency `Batteries.Data.List.Basic`, which exports
+        // `@[csimp] List.replaceF_eq_replaceFTR`, under an empty `[csimp] allow`.
         let mut modules = BTreeMap::new();
         modules.insert(
             "Batteries.Data.List.Basic".to_string(),
             csimp_posture_module(
                 "Batteries.Data.List.Basic",
-                false,
                 &[(
                     "List.replaceF_eq_replaceFTR",
                     "List.replaceF",
@@ -1192,7 +1198,45 @@ mod tests {
                 )],
             ),
         );
-        let targets: BTreeSet<String> = ["Root".to_string()].into();
+        let dependency_targets: BTreeSet<String> = ["Proj.Foo".to_string()].into();
+        assert_eq!(
+            decide_csimp_only(
+                &modules,
+                &dependency_targets,
+                &posture_lists(&[], &[], &[], &[])
+            ),
+            Vec::<String>::new(),
+            "a dependency csimp entry outside the audited set must not be refused early"
+        );
+        // The same entry with its owner audited as a target stays refused when unlisted.
+        let owner_targets: BTreeSet<String> = ["Batteries.Data.List.Basic".to_string()].into();
+        assert_eq!(
+            decide_csimp_only(&modules, &owner_targets, &posture_lists(&[], &[], &[], &[])).len(),
+            1,
+            "a target-owned unlisted csimp entry stays refused"
+        );
+    }
+
+    #[test]
+    fn test_import_policy_decision_table_csimp() {
+        let mut modules = BTreeMap::new();
+        modules.insert(
+            "Batteries.Data.List.Basic".to_string(),
+            csimp_posture_module(
+                "Batteries.Data.List.Basic",
+                &[(
+                    "List.replaceF_eq_replaceFTR",
+                    "List.replaceF",
+                    "List.replaceFTR",
+                    "List.replaceF_eq_replaceFTR",
+                    true,
+                    false,
+                )],
+            ),
+        );
+        // The owner is audited as a target, so its entries are inside the audited set the
+        // early pass mirrors; the dependency-shape test above pins the not-considered side.
+        let targets: BTreeSet<String> = ["Batteries.Data.List.Basic".to_string()].into();
 
         // Strict proven theorem, exact user-name allowlist entry: allowed.
         let allowed = decide_csimp_only(
@@ -1216,7 +1260,9 @@ mod tests {
                 "csimp replacement `List.replaceF_eq_replaceFTR` (List.replaceF -> List.replaceFTR) \
                  touching `Batteries.Data.List.Basic` is forbidden"
             ),
-            "violation must mirror the audit wording: {}",
+            "violation must name the entry, both declarations and the owner module (the audit \
+             labels by the target it reports against; the early message names the owner, which \
+             is what the `[csimp] allow` author needs): {}",
             refused[0]
         );
         assert!(
@@ -1240,13 +1286,13 @@ mod tests {
             "a non-strict csimp entry must stay forbidden under `*`: {refused_non_strict:?}"
         );
 
-        // Toolchain `Init.*` sysroot baseline: exempt while it does not touch a target...
+        // A toolchain module's entry outside the audited set (not owned by a target, touching
+        // none) is never considered, like any other dependency entry...
         let mut init_mod = BTreeMap::new();
         init_mod.insert(
             "Init.Data.Array".to_string(),
             csimp_posture_module(
                 "Init.Data.Array",
-                true,
                 &[("Init.thm", "Init.slow", "Init.fast", "Init.thm", true, false)],
             ),
         );
@@ -1254,12 +1300,12 @@ mod tests {
             decide_csimp_only(&init_mod, &targets, &posture_lists(&[], &[], &[], &[])),
             Vec::<String>::new()
         );
-        // ...but not when it touches an audited target.
+        // ...but one touching an audited target is considered and refused when unlisted.
         init_mod.get_mut("Init.Data.Array").unwrap().csimp[0].touches_target = true;
         assert_eq!(
             decide_csimp_only(&init_mod, &targets, &posture_lists(&[], &[], &[], &[])).len(),
             1,
-            "an Init-sysroot entry touching a target is not baseline-exempt"
+            "an entry touching an audited target is considered and stays refused when unlisted"
         );
     }
 
