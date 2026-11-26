@@ -1002,6 +1002,61 @@ theorem evalCodeR_fuel_mono (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
     subst h1
     exact ⟨_, rfl, fun env st code r hr => by obtain ⟨a, b⟩ := r; exact ih env st code a b hr⟩
 
+/-- A `false` recursive-join-point verdict survives more fuel: `hasJmpToPure 0` answers
+    `true` (an exhausted search counts as recursive), so `false` is a completed search,
+    and a deeper one finds the same nothing. This is the direction the `evalStepR`
+    monotonicity below needs: a `.jp` the source run accepted at fuel `n` is accepted at
+    `n + 1`. -/
+theorem hasJmpToPure_false_succ :
+    ∀ (fuel : Nat) (t : Lean.FVarId)
+      (target : Lean.Compiler.LCNF.Code .impure ⊕ List (Lean.Compiler.LCNF.Alt .impure)),
+      hasJmpToPure fuel t target = false → hasJmpToPure (fuel + 1) t target = false
+  | 0, _, _, h => by rw [hasJmpToPure.eq_1] at h; exact nomatch h
+  | fuel + 1, t, target, h => by
+    rw [hasJmpToPure.eq_def] at h ⊢
+    dsimp only at h ⊢
+    have ih := hasJmpToPure_false_succ fuel t
+    cases target with
+    | inr alts =>
+      cases alts with
+      | nil => exact h
+      | cons alt rest =>
+        dsimp only at h ⊢
+        rw [Bool.or_eq_false_iff] at h ⊢
+        exact ⟨ih _ h.1, ih _ h.2⟩
+    | inl code =>
+      cases code <;> dsimp only at h ⊢ <;>
+        first
+        | exact h
+        | exact ih _ h
+        | (rw [Bool.or_eq_false_iff] at h ⊢; exact ⟨ih _ h.1, ih _ h.2⟩)
+
+/-- Fuel monotonicity of the recursion-capable LCNF evaluator: a successful run keeps its
+    result with one more unit of step budget. The two sides unfold in lockstep (`split`
+    the hypothesis, replay its equation into the goal); the discriminants agree except at
+    the two places that read the budget — the resolved callee's run, upgraded by the
+    induction hypothesis, and the recursive-join-point gate, upgraded by
+    `hasJmpToPure_false_succ`. -/
+theorem evalStepR_fuel_mono (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx)) :
+    ∀ (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
+      (target : Lean.Compiler.LCNF.Code .impure ⊕
+        (Val × Bool × Nat × Option Lean.FVarId × List (Lean.Compiler.LCNF.Alt .impure)))
+      (r : Val × HeapState),
+      evalStepR Δ fuel ctx env st target = .ok r →
+      evalStepR Δ (fuel + 1) ctx env st target = .ok r
+  | 0, _, _, _, _, _, h => by rw [evalStepR.eq_1] at h; cases h
+  | fuel + 1, ctx, env, st, target, r, h => by
+    rw [evalStepR.eq_def] at h ⊢
+    dsimp only at h ⊢
+    repeat' (first
+      | (cases h; done)
+      | exact h
+      | exact evalStepR_fuel_mono Δ fuel _ _ _ _ _ h
+      | (rename_i hcall; simp only [evalStepR_fuel_mono Δ fuel _ _ _ _ _ hcall])
+      | (split at h <;> (try simp only [Bool.not_eq_true] at *) <;>
+          (try subst_vars) <;>
+          (try simp only [*, hasJmpToPure_false_succ fuel, ↓reduceIte, Bool.false_eq_true] at h ⊢)))
+
 /-! ### Part I — the call rule, pinned as kernel equations -/
 
 theorem evalCodeR_call_fuel_zero (Φ : List LNIRDecl) (env : VarEnv) (st : HeapState)
