@@ -3,7 +3,7 @@
   "kind": "build_loop_results",
   "created_utc": "2026-11-26T18:58:15Z",
   "leaf": "G2b",
-  "provenance_note": "Historical evidence: this run measured the G2b warm CAS-expr replay opt-in (TURBO_LEAN_WARM_CAS_REPLAY=1 vs unset), which was deleted on 2026-11-26 (roadmap/HORIZONS.md row G2b, deleted branch); it was produced by scripts/bench_build_loop.py at 0a593169, whose ON/OFF sides the current script no longer has.",
+  "provenance_note": "Historical evidence: this run measured the G2b warm CAS-expr replay opt-in (TURBO_LEAN_WARM_CAS_REPLAY=1 vs unset), which was deleted on 2026-11-26 (commit f4dfa82e removed the switches; roadmap/HORIZONS.md row G2b, deleted branch); this note was added after the run; it was produced by scripts/bench_build_loop.py at 0a593169, whose ON/OFF sides the current script no longer has.",
   "turbo_lean_commit": "0a593169fa846480e30f2e87f9df715770b50feb",
   "turbo_lean_dirty": false,
   "turbo_lean_binary": {
