@@ -4709,6 +4709,11 @@ pub fn reset_lake_inputs_tag_memo() {
             g.clear();
         }
     }
+    if let Some(m) = super::host_effects::TRACKED_INCLUDE_MEMO.get() {
+        if let Ok(mut g) = m.lock() {
+            g.clear();
+        }
+    }
     #[cfg(test)]
     if let Some(m) = OLEAN_TRANSITIVE_ENV_MEMO.get() {
         if let Ok(mut g) = m.lock() {

@@ -596,18 +596,25 @@ fn classify_clean_pinned_dep_source(
     exec_taint
 }
 
+/// Memoized `git ls-files --error-unmatch` answers for `include_str` targets, per
+/// (package root, relative path). The checkout is pinned only between requests: a
+/// daemon outlives `lake update`, after which the same `.lake/packages/<pkg>` path can
+/// hold a new rev where a target's tracked-ness changed, so
+/// [`reset_lake_inputs_tag_memo`] clears this memo at every memo-window boundary (once
+/// per CLI command and per serve / MCP request).
+pub(super) static TRACKED_INCLUDE_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<(PathBuf, PathBuf), bool>>,
+> = std::sync::OnceLock::new();
+
 /// Inside-the-root is not pinned-by-the-rev. The checkout is clean, so a *tracked*
 /// path's content equals the pinned rev's; a gitignored or generated file changes
 /// without moving the pin. Pathspec magic is disabled, so a literal `gen*.txt` target
 /// is never read as a glob that an unrelated tracked file satisfies. An unanswerable
 /// git (missing, refusing) fails closed. Answers are memoized per (package root,
-/// path): classification runs many times per module per check, and the checkout is
-/// pinned for the process's lifetime.
+/// path) in [`TRACKED_INCLUDE_MEMO`]: classification runs many times per module per
+/// check, and the checkout is pinned for the memo window's lifetime.
 fn include_targets_tracked_at_pin(canon_pkg_root: &Path, rels: &[PathBuf]) -> bool {
-    static TRACKED_MEMO: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<(PathBuf, PathBuf), bool>>,
-    > = std::sync::OnceLock::new();
-    let memo = TRACKED_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let memo = TRACKED_INCLUDE_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut pending: Vec<&PathBuf> = Vec::new();
     {
         let memo = memo.lock().unwrap_or_else(|e| e.into_inner());
@@ -3625,5 +3632,46 @@ mod host_effect_taint_tests {
             dotted.iter().any(|n| n == "helper") && dotted.iter().any(|n| n == "Foo.helper"),
             "def Foo.helper.{{u}} must define `Foo.helper` and its last segment; got {dotted:?}"
         );
+    }
+
+    /// The checkout is pinned only between requests: a daemon outlives `lake update`,
+    /// after which the same package path can hold a rev where a target's tracked-ness
+    /// changed. The tracked-include memo must reset with the Lake-inputs memo window.
+    #[test]
+    fn tracked_include_memo_resets_with_the_lake_inputs_memo_window() -> Result<()> {
+        let dir = temp_dir("tracked_reset");
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("data.txt"), "x\n")?;
+        git_init_commit(&dir)?;
+        let canon = fs::canonicalize(&dir)?;
+        let rels = [PathBuf::from("data.txt")];
+        assert!(
+            include_targets_tracked_at_pin(&canon, &rels),
+            "a committed file is tracked at the pin"
+        );
+        // The pin moves while the process runs: data.txt is no longer tracked.
+        let git = |args: &[&str]| -> Result<()> {
+            anyhow::ensure!(crate::trusted_tools::git(&canon)?
+                .arg("-C")
+                .arg(&canon)
+                .args(["-c", "user.name=t", "-c", "user.email=t@e", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .status()?
+                .success());
+            Ok(())
+        };
+        git(&["rm", "--cached", "-q", "data.txt"])?;
+        git(&["commit", "-qm", "untrack"])?;
+        assert!(
+            include_targets_tracked_at_pin(&canon, &rels),
+            "within one memo window the answer stays memoized"
+        );
+        reset_lake_inputs_tag_memo();
+        assert!(
+            !include_targets_tracked_at_pin(&canon, &rels),
+            "a new memo window must re-read git: the pin can move while the daemon runs"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
     }
 }
