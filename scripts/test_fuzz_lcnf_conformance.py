@@ -487,6 +487,32 @@ class PinnedEnvReachesToolchainSubprocesses(unittest.TestCase):
                     f"{mod.__name__}.tearDownModule must restore the saved env",
                 )
 
+    def test_p0_module_imports_and_skips_on_unsupported_host_arch(self):
+        """Importing test_p0_trust_boundary must not require a supported host
+        CPU: host_arch.host_target_arch() raises on e.g. riscv64, and an
+        import-time HOST_ARCH computation breaks this module's own
+        `import test_p0_trust_boundary` too. The arch is computed lazily and
+        the arch-dependent legs skip (never KeyError off CPU_ARCH_TRIPLES)."""
+        import importlib
+
+        import host_arch
+        import test_p0_trust_boundary as tp0
+
+        try:
+            with mock.patch.object(host_arch.platform, "machine", return_value="riscv64"):
+                importlib.reload(tp0)  # must not raise on an unsupported machine
+                with self.assertRaises(unittest.SkipTest):
+                    tp0.host_arch_or_skip(self)
+            # A value off the {x86_64, arm64} CPU_ARCH_TRIPLES set skips too.
+            with mock.patch.object(tp0.host_arch, "host_target_arch", return_value="z80"):
+                with self.assertRaises(unittest.SkipTest):
+                    tp0.host_arch_or_skip(self)
+            self.assertEqual(tp0.host_arch_or_skip(self), host_arch.host_target_arch())
+            self.assertEqual(tp0.cross_arch_for("arm64"), "x86_64")
+            self.assertEqual(tp0.cross_arch_for("x86_64"), "arm64")
+        finally:
+            importlib.reload(tp0)
+
 
 class ConLecheToolchainPinConsistency(unittest.TestCase):
     def test_suite_startup_fails_loudly_on_pin_mismatch(self):

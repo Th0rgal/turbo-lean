@@ -78,9 +78,29 @@ CORE_BIN = ROOT / "lean" / ".lake" / "build" / "bin" / "lean-native-core"
 # The primary CPU `--arch` legs run the host's TargetArch spelling; the opposite
 # CPU arch stays covered by explicit cross-emission legs (the Apple arm64 tests
 # below plus test_04b: an arm64 host cross-emits x86_64 IR and vice versa).
-HOST_ARCH = host_arch.host_target_arch()
-CROSS_ARCH = "x86_64" if HOST_ARCH == "arm64" else "arm64"
 CPU_ARCH_TRIPLES = {"x86_64": "x86_64-unknown-linux-gnu", "arm64": "aarch64-unknown-linux-gnu"}
+
+
+def host_arch_or_skip(test: unittest.TestCase) -> str:
+    """The host CPU in the `--arch` spelling, computed lazily per test.
+
+    host_arch.host_target_arch() raises on unsupported machines, so an
+    import-time HOST_ARCH computation broke importing this module at all
+    (including test_fuzz_lcnf_conformance's `import test_p0_trust_boundary`).
+    The arch-dependent legs call this instead and skip on such hosts, and skip
+    (never KeyError) when the arch has no CPU_ARCH_TRIPLES entry."""
+    try:
+        arch = host_arch.host_target_arch()
+    except RuntimeError as exc:
+        test.skipTest(str(exc))
+    if arch not in CPU_ARCH_TRIPLES:
+        test.skipTest(f"host arch {arch!r} has no CPU_ARCH_TRIPLES entry")
+    return arch
+
+
+def cross_arch_for(host: str) -> str:
+    """The opposite CPU arch for the symmetric cross-emission legs."""
+    return "x86_64" if host == "arm64" else "arm64"
 
 
 def find_clang() -> str:
@@ -137,7 +157,7 @@ class TestP0TrustBoundary(unittest.TestCase):
             self.assertNotEqual(res.returncode, 0, "Corrupt wire inside JSON with canonical moduleName must fail closed")
 
         worker_input = (
-            '{"id":1,"method":"compile-llvm","arch":"' + HOST_ARCH + '","wire":"not-valid-lnir"}\n'
+            '{"id":1,"method":"compile-llvm","arch":"' + host_arch_or_skip(self) + '","wire":"not-valid-lnir"}\n'
             '{"id":2,"method":"batch-fastcheck","wire":"not-valid-lnir"}\n'
             '{"id":3,"method":"compile-llvm","arch":"bogus-arch","canonical_benchmark":true}\n'
             '{"id":4,"method":"exit"}\n'
@@ -217,14 +237,16 @@ class TestP0TrustBoundary(unittest.TestCase):
         # The primary legs run `--arch HOST_ARCH`; the opposite CPU arch stays
         # covered as a cross-emission leg (an arm64 host cross-emits x86_64 IR,
         # an x86_64 host cross-emits arm64 IR).
+        host = host_arch_or_skip(self)
+        cross = cross_arch_for(host)
         host_ir = subprocess.check_output(
-            [str(CORE_BIN), "compile-llvm", "canonical", "--arch", HOST_ARCH], text=True
+            [str(CORE_BIN), "compile-llvm", "canonical", "--arch", host], text=True
         )
         cross_ir = subprocess.check_output(
-            [str(CORE_BIN), "compile-llvm", "canonical", "--arch", CROSS_ARCH], text=True
+            [str(CORE_BIN), "compile-llvm", "canonical", "--arch", cross], text=True
         )
-        self.assertIn(f'target triple = "{CPU_ARCH_TRIPLES[HOST_ARCH]}"', host_ir)
-        self.assertIn(f'target triple = "{CPU_ARCH_TRIPLES[CROSS_ARCH]}"', cross_ir)
+        self.assertIn(f'target triple = "{CPU_ARCH_TRIPLES[host]}"', host_ir)
+        self.assertIn(f'target triple = "{CPU_ARCH_TRIPLES[cross]}"', cross_ir)
 
     def test_05_wasm32_scalar_default_and_explicit_simd128(self) -> None:
         wasm_scalar = subprocess.check_output(
@@ -237,6 +259,7 @@ class TestP0TrustBoundary(unittest.TestCase):
         self.assertIn("+simd128", wasm_simd)
 
     def test_06_compile_static_lib_tool_failure_thin_archive_and_atomic_preservation(self) -> None:
+        host = host_arch_or_skip(self)
         clang_bin = find_clang()
         with tempfile.TemporaryDirectory(prefix="p0_atomic_") as tmp:
             tmpdir = Path(tmp)
@@ -249,7 +272,7 @@ class TestP0TrustBoundary(unittest.TestCase):
                     "compile-static-lib",
                     "canonical",
                     "--arch",
-                    HOST_ARCH,
+                    host,
                     "--clang-bin",
                     clang_bin,
                     "-o",
@@ -278,7 +301,7 @@ class TestP0TrustBoundary(unittest.TestCase):
                     "compile-static-lib",
                     "canonical",
                     "--arch",
-                    HOST_ARCH,
+                    host,
                     "--clang-bin",
                     clang_bin,
                     "--ar-bin",
@@ -308,7 +331,7 @@ class TestP0TrustBoundary(unittest.TestCase):
                     "compile-static-lib",
                     "canonical",
                     "--arch",
-                    HOST_ARCH,
+                    host,
                     "--clang-bin",
                     clang_bin,
                     "--ar-bin",
