@@ -2384,35 +2384,56 @@ pub(super) fn node_source_has_disallowed_elab_host_effects(
     node_source_host_effect_taint(cfg, node, src_raw).is_tainted()
 }
 
-/// The TRANSITIVE spread verdict per (package root, module), stamped with the memo
-/// window captured before its computation's reads (DA 71add786 finding 5; the
-/// stamping is finding 2's `CLEAN_GIT_PIN_MEMO` shape). Within one window the closure
-/// is walked once; a new window (one per CLI command and per serve / MCP request)
-/// recomputes, which is how an edit below an unchanged importer still flips its
-/// verdict in a long-lived daemon. One entry per module, overwritten per window;
-/// [`reset_lake_inputs_tag_memo`] clears it too.
+/// The TRANSITIVE spread verdict per (project config digest, package root, module),
+/// stamped with the memo window captured before its computation's reads (DA 71add786
+/// finding 5; the stamping is finding 2's `CLEAN_GIT_PIN_MEMO` shape). Within one
+/// window the closure is walked once; a new window (one per CLI command and per
+/// serve / MCP request) recomputes, which is how an edit below an unchanged importer
+/// still flips its verdict in a long-lived daemon. The verdict depends on the whole
+/// workspace configuration (root-first import resolution, the package set), so the key
+/// carries `ProjectConfig::canonical_config_digest`: two projects sharing one absolute
+/// `path` dependency never read each other's verdicts. A verdict whose computation
+/// read an in-progress cycle sentinel is never published here (DA 3ff1014b finding 2).
+/// One entry per module, overwritten per window; [`reset_lake_inputs_tag_memo`]
+/// clears it too.
 #[allow(clippy::type_complexity)]
 pub(super) static SPREAD_TRANSITIVE_VERDICTS: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<(PathBuf, String), (u64, bool)>>,
+    std::sync::Mutex<HashMap<(String, PathBuf, String), (u64, bool)>>,
 > = std::sync::OnceLock::new();
 
 /// Whether `spec`'s module, or anything below it in its *own* import graph, carries
 /// spreading host-effect taint. External `.olean` dependencies are not dag nodes, so
 /// spreading has to be chased through their source headers; one hop was not enough
 /// (`Dep.B` importing a host-reading `Dep.A` never marked the root). Lean import
-/// graphs are acyclic; a resolver cycle is cut by the in-progress memo entry. An
-/// unreadable source or broken header fails closed, as in the purge walk. Two cache
-/// layers: PER-FILE facts (the own-source spread verdict and the parsed header) keyed
-/// by source content, and the TRANSITIVE verdict in
-/// [`SPREAD_TRANSITIVE_VERDICTS`], keyed by memo window — within one window the
-/// closure is walked once, and the next request's fresh window recomputes, so an edit
-/// below an unchanged importer still flips the importer's verdict in a long-lived
-/// daemon (every request resets the window at entry).
+/// graphs are acyclic; a resolver cycle is cut by the in-progress memo entry (`None`),
+/// and a verdict whose computation read such a sentinel holds only under that call's
+/// assumption, so it stays in the per-call memo and is never published to
+/// [`SPREAD_TRANSITIVE_VERDICTS`] (DA 3ff1014b finding 2: publishing it served a
+/// wrong "does not spread" for the rest of the window). An unreadable source or
+/// broken header fails closed, as in the purge walk. Two cache layers: PER-FILE facts
+/// (the own-source spread verdict and the parsed header) keyed by source content, and
+/// the TRANSITIVE verdict in [`SPREAD_TRANSITIVE_VERDICTS`], keyed by project config
+/// and memo window — within one window the closure is walked once, and the next
+/// request's fresh window recomputes, so an edit below an unchanged importer still
+/// flips the importer's verdict in a long-lived daemon (every request resets the
+/// window at entry).
 pub(super) fn spec_spreads_host_effects_transitively(
     cfg: &ProjectConfig,
     spec: &DiscoveredModuleSpec,
-    memo: &mut HashMap<(PathBuf, String), bool>,
+    memo: &mut HashMap<(PathBuf, String), Option<bool>>,
 ) -> bool {
+    spec_spreads_host_effects_transitively_inner(cfg, spec, memo).0
+}
+
+/// Returns `(verdict, cycle_cut)`: `cycle_cut` is true when this computation, anywhere
+/// below it, read an in-progress memo sentinel. Such a verdict is correct for the
+/// queried root but conditioned on the cut for the members of the cycle, so no frame
+/// on a cut path publishes to the cross-call cache.
+fn spec_spreads_host_effects_transitively_inner(
+    cfg: &ProjectConfig,
+    spec: &DiscoveredModuleSpec,
+    memo: &mut HashMap<(PathBuf, String), Option<bool>>,
+) -> (bool, bool) {
     // Per-file facts only: whether the module's OWN source spreads, whether its header
     // failed to parse, and its imports. Never the transitive verdict, which depends on
     // every file below the module while this key covers only the one file.
@@ -2421,25 +2442,36 @@ pub(super) fn spec_spreads_host_effects_transitively(
         std::sync::Mutex<HashMap<(PathBuf, String, [u8; 32]), (bool, bool, Vec<String>)>>,
     > = std::sync::OnceLock::new();
     let key = (spec.pkg_root.clone(), spec.module_name.clone());
-    if let Some(&v) = memo.get(&key) {
-        return v;
+    match memo.get(&key) {
+        // Finalized within this call.
+        Some(Some(v)) => return (*v, false),
+        // An ancestor's in-progress entry: the resolver cycle is cut here, so the
+        // caller's verdict is conditioned on this frame's assumed `false`.
+        Some(None) => return (false, true),
+        None => {}
     }
     // Captured before any reads: a verdict computed before a reset is stamped with
     // the old window and never served to the new one (the finding 2 shape).
     let window = current_memo_window();
+    let cache_key = (
+        cfg.canonical_config_digest.clone(),
+        spec.pkg_root.clone(),
+        spec.module_name.clone(),
+    );
     let cached = SPREAD_TRANSITIVE_VERDICTS
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
+        .get(&cache_key)
         .copied();
     if let Some((w, v)) = cached {
         if w == window {
-            memo.insert(key, v);
-            return v;
+            memo.insert(key, Some(v));
+            return (v, false);
         }
     }
-    memo.insert(key.clone(), false);
+    memo.insert(key.clone(), None);
+    let mut cycle_cut = false;
     let v = match fs::read_to_string(&spec.src_path) {
         Err(_) => true,
         Ok(src) => {
@@ -2468,29 +2500,36 @@ pub(super) fn spec_spreads_host_effects_transitively(
                     facts
                 }
             };
-            own_spreads
-                || header_broken
-                || imports.iter().any(|sub| {
+            let mut spreads = own_spreads || header_broken;
+            if !spreads {
+                for sub in &imports {
                     let site = match resolve_module_in_package(&cfg.root_pkg, true, sub) {
                         Some(rs) => ImportSite::Module(Box::new(rs)),
                         None => resolve_import_site(cfg, sub),
                     };
-                    match site {
-                        ImportSite::Module(sub_spec) => {
-                            spec_spreads_host_effects_transitively(cfg, &sub_spec, memo)
+                    if let ImportSite::Module(sub_spec) = site {
+                        let (sub_v, sub_cut) =
+                            spec_spreads_host_effects_transitively_inner(cfg, &sub_spec, memo);
+                        cycle_cut |= sub_cut;
+                        if sub_v {
+                            spreads = true;
+                            break;
                         }
-                        _ => false,
                     }
-                })
+                }
+            }
+            spreads
         }
     };
-    memo.insert(key.clone(), v);
-    SPREAD_TRANSITIVE_VERDICTS
-        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(key, (window, v));
-    v
+    memo.insert(key, Some(v));
+    if !cycle_cut {
+        SPREAD_TRANSITIVE_VERDICTS
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(cache_key, (window, v));
+    }
+    (v, cycle_cut)
 }
 
 /// #433: a module is tainted when its own source is (`SelfOnly` or worse), or when a
@@ -2504,7 +2543,7 @@ pub(super) fn compute_tainted_elab_host_effect_modules(
     cfg: &ProjectConfig,
     dag: &ModuleDag,
 ) -> HashSet<String> {
-    let mut ext_spread_memo: HashMap<(PathBuf, String), bool> = HashMap::new();
+    let mut ext_spread_memo: HashMap<(PathBuf, String), Option<bool>> = HashMap::new();
     let mut ext_olean_memo: HashMap<PathBuf, bool> = HashMap::new();
     let mut tainted: HashSet<String> = HashSet::new();
     let mut spreading: HashSet<String> = HashSet::new();
@@ -4221,7 +4260,11 @@ mod host_effect_taint_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(
-                (spec.pkg_root.clone(), spec.module_name.clone()),
+                (
+                    cfg.canonical_config_digest.clone(),
+                    spec.pkg_root.clone(),
+                    spec.module_name.clone(),
+                ),
                 (superseded, true),
             );
         let mut memo = HashMap::new();
@@ -4229,6 +4272,101 @@ mod host_effect_taint_tests {
             !spec_spreads_host_effects_transitively(&cfg, &spec, &mut memo),
             "a planted wrong verdict stamped with a superseded window must be \
              ignored: the clean closure recomputes to non-spreading"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// DA 3ff1014b finding 2: an intermediate verdict computed through a cycle cut (it
+    /// read an ancestor's in-progress entry) is only valid inside that call. Published
+    /// to the cross-call cache it serves a wrong "does not spread" answer for the rest
+    /// of the window: A imports B and a spreading C, B imports A back; querying A first
+    /// computes B = false against A's in-progress entry, and a later fresh query for B
+    /// in the same window must still answer true.
+    #[test]
+    fn transitive_spread_cycle_cut_verdicts_stay_per_call() -> Result<()> {
+        // Serializes the process-global memo window against the module_builder tests
+        // that bump it: a reset between the two queries below would clear the cache and
+        // mask a poisoned entry.
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (dir, cfg, spec) = dep_fixture_with(
+            "spread_cycle",
+            "import LintLib.B\nimport LintLib.C\ndef l : Nat := 0\n",
+            false,
+            &[
+                ("LintLib/B.lean", "import LintLib\ndef b : Nat := 0\n"),
+                ("LintLib/C.lean", IMPORT_TIME_SHAPE),
+            ],
+        )?;
+        let dep_pkg = cfg
+            .dep_pkgs
+            .iter()
+            .find(|dp| dp.name == "lintlib")
+            .expect("dep pkg");
+        let b_spec = resolve_module_in_package(dep_pkg, false, "LintLib.B")
+            .expect("LintLib.B resolves in lintlib");
+        reset_lake_inputs_tag_memo();
+        let mut memo = HashMap::new();
+        assert!(
+            spec_spreads_host_effects_transitively(&cfg, &spec, &mut memo),
+            "the queried root spreads through C whatever the cycle contributes"
+        );
+        let published_b = SPREAD_TRANSITIVE_VERDICTS
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(
+                cfg.canonical_config_digest.clone(),
+                b_spec.pkg_root.clone(),
+                b_spec.module_name.clone(),
+            ))
+            .copied();
+        assert!(
+            published_b.is_none(),
+            "a cycle-cut intermediate stays per-call, never published: {published_b:?}"
+        );
+        let mut memo2 = HashMap::new();
+        assert!(
+            spec_spreads_host_effects_transitively(&cfg, &b_spec, &mut memo2),
+            "B spreads through A: the cycle-cut intermediate from A's call must not \
+             be served from the cross-call cache"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// DA 3ff1014b finding 2 (key): the cross-call cache key carries the project
+    /// configuration identity, so a verdict computed under another configuration for
+    /// the same (package root, module) is never served.
+    #[test]
+    fn transitive_spread_cache_is_scoped_to_the_project_config() -> Result<()> {
+        let (dir, cfg, spec) = dep_fixture_with(
+            "spread_cfg_scope",
+            "import LintLib.A\ndef l : Nat := 0\n",
+            false,
+            &[("LintLib/A.lean", "def a : Nat := 1\n")],
+        )?;
+        reset_lake_inputs_tag_memo();
+        let window = current_memo_window();
+        SPREAD_TRANSITIVE_VERDICTS
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                (
+                    "another-project-config-digest".to_string(),
+                    spec.pkg_root.clone(),
+                    spec.module_name.clone(),
+                ),
+                (window, true),
+            );
+        let mut memo = HashMap::new();
+        assert!(
+            !spec_spreads_host_effects_transitively(&cfg, &spec, &mut memo),
+            "a verdict stamped with another project configuration must be ignored: \
+             the clean closure recomputes to non-spreading"
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())

@@ -4213,6 +4213,39 @@ lean_lib Smoke where
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// DA 3ff1014b finding 3: the Lake-rejected `leanOptions` downgrade is recorded in its
+    /// own right, not found by scanning the shared `unsupported` reason slot afterwards. An
+    /// earlier unsupported construct in the same target occupies that slot first
+    /// (`unsupported_lake_field` keeps the first reason), and the refusal must still fire.
+    #[test]
+    fn test_l299_earlier_unsupported_reason_does_not_mask_rejected_options() {
+        let dir = make_temp_test_dir("l299_masked_rejected_options");
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  bogusUnknownField := true\n  leanOptions := #[LeanOption.mk `autoImplicit false]\n",
+        )
+        .unwrap();
+        fs::write(dir.join("Demo.lean"), "").unwrap();
+        // The earlier construct really is recorded first in the shared slot.
+        let dep = resolve_package_config(&dir, false).unwrap();
+        assert!(
+            dep.libs[0]
+                .unsupported
+                .as_deref()
+                .is_some_and(|w| w.contains("bogusUnknownField")),
+            "fixture must occupy the shared reason slot first, or it proves nothing: {:?}",
+            dep.libs[0].unsupported
+        );
+        assert!(
+            optional_package_config(&dir).is_err(),
+            "a dropped `leanOptions` entry must refuse even when an earlier reason \
+             occupies the `unsupported` slot"
+        );
+        assert!(try_resolve_lean_args_for_path(&dir, Some(Path::new("Demo.lean"))).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// L299 (#299, arguments and options): the sorry-adjacent debug keys stay outside the
     /// option allowlist, whatever value they carry.
     #[test]

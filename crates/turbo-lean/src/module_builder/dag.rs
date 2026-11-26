@@ -241,6 +241,13 @@ pub struct PackageConfig {
     /// still be used through Lake's own fresh build outputs.
     #[serde(default)]
     pub unsupported: Option<String>,
+    /// Why the dependency downgrade dropped Lake-rejected `leanOptions` entries from this
+    /// package or one of its targets. Recorded in its own slot, never found by scanning the
+    /// shared `unsupported` reason, which keeps only its first reason and can be occupied
+    /// by an earlier construct (#299 round 2; DA 3ff1014b finding 3). Callers that hand out
+    /// file args from a root-as-dependency parse refuse on it.
+    #[serde(default)]
+    pub lake_rejected_lean_options: Option<String>,
     #[serde(default)]
     pub native_unsupported: Option<String>,
     #[serde(default)]
@@ -3319,6 +3326,7 @@ pub(super) fn parse_lakefile_toml_inner(
         config_digest: String::new(),
         pre_recipe_config_digest: String::new(),
         unsupported: None,
+        lake_rejected_lean_options: None,
         native_unsupported: None,
         link_unsupported: None,
     };
@@ -5415,7 +5423,10 @@ pub(super) fn parse_lean_path_literal(field: &str, expr: &str) -> Result<PathBuf
 /// (`LeanOption.mk` applications, `(k, v)` tuples; `LAKE_REJECTED_LEAN_OPTIONS_ENTRY`) fail the
 /// root package closed at parse time but only record `unsupported` on a dependency, so one
 /// dependency's lakefile cannot refuse the whole workspace configuration; every other
-/// resolution error keeps failing closed for every package.
+/// resolution error keeps failing closed for every package. A downgrade returns
+/// `Ok(Some(why))` so the caller records it in `PackageConfig::lake_rejected_lean_options`
+/// explicitly: the shared `unsupported` slot keeps only its first reason, so scanning its
+/// text afterwards misses a downgrade an earlier construct masked (DA 3ff1014b finding 3).
 pub(super) fn extend_lean_options_or_record(
     target: &mut LeanOptionsMap,
     slot: &mut Option<String>,
@@ -5424,18 +5435,16 @@ pub(super) fn extend_lean_options_or_record(
     line_no: usize,
     is_root_pkg: bool,
     lean_path: &Path,
-) -> Result<()> {
+) -> Result<Option<String>> {
     match resolve_lean_options_expr(val_accum, bindings, line_no) {
         Ok(opts) => {
             target.extend(opts);
-            Ok(())
+            Ok(None)
         }
         Err(e) if !is_root_pkg && format!("{e:#}").contains(LAKE_REJECTED_LEAN_OPTIONS_ENTRY) => {
-            unsupported_lake_field(
-                slot,
-                is_root_pkg,
-                format!("{:#} in {} at line {}", e, lean_path.display(), line_no),
-            )
+            let why = format!("{:#} in {} at line {}", e, lean_path.display(), line_no);
+            unsupported_lake_field(slot, is_root_pkg, why.clone())?;
+            Ok(Some(why))
         }
         Err(e) => Err(e),
     }
@@ -5642,6 +5651,7 @@ pub(super) fn parse_lakefile_lean_inner(
         config_digest: String::new(),
         pre_recipe_config_digest: String::new(),
         unsupported: pkg_unsupported,
+        lake_rejected_lean_options: None,
         native_unsupported: None,
         link_unsupported: None,
     };
@@ -5943,7 +5953,7 @@ pub(super) fn parse_lakefile_lean_inner(
                                 parse_lean_option_bool(&val_accum, &location)?;
                         }
                         "leanOptions" => {
-                            extend_lean_options_or_record(
+                            if let Some(why) = extend_lean_options_or_record(
                                 &mut pkg.lean_options,
                                 &mut pkg.unsupported,
                                 &val_accum,
@@ -5951,7 +5961,9 @@ pub(super) fn parse_lakefile_lean_inner(
                                 line_no,
                                 is_root_pkg,
                                 lean_path,
-                            )?;
+                            )? {
+                                pkg.lake_rejected_lean_options.get_or_insert(why);
+                            }
                         }
                         other => {
                             let (c_why, l_why) = classify_native_unsupported_field(
@@ -6028,7 +6040,7 @@ pub(super) fn parse_lakefile_lean_inner(
                                 lake_precompile(key, &val_accum, &location)?;
                             }
                             "leanOptions" => {
-                                extend_lean_options_or_record(
+                                if let Some(why) = extend_lean_options_or_record(
                                     &mut lib.lean_options,
                                     &mut lib.unsupported,
                                     &val_accum,
@@ -6036,7 +6048,9 @@ pub(super) fn parse_lakefile_lean_inner(
                                     line_no,
                                     is_root_pkg,
                                     lean_path,
-                                )?;
+                                )? {
+                                    pkg.lake_rejected_lean_options.get_or_insert(why);
+                                }
                             }
                             "needs" => {
                                 let needs = parse_lean_bare_name_array_expr(&val_accum, key)?;
@@ -6159,7 +6173,7 @@ pub(super) fn parse_lakefile_lean_inner(
                                 exe.weak_lean_args = parse_lean_string_array_expr(&val_accum)?;
                             }
                             "leanOptions" => {
-                                extend_lean_options_or_record(
+                                if let Some(why) = extend_lean_options_or_record(
                                     &mut exe.lean_options,
                                     &mut exe.unsupported,
                                     &val_accum,
@@ -6167,7 +6181,9 @@ pub(super) fn parse_lakefile_lean_inner(
                                     line_no,
                                     is_root_pkg,
                                     lean_path,
-                                )?;
+                                )? {
+                                    pkg.lake_rejected_lean_options.get_or_insert(why);
+                                }
                             }
                             "needs" => {
                                 let needs = parse_lean_bare_name_array_expr(&val_accum, key)?;
@@ -6851,17 +6867,20 @@ pub(crate) fn optional_package_config(project_dir: &Path) -> Result<Option<Packa
     // `leanOptions` entry forms must not let a ROOT lakefile parse `Ok` here with entries
     // silently dropped from the args these callers hand out; only the workspace dependency
     // loader keeps the downgrade.
-    if let Some(why) = std::iter::once(&pkg.unsupported)
-        .chain(pkg.libs.iter().map(|l| &l.unsupported))
-        .chain(pkg.exes.iter().map(|e| &e.unsupported))
-        .find_map(|u| {
-            u.as_deref()
-                .filter(|w| w.contains(LAKE_REJECTED_LEAN_OPTIONS_ENTRY))
-        })
-    {
+    refuse_lake_rejected_lean_options(&pkg)?;
+    Ok(Some(pkg))
+}
+
+/// Refuse a config whose `leanOptions` entries the dependency downgrade dropped: every path
+/// that hands out file args from a root-as-dependency parse (`optional_package_config`, the
+/// trusted declaration-identity resolve) fails like the root parse instead of serving args
+/// with entries silently gone. Reads the dedicated record, never the shared `unsupported`
+/// reason text, which an earlier construct can occupy first (DA 3ff1014b finding 3).
+pub(crate) fn refuse_lake_rejected_lean_options(pkg: &PackageConfig) -> Result<()> {
+    if let Some(why) = &pkg.lake_rejected_lean_options {
         anyhow::bail!("{why}");
     }
-    Ok(Some(pkg))
+    Ok(())
 }
 
 /// Resolve effective Lake options, propagating configuration errors before cache lookup.
