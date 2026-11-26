@@ -138,10 +138,6 @@ RECORDED_ENV_VARS = [
     "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY", "TURBO_LEAN_HOME", "TURBO_LEAN_STAGING_DIR",
     "TURBO_LEAN_NO_DAEMON", "TURBO_LEAN_NO_REMOTE_TELEMETRY", "TURBO_LEAN_TELEMETRY",
     "TURBO_LEAN_DAEMON_IDLE_SECS", "TURBO_LEAN_BENCH_CHECK_TIMEOUT_S",
-    # The warm CAS-expr replay switches: recorded so paired on-vs-off runs
-    # self-describe in their settings blocks (the G2b delta artifacts were
-    # indistinguishable without this) and settings-mismatch across sides.
-    "TURBO_LEAN_WARM_CAS_REPLAY", "TURBO_LEAN_NO_WARM_CAS_REPLAY",
 ]
 
 VERDICT_EXIT = {
