@@ -1,3 +1,8 @@
+import LeanNative.Semantics.EvalRec
+import LeanNative.IR.RealLCNFRecSemantics
+import LeanNative.Proofs.RealLCNFBridgeProofs
+import LeanNative.Proofs.RealLCNFBridge.CallsF
+
 /-!
 ## L3 contract (roadmap/HORIZONS.md, H1 rung L3 "Recursion and loops") — w-l3
 
@@ -547,3 +552,622 @@ unchanged; elaborable once L2's definitions exist.)
   0 vacuous, 0 trivial, 0 stub_defs, 0 forbidden_scope_decls);
   `python3 scripts/sync_docs_inventory.py --check` (the Spec counts do not move).
 -/
+
+namespace LeanNative.Proofs
+
+open LeanNative.IR
+open LeanNative.IR.RealLCNFBridge
+open LeanNative.IR.RealLCNFSemantics
+open LeanNative.Semantics
+
+/-! ### Part I definitions -/
+
+/-- Reserved runtime symbols `evalExpr` interprets as intrinsics (`lean_native_*`,
+    `lean_mark_mt`); a lowered local callee must not shadow them. The lanes fold onto
+    ONE predicate: this is L2's `reservedRuntimeName` (`RealLCNFBridge/CallsF.lean`)
+    under the L3 contract's spelling, so the two names cannot disagree. -/
+def reservedRuntimeCallee (s : String) : Bool := reservedRuntimeName s
+
+/-- The evaluation-side environment of a lowering environment: each entry keeps its
+    declaration and its own context; the per-entry LOWERING fuel is a lowering-time
+    quantity, not an evaluation input (the evaluation fuel stays the single step
+    budget). -/
+def declEnvR (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) :
+    List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx) :=
+  Δ.map fun e => (e.1, e.2.1)
+
+/-- Pointwise "Δ lowers to Φ" for the FULL-environment semantics, with PER-ENTRY context
+    and lowering fuel: each entry's own context maps its own declaration's name to its
+    LNIR name, the lowering hypothesis holds at the entry's own fuel, lowered names are
+    unreserved, and tail freshness over the whole list makes `lookupDeclRec?` and
+    `lookupFuncRec?` find corresponding positions WITHOUT stratification. The contract's
+    `nil`/`cons` constructors are the two matching clauses of this recursive `Prop`
+    (strict-proofs scope admits no new `inductive` under `Proofs/`, the shape L2's
+    `DeclEnvLowers` takes for the same reason); length-mismatched lists relate never. -/
+def DeclEnvLowersR :
+    List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat) → List LNIRDecl → Prop
+  | [], [] => True
+  | (sd, ctx, fuel) :: Δ, ld :: Φ =>
+      ctx.findLocalCallee? sd.name = some ld.name ∧
+      lowerRealLCNFDecl fuel ctx sd ld.name = .ok ld ∧
+      reservedRuntimeCallee ld.name = false ∧
+      (∀ ld' ∈ Φ, ld'.name ≠ ld.name) ∧
+      DeclEnvLowersR Δ Φ
+  | _, _ => False
+
+/-- `CodeRefines` with the recursion-capable environment (the L3 form of refinement). -/
+def CodeRefinesR (Φ : List LNIRDecl) (src tgt : LNIRCode) : Prop :=
+  ∀ fuel env st v st', evalCodeR Φ fuel env st src = .ok (v, st') →
+    evalCodeR Φ fuel env st tgt = .ok (v, st')
+
+/-! ### Helpers on the LNIR side -/
+
+/-- The non-call `.letBind` arm of `evalCodeRAux` is `evalCode`'s: when the bound
+    expression is not a non-extern call, the environment is never consulted. -/
+theorem evalCodeRAux_letBind_of_not_call {Φ : List LNIRDecl} {budget : Nat}
+    {callee? : Option (VarEnv → HeapState → LNIRCode → Except UBError (Val × HeapState))}
+    {val : LNIRExpr} (hnc : ∀ fn args retTy, val ≠ .call fn args retTy false)
+    (env : VarEnv) (st : HeapState) (dst : VarId) (ty : LNIRType) (k : LNIRCode) :
+    evalCodeRAux Φ budget callee? env st (.letBind dst ty val k) =
+      match evalExpr env st val with
+      | .ok (v, st') => evalCodeRAux Φ budget callee? (env.bind dst v) st' k
+      | .error err => .error err := by
+  cases val <;> try rfl
+  case call fn args retTy isExt =>
+    cases isExt
+    · exact absurd rfl (hnc fn args retTy)
+    · rfl
+
+/-- Pointwise transport through the `seqFor` loop closure: a step evaluator that
+    reproduces every successful step of another reproduces every successful loop. -/
+theorem evalSeqLoop_mono_of_step_mono
+    (f g : VarEnv → HeapState → Except UBError (Val × HeapState))
+    (hfg : ∀ se ss r, f se ss = .ok r → g se ss = .ok r) (idxVar accVar : VarId) :
+    ∀ (count cur : Nat) (acc : Val) (env : VarEnv) (st : HeapState) (r : Val × HeapState),
+      evalSeqLoop count cur idxVar accVar acc env st f = .ok r →
+      evalSeqLoop count cur idxVar accVar acc env st g = .ok r
+  | 0, _, _, _, _, _, h => h
+  | count + 1, cur, acc, env, st, r, h => by
+    dsimp only [evalSeqLoop] at h ⊢
+    cases hs : f ((env.bind idxVar (.u64 cur.toUInt64)).bind accVar acc) st with
+    | error _ => rw [hs] at h; exact nomatch h
+    | ok pr =>
+      rw [hs] at h
+      rw [hfg _ _ pr hs]
+      exact evalSeqLoop_mono_of_step_mono f g hfg idxVar accVar count (cur + 1) pr.1 env pr.2 r h
+
+/-- `evalParFor`'s budget is an upper bound on the loop length only: a larger budget
+    reproduces every successful run. -/
+theorem evalParFor_fuel_mono (b b' : Nat) (hb : b ≤ b') (env : VarEnv) (st : HeapState)
+    (lenVar : VarId) (inputs : List VarId) (kernel : ParallelKernelKind) (elemTy : LNIRType)
+    (r : Val × HeapState) (h : evalParFor b env st lenVar inputs kernel elemTy = .ok r) :
+    evalParFor b' env st lenVar inputs kernel elemTy = .ok r := by
+  unfold evalParFor at h ⊢
+  cases hl : env lenVar <;> rw [hl] at h
+  · exact nomatch h
+  · rename_i vl
+    cases vl with
+    | u64 n =>
+      dsimp only at h ⊢
+      by_cases hgt : n.toNat > b
+      · simp only [hgt, ↓reduceIte] at h; exact nomatch h
+      · have hgt' : ¬(n.toNat > b') := by omega
+        simp only [hgt, hgt', ↓reduceIte] at h ⊢; exact h
+    | _ => exact nomatch h
+
+/-- At `Φ = []` every level of the recursion-capable evaluator is `evalCode` at its
+    budget, whatever the callee slot holds: no call resolves. -/
+theorem evalCodeRAux_nil (budget : Nat)
+    (callee? : Option (VarEnv → HeapState → LNIRCode → Except UBError (Val × HeapState)))
+    (env : VarEnv) (st : HeapState) (c : LNIRCode) :
+    evalCodeRAux [] budget callee? env st c = evalCode budget env st c := by
+  -- The two evaluators' arms elaborate to distinct matcher constants, so each arm closes
+  -- by `rfl` once the recursive occurrences are rewritten.
+  induction c generalizing env st with
+  | letBind dst ty val k ih =>
+    unfold evalCodeRAux evalCode
+    split
+    · simp only [lookupFuncRec?, ih] <;> rfl
+    · simp only [ih] <;> rfl
+  | rawStore ptrVar idxVar valVar elemTy k ih =>
+    unfold evalCodeRAux evalCode
+    simp only [ih] <;> rfl
+  | incRef objVar count k ih =>
+    unfold evalCodeRAux evalCode
+    simp only [ih] <;> rfl
+  | decRef objVar count k ih =>
+    unfold evalCodeRAux evalCode
+    simp only [ih] <;> rfl
+  | ite condVar t e iht ihe =>
+    unfold evalCodeRAux evalCode
+    simp only [iht, ihe] <;> rfl
+  | seqFor idxVar loVar hiVar accVar accInit accTy stepBody k ihStep ihK =>
+    unfold evalCodeRAux evalCode
+    simp only [ihStep, ihK] <;> rfl
+  | parFor outVar lenVar inputs elemTy kernel k ih =>
+    unfold evalCodeRAux evalCode
+    simp only [ih] <;> rfl
+  | ret v => rfl
+  | unreachable => rfl
+
+/-! ### Part I — conservativity: the old semantics is the empty-environment instance -/
+
+theorem evalCodeR_nil (fuel : Nat) (env : VarEnv) (st : HeapState) (c : LNIRCode) :
+    evalCodeR [] fuel env st c = evalCode fuel env st c := by
+  cases fuel with
+  | zero => exact evalCodeRAux_nil 0 none env st c
+  | succ n => exact evalCodeRAux_nil (n + 1) (some (evalCodeR [] n)) env st c
+
+/-- `evalLetValue` on a `ctx`-local `.fap` is the deliberate `.unsupportedCall` refusal
+    the R rule replaces (`RealLCNFSemantics.lean`, the `.fap` arm's first test). -/
+theorem evalLetValue_fap_local (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
+    (fn : Lean.Name) (args : Array (Lean.Compiler.LCNF.Arg .impure)) (ty : LNIRType)
+    (hloc : (ctx.findLocalCallee? fn).isSome = true) :
+    evalLetValue ctx env st (.fap fn args rfl) ty = .error (.unsupportedCall fn.toString) := by
+  unfold evalLetValue
+  simp only [hloc, ↓reduceIte]
+
+theorem evalStepR_nil (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
+    (target : Lean.Compiler.LCNF.Code .impure ⊕
+      (Val × Bool × Nat × Option Lean.FVarId × List (Lean.Compiler.LCNF.Alt .impure))) :
+    evalStepR [] fuel ctx env st target = evalStep fuel ctx env st target := by
+  induction fuel generalizing ctx env st target with
+  | zero => simp only [evalStepR, evalStep]
+  | succ fuel ih =>
+    unfold evalStepR evalStep
+    cases target with
+    | inr p =>
+      obtain ⟨cond, isBool, idx, discr?, alts⟩ := p
+      simp only [ih]
+      rfl
+    | inl code =>
+      cases code
+      case «let» decl k =>
+        simp only [ih, lookupDeclRec?]
+        obtain ⟨fvarId, binderName, type, value⟩ := decl
+        cases value
+        case fap fn args h =>
+          cases h
+          dsimp only
+          by_cases hloc : (ctx.findLocalCallee? fn).isSome = true
+          · simp only [hloc, ↓reduceIte, evalLetValue_fap_local ctx env st fn args _ hloc]
+          · simp only [hloc, Bool.false_eq_true, ↓reduceIte]
+            rfl
+        all_goals first | rfl | (dsimp only; rfl)
+      all_goals (simp only [ih]; try rfl)
+
+theorem evalRealLCNFDeclR_nil (fuel : Nat) (ctx : RealBridgeCtx)
+    (decl : Lean.Compiler.LCNF.Decl .impure) (args : List Val) (st : HeapState) :
+    evalRealLCNFDeclR [] fuel ctx decl args st = evalRealLCNFDecl fuel ctx decl args st := by
+  unfold evalRealLCNFDeclR evalRealLCNFDecl evalRealLCNFCodeR evalRealLCNFCode
+  cases decl.value with
+  | extern _ => rfl
+  | code c =>
+    cases bindParams ctx true LEnv.empty decl.params.toList args with
+    | ok env => exact evalStepR_nil fuel ctx env st (.inl c)
+    | error _ => rfl
+
+/-! ### Part I — fuel monotonicity of the recursion-capable evaluator -/
+
+/-- One level of `evalCodeR` is monotone in its budget and in its callee slot: a slot
+    that reproduces every successful callee run of another, at a budget one larger,
+    reproduces every successful run of the level. -/
+theorem evalCodeRAux_fuel_mono (Φ : List LNIRDecl) (budget : Nat)
+    (c1 c2 : Option (VarEnv → HeapState → LNIRCode → Except UBError (Val × HeapState)))
+    (hc : ∀ f1, c1 = some f1 → ∃ f2, c2 = some f2 ∧
+      ∀ env st code r, f1 env st code = .ok r → f2 env st code = .ok r) :
+    ∀ (c : LNIRCode) (env : VarEnv) (st : HeapState) (v : Val) (st' : HeapState),
+      evalCodeRAux Φ budget c1 env st c = .ok (v, st') →
+      evalCodeRAux Φ (budget + 1) c2 env st c = .ok (v, st')
+  | .letBind dst ty val k, env, st, v, st', h => by
+    by_cases hcall : ∃ fn args retTy, val = .call fn args retTy false
+    · obtain ⟨fn, args, retTy, rfl⟩ := hcall
+      dsimp only [evalCodeRAux] at h ⊢
+      cases hlk : lookupFuncRec? Φ fn with
+      | none =>
+        rw [hlk] at h; dsimp only at h ⊢
+        cases he : evalExpr env st (.call fn args retTy false) with
+        | error _ => rw [he] at h; exact nomatch h
+        | ok p =>
+          rw [he] at h; dsimp only at h ⊢
+          exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc k (env.bind dst p.1) p.2 v st' h
+      | some ld =>
+        rw [hlk] at h; dsimp only at h ⊢
+        cases hc1 : c1 with
+        | none => rw [hc1] at h; exact nomatch h
+        | some f1 =>
+          obtain ⟨f2, hc2, hf⟩ := hc f1 hc1
+          have ihk := evalCodeRAux_fuel_mono Φ budget c1 c2 hc k
+          rw [hc1] at h ihk
+          rw [hc2] at ihk ⊢
+          dsimp only at h ⊢
+          cases hvl : evalVarList env args with
+          | error _ => rw [hvl] at h; exact nomatch h
+          | ok vals =>
+            rw [hvl] at h; dsimp only at h ⊢
+            cases hb : f1 ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val)
+                VarEnv.empty) st ld.body with
+            | error _ => rw [hb] at h; exact nomatch h
+            | ok q =>
+              rw [hb] at h; rw [hf _ _ _ q hb]; dsimp only at h ⊢
+              exact ihk (env.bind dst q.1) q.2 v st' h
+    · have hnc : ∀ fn args retTy, val ≠ .call fn args retTy false :=
+        fun fn args retTy heq => hcall ⟨fn, args, retTy, heq⟩
+      rw [evalCodeRAux_letBind_of_not_call hnc] at h ⊢
+      cases he : evalExpr env st val with
+      | error _ => rw [he] at h; exact nomatch h
+      | ok p =>
+        rw [he] at h; dsimp only at h ⊢
+        exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc k (env.bind dst p.1) p.2 v st' h
+  | .rawStore pv iv vv elemTy k, env, st, v, st', h => by
+    dsimp only [evalCodeRAux] at h ⊢
+    cases hp : env pv <;> cases hi : env iv <;>
+      cases hv : env vv <;> simp only [hp, hi, hv] at h <;> try contradiction
+    rename_i vp vi vv0
+    cases vp <;> cases vi <;>
+      cases vv0 <;> simp only at h ⊢ <;> try contradiction
+    all_goals (
+      rename_i bufId idx val
+      cases hw : st.writeElemExclusive bufId idx.toNat (maskElemVal elemTy val) <;>
+        simp only [hw] at h ⊢
+      · contradiction
+      · rename_i st1; exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc k env st1 v st' h)
+  | .incRef ov cnt k, env, st, v, st', h => by
+    dsimp only [evalCodeRAux] at h ⊢
+    cases he : st.evalIncRef env ov cnt with
+    | error _ => rw [he] at h; exact nomatch h
+    | ok st1 => rw [he] at h; exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc k env st1 v st' h
+  | .decRef ov cnt k, env, st, v, st', h => by
+    dsimp only [evalCodeRAux] at h ⊢
+    cases he : st.evalDecRef env ov cnt with
+    | error _ => rw [he] at h; exact nomatch h
+    | ok st1 => rw [he] at h; exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc k env st1 v st' h
+  | .ite cv t e, env, st, v, st', h => by
+    dsimp only [evalCodeRAux] at h ⊢
+    cases hcv : env cv <;> rw [hcv] at h
+    · exact nomatch h
+    · rename_i vc; cases vc with
+      | bool b => cases b <;> exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc _ env st v st' h
+      | u64 n => by_cases hn : n != 0 <;> simp only [hn, ↓reduceIte, Bool.false_eq_true] at h ⊢ <;>
+          exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc _ env st v st' h
+      | u256 w => by_cases hw : w != UInt256.zero <;>
+          simp only [hw, ↓reduceIte, Bool.false_eq_true] at h ⊢ <;>
+          exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc _ env st v st' h
+      | _ => exact nomatch h
+  | .seqFor idxVar loVar hiVar accVar accInit _ stepBody k, env, st, v, st', h => by
+    dsimp only [evalCodeRAux] at h ⊢
+    cases hlo : env loVar <;> cases hhi : env hiVar <;>
+      cases hain : env accInit <;> simp only [hlo, hhi, hain] at h <;> try contradiction
+    rename_i vlo vhi initVal
+    cases vlo <;> cases vhi <;>
+      simp only at h ⊢ <;> try contradiction
+    rename_i lo hi
+    have hloop := evalSeqLoop_mono_of_step_mono
+      (fun se ss => evalCodeRAux Φ budget c1 se ss stepBody)
+      (fun se ss => evalCodeRAux Φ (budget + 1) c2 se ss stepBody)
+      (fun se ss r hr => by
+        obtain ⟨a, b⟩ := r
+        exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc stepBody se ss a b hr)
+      idxVar accVar
+    cases hl : evalSeqLoop (hi.toNat - lo.toNat) lo.toNat idxVar accVar initVal env st
+        (fun se ss => evalCodeRAux Φ budget c1 se ss stepBody) with
+    | error _ => rw [hl] at h; exact nomatch h
+    | ok pr =>
+      rw [hl] at h; rw [hloop _ _ _ _ _ pr hl]
+      exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc k (env.bind accVar pr.1) pr.2 v st' h
+  | .parFor outVar lenVar inputs elemTy kernel k, env, st, v, st', h => by
+    dsimp only [evalCodeRAux] at h ⊢
+    cases hp : evalParFor budget env st lenVar inputs kernel elemTy with
+    | error _ => rw [hp] at h; exact nomatch h
+    | ok pr =>
+      rw [hp] at h
+      rw [evalParFor_fuel_mono budget (budget + 1) (Nat.le_succ _) env st lenVar inputs kernel
+        elemTy pr hp]
+      exact evalCodeRAux_fuel_mono Φ budget c1 c2 hc k (env.bind outVar pr.1) pr.2 v st' h
+  | .ret _, _, _, _, _, h => by
+    dsimp only [evalCodeRAux] at h ⊢; exact h
+  | .unreachable, _, _, _, _, h => by
+    dsimp only [evalCodeRAux] at h ⊢; exact h
+
+theorem evalCodeR_fuel_mono (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
+    (st : HeapState) (c : LNIRCode) (v : Val) (st' : HeapState) :
+    evalCodeR Φ fuel env st c = .ok (v, st') → evalCodeR Φ (fuel + 1) env st c = .ok (v, st') := by
+  induction fuel generalizing env st c v st' with
+  | zero =>
+    intro h
+    exact evalCodeRAux_fuel_mono Φ 0 none (some (evalCodeR Φ 0)) (fun _ h1 => nomatch h1)
+      c env st v st' h
+  | succ n ih =>
+    intro h
+    refine evalCodeRAux_fuel_mono Φ (n + 1) (some (evalCodeR Φ n)) (some (evalCodeR Φ (n + 1)))
+      ?_ c env st v st' h
+    intro f1 h1
+    injection h1 with h1
+    subst h1
+    exact ⟨_, rfl, fun env st code r hr => by obtain ⟨a, b⟩ := r; exact ih env st code a b hr⟩
+
+/-! ### Part I — the call rule, pinned as kernel equations -/
+
+theorem evalCodeR_call_fuel_zero (Φ : List LNIRDecl) (env : VarEnv) (st : HeapState)
+    (dst : VarId) (ty : LNIRType) (fn : String) (args : List VarId) (retTy : LNIRType)
+    (k : LNIRCode) (ld : LNIRDecl) (hlk : lookupFuncRec? Φ fn = some ld) :
+    evalCodeR Φ 0 env st (.letBind dst ty (.call fn args retTy false) k) =
+      .error .fuelExhausted := by
+  show evalCodeRAux Φ 0 none env st (.letBind dst ty (.call fn args retTy false) k) = _
+  dsimp only [evalCodeRAux]
+  rw [hlk]
+
+theorem evalCodeR_call_unfold (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
+    (st : HeapState) (dst : VarId) (ty : LNIRType) (fn : String) (args : List VarId)
+    (retTy : LNIRType) (k : LNIRCode) (ld : LNIRDecl)
+    (hlk : lookupFuncRec? Φ fn = some ld) :
+    evalCodeR Φ (fuel + 1) env st (.letBind dst ty (.call fn args retTy false) k) =
+      match evalVarList env args with
+      | .error e => .error e
+      | .ok vals =>
+        match evalCodeR Φ fuel
+            ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
+            st ld.body with
+        | .error e => .error e
+        | .ok (v, st') => evalCodeR Φ (fuel + 1) (env.bind dst v) st' k := by
+  show evalCodeRAux Φ (fuel + 1) (some (evalCodeR Φ fuel)) env st
+    (.letBind dst ty (.call fn args retTy false) k) = _
+  dsimp only [evalCodeRAux]
+  rw [hlk]
+  dsimp only
+  cases evalVarList env args with
+  | error e => rfl
+  | ok vals =>
+    dsimp only
+    cases evalCodeR Φ fuel ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val)
+        VarEnv.empty) st ld.body with
+    | error e => rfl
+    | ok p => rfl
+
+theorem evalStepR_localCall_unfold (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx))
+    (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
+    (decl : Lean.Compiler.LCNF.LetDecl .impure) (k : Lean.Compiler.LCNF.Code .impure)
+    (fn : Lean.Name) (args : Array (Lean.Compiler.LCNF.Arg .impure))
+    (sd : Lean.Compiler.LCNF.Decl .impure) (sdCtx : RealBridgeCtx)
+    (hval : decl.value = .fap fn args rfl)
+    (hloc : (ctx.findLocalCallee? fn).isSome = true)
+    (hlk : lookupDeclRec? Δ fn = some (sd, sdCtx)) :
+    evalStepR Δ (fuel + 1) ctx env st (.inl (.let decl k)) =
+      match evalArgs env.vals args.toList with
+      | .error e => .error e
+      | .ok vals =>
+        match sd.value with
+        | .extern _ => .error (.unsupportedCall fn.toString)
+        | .code c =>
+          match bindParams sdCtx true LEnv.empty sd.params.toList vals with
+          | .error e => .error e
+          | .ok env' =>
+            match evalStepR Δ fuel sdCtx env' st (.inl c) with
+            | .error e => .error e
+            | .ok (v, st') =>
+              evalStepR Δ fuel ctx
+                (env.bind decl.fvarId v none
+                  (some (if isUnboxedScalarOrTuple (lowerGroundImpureTypeWith ctx decl.type)
+                         then lowerGroundImpureTypeWith ctx decl.type else .i64)))
+                st' (.inl k) := by
+  rw [evalStepR.eq_def]
+  simp only [hval, hloc, hlk, ↓reduceIte]
+  rfl
+
+theorem evalStepR_localCall_miss (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx))
+    (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
+    (decl : Lean.Compiler.LCNF.LetDecl .impure) (k : Lean.Compiler.LCNF.Code .impure)
+    (fn : Lean.Name) (args : Array (Lean.Compiler.LCNF.Arg .impure))
+    (hval : decl.value = .fap fn args rfl)
+    (hloc : (ctx.findLocalCallee? fn).isSome = true)
+    (hlk : lookupDeclRec? Δ fn = none) :
+    evalStepR Δ (fuel + 1) ctx env st (.inl (.let decl k)) =
+      .error (.unsupportedCall fn.toString) := by
+  rw [evalStepR.eq_def]
+  simp only [hval, hloc, hlk, ↓reduceIte]
+
+/-! ### Part I — environment-extension conservativity -/
+
+theorem evalExpr_call_ok_reserved (env : VarEnv) (st : HeapState) (fn : String)
+    (args : List VarId) (retTy : LNIRType) (isExt : Bool) (r : Val × HeapState)
+    (h : evalExpr env st (.call fn args retTy isExt) = .ok r) :
+    reservedRuntimeCallee fn = true := by
+  cases hres : reservedRuntimeCallee fn with
+  | true => rfl
+  | false =>
+    exfalso
+    have hne : ∀ L : String, reservedRuntimeCallee L = true → (fn == L) = false := by
+      intro L hL
+      cases hb : (fn == L) with
+      | false => rfl
+      | true => rw [eq_of_beq hb] at hres; rw [hres] at hL; exact nomatch hL
+    dsimp only [evalExpr] at h
+    cases hvl : evalVarList env args with
+    | error _ => rw [hvl] at h; exact nomatch h
+    | ok vals =>
+      rw [hvl] at h
+      cases isExt
+      · simp only [Bool.false_eq_true, ↓reduceIte, Bool.or_false,
+          hne "lean_native_box_u64" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
+          hne "lean_native_unbox_u64" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
+          hne "lean_native_ensure_exclusive" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
+          hne "lean_native_sarray_len" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
+          hne "lean_mark_mt" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
+          hne "lean_native_ctor_set" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
+          hne "lean_native_ctor_set_scalar" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
+          hne "lean_native_ctor_set_tag" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
+          hne "lean_native_del_obj" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
+          hne "lean_native_ctor_tag" (by simp [reservedRuntimeCallee, reservedRuntimeName])] at h
+        all_goals exact nomatch h
+      · simp only [↓reduceIte] at h
+        all_goals exact nomatch h
+
+/-- One level of the call-free evaluator embeds into every level of the
+    recursion-capable one under an environment of unreserved names: every call the old
+    evaluator succeeds on names a reserved intrinsic, so no environment entry captures
+    it, and every other clause is the same clause. -/
+theorem evalCodeRAux_extend_of_ok (Φ : List LNIRDecl)
+    (hfresh : ∀ ld ∈ Φ, reservedRuntimeCallee ld.name = false) (budget : Nat)
+    (callee? : Option (VarEnv → HeapState → LNIRCode → Except UBError (Val × HeapState))) :
+    ∀ (c : LNIRCode) (env : VarEnv) (st : HeapState) (v : Val) (st' : HeapState),
+      evalCode budget env st c = .ok (v, st') →
+      evalCodeRAux Φ budget callee? env st c = .ok (v, st')
+  | .letBind dst ty val k, env, st, v, st', h => by
+    dsimp only [evalCode] at h
+    cases he : evalExpr env st val with
+    | error _ => rw [he] at h; exact nomatch h
+    | ok p =>
+      rw [he] at h
+      have ihk := evalCodeRAux_extend_of_ok Φ hfresh budget callee? k (env.bind dst p.1) p.2
+        v st' h
+      by_cases hcall : ∃ fn args retTy, val = .call fn args retTy false
+      · obtain ⟨fn, args, retTy, rfl⟩ := hcall
+        have hmiss : lookupFuncRec? Φ fn = none := by
+          cases hlk : lookupFuncRec? Φ fn with
+          | none => rfl
+          | some ld =>
+            obtain ⟨hm, hn⟩ := lookupFuncRec?_mem Φ fn ld hlk
+            have h1 := hfresh ld hm
+            rw [hn, evalExpr_call_ok_reserved env st fn args retTy false p he] at h1
+            exact nomatch h1
+        dsimp only [evalCodeRAux]
+        rw [hmiss]; dsimp only
+        rw [he]; exact ihk
+      · have hnc : ∀ fn args retTy, val ≠ .call fn args retTy false :=
+          fun fn args retTy heq => hcall ⟨fn, args, retTy, heq⟩
+        rw [evalCodeRAux_letBind_of_not_call hnc, he]
+        exact ihk
+  | .rawStore pv iv vv elemTy k, env, st, v, st', h => by
+    dsimp only [evalCode] at h; dsimp only [evalCodeRAux]
+    cases hp : env pv <;> cases hi : env iv <;>
+      cases hv : env vv <;> simp only [hp, hi, hv] at h <;> try contradiction
+    rename_i vp vi vv0
+    cases vp <;> cases vi <;>
+      cases vv0 <;> simp only at h ⊢ <;> try contradiction
+    all_goals (
+      rename_i bufId idx val
+      cases hw : st.writeElemExclusive bufId idx.toNat (maskElemVal elemTy val) <;>
+        simp only [hw] at h ⊢
+      · contradiction
+      · rename_i st1; exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? k env st1 v st' h)
+  | .incRef ov cnt k, env, st, v, st', h => by
+    dsimp only [evalCode] at h; dsimp only [evalCodeRAux]
+    cases he : st.evalIncRef env ov cnt with
+    | error _ => rw [he] at h; exact nomatch h
+    | ok st1 =>
+      rw [he] at h; exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? k env st1 v st' h
+  | .decRef ov cnt k, env, st, v, st', h => by
+    dsimp only [evalCode] at h; dsimp only [evalCodeRAux]
+    cases he : st.evalDecRef env ov cnt with
+    | error _ => rw [he] at h; exact nomatch h
+    | ok st1 =>
+      rw [he] at h; exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? k env st1 v st' h
+  | .ite cv t e, env, st, v, st', h => by
+    dsimp only [evalCode] at h; dsimp only [evalCodeRAux]
+    cases hcv : env cv <;> rw [hcv] at h
+    · exact nomatch h
+    · rename_i vc; cases vc with
+      | bool b => cases b <;> exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? _ env st v st' h
+      | u64 n => by_cases hn : n != 0 <;> simp only [hn, ↓reduceIte, Bool.false_eq_true] at h ⊢ <;>
+          exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? _ env st v st' h
+      | u256 w => by_cases hw : w != UInt256.zero <;>
+          simp only [hw, ↓reduceIte, Bool.false_eq_true] at h ⊢ <;>
+          exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? _ env st v st' h
+      | _ => exact nomatch h
+  | .seqFor idxVar loVar hiVar accVar accInit _ stepBody k, env, st, v, st', h => by
+    dsimp only [evalCode] at h; dsimp only [evalCodeRAux]
+    cases hlo : env loVar <;> cases hhi : env hiVar <;>
+      cases hain : env accInit <;> simp only [hlo, hhi, hain] at h <;> try contradiction
+    rename_i vlo vhi initVal
+    cases vlo <;> cases vhi <;>
+      simp only at h ⊢ <;> try contradiction
+    rename_i lo hi
+    have hloop := evalSeqLoop_mono_of_step_mono
+      (fun se ss => evalCode budget se ss stepBody)
+      (fun se ss => evalCodeRAux Φ budget callee? se ss stepBody)
+      (fun se ss r hr => by
+        obtain ⟨a, b⟩ := r
+        exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? stepBody se ss a b hr)
+      idxVar accVar
+    cases hl : evalSeqLoop (hi.toNat - lo.toNat) lo.toNat idxVar accVar initVal env st
+        (fun se ss => evalCode budget se ss stepBody) with
+    | error _ => rw [hl] at h; exact nomatch h
+    | ok pr =>
+      rw [hl] at h; rw [hloop _ _ _ _ _ pr hl]
+      exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? k (env.bind accVar pr.1) pr.2 v st' h
+  | .parFor outVar lenVar inputs elemTy kernel k, env, st, v, st', h => by
+    dsimp only [evalCode] at h; dsimp only [evalCodeRAux]
+    cases hp : evalParFor budget env st lenVar inputs kernel elemTy with
+    | error _ => rw [hp] at h; exact nomatch h
+    | ok pr =>
+      rw [hp] at h
+      exact evalCodeRAux_extend_of_ok Φ hfresh budget callee? k (env.bind outVar pr.1) pr.2 v st' h
+  | .ret _, _, _, _, _, h => by
+    dsimp only [evalCode] at h; dsimp only [evalCodeRAux]; exact h
+  | .unreachable, _, _, _, _, h => by
+    dsimp only [evalCode] at h; dsimp only [evalCodeRAux]; exact h
+
+theorem evalCodeR_extend_of_ok (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
+    (st : HeapState) (c : LNIRCode) (v : Val) (st' : HeapState)
+    (hfresh : ∀ ld ∈ Φ, reservedRuntimeCallee ld.name = false)
+    (h : evalCode fuel env st c = .ok (v, st')) :
+    evalCodeR Φ fuel env st c = .ok (v, st') := by
+  cases fuel with
+  | zero => exact evalCodeRAux_extend_of_ok Φ hfresh 0 none c env st v st' h
+  | succ n =>
+    exact evalCodeRAux_extend_of_ok Φ hfresh (n + 1) (some (evalCodeR Φ n)) c env st v st' h
+
+theorem DeclEnvLowersR.fresh
+    (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) (Φ : List LNIRDecl)
+    (h : DeclEnvLowersR Δ Φ) :
+    ∀ ld ∈ Φ, reservedRuntimeCallee ld.name = false := by
+  induction Δ generalizing Φ with
+  | nil =>
+    cases Φ with
+    | nil => intro ld hm; exact nomatch hm
+    | cons _ _ => exact nomatch h
+  | cons e Δ ih =>
+    obtain ⟨sd, ctx, fuel⟩ := e
+    cases Φ with
+    | nil => exact nomatch h
+    | cons ld0 Φ =>
+      obtain ⟨_, _, hres, _, htail⟩ := h
+      intro ld hm
+      cases hm with
+      | head => exact hres
+      | tail _ hm => exact ih Φ htail ld hm
+
+theorem lowerRealLCNFDecl_soundR_base (fuel : Nat) (ctx : RealBridgeCtx)
+    (Φ : List LNIRDecl)
+    (decl : Lean.Compiler.LCNF.Decl .impure) (args : List Val) (hst hst' : HeapState)
+    (v : Val) (d : LNIRDecl) (mangled : String)
+    (hfresh : ∀ ld ∈ Φ, reservedRuntimeCallee ld.name = false)
+    (h_lower : lowerRealLCNFDecl fuel ctx decl mangled = .ok d)
+    (h_eval : evalRealLCNFDecl fuel ctx decl args hst = .ok (v, hst')) :
+    evalCodeR Φ fuel
+      ((d.params.zip args).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
+      hst d.body = .ok (v, hst') :=
+  evalCodeR_extend_of_ok Φ fuel _ hst d.body v hst' hfresh
+    (lowerRealLCNFDecl_sound fuel ctx decl args hst hst' v d mangled h_lower h_eval)
+
+/-! ### Part I — fail-closed honesty for recursive join points (pinned files, unedited) -/
+
+theorem evalStep_recursive_jp_unsupported (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv)
+    (st : HeapState) (decl : Lean.Compiler.LCNF.FunDecl .impure)
+    (k : Lean.Compiler.LCNF.Code .impure)
+    (h : hasJmpToPure fuel decl.fvarId (.inl decl.value) = true) :
+    evalStep (fuel + 1) ctx env st (.inl (.jp decl k)) =
+      .error (.unsupportedCall "recursive join point") := by
+  rw [evalStep.eq_def]
+  simp only [h, ↓reduceIte]
+
+theorem lowerImpureStepPure_recursive_jp_rejected (fuel : Nat) (ctx : RealBridgeCtx)
+    (st : RealBridgeState) (decl : Lean.Compiler.LCNF.FunDecl .impure)
+    (k : Lean.Compiler.LCNF.Code .impure)
+    (h : hasJmpToPure fuel decl.fvarId (.inl decl.value) = true) :
+    lowerImpureStepPure (fuel + 1) ctx st (.inl (.jp decl k)) =
+      .error s!"[lean-native] unsupported recursive join point `{decl.fvarId.name}`: no qualified loop lowering" := by
+  rw [lowerImpureStepPure.eq_def]
+  simp only [h, ↓reduceIte]
+
+end LeanNative.Proofs
