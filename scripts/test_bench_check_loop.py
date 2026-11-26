@@ -1597,6 +1597,27 @@ class CliFlags(unittest.TestCase):
             argv = runner.check_argv(mod.WORKLOADS[0], Path(td), Path(td) / "f.lean")
         self.assertEqual(argv[argv.index("--timeout") + 1], str(mod.CHECK_TIMEOUT_S))
 
+    def test_a_timed_out_check_keeps_the_stderr_it_wrote_first(self):
+        # TimeoutExpired carries the partial stderr as bytes, whatever `text=` said.
+        mod = load_script()
+        runner = self._make_runner(mod, self._runner_args())
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            stub = root / "slow-turbo-lean"
+            stub.write_text("#!/usr/bin/env python3\n"
+                            "import sys, time\n"
+                            "sys.stderr.write('partial stderr\\n')\n"
+                            "sys.stderr.flush()\n"
+                            "time.sleep(30)\n")
+            stub.chmod(0o755)
+            with mock.patch.object(runner, "check_argv", return_value=[str(stub)]), \
+                    mock.patch.object(runner, "trial_env", return_value=dict(os.environ)), \
+                    mock.patch.object(runner, "source_path", return_value=root / "f.lean"):
+                r = runner.run_check(mod.WORKLOADS[0], root, root, root, True, timeout_s=1)
+        self.assertEqual(r["exit_code"], -1)
+        self.assertIn("partial stderr", r["stderr"])
+        self.assertIn("timeout after 1s", r["stderr"])
+
     def test_only_workloads_unknown_name_exits_2(self):
         mod = load_script()
         with self.assertRaises(SystemExit) as cm:

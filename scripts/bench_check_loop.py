@@ -247,6 +247,15 @@ def host_path_roots(scratch, dirs, bin_path, git_bin) -> list:
     return roots + [(os.path.realpath(r), p) for r, p in roots if os.path.isabs(r)]
 
 
+def _decode_partial(v) -> str:
+    """Text of the partial output a TimeoutExpired carries (bytes, str or None)."""
+    if v is None:
+        return ""
+    if isinstance(v, bytes):
+        return v.decode("utf-8", "replace")
+    return v
+
+
 def remove_tree(root) -> None:
     """Remove a directory the bench made, read-only directories included.
 
@@ -1481,7 +1490,9 @@ class Runner:
                                   timeout=timeout_s)
             rc, out, err = proc.returncode, proc.stdout, proc.stderr
         except subprocess.TimeoutExpired as e:
-            rc, out, err = -1, e.stdout or "", (e.stderr or "") + f"\ntimeout after {timeout_s}s"
+            # TimeoutExpired carries bytes (or None) whatever `text=True` said.
+            rc, out = -1, _decode_partial(e.stdout)
+            err = _decode_partial(e.stderr) + f"\ntimeout after {timeout_s}s"
         wall_ms = (time.perf_counter_ns() - t0) / 1e6
         psi_after = sample_psi()
         parsed = parse_check_json(out or "")
