@@ -1,4 +1,6 @@
 import LeanNative.Proofs.RealLCNFBridge.CtorScalarCall
+import LeanNative.Proofs.SymbolicTVRefinesSoundness
+import LeanNative.IR.BridgeHelpers.RealBridgeCtxAndSlices
 
 namespace LeanNative.Proofs
 
@@ -620,5 +622,52 @@ theorem lowerRealLCNFDecl_sound (fuel : Nat) (ctx : RealBridgeCtx)
           (internRealParams_sound ctx decl.params.toList args {} LEnv.empty lenv VarEnv.empty bridgeInv_empty hbp)
           hlc h_eval
 
+
+private theorem runSymbolicValidatedDecl_some_eq (propose : LNIRDecl → LNIRDecl)
+    (d d' : LNIRDecl) (h : runSymbolicValidatedDecl propose d = some d') :
+    d' = propose d := by
+  unfold runSymbolicValidatedDecl at h
+  dsimp only at h
+  cases hgate : (d.checkElemTypes.isNone && (propose d).checkElemTypes.isNone &&
+      symbolicCodeRefines d.body (propose d).body)
+  · rw [hgate] at h; cases h
+  · rw [hgate] at h
+    simp only [↓reduceIte, Option.some.injEq] at h
+    exact h.symm
+
+/-- L1 (`roadmap/HORIZONS.md` rung L1): the driver post-pass never changes the parameter
+    list, and its output body refines the proved lowering's body — a compression candidate
+    is taken only through the kernel-proved `runSymbolicValidatedDecl` gate. -/
+theorem applyValidatedCompression_refines (d : LNIRDecl) (cand : LNIRCode) :
+    (applyValidatedCompression d cand).params = d.params ∧
+    CodeRefines d.body (applyValidatedCompression d cand).body := by
+  unfold LeanNative.IR.applyValidatedCompression
+  split
+  · exact ⟨rfl, CodeRefines.refl d.body⟩
+  · split
+    next d' hrun =>
+      have he := runSymbolicValidatedDecl_some_eq _ d d' hrun
+      subst he
+      exact ⟨rfl, symbolicValidatedDeclOpt_sound _ d _ hrun⟩
+    next => exact ⟨rfl, CodeRefines.refl d.body⟩
+
+/-- L1 headline (`roadmap/HORIZONS.md` rung L1): soundness of the lowering pipeline the
+    driver runs — `lowerRealLCNFDecl` composed with the checker-gated compression post-pass
+    (`applyValidatedCompression`) — stated for every context the driver builds
+    (`evalRealLCNFDecl` reads the same `ctx`) and every candidate the producer proposes.
+    Forward simulation on successful runs. -/
+theorem lowerRealLCNFDecl_driver_sound (fuel : Nat) (ctx : RealBridgeCtx)
+    (decl : Lean.Compiler.LCNF.Decl .impure) (args : List Val) (hst hst' : HeapState)
+    (v : Val) (d : LNIRDecl) (mangled : String) (cand : LNIRCode)
+    (h_lower : lowerRealLCNFDecl fuel ctx decl mangled = .ok d)
+    (h_eval : evalRealLCNFDecl fuel ctx decl args hst = .ok (v, hst')) :
+    evalCode fuel
+      (((applyValidatedCompression d cand).params.zip args).foldl
+        (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
+      hst (applyValidatedCompression d cand).body = .ok (v, hst') := by
+  obtain ⟨hp, href⟩ := applyValidatedCompression_refines d cand
+  rw [hp]
+  exact href fuel _ hst v hst'
+    (lowerRealLCNFDecl_sound fuel ctx decl args hst hst' v d mangled h_lower h_eval)
 
 end LeanNative.Proofs

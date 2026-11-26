@@ -1,4 +1,5 @@
 import LeanNative.IR.BridgeHelpers.HeapAndConstructors
+import LeanNative.Proofs.SymbolicTVRefinesDefs
 
 set_option autoImplicit true
 
@@ -518,6 +519,32 @@ def extractPureDeclFactsWithBridgeState (decl : Lean.Compiler.LCNF.Decl .pure)
   let merged := facts.foldl LeanNative.IR.consFact d.retainedFacts
   { d with retainedFacts := merged }
 
+/-- Effective return type of a compression candidate: the returned tuple shape when the body
+    returns a freshly built tuple, the base declaration's `retTy` otherwise. -/
+def compressedBodyRetTy (retTy : LNIRType) (cand : LNIRCode) : LNIRType :=
+  match inferReturnedType cand with
+  | some (.tuple fs) => .tuple fs
+  | _ => retTy
+
+/-- L1 single-path driver post-pass (`roadmap/HORIZONS.md` rung L1): accept the untrusted
+    compression candidate `cand` for `d.body` only when the total, kernel-proved refinement
+    checker admits it — `LeanNative.Proofs.runSymbolicValidatedDecl`, the Contract-V2
+    `VerifiedTVPassContract` gate, backed by `symbolicValidatedDeclOpt_sound`; otherwise
+    return `d` unchanged. `params` are never changed
+    (`LeanNative.Proofs.applyValidatedCompression_refines`). -/
+def applyValidatedCompression (d : LNIRDecl) (cand : LNIRCode) : LNIRDecl :=
+  if cand == d.body then d
+  else
+    match LeanNative.Proofs.runSymbolicValidatedDecl
+        (fun d0 => { d0 with
+          body := cand
+          retTy := compressedBodyRetTy d0.retTy cand
+          assurance := AssuranceLevel.combine d0.assurance .translationValidated
+          isGpuCand := d0.params.all (fun p => p.ty.isGpuCompatible) &&
+            (compressedBodyRetTy d0.retTy cand).isGpuCompatible }) d with
+    | some d' => d'
+    | none => d
+
 /-- Delegate `Decl .impure` lowering directly to `RealLCNFBridge.lowerRealLCNFDecl` (backed by `lowerRealLCNFDecl_sound`). -/
 def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64)
@@ -603,22 +630,9 @@ def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
           varTypes := endVarTypes.foldl (fun m (v, t) => m.insert v t) s.varTypes
           nextVarId := max s.nextVarId (nextAfter + 4) }
         let compressedCand ← compressScalarCode d.body
-        let candRetTy := match inferReturnedType compressedCand with | some (.tuple fs) => .tuple fs | _ => d.retTy
-        let baseRetTy := match inferReturnedType d.body with | some (.tuple fs) => .tuple fs | _ => d.retTy
-        let baseDecl : LNIRDecl := { d with retTy := baseRetTy }
-        let candDecl : LNIRDecl := { d with body := compressedCand, retTy := candRetTy }
-        let useCompressed :=
-          compressedCand != d.body && (LeanNative.Proofs.validateTranslationDecl baseDecl candDecl 64).passed
-        let finalBody := if useCompressed then compressedCand else d.body
-        let effRetTy := if useCompressed then candRetTy else baseRetTy
-        let effAssurance :=
-          if useCompressed then AssuranceLevel.combine d.assurance .translationValidated else d.assurance
-        let dOut : LNIRDecl := { d with
-          body := finalBody
-          retTy := effRetTy
-          assurance := effAssurance
-          isGpuCand := d.params.all (fun p => p.ty.isGpuCompatible) && effRetTy.isGpuCompatible }
-        attachBaseDeclFactsM decl.name dOut
+        -- L1: one lowering callee; the only post-pass is the kernel-proved-checker-gated
+        -- compression (`applyValidatedCompression`, `lowerRealLCNFDecl_driver_sound`).
+        attachBaseDeclFactsM decl.name (applyValidatedCompression d compressedCand)
       | .error msg => Lean.throwError msg
   Prod.fst <$> action.run initSt
 
