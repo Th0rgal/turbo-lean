@@ -391,3 +391,214 @@ fn cli_check_runs_dependent_recheck_and_fails_on_broken_importer() {
         String::from_utf8_lossy(&c_decl_allow.stderr)
     );
 }
+
+/// Asserts that `check` failed and, if it printed a JSON report, that the report does not claim success.
+fn assert_allow_sorry_rejected(out: &Output, what: &str) {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "{what} must be rejected; stdout={stdout} stderr={stderr}"
+    );
+    for forbidden in [
+        "verified_modulo_sorry",
+        "file_verified",
+        "theorem_verified",
+        "theorem_cache_hit",
+        "decl_sorry",
+    ] {
+        assert!(
+            !stdout.contains(forbidden),
+            "{what} was rejected but its report claims `{forbidden}`: {stdout}"
+        );
+    }
+}
+
+/// A zero-sorry file whose trailing `def` does not elaborate must fail `check --allow-sorry` and must
+/// never be reported as `file_verified`.
+///
+/// Ported from #342 (its P0-2 case). RED at this tree's tip: `--allow-sorry` runs the theorem shards
+/// only (`mode: modulo_sorry_shards`) and reports `file_verified`, exit 0, for
+/// `def brokenTrailing : Nat := "not_a_nat"`. The same file with an added `sorry` theorem is rejected.
+/// `check --decl <thm> --allow-sorry` has the same hole (#342 P2). Ignored until the module-skeleton
+/// check from #342 is carried; run with `--ignored` to see it fail.
+#[test]
+#[ignore = "known gap: check --allow-sorry certifies a file with a broken trailing def when no theorem uses sorry (#342 P0-2/P2, not carried)"]
+fn cli_allow_sorry_rejects_zero_sorry_file_with_broken_trailing_def() {
+    if !lean_available() {
+        return;
+    }
+    let ws = TestWorkspace::new("allow_sorry_zero");
+    fs::write(
+        ws.proj().join("W8/Partial.lean"),
+        "theorem clean_one : 1 + 1 = 2 := rfl\n\
+         def brokenTrailing : Nat := \"not_a_nat\"\n",
+    )
+    .unwrap();
+    for run in 0..2 {
+        let out = ws.run(&["--json", "check", "W8/Partial.lean", "--allow-sorry"]);
+        assert_allow_sorry_rejected(
+            &out,
+            &format!("zero-sorry file with broken trailing def (run {run})"),
+        );
+    }
+    let decl = ws.run(&[
+        "--json",
+        "check",
+        "W8/Partial.lean",
+        "--decl",
+        "clean_one",
+        "--allow-sorry",
+    ]);
+    assert_allow_sorry_rejected(&decl, "check --decl --allow-sorry with a broken trailing def");
+}
+
+/// `check --decl <thm> --allow-sorry` must reject `sorry` in a non-theorem `def` outside the theorem
+/// shards, even when `<thm>` does not reference it.
+///
+/// Ported from #342 (its P1-3 case). RED at this tree's tip: the decl check reports success for
+/// `clean_target` next to `def sneakyBad : Nat := sorry`. Ignored until the maintainers decide whether
+/// this tree's `--decl --allow-sorry` contract (sorry only in theorem shards) should include defs.
+#[test]
+#[ignore = "known difference: check --decl --allow-sorry accepts sorry in an unrelated def (#342 P1-3, not carried)"]
+fn cli_allow_sorry_decl_rejects_def_sorry_outside_theorem_shards() {
+    if !lean_available() {
+        return;
+    }
+    let ws = TestWorkspace::new("allow_sorry_def");
+    fs::write(
+        ws.proj().join("W8/DefSorry.lean"),
+        "def sneakyBad : Nat := sorry\n\ntheorem clean_target : 3 + 3 = 6 := rfl\n",
+    )
+    .unwrap();
+    let out = ws.run(&[
+        "--json",
+        "check",
+        "W8/DefSorry.lean",
+        "--decl",
+        "clean_target",
+        "--allow-sorry",
+    ]);
+    assert_allow_sorry_rejected(&out, "check --decl --allow-sorry with `def ... := sorry`");
+}
+
+/// `check --allow-sorry` rejects a broken trailing `def` after a `sorry` theorem, permits a sorry sibling
+/// when checking a clean declaration, and never reports a clean verdict or leaves a strict-check cache
+/// entry for `sorry` inside a theorem statement.
+///
+/// Ported from the owner's closed draft PR #342, with the assertions rewritten against this tree's
+/// `check --allow-sorry --json` report (`status`, `allow_sorry`, `used_sorry`). The two #342 cases this
+/// tree does not satisfy are the ignored tests above.
+#[test]
+fn cli_allow_sorry_rejects_broken_def_after_sorry_and_never_caches_statement_sorry() {
+    if !lean_available() {
+        return;
+    }
+    let ws = TestWorkspace::new("allow_sorry");
+    let proj = ws.proj();
+
+    // 1) A broken trailing `def` after a clean theorem and a `sorry` theorem fails `--allow-sorry`,
+    //    on the first run and again on the second (a rejected file is never cached).
+    fs::write(
+        proj.join("W8/Partial.lean"),
+        "theorem clean_one : 1 + 1 = 2 := rfl\n\
+         theorem wip_one : 2 + 2 = 4 := by\n\
+           sorry\n\
+         def brokenTrailing : Nat := \"not_a_nat\"\n",
+    )
+    .unwrap();
+    for run in 0..2 {
+        let out = ws.run(&["--json", "check", "W8/Partial.lean", "--allow-sorry"]);
+        assert_allow_sorry_rejected(&out, &format!("sorry file with broken trailing def (run {run})"));
+    }
+
+    // (A zero-sorry file with a broken trailing `def` is pinned separately, below.)
+
+    // 3) (`def ... := sorry` outside theorem shards is pinned separately, above.)
+    //
+    // A sibling `theorem` with `sorry` is allowed when checking `clean_target` under `--allow-sorry`.
+    fs::write(
+        proj.join("W8/ThmSorry.lean"),
+        "theorem wip_sibling : 1 = 1 := by\n  sorry\n\ntheorem clean_target : 3 + 3 = 6 := rfl\n",
+    )
+    .unwrap();
+    let out4 = ws.run(&[
+        "--json",
+        "check",
+        "W8/ThmSorry.lean",
+        "--decl",
+        "clean_target",
+        "--allow-sorry",
+    ]);
+    assert!(
+        out4.status.success(),
+        "a sibling theorem with sorry must permit checking clean_target: stdout={} stderr={}",
+        String::from_utf8_lossy(&out4.stdout),
+        String::from_utf8_lossy(&out4.stderr)
+    );
+    let j4: Value = serde_json::from_slice(&out4.stdout).expect("valid JSON");
+    assert_eq!(j4["allow_sorry"], true, "{j4}");
+    assert!(
+        j4["status"]
+            .as_str()
+            .is_some_and(|s| s == "theorem_verified" || s == "verified_modulo_sorry"),
+        "unexpected status for clean_target next to a sorry sibling: {j4}"
+    );
+
+    // 4) (A broken trailing `def` next to `--decl` is pinned separately, above.)
+    //
+    // 5) `sorry` inside theorem signatures or statements, and a same-line `def bad := sorry; theorem ...`,
+    //    are rejected for the whole file and for each declaration, and never reported as verified.
+    for (file_name, bad_src, decls) in [
+        (
+            "W8/StmtParamSorry.lean",
+            "theorem t1 (h : False := sorry) : False := h\ntheorem clean_false : False := t1\n",
+            &["t1", "clean_false"][..],
+        ),
+        (
+            "W8/StmtTypeSorry.lean",
+            "theorem t1 : sorry := trivial\n",
+            &["t1"][..],
+        ),
+        (
+            "W8/SameLineDefSorry.lean",
+            "def bad : Nat := sorry; theorem ok : True := trivial\n",
+            &["ok"][..],
+        ),
+    ] {
+        fs::write(proj.join(file_name), bad_src).unwrap();
+        let whole = ws.run(&["--json", "check", file_name, "--allow-sorry"]);
+        assert_rejected_or_modulo_sorry(&whole, &format!("check {file_name} --allow-sorry"));
+        for d in decls {
+            let decl_out = ws.run(&["--json", "check", file_name, "--decl", d, "--allow-sorry"]);
+            assert_rejected_or_modulo_sorry(
+                &decl_out,
+                &format!("check {file_name} --decl {d} --allow-sorry"),
+            );
+            // Whatever `--allow-sorry` reported, the strict check must not find the declaration cached.
+            let strict = ws.run(&["--json", "check", file_name, "--decl", d]);
+            assert!(
+                !strict.status.success(),
+                "strict check {file_name} --decl {d} must fail after --allow-sorry; stdout={}",
+                String::from_utf8_lossy(&strict.stdout)
+            );
+        }
+    }
+}
+
+/// This tree reports `sorry` inside a theorem statement honestly as `verified_modulo_sorry` with
+/// `used_sorry: true` where #342 rejected it outright. Either is fine; a clean-looking verdict is not.
+fn assert_rejected_or_modulo_sorry(out: &Output, what: &str) {
+    if !out.status.success() {
+        assert_allow_sorry_rejected(out, what);
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let j: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{what}: exit 0 without a JSON report ({e}): {stdout}"));
+    assert_eq!(
+        j["status"], "verified_modulo_sorry",
+        "{what} succeeded with a clean-looking verdict: {stdout}"
+    );
+    assert_eq!(j["used_sorry"], true, "{what}: used_sorry must be true: {stdout}");
+}
