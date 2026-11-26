@@ -89,7 +89,12 @@
 
 1. `RealLCNFSemantics` agrees with Lean's own evaluation — differential test not landed (`H1.1`,
    acceptance `mismatch_count == 0`; no such test result exists yet).
-2. The H1 theorem statement is not frozen or hash-pinned yet (`H1.F` is an open leaf).
+2. The H1 theorem statement is frozen and hash-pinned (`H1.F`, w-h1f 2026-11-26):
+   `lean/LeanNative/SpecLocked.lean` restates `lowerRealLCNFDecl_sound` verbatim (proved by
+   delegation), and an in-file `#eval` gate fails every `lake build` of the `LeanNative` library
+   unless the live `ConstantInfo.type` structurally equals the frozen copy (modulo the documented
+   per-declaration matcher renaming) and its `Expr.hash` equals the pinned `306234630` (measured
+   on v4.35.0); the file-level SHA-256 is recorded in the freezing commit.
 3. No generated coverage matrix exists yet (`H1.0` is an open leaf; no JSON is committed).
 4. The `Contract V4 M2`/`M3` theorems are stated over the in-repo `"OLEN"` v1 model — `ConLeche.lean`
    says so in-file (`lean/TurboLean/ConLeche.lean:7,12`: "binary `"OLEN"` v1 … shard model format,
