@@ -43,6 +43,11 @@ Honesty rules (matching `scripts/lcnf_coverage.py`)
 - The selection is deterministic (sorted enumeration, fixed quotas, greedy
   rounds); re-running `--write` against the pinned checkout reproduces the
   committed manifest byte for byte.
+- Only import-free (self-contained) pile files are candidates: the suite leg
+  elaborates each program standalone, and import-bearing files fail
+  elaboration outright at the pin (measured 2026-11-26: the five
+  tests/elab/bv_*.lean importing Std.Tactic.BVDecide), which the hardened leg
+  records as `frontend_error`, never as an expected rejection.
 """
 from __future__ import annotations
 
@@ -193,6 +198,14 @@ def enumerate_candidates(corpus_root: Path) -> list[dict[str, Any]]:
             if len(raw) > MAX_PROGRAM_BYTES:
                 continue
             text = raw.decode("utf-8", errors="replace")
+            if _IMPORT_RE.search(text) is not None:
+                # The suite leg elaborates each program standalone, so only
+                # self-contained (import-free) pile files are candidates.
+                # Measured at the pin: import-bearing files (the five
+                # tests/elab/bv_*.lean importing Std.Tactic.BVDecide) fail
+                # elaboration outright, which the hardened leg records as
+                # frontend_error, not as an expected rejection.
+                continue
             cands.append(
                 {
                     "path": f"{pile}/{fp.name}",
@@ -345,6 +358,9 @@ def verify_manifest(
             break
         if not re.fullmatch(r"[0-9a-f]{64}", p.get("sha256", "")):
             reasons.append(f"{path!r} has no well-formed sha256")
+            break
+        if p.get("importFree") is not True:
+            reasons.append(f"{path!r} is not import-free; the leg elaborates programs standalone")
             break
         if not p.get("matrixConstructs") or not set(p["matrixConstructs"]) <= set(TARGET_STATUS):
             reasons.append(f"{path!r} has empty or unknown matrixConstructs")
@@ -543,6 +559,22 @@ class C1CorpusManifestSelfTest(unittest.TestCase):
             red2 = verify_manifest(mp, expect_program_count=bad_cov["programCount"])
             self.assertFalse(red2["ok"])
             self.assertTrue(any("no covering program" in r for r in red2["reasons"]), red2["reasons"])
+
+    def test_import_bearing_files_are_not_candidates(self):
+        # The leg elaborates each program standalone; a file importing beyond
+        # the prelude (measured: the five tests/elab/bv_*.lean importing
+        # Std.Tactic.BVDecide all fail elaboration outright at the pin) is not
+        # a self-contained run test and never enters the candidate set.
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="c1x_imp_") as tmp:
+            root = self._synth_corpus(Path(tmp))
+            (root / "tests/elab/synth_imports.lean").write_text(
+                "import Std.Tactic.BVDecide\ndef si2 : Int8 := 2\n", encoding="utf-8"
+            )
+            paths = [c["path"] for c in enumerate_candidates(root)]
+            self.assertNotIn("tests/elab/synth_imports.lean", paths)
+            self.assertIn("tests/elab/synth_scalar.lean", paths)
 
     def test_fill_step_skips_constructless_candidates(self):
         # R6: the fill step never pads the corpus with a candidate carrying no

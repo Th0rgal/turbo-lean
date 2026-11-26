@@ -2,12 +2,12 @@
   "categoriesNote": "matrixConstructs/emphasis are syntactic selection markers (regexes over program source), chosen to exercise the lowered_unproved and rejected rows of the LCNF coverage matrix; they are not executed-lowering measurements. The executed classification is recorded per program by run_conformance_suite.py --tier C1.",
   "emphasis": {
     "array_bytearray_sharing": {
-      "count": 66,
+      "count": 67,
       "pattern": "\\b(?:Array|ByteArray)\\b",
       "required": 30
     },
     "closures": {
-      "count": 162,
+      "count": 171,
       "pattern": "(?:\\bfun\\b|\u03bb)",
       "required": 40
     },
@@ -17,14 +17,14 @@
       "required": 30
     },
     "pap_partial_application": {
-      "count": 97,
+      "count": 103,
       "pattern": "\\.(?:map|foldl|foldr|filter)\\b|\\(\u00b7",
       "required": 30
     },
     "signed_int_scalars": {
-      "count": 27,
+      "count": 13,
       "pattern": "\\b(?:Int(?:8|16|32|64)|ISize)\\b",
-      "required": 27
+      "required": 13
     }
   },
   "excludedTargets": {
@@ -131,6 +131,25 @@
       ],
       "path": "tests/compile/arrayMk.lean",
       "sha256": "b00cba3126381c6351bd0a8d4a363fe7d7b78e33a62a8a6ecdbe4a2cec348fcb"
+    },
+    {
+      "bytes": 1237,
+      "emphasis": [
+        "closures",
+        "pap_partial_application",
+        "array_bytearray_sharing"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.ctor.general",
+        "LetValue.pap",
+        "LetValue.reset_reuse",
+        "LetValue.const",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/compile/array_test.lean",
+      "sha256": "f4a54c70cea13fe6b7c5ced7e0a80fcbce5ad3b0f601571e7c4a029786096360"
     },
     {
       "bytes": 449,
@@ -796,6 +815,23 @@
       "sha256": "0456e44d131ea1a9db0407f8ab3c85cb3d62cb9a0a1dd169413fb42d67f81b63"
     },
     {
+      "bytes": 1309,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.lit.str",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.const",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/28.lean",
+      "sha256": "6b5465d9bc6f4fe7916f42af215aa5e4dc87d179849d139e04916be1bf134111"
+    },
+    {
       "bytes": 280,
       "emphasis": [
         "pap_partial_application"
@@ -880,6 +916,23 @@
       ],
       "path": "tests/elab/4171.lean",
       "sha256": "97d13f95f8b83f674cbe859b390898b9c32b674a4b856d6653693b22248e1c46"
+    },
+    {
+      "bytes": 840,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.fap.general",
+        "LetValue.const",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/4320.lean",
+      "sha256": "e547f3e54aafb767824427dfa2d92978fa51e383dafe348c567bc8a65c3c0ea2"
     },
     {
       "bytes": 136,
@@ -1206,6 +1259,23 @@
       "sha256": "c98cb231d7a3090edb5e25ddbb66f159a145c532559ba9f74b719abfbca1ba6a"
     },
     {
+      "bytes": 1038,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.lit.str",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.const",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/MonadControl_tutorial.lean",
+      "sha256": "caad7e927c89c9814c40d795a32afeb323208accd18d572fbafb91acdba48d95"
+    },
+    {
       "bytes": 10384,
       "emphasis": [
         "closures",
@@ -1319,72 +1389,6 @@
       ],
       "path": "tests/elab/binsearch.lean",
       "sha256": "aa19a201c247fd99734d107ca2970c94adbeea5283d193f11a7345aee837b974"
-    },
-    {
-      "bytes": 1618,
-      "emphasis": [
-        "signed_int_scalars"
-      ],
-      "importFree": false,
-      "matrixConstructs": [
-        "Type.signed_scalars",
-        "LetValue.const"
-      ],
-      "path": "tests/elab/bv_minmax.lean",
-      "sha256": "0308304d6c9712522d786d78912f8d54f72447ca59f01f1dd93550da2b0e4068"
-    },
-    {
-      "bytes": 2543,
-      "emphasis": [
-        "signed_int_scalars"
-      ],
-      "importFree": false,
-      "matrixConstructs": [
-        "Type.signed_scalars",
-        "LetValue.const"
-      ],
-      "path": "tests/elab/bv_sint.lean",
-      "sha256": "1f775b8eccd1c960161c3bf7666545c922b3adaa9924d0256b1b46c91de30d4e"
-    },
-    {
-      "bytes": 2827,
-      "emphasis": [
-        "signed_int_scalars"
-      ],
-      "importFree": false,
-      "matrixConstructs": [
-        "LetValue.ctor.general",
-        "Type.signed_scalars"
-      ],
-      "path": "tests/elab/bv_structures.lean",
-      "sha256": "de085c2604d1acb64ec285b89b5db2805d4cec94625b51eb194b17a2ca9f562e"
-    },
-    {
-      "bytes": 4052,
-      "emphasis": [
-        "signed_int_scalars"
-      ],
-      "importFree": false,
-      "matrixConstructs": [
-        "LetValue.ctor.general",
-        "Type.signed_scalars",
-        "LetValue.const"
-      ],
-      "path": "tests/elab/bv_sym.lean",
-      "sha256": "82869c42f950d1855d2178af83c3220ac34ef991645c2591d1f382b158ef9a40"
-    },
-    {
-      "bytes": 3878,
-      "emphasis": [
-        "signed_int_scalars"
-      ],
-      "importFree": false,
-      "matrixConstructs": [
-        "Type.signed_scalars",
-        "LetValue.const"
-      ],
-      "path": "tests/elab/bv_uint.lean",
-      "sha256": "65d136846caf58f13a2915f41468ade1cd10417667332682d387fa96517f0f31"
     },
     {
       "bytes": 200,
@@ -1727,6 +1731,24 @@
       "sha256": "a893dc5ffe13efadcdfe589fe4926bd9632df36194c01e7d57f71313b21370e4"
     },
     {
+      "bytes": 1058,
+      "emphasis": [
+        "closures",
+        "pap_partial_application"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.lit.str",
+        "LetValue.ctor.general",
+        "LetValue.fap.general",
+        "LetValue.pap",
+        "LetValue.const"
+      ],
+      "path": "tests/elab/derivingHashable.lean",
+      "sha256": "77652335aafbf37379135bd5668d9b870077c4bb46e749f6ee08d72589b902f8"
+    },
+    {
       "bytes": 762,
       "emphasis": [
         "closures",
@@ -1941,6 +1963,24 @@
       "sha256": "e809da2605eecbf8a4ff079d7d687782b104a157a7ad1d360814d119e16da83a"
     },
     {
+      "bytes": 1157,
+      "emphasis": [
+        "closures",
+        "pap_partial_application"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.lit.str",
+        "LetValue.ctor.general",
+        "LetValue.pap",
+        "LetValue.const",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/fib_correct.lean",
+      "sha256": "d795bd86f4d0b534cdc16caa1d4186b1d8f9101a94f5499708df26d429acfed5"
+    },
+    {
       "bytes": 316,
       "emphasis": [
         "pap_partial_application"
@@ -2025,6 +2065,24 @@
       ],
       "path": "tests/elab/float_conversions.lean",
       "sha256": "12fd8c62339e40e8fa06673de1671a9a5d9f95df529775e3d30f2486ba088e0a"
+    },
+    {
+      "bytes": 876,
+      "emphasis": [
+        "closures",
+        "pap_partial_application"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.pap",
+        "LetValue.const",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/funind_demo.lean",
+      "sha256": "4bba76dab70de5ca4b035d8a14c882666f56c194012ef6693f25fd2692bdecba"
     },
     {
       "bytes": 2544,
@@ -2254,35 +2312,6 @@
       "sha256": "ce9cdc45f45af454ea550480538257e36dfe2a3a653dba6e1a36a4f9546dbe42"
     },
     {
-      "bytes": 2212,
-      "emphasis": [
-        "signed_int_scalars"
-      ],
-      "importFree": false,
-      "matrixConstructs": [
-        "Type.signed_scalars"
-      ],
-      "path": "tests/elab/grind_hom_engine.lean",
-      "sha256": "dbe5bc2816a910d07a18fd65f00320d8a7efa782c87c3243adad0291a10d6c57"
-    },
-    {
-      "bytes": 4692,
-      "emphasis": [
-        "closures",
-        "signed_int_scalars"
-      ],
-      "importFree": false,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.lit.str",
-        "Type.signed_scalars",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/elab/grind_hom_lemmas.lean",
-      "sha256": "fdddb7911665f5c75f8cd7e0d85844ee34f4cd01cb2569bf5033ea20016566a5"
-    },
-    {
       "bytes": 13899,
       "emphasis": [
         "closures",
@@ -2477,25 +2506,6 @@
       "sha256": "c86a1fda9db80e04163332a84bbb623f61aa60b85b05a5331a931df809ad0711"
     },
     {
-      "bytes": 18800,
-      "emphasis": [
-        "pap_partial_application",
-        "array_bytearray_sharing",
-        "signed_int_scalars"
-      ],
-      "importFree": false,
-      "matrixConstructs": [
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "LetValue.pap",
-        "LetValue.reset_reuse",
-        "Type.signed_scalars",
-        "LetValue.const"
-      ],
-      "path": "tests/elab/implicitReducibilityForDSimprocs.lean",
-      "sha256": "b98debc2df4a4c7f0790af0e54368b554a339cd8e557364ea60850331ef570e6"
-    },
-    {
       "bytes": 1247,
       "emphasis": [
         "closures",
@@ -2599,6 +2609,25 @@
       ],
       "path": "tests/elab/issue10299.lean",
       "sha256": "e270a16d0b75ca22a5db88894a44d55a5214dd35c0056690c9f95939acbaae68"
+    },
+    {
+      "bytes": 1039,
+      "emphasis": [
+        "closures",
+        "pap_partial_application",
+        "array_bytearray_sharing"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.pap",
+        "LetValue.const",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/issue10573.lean",
+      "sha256": "ee8e48155f921d1c1a0971aeb9c9d32f7b918af6af0cc365f3c81998ef04a65e"
     },
     {
       "bytes": 292,
@@ -2793,6 +2822,24 @@
       "sha256": "3db58a6df399ec793cdf8ed9e4a50af22c8ee96936541f868de4eb7ce1f58002"
     },
     {
+      "bytes": 1345,
+      "emphasis": [
+        "closures",
+        "pap_partial_application"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.pap",
+        "LetValue.const",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/lcnfCache.lean",
+      "sha256": "ae24e3990923085339362b71984ee0fb1f2085a94e545923941889b3f7db57da"
+    },
+    {
       "bytes": 1025,
       "emphasis": [
         "closures",
@@ -2811,6 +2858,23 @@
       ],
       "path": "tests/elab/lcnfCastIssue.lean",
       "sha256": "476523856f27c93ce33a85c54c4a7f3893be4e577bb66dd89cc94488e9c116f4"
+    },
+    {
+      "bytes": 913,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.lit.str",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.const",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/lcnfInliningIssue.lean",
+      "sha256": "9ae27e799f62b29c65b265fb6e70b457cf7855a1afa7b38c9dcf2e348567be12"
     },
     {
       "bytes": 84,
@@ -2869,18 +2933,6 @@
       ],
       "path": "tests/elab/linearCategory_perf_issue.lean",
       "sha256": "8abc0041272046d4b13a9431073a700914b4d84da2ec5c846c65f29237328acc"
-    },
-    {
-      "bytes": 824,
-      "emphasis": [
-        "signed_int_scalars"
-      ],
-      "importFree": false,
-      "matrixConstructs": [
-        "Type.signed_scalars"
-      ],
-      "path": "tests/elab/lossy_casts.lean",
-      "sha256": "6e4f3309e242189030bc29f14472103b72cccea460233983b7e6fc78b85336c7"
     },
     {
       "bytes": 138,
@@ -3046,40 +3098,6 @@
       ],
       "path": "tests/elab/multiTargetCasesInductionIssue.lean",
       "sha256": "096a9f32ea2d4db5a00ea7ab7c198c44672c8c2a25038f0850a89192b13db921"
-    },
-    {
-      "bytes": 1325,
-      "emphasis": [
-        "closures",
-        "signed_int_scalars"
-      ],
-      "importFree": false,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "Type.signed_scalars",
-        "LetValue.const"
-      ],
-      "path": "tests/elab/mvcgenRflReducibility.lean",
-      "sha256": "50a5bf0c98076ccdb15c8d93e9e4847e8fc89f987db1794875bc4aa07270929d"
-    },
-    {
-      "bytes": 1233,
-      "emphasis": [
-        "closures",
-        "signed_int_scalars"
-      ],
-      "importFree": false,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "Type.signed_scalars",
-        "LetValue.const"
-      ],
-      "path": "tests/elab/mvcgenSimpClassMethod.lean",
-      "sha256": "5885007ffdbf8d43a050e3426249645853fed8bb6eeacb7a411f6a734a731e43"
     },
     {
       "bytes": 152,
@@ -3368,21 +3386,38 @@
       "sha256": "c9765697c674c0a889f0e84e9b3b4f1af22fb921793d81bd207382c183cb548e"
     },
     {
-      "bytes": 7394,
+      "bytes": 1375,
       "emphasis": [
-        "array_bytearray_sharing",
-        "signed_int_scalars"
+        "closures"
       ],
-      "importFree": false,
+      "importFree": true,
       "matrixConstructs": [
+        "Code.fun",
         "LetValue.lit.str",
+        "LetValue.fvar.app",
         "LetValue.ctor.general",
-        "Type.signed_scalars",
         "LetValue.const",
         "LetValue.fap.local_call"
       ],
-      "path": "tests/elab/rangePolymorphic.lean",
-      "sha256": "1e0039877970f3bd85cb2e35da18f67a40f12a4bb782566b0ccfeb5e15a39ebc"
+      "path": "tests/elab/pullInstancesDecidable.lean",
+      "sha256": "fa16a81663a1d4651aa1e4f52a15a45c1a0de23fcb55bfab7149bf1d6a21512e"
+    },
+    {
+      "bytes": 1051,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.fap.general",
+        "LetValue.const",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/rc_tests.lean",
+      "sha256": "b5c2582aacb4dc82006222cfffd6e427baf7402de83c560c45403662f8ebfd2f"
     },
     {
       "bytes": 600,
@@ -3459,6 +3494,25 @@
       ],
       "path": "tests/elab/sanitizeMacroScopes.lean",
       "sha256": "2f1313c60eeb847848546e2298f2f5c465b274ad14397ec892b7043e8a86736c"
+    },
+    {
+      "bytes": 1022,
+      "emphasis": [
+        "closures",
+        "pap_partial_application",
+        "array_bytearray_sharing"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.ctor.general",
+        "LetValue.pap",
+        "LetValue.reset_reuse",
+        "LetValue.const",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/sarray.lean",
+      "sha256": "f4fe0a099552a106661eb06fc91035a2313650824b752bdf29b6789b73ced7db"
     },
     {
       "bytes": 272,
@@ -3774,23 +3828,6 @@
       "sha256": "54dbc426c0ed904c04f989dd0af7d2d700f6aca5e0d682fd16bffa8c588d1949"
     },
     {
-      "bytes": 10851,
-      "emphasis": [
-        "closures",
-        "signed_int_scalars"
-      ],
-      "importFree": false,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "Type.signed_scalars",
-        "LetValue.const"
-      ],
-      "path": "tests/elab/sym_simp_2.lean",
-      "sha256": "705d396adb6a316c2e8c005cfd7ec97d214f5975c427f778ec382b191676da9d"
-    },
-    {
       "bytes": 149,
       "emphasis": [
         "pap_partial_application"
@@ -3857,22 +3894,6 @@
       "sha256": "aaf51d63382e0aae22cb6ec054a34c96ae78b4b47f3eb5da1c0c6f7119c17e4e"
     },
     {
-      "bytes": 5789,
-      "emphasis": [
-        "signed_int_scalars"
-      ],
-      "importFree": false,
-      "matrixConstructs": [
-        "DeclValue.extern",
-        "LetValue.ctor.general",
-        "LetValue.reset_reuse",
-        "Type.signed_scalars",
-        "LetValue.const"
-      ],
-      "path": "tests/elab/test_extern_int.lean",
-      "sha256": "ecfa46cf4e805d62d83aef30469a9756afd2f22f10da1c5aeb75799cf83ab1f8"
-    },
-    {
       "bytes": 278,
       "emphasis": [
         "array_bytearray_sharing"
@@ -3932,6 +3953,17 @@
       ],
       "path": "tests/elab/univIssue.lean",
       "sha256": "205873508e12e1c2c5b03a91c88d01cb62f4ca820685eac45957774727b1d343"
+    },
+    {
+      "bytes": 45,
+      "emphasis": [],
+      "importFree": true,
+      "matrixConstructs": [
+        "DeclValue.extern",
+        "LetValue.lit.str"
+      ],
+      "path": "tests/elab/unsafeConst.lean",
+      "sha256": "9fad31b63b364879c04cb2f65bd00290e03e7e44f8c64ea84a06a352e01e182c"
     },
     {
       "bytes": 174,
