@@ -510,8 +510,11 @@ pub(crate) fn record_snapshot_modules_in_store_with_posture(
 // (a single `importModules`, no snapshot, no kernel replay, no per-declaration axiom-closure
 // walk) reports the posture facts; `kernel::decide_import_posture_policy` applies the
 // `turbo-lean.toml` allowlists and refuses forbidden postures with the knob named BEFORE the
-// expensive audit machinery runs. Allowed postures proceed into the unchanged, authoritative
-// audit; any infrastructure failure of this pass falls through to that audit (never fail-open).
+// expensive audit machinery runs, deciding exactly the posture set that audit considers (for
+// csimp entries: those a target module owns or touches; the worker already filtered the
+// per-target candidates through the audit's structural exemptions). Allowed postures proceed
+// into the unchanged, authoritative audit; any infrastructure failure of this pass falls
+// through to that audit (never fail-open).
 // -------------------------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -523,10 +526,10 @@ struct WirePostureCsimpEntry {
 }
 
 #[derive(Debug, Deserialize)]
+// The worker also reports `init_sysroot` per module (the import-audit mode's `Init.*` baseline);
+// the non-import decision mirrored here never consults it, so serde ignores that key.
 struct WirePostureModule {
     m: String,
-    #[serde(default)]
-    init_sysroot: bool,
     #[serde(default)]
     imports: Vec<String>,
     #[serde(default)]
@@ -677,23 +680,11 @@ fn early_import_policy_prepass(
             m.m.clone(),
             crate::kernel::ImportPostureModule {
                 module: m.m.clone(),
-                init_sysroot: m.init_sysroot,
                 imports: m.imports.clone(),
                 csimp: entries,
             },
         );
     }
-    let mut csimp_posture_digests = std::collections::BTreeMap::new();
-    for root in sorted_mods {
-        match crate::kernel::scan_transitive_csimp_posture(root, |m| Ok(scan_map.get(m).cloned()))
-        {
-            Ok(posture) => {
-                csimp_posture_digests.insert(root.clone(), posture.digest);
-            }
-            Err(e) => return undecided(format!("transitive csimp posture scan failed: {e:#}")),
-        }
-    }
-
     let targets: Vec<crate::kernel::ImportPostureTarget> = reply
         .targets
         .iter()
@@ -746,6 +737,21 @@ fn early_import_policy_prepass(
             "Imported `.olean` import policy refused before the in-kernel audit (decided early from the compiled posture; allowlisted postures proceed):\n  {}",
             decision.violations.join("\n  ")
         );
+    }
+    // The G1a cache-key digests are computed best-effort after the decision (the decision does
+    // not use them): a failed root scan logs and leaves that root's audited record with an
+    // empty posture digest instead of withdrawing the whole early decision.
+    let mut csimp_posture_digests = std::collections::BTreeMap::new();
+    for root in sorted_mods {
+        match crate::kernel::scan_transitive_csimp_posture(root, |m| Ok(scan_map.get(m).cloned()))
+        {
+            Ok(posture) => {
+                csimp_posture_digests.insert(root.clone(), posture.digest);
+            }
+            Err(e) => eprintln!(
+                "[turbo-lean] transitive csimp posture digest scan failed for `{root}` ({e:#}); its audited record carries an empty digest"
+            ),
+        }
     }
     Ok(Some(ImportPolicyPrepass {
         csimp_posture_digests,

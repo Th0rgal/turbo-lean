@@ -216,14 +216,28 @@ pub fn probe_con_leche_support_for_selection(
 ) -> Option<String> {
     if !matches!(
         requested,
-        KernelEngineSelection::ConLeche | KernelEngineSelection::Both
+        KernelEngineSelection::Auto
+            | KernelEngineSelection::ConLeche
+            | KernelEngineSelection::Both
     ) {
         return probe_con_leche_support(lean_toolchain);
     }
     if normalize_lean_toolchain(lean_toolchain) != PINNED_CON_LECHE_TOOLCHAIN {
         return None;
     }
-    let bin = discover_con_leche_binary(workspace_root).ok()?;
+    let bin = match discover_con_leche_binary(workspace_root) {
+        Ok(b) => b,
+        // G1c: `auto` also accepts the toolchain-bundled binary; the explicit selections keep
+        // failing closed on the provisioned (`TURBO_CON_LECHE_BIN` / bridge) binaries only. The
+        // bundled binary lives outside any checkout, so the bridge-identity check below does
+        // not apply to it.
+        Err(_) if requested == KernelEngineSelection::Auto => {
+            return bundled_toolchain_con_leche_binary(lean_toolchain)
+                .filter(|b| is_executable_file(b))
+                .map(|_| PINNED_CON_LECHE_REV.to_string());
+        }
+        Err(_) => return None,
+    };
     if let Some(proj) = workspace_root {
         let canon_proj = proj.canonicalize().ok()?;
         let checkout = canon_proj
@@ -430,6 +444,28 @@ pub fn discover_con_leche_binary(workspace_root: Option<&Path>) -> Result<PathBu
 
     anyhow::bail!(
         "Verified `con-leche` binary not found (expected `{CON_LECHE_BIN_ENV}` or `{BRIDGE_CON_LECHE_BIN_REL}` built at rev `{PINNED_CON_LECHE_REV}`)"
+    )
+}
+
+/// The toolchain-bundled `con-leche` binary (`$ELAN_HOME/toolchains/<toolchain>/bin/con-leche`,
+/// with elan's directory mangling of `/` to `--` and `:` to `---`), for the `auto` selection's
+/// support probe (G1c). Returns the path only for the pinned toolchain; callers check that it is
+/// an executable file. Explicit `con-leche`/`both` selections never consult it.
+fn bundled_toolchain_con_leche_binary(lean_toolchain: &str) -> Option<PathBuf> {
+    let toolchain = normalize_lean_toolchain(lean_toolchain);
+    if toolchain != PINNED_CON_LECHE_TOOLCHAIN {
+        return None;
+    }
+    let elan_home = std::env::var_os("ELAN_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".elan")))?;
+    let dir_name = toolchain.replace('/', "--").replace(':', "---");
+    Some(
+        elan_home
+            .join("toolchains")
+            .join(dir_name)
+            .join("bin")
+            .join("con-leche"),
     )
 }
 
@@ -891,7 +927,7 @@ fn split_lean_csimp_arrow(pair: &str) -> Vec<&str> {
 // |-------------------------------------------|--------------------------------------|-----------|
 // | csimp entry, strict proven theorem        | `[csimp] allow` glob (raw or user)   | allow/forbid |
 // | csimp entry, non-theorem or non-strict    | never allowlistable                  | forbid    |
-// | csimp entry owned by toolchain `Init.*`   | exempt unless it touches a target    | allow     |
+// | csimp entry a target neither owns nor touches | never considered (mirrors the non-import audit) | skipped |
 // | unsafe declaration (post structural exemptions) | `[unsafe] allow` on decl or wrapper | allow/forbid |
 // | unsafe `_unsafe_rec` twin                 | never allowlistable by name          | forbid (wrapper `[unsafe]` allow only) |
 // | unsafe inductive                          | never allowlistable                  | forbid    |
@@ -900,8 +936,11 @@ fn split_lean_csimp_arrow(pair: &str) -> Vec<&str> {
 // | custom axiom declaration                  | standard axioms + `[axioms] allow` (never `sorryAx` / `Lean.trustCompiler`) | allow/forbid |
 //
 // A forbidden outcome fails closed with a message naming the exact `turbo-lean.toml` knob; an
-// allowed outcome proceeds into the unchanged, authoritative in-kernel audit. The early pass can
-// therefore only add early refusals; it never admits anything the audit would refuse.
+// allowed outcome proceeds into the unchanged, authoritative in-kernel audit. The pass decides
+// exactly the entries that audit considers — for csimp, those a target module owns or touches
+// (`checkCSimpEntry` with `isImportAudit = false`); for the rest, the per-target candidates the
+// worker already passed through the audit's structural exemptions — so it refuses nothing the
+// audit would skip and admits nothing it would refuse.
 // -------------------------------------------------------------------------------------------
 
 pub const EARLY_IMPORT_POLICY_ENV: &str = "TURBO_LEAN_EARLY_IMPORT_POLICY";
@@ -933,8 +972,6 @@ pub struct PostureCsimpEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportPostureModule {
     pub module: String,
-    /// The module is `Init.*` inside the toolchain sysroot (the audit's baseline exemption).
-    pub init_sysroot: bool,
     pub imports: Vec<String>,
     pub csimp: Vec<PostureCsimpEntry>,
 }
@@ -1094,9 +1131,11 @@ pub fn decide_import_posture_policy(
     }
     for (owner, m) in modules {
         for e in &m.csimp {
-            let toolchain_baseline =
-                m.init_sysroot && !target_modules.contains(owner) && !e.touches_target;
-            if toolchain_baseline {
+            // Mirror of the authoritative audit that runs next (`checkCSimpEntry` with
+            // `isImportAudit = false` in `ZygoteWorker.lean`): a csimp entry that a target
+            // module neither owns nor touches is never considered by that audit, so it is
+            // never refused early either.
+            if !(target_modules.contains(owner) || e.touches_target) {
                 continue;
             }
             let allowed = e.strict
@@ -1140,12 +1179,10 @@ mod tests {
 
     fn csimp_posture_module(
         module: &str,
-        init_sysroot: bool,
         entries: &[(&str, &str, &str, &str, bool, bool)],
     ) -> ImportPostureModule {
         ImportPostureModule {
             module: module.to_string(),
-            init_sysroot,
             imports: Vec::new(),
             csimp: entries
                 .iter()
@@ -1175,13 +1212,18 @@ mod tests {
     }
 
     #[test]
-    fn test_import_policy_decision_table_csimp() {
+    fn test_import_policy_dependency_csimp_entries_follow_the_audited_set() {
+        // Mirror of the non-import audit that runs next (`checkCSimpEntry` with
+        // `isImportAudit = false`, `ZygoteWorker.lean`): a csimp entry that a target module
+        // neither owns nor touches is never considered by that audit, so the early pass must
+        // not refuse it either. Dependency shape: the target `Proj.Foo` imports the trusted
+        // dependency `Batteries.Data.List.Basic`, which exports
+        // `@[csimp] List.replaceF_eq_replaceFTR`, under an empty `[csimp] allow`.
         let mut modules = BTreeMap::new();
         modules.insert(
             "Batteries.Data.List.Basic".to_string(),
             csimp_posture_module(
                 "Batteries.Data.List.Basic",
-                false,
                 &[(
                     "List.replaceF_eq_replaceFTR",
                     "List.replaceF",
@@ -1192,7 +1234,45 @@ mod tests {
                 )],
             ),
         );
-        let targets: BTreeSet<String> = ["Root".to_string()].into();
+        let dependency_targets: BTreeSet<String> = ["Proj.Foo".to_string()].into();
+        assert_eq!(
+            decide_csimp_only(
+                &modules,
+                &dependency_targets,
+                &posture_lists(&[], &[], &[], &[])
+            ),
+            Vec::<String>::new(),
+            "a dependency csimp entry outside the audited set must not be refused early"
+        );
+        // The same entry with its owner audited as a target stays refused when unlisted.
+        let owner_targets: BTreeSet<String> = ["Batteries.Data.List.Basic".to_string()].into();
+        assert_eq!(
+            decide_csimp_only(&modules, &owner_targets, &posture_lists(&[], &[], &[], &[])).len(),
+            1,
+            "a target-owned unlisted csimp entry stays refused"
+        );
+    }
+
+    #[test]
+    fn test_import_policy_decision_table_csimp() {
+        let mut modules = BTreeMap::new();
+        modules.insert(
+            "Batteries.Data.List.Basic".to_string(),
+            csimp_posture_module(
+                "Batteries.Data.List.Basic",
+                &[(
+                    "List.replaceF_eq_replaceFTR",
+                    "List.replaceF",
+                    "List.replaceFTR",
+                    "List.replaceF_eq_replaceFTR",
+                    true,
+                    false,
+                )],
+            ),
+        );
+        // The owner is audited as a target, so its entries are inside the audited set the
+        // early pass mirrors; the dependency-shape test above pins the not-considered side.
+        let targets: BTreeSet<String> = ["Batteries.Data.List.Basic".to_string()].into();
 
         // Strict proven theorem, exact user-name allowlist entry: allowed.
         let allowed = decide_csimp_only(
@@ -1216,7 +1296,9 @@ mod tests {
                 "csimp replacement `List.replaceF_eq_replaceFTR` (List.replaceF -> List.replaceFTR) \
                  touching `Batteries.Data.List.Basic` is forbidden"
             ),
-            "violation must mirror the audit wording: {}",
+            "violation must name the entry, both declarations and the owner module (the audit \
+             labels by the target it reports against; the early message names the owner, which \
+             is what the `[csimp] allow` author needs): {}",
             refused[0]
         );
         assert!(
@@ -1240,13 +1322,13 @@ mod tests {
             "a non-strict csimp entry must stay forbidden under `*`: {refused_non_strict:?}"
         );
 
-        // Toolchain `Init.*` sysroot baseline: exempt while it does not touch a target...
+        // A toolchain module's entry outside the audited set (not owned by a target, touching
+        // none) is never considered, like any other dependency entry...
         let mut init_mod = BTreeMap::new();
         init_mod.insert(
             "Init.Data.Array".to_string(),
             csimp_posture_module(
                 "Init.Data.Array",
-                true,
                 &[("Init.thm", "Init.slow", "Init.fast", "Init.thm", true, false)],
             ),
         );
@@ -1254,12 +1336,12 @@ mod tests {
             decide_csimp_only(&init_mod, &targets, &posture_lists(&[], &[], &[], &[])),
             Vec::<String>::new()
         );
-        // ...but not when it touches an audited target.
+        // ...but one touching an audited target is considered and refused when unlisted.
         init_mod.get_mut("Init.Data.Array").unwrap().csimp[0].touches_target = true;
         assert_eq!(
             decide_csimp_only(&init_mod, &targets, &posture_lists(&[], &[], &[], &[])).len(),
             1,
-            "an Init-sysroot entry touching a target is not baseline-exempt"
+            "an entry touching an audited target is considered and stays refused when unlisted"
         );
     }
 
@@ -1537,6 +1619,103 @@ mod tests {
                 "unexpected error: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn test_kernel_auto_selects_bundled_con_leche_on_pinned_toolchain() {
+        // G1c: `--kernel auto` performs the real support probe. On the pinned toolchain it also
+        // accepts the toolchain-bundled binary (`$ELAN_HOME/toolchains/<pinned>/bin/con-leche`);
+        // off the pin, or without the binary, it resolves to the standard kernel with a fallback
+        // reason. Explicit `con-leche`/`both` keep failing closed on the provisioned
+        // (env / bridge) binaries only: the bundled binary never satisfies them.
+        static ELAN_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _env = ELAN_TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_elan = std::env::var_os("ELAN_HOME");
+        let prev_bin = std::env::var_os(CON_LECHE_BIN_ENV);
+        std::env::remove_var(CON_LECHE_BIN_ENV);
+
+        let tmp = std::env::temp_dir().join(format!(
+            "turbo_lean_g1c_elan_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ws = tmp.join("ws");
+        let elan = tmp.join("elan");
+        let bin_dir = elan.join("toolchains/leanprover--lean4---v4.35.0/bin");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        // No bundled binary yet: auto on the pinned toolchain stays standard, with a reason.
+        std::env::set_var("ELAN_HOME", &elan);
+        let std_prov = resolve_kernel_engine_in_workspace(
+            KernelEngineSelection::Auto,
+            PINNED_CON_LECHE_TOOLCHAIN,
+            Some(&ws),
+        )
+        .unwrap();
+        assert_eq!(std_prov.kernel_engine, ResolvedKernelEngine::Standard);
+        assert!(std_prov.fallback_reason.is_some());
+
+        // Bundled executable present: auto selects con-leche with the pinned rev, no fallback.
+        let bundled = bin_dir.join("con-leche");
+        std::fs::write(&bundled, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bundled, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let auto_prov = resolve_kernel_engine_in_workspace(
+            KernelEngineSelection::Auto,
+            PINNED_CON_LECHE_TOOLCHAIN,
+            Some(&ws),
+        )
+        .unwrap();
+        assert_eq!(
+            auto_prov.kernel_engine,
+            ResolvedKernelEngine::ConLeche,
+            "auto on the pinned toolchain must select the bundled con-leche"
+        );
+        assert_eq!(
+            auto_prov.con_leche_rev.as_deref(),
+            Some(PINNED_CON_LECHE_REV)
+        );
+        assert_eq!(auto_prov.fallback_reason, None);
+
+        // Off the pinned toolchain the bundled binary is never consulted.
+        let off_pin = resolve_kernel_engine_in_workspace(
+            KernelEngineSelection::Auto,
+            "leanprover/lean4:v4.36.0",
+            Some(&ws),
+        )
+        .unwrap();
+        assert_eq!(off_pin.kernel_engine, ResolvedKernelEngine::Standard);
+
+        // Explicit selections keep failing closed: the bundled binary does not provision them.
+        for req in [KernelEngineSelection::ConLeche, KernelEngineSelection::Both] {
+            let err = resolve_kernel_engine_in_workspace(
+                req,
+                PINNED_CON_LECHE_TOOLCHAIN,
+                Some(&ws),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("fail-closed kernel gate"),
+                "explicit {req} must stay fail-closed with only the bundled binary present: {err:#}"
+            );
+        }
+
+        match prev_elan {
+            Some(v) => std::env::set_var("ELAN_HOME", v),
+            None => std::env::remove_var("ELAN_HOME"),
+        }
+        match prev_bin {
+            Some(v) => std::env::set_var(CON_LECHE_BIN_ENV, v),
+            None => std::env::remove_var(CON_LECHE_BIN_ENV),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

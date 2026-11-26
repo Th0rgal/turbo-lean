@@ -4106,6 +4106,128 @@ use super::*;
     }
 
     #[test]
+    fn test_audit_dependency_csimp_entries_early_pass_subset_of_audit() {
+        // Differential fixture for the P9 early import-policy pass. Dependency shape: the
+        // audited target `App.Main` imports the separately compiled module `Dep.Lib`, which
+        // exports `@[csimp] Dep.slow_eq_fast`. The authoritative audit runs `--audit-modules`
+        // without `--audit-imports` and never considers a csimp entry that a target neither
+        // owns nor touches, so with an empty `[csimp] allow` the audit of `App.Main` passes
+        // and the early pass must pass too: its refusals must be a subset of the audit's.
+        // Auditing `Dep.Lib` itself (the owner as target) must refuse in both modes.
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_csimp = std::env::var_os("TURBO_LEAN_ALLOWED_CSIMP");
+        let prev_early = std::env::var_os("TURBO_LEAN_EARLY_IMPORT_POLICY");
+        std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP");
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_dep_csimp_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(tmp_dir.join("App")).unwrap();
+        fs::create_dir_all(tmp_dir.join("Dep")).unwrap();
+        fs::write(tmp_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            tmp_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nroots = [\"App.Main\"]\n[[lean_lib]]\nname = \"Dep\"\nroots = [\"Dep.Lib\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp_dir.join("Dep/Lib.lean"),
+            "namespace Dep\n@[noinline] def slow (n : Nat) : Nat := n + 0\n@[noinline] def fast (n : Nat) : Nat := n\n@[csimp] theorem slow_eq_fast : @slow = @fast := by\n  funext n\n  simp [slow, fast]\nend Dep\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp_dir.join("App/Main.lean"),
+            "import Dep.Lib\ndef x : Nat := Dep.fast 1\n",
+        )
+        .unwrap();
+        let cfg = crate::module_builder::resolve_project_config(&tmp_dir).unwrap();
+        let env = build_auditor_bootstrap_env(&cfg);
+        let ld = env.get("LD_LIBRARY_PATH").cloned().unwrap_or_default();
+        let lib_dir = tmp_dir.join(".lake/build/lib/lean");
+        fs::create_dir_all(lib_dir.join("Dep")).unwrap();
+        fs::create_dir_all(lib_dir.join("App")).unwrap();
+        for (src, olean) in [
+            ("Dep/Lib.lean", "Dep/Lib.olean"),
+            ("App/Main.lean", "App/Main.olean"),
+        ] {
+            let out = Command::new(&cfg.lean_bin)
+                .current_dir(&tmp_dir)
+                .arg("-R")
+                .arg(&tmp_dir)
+                .arg("-o")
+                .arg(lib_dir.join(olean))
+                .arg(tmp_dir.join(src))
+                .env(
+                    "LEAN_PATH",
+                    format!(
+                        "{}:{}",
+                        cfg.toolchain_lib_lean.to_string_lossy(),
+                        lib_dir.to_string_lossy()
+                    ),
+                )
+                .env("LD_LIBRARY_PATH", &ld)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "lean compile of {src} failed: {out:?}");
+        }
+        let store = TurboStore::open(Some(&tmp_dir.join("store"))).unwrap();
+        let (lean_path_env, _) = crate::module_builder::build_lean_search_path(&cfg, true);
+
+        for early in ["on", "off"] {
+            if early == "off" {
+                std::env::set_var("TURBO_LEAN_EARLY_IMPORT_POLICY", "off");
+            } else {
+                std::env::remove_var("TURBO_LEAN_EARLY_IMPORT_POLICY");
+            }
+            let dep_shape = audit_compiled_modules_with_zygote(
+                &store,
+                &cfg,
+                &["App.Main".to_string()],
+                &lean_path_env,
+                &[],
+                false,
+            );
+            assert!(
+                dep_shape.is_ok(),
+                "early={early}: the dependency's csimp entry is outside the audited set; the \
+                 audit passes, so the early pass must pass too: {:#}",
+                dep_shape.unwrap_err()
+            );
+            let owner_shape = audit_compiled_modules_with_zygote(
+                &store,
+                &cfg,
+                &["Dep.Lib".to_string()],
+                &lean_path_env,
+                &[],
+                false,
+            );
+            let err = format!("{:#}", owner_shape.expect_err("owner-as-target must refuse"));
+            assert!(
+                err.contains("csimp replacement"),
+                "early={early}: owner-as-target refusal must name the csimp entry: {err}"
+            );
+        }
+
+        match prev_csimp {
+            Some(v) => std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", v),
+            None => std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP"),
+        }
+        match prev_early {
+            Some(v) => std::env::set_var("TURBO_LEAN_EARLY_IMPORT_POLICY", v),
+            None => std::env::remove_var("TURBO_LEAN_EARLY_IMPORT_POLICY"),
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
     fn test_audit_compiled_modules_respects_axiom_allowlist_and_never_allows_sorry_or_trust_compiler(
     ) {
         let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
