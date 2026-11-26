@@ -47,6 +47,9 @@ jobs:
       - run: |
           python3 scripts/ci_impact_plan.py --self-test
           python3 scripts/sync_docs_inventory.py --check
+          python3 scripts/build_c1_corpus_manifest.py --self-test
+          python3 scripts/build_c1_corpus_manifest.py --verify --corpus-root none
+          python3 -m unittest -v scripts/test_c1_upstream_leg.py
           python3 scripts/emitter_mutants.py --unit-tests
           python3 scripts/run_llvm_lli_diff.py --self-test
           python3 scripts/run_alive2_tv.py --self-test

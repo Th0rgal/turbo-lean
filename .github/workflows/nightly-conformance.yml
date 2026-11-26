@@ -55,6 +55,12 @@ jobs:
           path: .turbo-cache/c2-external
           key: ${{ runner.os }}-${{ runner.arch }}-c2-external-batteries-66e469188fe07963e5cf666c7d4433f45b8131c5-v1
 
+      - name: Cache pinned Tier C1 upstream corpus checkout (leanprover/lean4 test piles)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .turbo-cache/c1-upstream
+          key: ${{ runner.os }}-${{ runner.arch }}-c1-upstream-lean4-eb6cafb7290e8bd5f2937522d8d804f58f02bafc-v1
+
       - name: Setup Lean 4 toolchain
         run: |
           TOOLCHAIN="$(tr -d '[:space:]' < lean/lean-toolchain)"
@@ -71,9 +77,9 @@ jobs:
         run: |
           (cd lean && lake build lean-native lean-native-core)
 
-      - name: Run Tier C2 3-way ASan/UBSan conformance (in-repo fixtures + pinned external Batteries driver)
+      - name: Run Tier C1 (incl. 250-program upstream manifest corpus) & Tier C2 3-way ASan/UBSan conformance
         run: |
-          python3 scripts/run_conformance_suite.py --tier C2 --c2-packages-dir auto --c2-external --asan --ubsan --json
+          python3 scripts/run_conformance_suite.py --tier C1,C2 --c1-upstream --c2-packages-dir auto --c2-external --asan --ubsan --json
 
       - name: Run Tier C4 10,000-seed shared/exclusive-alias LCNF fuzz (ASan/UBSan)
         run: |
