@@ -1268,7 +1268,12 @@ pub(super) fn remove_module_build_artifacts(canon_dir: &Path, rel_slash: &str) {
 /// Returns `modules` unchanged for every project without Lake file inputs and without matching
 /// `lean_exe` roots.
 pub(crate) fn lake_refresh_targets(canon_dir: &Path, modules: &[String]) -> Vec<String> {
-    lake_refresh_targets_inner(canon_dir, modules, false)
+    // A project whose config does not resolve has no Lake file inputs this path can
+    // see, so the stale-import refresh keeps its documented pass-through shape.
+    let Ok(cfg) = crate::module_builder::resolve_project_config(canon_dir) else {
+        return modules.to_vec();
+    };
+    lake_refresh_targets_inner(&cfg, modules, false)
 }
 
 /// The Lake-inputs closure sweep's variant (#434 / DA 449989b1 F3): dependency-package
@@ -1277,29 +1282,32 @@ pub(crate) fn lake_refresh_targets(canon_dir: &Path, modules: &[String]) -> Vec<
 /// `@<dep>/<exe>:exe`, a `+<Mod>` qualification — is emitted only for owned packages,
 /// and a non-owned module (a shared checkout behind a symlinked `.lake/packages`
 /// entry) emits nothing, matching the sweep's input-target seed gate and its purge
-/// skip. The unfiltered [`lake_refresh_targets`] stays the stale-import refresh's
-/// shape: asking Lake to bring a pinned dependency import up to date is that path's
-/// sanctioned job (the worktree opt-out is its off switch), distinct from this
-/// project driving a non-owned package's input-bearing targets.
+/// skip. Which modules the sweep considers at all is [`input_closure_sweep_mods`]'s
+/// job: a non-owned module must not pull its owned dependents into the closure
+/// either, or `lake build <dependent>` writes the stale non-owned module into the
+/// shared checkout's build dir (DA 47e88386 F4). Taking the resolved config the
+/// caller already holds closes the fail-open the path-taking shape had (an
+/// unresolvable config returned the module list unfiltered) and drops the duplicate
+/// resolution. The unfiltered [`lake_refresh_targets`] stays the stale-import
+/// refresh's shape: asking Lake to bring a pinned dependency import up to date is
+/// that path's sanctioned job (the worktree opt-out is its off switch), distinct
+/// from this project driving a non-owned package's input-bearing targets.
 pub(crate) fn lake_refresh_targets_for_input_closure(
-    canon_dir: &Path,
+    cfg: &crate::module_builder::ProjectConfig,
     modules: &[String],
 ) -> Vec<String> {
-    lake_refresh_targets_inner(canon_dir, modules, true)
+    lake_refresh_targets_inner(cfg, modules, true)
 }
 
 fn lake_refresh_targets_inner(
-    canon_dir: &Path,
+    cfg: &crate::module_builder::ProjectConfig,
     modules: &[String],
     owned_only: bool,
 ) -> Vec<String> {
-    let Ok(cfg) = crate::module_builder::resolve_project_config(canon_dir) else {
-        return modules.to_vec();
-    };
     let owned_dep: std::collections::HashSet<&str> = if owned_only {
         cfg.dep_pkgs
             .iter()
-            .filter(|dp| crate::module_builder::dep_pkg_lake_targets_owned_by_project(&cfg, dp))
+            .filter(|dp| crate::module_builder::dep_pkg_lake_targets_owned_by_project(cfg, dp))
             .map(crate::module_builder::pkg_target_base_name)
             .collect()
     } else {
@@ -1323,7 +1331,7 @@ fn lake_refresh_targets_inner(
     let any_inputs =
         !cfg.root_pkg.inputs.is_empty() || cfg.dep_pkgs.iter().any(|dp| !dp.inputs.is_empty());
     let any_matching_exe = modules.iter().any(|m| {
-        crate::module_builder::exe_targets_for_module(&cfg, m)
+        crate::module_builder::exe_targets_for_module(cfg, m)
             .iter()
             .any(|t| dep_target_owned(t))
     });
@@ -1362,14 +1370,14 @@ fn lake_refresh_targets_inner(
     let mut other_targets: Vec<String> = Vec::new();
     for m in modules {
         let libs: Vec<String> = if any_inputs {
-            crate::module_builder::input_bearing_libs_for_module(&cfg, m)
+            crate::module_builder::input_bearing_libs_for_module(cfg, m)
                 .into_iter()
                 .filter(|t| dep_target_owned(t))
                 .collect()
         } else {
             Vec::new()
         };
-        let exes: Vec<String> = crate::module_builder::exe_targets_for_module(&cfg, m)
+        let exes: Vec<String> = crate::module_builder::exe_targets_for_module(cfg, m)
             .into_iter()
             .filter(|t| dep_target_owned(t))
             .collect();
@@ -1389,6 +1397,69 @@ fn lake_refresh_targets_inner(
     other_targets.retain(|t| !input_lib_targets.contains(t));
     input_lib_targets.extend(other_targets);
     input_lib_targets
+}
+
+/// The Lake-inputs sweep's module closure over `dag`: every module whose own build
+/// reads a Lake file input (an input-bearing library or executable can build it, or
+/// its source uses `include_str`), plus every transitive dependent, each of which
+/// has to be re-checked once an input changes.
+pub(crate) fn input_closure_sweep_mods(
+    cfg: &crate::module_builder::ProjectConfig,
+    dag: &crate::module_builder::ModuleDag,
+) -> std::collections::BTreeSet<String> {
+    let mut closure: std::collections::BTreeSet<String> = dag
+        .nodes
+        .iter()
+        .filter_map(|(m, n)| {
+            let spec_has_include_str = crate::module_builder::resolve_module_in_package(
+                &cfg.root_pkg,
+                true,
+                m,
+            )
+            .or_else(
+                || match crate::module_builder::resolve_import_site(cfg, m) {
+                    crate::module_builder::ImportSite::Module(s) => Some(*s),
+                    _ => None,
+                },
+            )
+            .is_some_and(|spec| {
+                fs::read_to_string(&spec.src_path)
+                    .map(|s| {
+                        crate::module_builder::module_directly_depends_on_lake_inputs(
+                            cfg,
+                            &spec.pkg_root,
+                            &spec.module_name,
+                            &s,
+                        )
+                    })
+                    .unwrap_or(true)
+            });
+            if !crate::module_builder::input_bearing_libs_for_module(cfg, m).is_empty()
+                || !crate::module_builder::input_bearing_exes_for_module(cfg, m).is_empty()
+                || spec_has_include_str
+                || fs::read_to_string(&n.src_path)
+                    .map(|s| crate::module_builder::source_uses_include_str(&s))
+                    .unwrap_or(false)
+            {
+                Some(m.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut changed = !closure.is_empty();
+    while changed {
+        changed = false;
+        for (m, n) in &dag.nodes {
+            if !closure.contains(m)
+                && n.direct_dag_deps.iter().any(|d| closure.contains(d))
+            {
+                closure.insert(m.clone());
+                changed = true;
+            }
+        }
+    }
+    closure
 }
 
 pub(super) struct DiscoveredRootImportMod {
@@ -3579,60 +3650,7 @@ pub(crate) fn recheck_dependents_if_nonlocal_for_check(
                 if let Ok(dag) =
                     crate::module_builder::build_module_dag_with_trust(&cfg, &dag_seeds, false)
                 {
-                    let mut closure: std::collections::BTreeSet<String> = dag
-                        .nodes
-                        .iter()
-                        .filter_map(|(m, n)| {
-                            let spec_has_include_str =
-                                crate::module_builder::resolve_module_in_package(
-                                    &cfg.root_pkg,
-                                    true,
-                                    m,
-                                )
-                                .or_else(|| match crate::module_builder::resolve_import_site(&cfg, m)
-                                {
-                                    crate::module_builder::ImportSite::Module(s) => Some(*s),
-                                    _ => None,
-                                })
-                                .is_some_and(|spec| {
-                                    fs::read_to_string(&spec.src_path)
-                                        .map(|s| {
-                                            crate::module_builder::module_directly_depends_on_lake_inputs(
-                                                &cfg,
-                                                &spec.pkg_root,
-                                                &spec.module_name,
-                                                &s,
-                                            )
-                                        })
-                                        .unwrap_or(true)
-                                });
-                            if !crate::module_builder::input_bearing_libs_for_module(&cfg, m)
-                                .is_empty()
-                                || !crate::module_builder::input_bearing_exes_for_module(&cfg, m)
-                                    .is_empty()
-                                || spec_has_include_str
-                                || fs::read_to_string(&n.src_path)
-                                    .map(|s| crate::module_builder::source_uses_include_str(&s))
-                                    .unwrap_or(false)
-                            {
-                                Some(m.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    let mut changed = !closure.is_empty();
-                    while changed {
-                        changed = false;
-                        for (m, n) in &dag.nodes {
-                            if !closure.contains(m)
-                                && n.direct_dag_deps.iter().any(|d| closure.contains(d))
-                            {
-                                closure.insert(m.clone());
-                                changed = true;
-                            }
-                        }
-                    }
+                    let closure = input_closure_sweep_mods(&cfg, &dag);
                     closure_files = closure
                         .iter()
                         .filter_map(|m| dag.nodes.get(m).map(|n| n.src_path.clone()))
@@ -3704,7 +3722,7 @@ pub(crate) fn recheck_dependents_if_nonlocal_for_check(
                             }
                             if all_ok {
                                 let check_exes: Vec<String> =
-                                    lake_refresh_targets_for_input_closure(&dir, &closure_mods)
+                                    lake_refresh_targets_for_input_closure(&cfg, &closure_mods)
                                         .into_iter()
                                         .chain(input_exes.iter().cloned())
                                         .filter(|t| t.ends_with(":exe"))
@@ -3723,7 +3741,7 @@ pub(crate) fn recheck_dependents_if_nonlocal_for_check(
                     if all_fresh_on_disk {
                         ordered_targets.clear();
                     } else {
-                        for t in lake_refresh_targets_for_input_closure(&dir, &closure_mods) {
+                        for t in lake_refresh_targets_for_input_closure(&cfg, &closure_mods) {
                             if !ordered_targets.contains(&t) {
                                 ordered_targets.push(t);
                             }
