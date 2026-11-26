@@ -76,6 +76,7 @@ if log and os.environ.get("FAKE_FAIL_CALL"):
         sys.stderr.write("fake failure\n")
         if os.environ.get("FAKE_FAIL_SHOW_HOME"):
             sys.stderr.write("home was " + os.environ["TURBO_LEAN_HOME"] + "\n")
+            sys.stderr.write("binary was " + sys.argv[0] + "\n")
         sys.exit(3)
 if not seed and os.environ.get("FAKE_HANG_PID_FILE"):
     # A warm call that hangs with a child of its own holding the output pipe.
@@ -313,13 +314,14 @@ class ExpectationTests(unittest.TestCase):
         self.assertIn("warm_opt_in", moded)
 
     def test_failure_heads_name_the_scratch_root_by_placeholder(self):
-        scratch = Path("/run/x/build-loop-ab12")
+        roots = mod.path_roots(Path("/run/x/build-loop-ab12"), Path("/opt/tl/bin/turbo-lean"),
+                               "/opt/gitbin/git")
         r = {"exit_code": 3, "json": None,
-             "stderr": "cannot open /run/x/build-loop-ab12/home/db\n"}
-        self.assertEqual(mod.trial_problem(r, scratch),
-                         "exit 3: cannot open <scratch>/home/db")
-        self.assertEqual(mod.cold_problem(r, 6, scratch),
-                         "exit 3: cannot open <scratch>/home/db")
+             "stderr": "cannot open /run/x/build-loop-ab12/home/db via /opt/tl/bin/turbo-lean"
+                       " and /opt/gitbin/git\n"}
+        want = "exit 3: cannot open <scratch>/home/db via <bin-dir>/turbo-lean and <git-dir>/git"
+        self.assertEqual(mod.trial_problem(r, roots), want)
+        self.assertEqual(mod.cold_problem(r, 6, roots), want)
 
 
 class CommittedArtifactTests(unittest.TestCase):
@@ -414,7 +416,10 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
             text = (root / "out.json").read_text()
             self.assertIn("home was <scratch>/home", text)
-            self.assertNotIn(str(root), text)
+            self.assertIn("binary was <bin-dir>/fake-turbo-lean", text)
+            # A failing call's excerpt carries no host path at all.
+            for host_path in {str(root), os.path.realpath(str(root))}:
+                self.assertNotIn(host_path, text)
 
     def test_a_timed_out_call_takes_its_children_with_it(self):
         with tempfile.TemporaryDirectory() as td:
@@ -549,6 +554,39 @@ class InProcessTests(unittest.TestCase):
             self.assertEqual(code, 4, err)
             self.assertIn("launch", err)
             self.assertEqual(list(scratch.iterdir()), [])
+
+    def test_an_existing_out_file_of_another_schema_is_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            stub, bin_dir = make_stub(root), make_fake_lean(root)
+            scratch = root / "scratch"
+            scratch.mkdir()
+            env = clean_env(PATH=str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+            artifact = SCRIPT.parent / "bench_build_loop_g2b.json"
+            cases = {"g2b-record.json": artifact.read_text(),
+                     "other-kind.json": json.dumps({"schema_version": mod.SCHEMA_VERSION,
+                                                    "kind": "check_loop_results"}),
+                     "not-json.json": "plain text"}
+            for name, text in cases.items():
+                with self.subTest(name=name):
+                    out = root / name
+                    out.write_text(text)
+                    code, err = self.run_main(
+                        ["--turbo-lean-bin", str(stub), "--allow-busy-node",
+                         "--scratch-dir", str(scratch), "--out", str(out)], env)
+                    self.assertEqual(code, 4, err)
+                    self.assertIn("--out", err)
+                    self.assertEqual(out.read_text(), text)
+            self.assertEqual(list(scratch.iterdir()), [])
+
+    def test_a_previous_result_of_this_schema_may_be_replaced(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            out = root / "out.json"
+            out.write_text(json.dumps({"schema_version": mod.SCHEMA_VERSION,
+                                       "kind": "build_loop_results"}))
+            mod.refuse_other_artifact(out)
+            mod.refuse_other_artifact(root / "missing.json")
 
     def test_usage_errors_exit_2(self):
         for argv in (["--trials", "0"], ["--warmup", "-1"], ["--modules", "0"],

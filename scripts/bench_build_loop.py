@@ -199,6 +199,27 @@ def validate_environment(args) -> Path:
     return binary.resolve()
 
 
+def refuse_other_artifact(out: Path) -> None:
+    """An existing --out file must be an earlier result of this script's own schema.
+
+    A committed record of another shape (the schema-1 G2b artifact, a check-loop
+    results file) is evidence this run would replace, so it exits 4 first. A file
+    that is not JSON is refused too; a missing file is fine.
+    """
+    if not out.exists():
+        return
+    try:
+        old = json.loads(out.read_text())
+    except (OSError, ValueError) as e:
+        raise BenchEnvError(f"--out: {out.name} exists and is not a results JSON ({e})") from e
+    if not isinstance(old, dict) or (old.get("schema_version"), old.get("kind")) != (
+            SCHEMA_VERSION, "build_loop_results"):
+        raise BenchEnvError(
+            f"--out: {out.name} exists with schema_version {old.get('schema_version')!r} / "
+            f"kind {old.get('kind')!r}, not this script's schema {SCHEMA_VERSION} "
+            "build_loop_results; refusing to overwrite it")
+
+
 def lean_version(fixture_dir: Path) -> str:
     """`lean --version` run inside the fixture, so elan resolves its toolchain."""
     lean_bin = shutil.which("lean")
@@ -290,12 +311,30 @@ def run_build(argv, env, timeout_s):
             "psi_before": psi_before, "psi_after": psi_after}
 
 
-def _failure_head(r, scratch=None):
+def path_roots(scratch: Path, binary: Path, git_bin=None) -> list:
+    """The (root, placeholder) pairs a recorded stderr excerpt may name.
+
+    The check-loop bench's rule: the scratch root, the binary's directory, this
+    repository, the working and temp directories, the home directory, and the
+    directory of an absolute TURBO_LEAN_GIT, each as written and as resolved.
+    """
+    roots = [(str(scratch), "<scratch>"),
+             (str(Path(binary).parent), "<bin-dir>"),
+             (str(REPO_ROOT), "<repo>"),
+             (os.getcwd(), "<cwd>"),
+             (tempfile.gettempdir(), "<tmp>"),
+             (os.path.expanduser("~"), "<home>")]
+    if git_bin and os.path.isabs(git_bin):
+        roots.append((str(Path(git_bin).parent), "<git-dir>"))
+    return roots + [(os.path.realpath(r), p) for r, p in roots if os.path.isabs(r)]
+
+
+def _failure_head(r, roots=None):
     if r.get("exit_code") != 0:
         stderr = r.get("stderr") or ""
-        if scratch is not None:
+        if roots:
             # Scrub before cutting the tail, so a path split by the cut cannot leak.
-            stderr = stderr.replace(str(scratch), "<scratch>")
+            stderr = bcl.scrub_host_paths(stderr, roots)
         tail = stderr[-300:].strip()
         return f"exit {r.get('exit_code')}" + (f": {tail}" if tail else "")
     if not isinstance(r.get("json"), dict):
@@ -303,9 +342,9 @@ def _failure_head(r, scratch=None):
     return None
 
 
-def cold_problem(r, theorems: int, scratch=None):
+def cold_problem(r, theorems: int, roots=None):
     """None when the cold seeded build met its expectation, else why not."""
-    head = _failure_head(r, scratch)
+    head = _failure_head(r, roots)
     if head:
         return head
     j = r["json"]
@@ -317,9 +356,9 @@ def cold_problem(r, theorems: int, scratch=None):
     return None
 
 
-def trial_problem(r, scratch=None):
+def trial_problem(r, roots=None):
     """None when a warm call was a healthy cache hit that replayed nothing, else why not."""
-    head = _failure_head(r, scratch)
+    head = _failure_head(r, roots)
     if head:
         return head
     j = r["json"]
@@ -457,6 +496,7 @@ def main(argv=None) -> int:
             if not out_dir.is_dir() or not os.access(out_dir, os.W_OK | os.X_OK):
                 raise BenchEnvError(
                     f"--out: {out_dir} is not a writable directory")
+            refuse_other_artifact(Path(args.out))
         loadavg_at_start = read_loadavg()
         load_at_start = bcl.require_quiet_node(args)
         toolchain_line = args.lean_toolchain or repo_lean_toolchain()
@@ -500,7 +540,8 @@ def main(argv=None) -> int:
         print(f"[{bcl.utc_now_iso()}] cold seeded build ({args.modules} modules x "
               f"{args.theorems_per_module} theorems) ...", flush=True)
         cold = run_build(build_argv(binary, scratch, True), env, args.build_timeout_s)
-        problem = cold_problem(cold, theorems, scratch)
+        roots = path_roots(scratch, binary, git_bin)
+        problem = cold_problem(cold, theorems, roots)
         results["cold"] = cold_record(cold, problem)
         problems = [f"cold: {problem}"] if problem else []
         if not problem:
@@ -511,7 +552,7 @@ def main(argv=None) -> int:
             for call in range(args.warmup + args.trials):
                 r = run_build(build_argv(binary, scratch, False), env, args.build_timeout_s)
                 r.update(call=call, measured=call >= args.warmup,
-                         problem=trial_problem(r, scratch))
+                         problem=trial_problem(r, roots))
                 trials.append(r)
             results["sequence"] = [{"call": t["call"], "measured": t["measured"],
                                     "ok": t["problem"] is None} for t in trials]
