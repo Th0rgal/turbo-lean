@@ -620,18 +620,6 @@ pub(super) fn extract_local_def_unfoldings(clean_src: &str) -> Vec<LocalDefUnfol
     extract_local_def_unfoldings_and_sources(clean_src).0
 }
 
-/// Like [`extract_local_def_unfoldings`], but also returns each captured `def`/`abbrev`
-/// command's original one-line source as `(qualified name, command text, unsafe to
-/// re-emit)`, plus the short names of definitions the extractor had to SKIP (`by`/`do`/
-/// `where`/signature-only bodies), for the self-contained kernel witness fallback
-/// probes. A def is unsafe to re-emit when a semantics-changing `partial`/`unsafe`/
-/// `noncomputable` modifier (or an evaluation-bearing attribute such as
-/// `@[implemented_by ...]` or `@[extern ...]`) was consumed — a visibility or hint
-/// prefix (`private`, `scoped`, `local`, `@[simp]`, `@[inline]`, `@[reducible]`)
-/// either leaves the re-emitted meaning unchanged or makes the probe fail to
-/// elaborate, and a probe that fails to elaborate certifies nothing — or when
-/// gathering stopped at a blank line that an indented continuation follows (the
-/// gathered text may truncate the real body).
 /// Column-0 command starts that end a def-body gather. Shared between the gather
 /// break and the truncation peek, so a line that would NOT break the gather as a
 /// new command marks the gathered text truncation-suspect instead of being lost.
@@ -665,9 +653,30 @@ const DECL_GATHER_BREAK_PREFIXES: &[&str] = &[
     "unsafe ",
     "@[",
     "noncomputable ",
+    "example ",
+    "variable ",
+    "universe ",
+    "set_option ",
+    "alias ",
+    "omit ",
+    "include ",
+    "public ",
+    "meta ",
     "#",
 ];
 
+/// Like [`extract_local_def_unfoldings`], but also returns each captured `def`/`abbrev`
+/// command's original one-line source as `(qualified name, command text, unsafe to
+/// re-emit)`, plus the short names of definitions the extractor had to SKIP (`by`/`do`/
+/// `where`/signature-only bodies), for the self-contained kernel witness fallback
+/// probes. A def is unsafe to re-emit when a semantics-changing `partial`/`unsafe`/
+/// `noncomputable` modifier (or an evaluation-bearing attribute such as
+/// `@[implemented_by ...]` or `@[extern ...]`) was consumed — a visibility or hint
+/// prefix (`private`, `scoped`, `local`, `@[simp]`, `@[inline]`, `@[reducible]`)
+/// either leaves the re-emitted meaning unchanged or makes the probe fail to
+/// elaborate, and a probe that fails to elaborate certifies nothing — or when
+/// gathering stopped at a blank line that an indented continuation follows (the
+/// gathered text may truncate the real body).
 pub(super) fn extract_local_def_unfoldings_and_sources(
     clean_src: &str,
 ) -> (
@@ -944,7 +953,29 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
         }
         let raw_def_name = sig[..name_end].trim().trim_end_matches('.');
         let def_name = crate::splitter::qualified_decl_name(raw_def_name, &scope_stack);
-        let after_name = sig[name_end..].trim();
+        // A universe-polymorphic `foo.{u, v}` leaves the scan at the `{`: skip the
+        // balanced `.{...}` block so the universe names are not read as binders.
+        let mut after_name = sig[name_end..].trim();
+        if sig[..name_end].ends_with('.') && after_name.starts_with('{') {
+            let mut depth = 0usize;
+            let mut close = None;
+            for (ci, c) in after_name.char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(ci);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(ci) = close {
+                after_name = after_name[ci + 1..].trim();
+            }
+        }
         let mut params = Vec::new();
         let mut type_dependencies = String::new();
         let chars: Vec<char> = after_name.chars().collect();
@@ -4212,19 +4243,23 @@ pub(super) fn run_kernel_witness_probe(
     Ok(KernelWitnessProbeRun::Rejected { diagnostics })
 }
 
-/// Line numbers of `error:` diagnostics in a Lean compile log
-/// (`<path>:<line>:<col>: error: ...`), counting only the probe module's own file
-/// (its scratch name carries `TurboAuditedShard`), never a diagnostic some other file
-/// or a quoted message happens to print.
 /// Whether the per-probe sentinel's `#check` output is in the diagnostics. The
 /// `#check` info message arrives WITHOUT a file:line prefix (measured on the live
 /// toolchain), so positional acceptance is impossible; soundness comes from the
 /// derived marker instead: the sentinel name embeds a hash of the audited source,
-/// so audited text cannot print it — a file cannot contain its own hash.
+/// so the audited LITERAL source text cannot contain it — a file cannot contain its
+/// own hash. Code that runs at elaboration time (`run_cmd`, `#eval` in
+/// `CommandElabM`, ...) can read the probe file and print the marker; such commands
+/// are listed in `audited_src_declares_probe_hostile_commands`, which disables the
+/// fallback for them.
 fn sentinel_present(diagnostics: &str, derived_marker: &str) -> bool {
     diagnostics.contains(derived_marker)
 }
 
+/// Line numbers of `error:` diagnostics in a Lean compile log
+/// (`<path>:<line>:<col>: error: ...`), counting only the probe module's own file
+/// (its scratch name carries `TurboAuditedShard`), never a diagnostic some other file
+/// or a quoted message happens to print.
 fn lean_error_lines(diagnostics: &str) -> Vec<usize> {
     let mut out = Vec::new();
     for line in diagnostics.lines() {
@@ -4265,10 +4300,39 @@ fn lean_header_import_lines(src: &str) -> Vec<usize> {
     out
 }
 
+/// Whether the inside of an `@[...]` group names an attribute that registers
+/// something the probe cannot reproduce. Matches exact attribute names and known
+/// families, never substrings: `@[macro_inline]` and `@[elab_as_elim]` are harmless.
+fn attr_group_is_probe_hostile(group: &str) -> bool {
+    group.split(',').any(|attr| {
+        let mut words = attr.split_whitespace();
+        let mut name = words.next().unwrap_or("");
+        // `local`/`scoped` scope an attribute application: `@[local instance]`.
+        if matches!(name, "local" | "scoped") {
+            name = words.next().unwrap_or("");
+        }
+        matches!(
+            name,
+            "instance"
+                | "default_instance"
+                | "macro"
+                | "tactic"
+                | "delab"
+                | "app_unexpander"
+                | "unification_hint"
+                | "builtin_macro"
+                | "builtin_tactic"
+        ) || name.ends_with("_elab")
+            || name.ends_with("_parser")
+            || name.ends_with("_delab")
+    })
+}
+
 /// Commands in the audited source that change how appended or reconstructed text
 /// elaborates (instances, notation, macros, custom syntax and elaborators, attribute
-/// applications): a self-contained probe cannot reproduce them, so their presence
-/// disables the fallback shapes for the whole file.
+/// applications, and commands that run code at elaboration time and so can register
+/// any of those or read the probe file): a self-contained probe cannot reproduce
+/// them, so their presence disables the fallback shapes for the whole file.
 fn audited_src_declares_probe_hostile_commands(clean_src: &str) -> bool {
     clean_src.lines().any(|line| {
         let mut t = line.trim_start();
@@ -4308,13 +4372,7 @@ fn audited_src_declares_probe_hostile_commands(clean_src: &str) -> bool {
                 let Some(end) = close else {
                     return true;
                 };
-                if rest[..end].contains("instance")
-                    || rest[..end].contains("macro")
-                    || rest[..end].contains("elab")
-                    // Review 29baa2ab F4 residual: `@[tactic k]` registers a tactic
-                    // elaborator without carrying any of the three substrings above.
-                    || rest[..end].contains("tactic")
-                {
+                if attr_group_is_probe_hostile(&rest[..end]) {
                     return true;
                 }
                 t = rest[end + 1..].trim_start();
@@ -4353,6 +4411,12 @@ fn audited_src_declares_probe_hostile_commands(clean_src: &str) -> bool {
             "binder_predicate",
             "unif_hint",
             "#exit",
+            "run_cmd",
+            "run_elab",
+            "run_meta",
+            "initialize",
+            "builtin_initialize",
+            "declare_syntax_cat",
         ]
         .iter()
         .any(|kw| {
@@ -4363,6 +4427,9 @@ fn audited_src_declares_probe_hostile_commands(clean_src: &str) -> bool {
                     })
             })
         })
+            // `#eval` run in `CommandElabM`/`TermElabM` executes commands at
+            // elaboration time (it can register syntax or read the probe file).
+            || (t.starts_with("#eval") && t.contains("ElabM"))
     })
 }
 
@@ -6098,11 +6165,76 @@ mod lexer_tests {
         // Another source's sentinel does not satisfy this probe's gate.
         assert!(!sentinel_present(&format!("{name_b} : Nat"), &marker_a));
         // The probe builder emits the derived sentinel, not the bare prefix.
-        let (probe, _) = build_kernel_witness_probe_src(src_a, src_a, &[], true)
-            .map(|p| p)
-            .unwrap_or_else(|| (String::new(), Vec::new()));
-        if !probe.is_empty() {
-            assert!(probe.contains(&name_a));
+        let cand = SpecKernelWitnessCandidate {
+            pos: None,
+            neg: Some(KernelWitnessSide {
+                lets: vec!["let n : Nat := 0x0".to_string()],
+                body: "n = 0".to_string(),
+                assign_desc: "n=0".to_string(),
+                upgrade_label: true,
+            }),
+        };
+        let (probe, _) = build_kernel_witness_probe_src(src_a, src_a, &[(0, cand)], true)
+            .expect("a candidate with a neg side must yield a probe");
+        assert!(
+            probe.contains(&format!("def {name_a} : Nat")),
+            "the probe must define the derived sentinel the gate looks for"
+        );
+    }
+
+    /// Review f9807eb0 F1: `def liftU.{u} (n : Nat) ...` must not record the universe
+    /// name `u` as a parameter, and the def must unfold with its one real argument.
+    #[test]
+    fn extractor_skips_universe_block_after_def_name() {
+        let src = "def liftU.{u} (n : Nat) : ULift.{u} Nat := ⟨n⟩\n";
+        let defs = extract_local_def_unfoldings(src);
+        let d = defs
+            .iter()
+            .find(|(n, _, _, _)| n == "liftU" || n.ends_with(".liftU"))
+            .unwrap_or_else(|| panic!("liftU must be captured: {defs:?}"));
+        assert_eq!(d.1, vec!["n".to_string()], "universe names are not parameters");
+        let src2 = "def two.{u, v} (a : Nat) (b : Nat) : Nat := a + b\n";
+        let defs2 = extract_local_def_unfoldings(src2);
+        let d2 = defs2
+            .iter()
+            .find(|(n, _, _, _)| n == "two" || n.ends_with(".two"))
+            .unwrap_or_else(|| panic!("two must be captured: {defs2:?}"));
+        assert_eq!(d2.1, vec!["a".to_string(), "b".to_string()]);
+        let unfolded = unfold_expr_single_step("liftU 3", &defs);
+        assert!(unfolded.contains('3') && !unfolded.contains("liftU"), "got {unfolded}");
+    }
+
+    /// Review f9807eb0 F3: a blank line followed by a non-def command start such as
+    /// `example` keeps the preceding def re-emittable, and `example` does not get
+    /// absorbed into a def body with no blank line before it.
+    #[test]
+    fn extractor_treats_example_variable_universe_as_command_starts() {
+        for next in [
+            "example : f 1 = 2 := rfl",
+            "variable (n : Nat)",
+            "universe u",
+            "set_option maxRecDepth 100",
+            "alias g := f",
+            "omit n",
+            "include n",
+            "public def h : Nat := 0",
+            "meta def m : Nat := 0",
+        ] {
+            let src = format!("def f (n : Nat) : Nat := n + 1\n\n{next}\n");
+            let (_, def_srcs, _) = extract_local_def_unfoldings_and_sources(&src);
+            let f = def_srcs
+                .iter()
+                .find(|(n, _, _)| n == "f" || n.ends_with(".f"))
+                .unwrap_or_else(|| panic!("f must be captured for {next}"));
+            assert!(!f.2, "`{next}` must keep f re-emittable");
+            let src_nb = format!("def f (n : Nat) : Nat := n + 1\n{next}\n");
+            let (defs, _, _) = extract_local_def_unfoldings_and_sources(&src_nb);
+            let body = &defs
+                .iter()
+                .find(|(n, _, _, _)| n == "f" || n.ends_with(".f"))
+                .expect("f captured")
+                .2;
+            assert!(!body.contains(next.split(' ').next().unwrap()), "absorbed `{next}` into body: {body}");
         }
     }
 
@@ -6906,6 +7038,17 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
             // registers a tactic elaborator without the `instance`/`macro`/`elab`
             // attribute substrings.
             "@[tactic fooElab] def f : Nat := 0\n",
+            // Review f9807eb0 F2/F4: elaboration-time commands and exact attribute families.
+            "run_cmd logInfo \"x\"\n",
+            "run_elab pure ()\n",
+            "run_meta pure ()\n",
+            "initialize fooRef : IO.Ref Nat <- IO.mkRef 0\n",
+            "declare_syntax_cat foo\n",
+            "#eval show CommandElabM Unit from do pure ()\n",
+            "@[term_elab foo] def e : Nat := 0\n",
+            "@[local instance] def i : Nat := 0\n",
+            "@[simp, macro foo] def m : Nat := 0\n",
+            "@[app_unexpander foo] def u : Nat := 0\n",
         ] {
             assert!(
                 audited_src_declares_probe_hostile_commands(src),
@@ -6917,6 +7060,9 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
             "def infixes (n : Nat) : Nat := n\n",
             // A benign attribute must not be flagged (a64324fd F9 control case).
             "@[simp] theorem s : True := trivial\n",
+            "@[macro_inline] def mi (n : Nat) : Nat := n\n",
+            "@[elab_as_elim] theorem ee : True := trivial\n",
+            "@[elab_without_expected_type] def ew : Nat := 0\n",
         ] {
             assert!(
                 !audited_src_declares_probe_hostile_commands(src),
