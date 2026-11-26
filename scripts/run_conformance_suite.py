@@ -1452,12 +1452,30 @@ def main() -> int:
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
         failures.append({"stage": "execution_failure", "detail": str(error)})
 
+    c1_upstream = tier_results.get("C1", {}).get("upstream", {})
     missing_coverage = [
         "alias_RC_seqFor_llvm",
+        # R7: the former single upstream_lean4_run_250 token is split. The
+        # manifest-gate token clears when the opt-in manifest leg runs green;
+        # the three-way token stays until a MANIFEST program records
+        # lowered_llvm_emitted with executed 3-way case vectors. The authored
+        # canary fixture is manifest-external and deliberately outside the
+        # three-way condition: it proves the frontend still lowers, not that
+        # upstream programs execute three ways (outcomeCounts never includes
+        # it, and caseVectorExecutions stays 0 until case vectors exist).
         *(
             []
-            if tier_results.get("C1", {}).get("upstream", {}).get("ok") is True
-            else ["upstream_lean4_run_250"]
+            if c1_upstream.get("ok") is True
+            else ["upstream_lean4_run_250_manifest_gate"]
+        ),
+        *(
+            []
+            if (
+                c1_upstream.get("ok") is True
+                and c1_upstream.get("outcomeCounts", {}).get("lowered_llvm_emitted", 0) > 0
+                and c1_upstream.get("caseVectorExecutions", 0) > 0
+            )
+            else ["upstream_lean4_run_250_three_way"]
         ),
         *(
             []
