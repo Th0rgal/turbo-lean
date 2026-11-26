@@ -1779,7 +1779,7 @@ pub(super) fn audit_compiled_module_batch_exec_pinned(
     });
     match attempt {
         Ok(_) => Ok(()),
-        Err(e) if mod_names.len() > 1 && !WorkerBudget::error_names_memory_cap(&e) => {
+        Err(e) if mod_names.len() > 1 && !WorkerBudget::error_names_definite_memory_cap(&e) => {
             let mid = mod_names.len() / 2;
             audit_compiled_module_batch_exec_pinned(
                 store_root,

@@ -238,8 +238,14 @@ impl WorkerBudget {
     /// 5 GiB-footprint worker passed at share 2000 and failed at share 2048, and the
     /// kill note's "raise the budget" advice pointed the wrong way). A tighter budget
     /// (the governor documents 256 and 512 MiB values) still gets the 4096 MiB floor
-    /// cap, generous enough that trusted kernel replay does not fail outright under it
-    /// while scheduling width, SHM quotas and batch sizing enforce the real share.
+    /// cap while scheduling width, SHM quotas and batch sizing enforce the real share.
+    /// That floor is a REAL limit where tight budgets used to run uncapped (review
+    /// a64324fd F7): a worker whose writable virtual footprint passes 4096 MiB now
+    /// fails under `--max-memory-mb 4096 -j 8` where it passed before, and raising
+    /// `--max-memory-mb` moves the cap only once the per-worker share exceeds
+    /// `REPLAY_WORKER_EST_RSS_MB` (2048 MiB) — below that, lowering `--jobs` is what
+    /// raises the share. `memory_kill_note` names that threshold so the advice in the
+    /// failure text points at a knob that actually moves the cap.
     pub fn per_worker_rlimit_mb(&self, parallelism: usize) -> Option<u64> {
         self.per_worker_share_mb(parallelism)
             .map(|mb| {
@@ -339,8 +345,11 @@ impl WorkerBudget {
                     "\nworker died with signal {sig}; it may have been out of memory under \
                      the per-worker cap of {mb} MiB (RLIMIT_DATA from --max-memory-mb / \
                      TURBO_LEAN_MAX_MEMORY_MB), or it may have died for an unrelated \
-                     reason; raise the budget or lower --jobs / TURBO_LEAN_JOBS to give \
-                     each worker a larger share, then retry"
+                     reason; the cap is the per-worker share floored at \
+                     {REPLAY_WORKER_EST_RSS_MB} MiB, times {RLIMIT_DATA_HEADROOM_MULT}, \
+                     so raising the budget moves it only once the share passes \
+                     {REPLAY_WORKER_EST_RSS_MB} MiB; lower --jobs / TURBO_LEAN_JOBS to \
+                     raise the share, then retry"
                 );
             }
         }
@@ -358,8 +367,11 @@ impl WorkerBudget {
         if alloc_failure {
             return format!(
                 "\nworker failed to allocate under the per-worker memory cap of {mb} MiB \
-                 (RLIMIT_DATA from --max-memory-mb / TURBO_LEAN_MAX_MEMORY_MB); raise the \
-                 budget or lower --jobs / TURBO_LEAN_JOBS to give each worker a larger share"
+                 (RLIMIT_DATA from --max-memory-mb / TURBO_LEAN_MAX_MEMORY_MB); the cap \
+                 is the per-worker share floored at {REPLAY_WORKER_EST_RSS_MB} MiB, times \
+                 {RLIMIT_DATA_HEADROOM_MULT}, so raising the budget moves it only once \
+                 the share passes {REPLAY_WORKER_EST_RSS_MB} MiB; lower --jobs / \
+                 TURBO_LEAN_JOBS to raise the share"
             );
         }
         String::new()
@@ -372,6 +384,16 @@ impl WorkerBudget {
     pub fn error_names_memory_cap(err: &anyhow::Error) -> bool {
         let msg = format!("{err:#}");
         msg.contains("per-worker cap of") || msg.contains("per-worker memory cap of")
+    }
+
+    /// True only for the DEFINITE memory-cap attribution — the allocation-failure note
+    /// (`"per-worker memory cap of"`), never the "may have been" signal note (review
+    /// a64324fd F5). Bisection is skipped only when the worker provably hit the cap,
+    /// because halving a capped chunk redoes full-closure loads under the same cap; a
+    /// SIGSEGV or SIGABRT from an unrelated crash still gets the bisection that
+    /// isolates the failing module.
+    pub fn error_names_definite_memory_cap(err: &anyhow::Error) -> bool {
+        format!("{err:#}").contains("per-worker memory cap of")
     }
 }
 
