@@ -2407,6 +2407,46 @@ use super::*;
     }
 
     #[test]
+    fn test_memory_cap_error_classification_distinguishes_definite_from_signal() {
+        // Review a64324fd F5/F9: the broad predicate matches BOTH kill-note texts (the
+        // union-replay early return wants either attribution surfaced); the definite
+        // predicate matches only the allocation-failure note, so a SIGSEGV/SIGABRT
+        // ("may have been" out of memory) keeps the bisection that isolates the
+        // failing module while a proven cap hit skips it. The notes are built through
+        // `memory_kill_note` itself, so the test pins the real texts the predicates
+        // classify, never a copy that could drift.
+        use crate::zygote::WorkerBudget;
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            // A raw wait status of 11 is "killed by SIGSEGV".
+            let sig_status = std::process::ExitStatus::from_raw(11);
+            let note = WorkerBudget::memory_kill_note(&sig_status, "", Some(4096));
+            assert!(note.contains("per-worker cap of"), "signal note text: {note}");
+            let err = anyhow::anyhow!("{}", note.trim_start());
+            assert!(WorkerBudget::error_names_memory_cap(&err));
+            assert!(
+                !WorkerBudget::error_names_definite_memory_cap(&err),
+                "a signal death is never a DEFINITE cap hit: {note}"
+            );
+            // A raw wait status of 1 << 8 is "exited with code 1".
+            let fail_status = std::process::ExitStatus::from_raw(1 << 8);
+            let alloc_note =
+                WorkerBudget::memory_kill_note(&fail_status, "std::bad_alloc", Some(4096));
+            assert!(
+                alloc_note.contains("per-worker memory cap of"),
+                "alloc note text: {alloc_note}"
+            );
+            let alloc_err = anyhow::anyhow!("{}", alloc_note.trim_start());
+            assert!(WorkerBudget::error_names_memory_cap(&alloc_err));
+            assert!(WorkerBudget::error_names_definite_memory_cap(&alloc_err));
+        }
+        let unrelated = anyhow::anyhow!("lean worker exited with status 1");
+        assert!(!WorkerBudget::error_names_memory_cap(&unrelated));
+        assert!(!WorkerBudget::error_names_definite_memory_cap(&unrelated));
+    }
+
+    #[test]
     fn test_explicit_audit_timeout_parser_and_unbounded_threshold() {
         // #443 review (finding 3): one shared parser decides what an explicit
         // TURBO_LEAN_AUDIT_TIMEOUT_SECS means, and the shard auditor's unbounded-request
@@ -2424,8 +2464,11 @@ use super::*;
             assert_eq!(explicit_audit_timeout_ms(), Some(UNBOUNDED_TIMEOUT_MS));
         }
         {
+            // Review a64324fd F1 (pinning bb7c0f2f F1): an empty or whitespace-only
+            // value is NO configuration — an empty export such as `VAR=${UNSET}` in CI
+            // must not silently mean "no timeout". Only a literal `0` is unbounded.
             let _empty = EnvVarGuard::set("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "  ");
-            assert_eq!(explicit_audit_timeout_ms(), Some(UNBOUNDED_TIMEOUT_MS));
+            assert_eq!(explicit_audit_timeout_ms(), None);
         }
         {
             let _secs = EnvVarGuard::set("TURBO_LEAN_AUDIT_TIMEOUT_SECS", " 60 ");

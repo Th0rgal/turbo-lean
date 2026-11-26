@@ -611,8 +611,10 @@ fn write_executable_script(path: &Path, body: &str) {
 /// G1b: compile `<module>.lean` in `dir` into a REAL `<module>.olean` with the repo's pinned
 /// toolchain, so the con-leche verification path is tested over real compiled artifacts and
 /// never over synthesized `.olean` bytes or an empty search path. Returns `None` (after
-/// printing a skip message) when no runnable Lean toolchain (`elan` or `lean`) is on PATH;
-/// a toolchain that is present but fails to compile is still a hard test failure.
+/// printing a skip message) when no runnable Lean toolchain (`elan` or `lean`) is on PATH
+/// and `TURBO_LEAN_REQUIRE_LEAN` is unset; under `TURBO_LEAN_REQUIRE_LEAN` a missing
+/// toolchain is a hard test failure, and a toolchain that is present but fails to compile
+/// is always one.
 #[cfg(unix)]
 fn compile_real_olean_module(dir: &Path, module: &str) -> Option<PathBuf> {
     let toolchain = include_str!("../../../lean/lean-toolchain").trim();
@@ -626,8 +628,8 @@ fn compile_real_olean_module(dir: &Path, module: &str) -> Option<PathBuf> {
         .filter(|o| o.status.success())
         .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
         .unwrap_or_else(|| PathBuf::from("lean"));
-    // Review finding 7: skip (never panic) when neither `elan` nor `lean` resolves to a
-    // runnable toolchain on this host.
+    // Review finding 7: skip when neither `elan` nor `lean` resolves to a runnable
+    // toolchain on this host, unless the environment explicitly requires Lean.
     match Command::new(&lean_bin)
         .current_dir(dir)
         .arg("--version")
@@ -636,13 +638,14 @@ fn compile_real_olean_module(dir: &Path, module: &str) -> Option<PathBuf> {
         Ok(v) if v.status.success() => {}
         _ => {
             // Review bb7c0f2f F6: a silent skip would let CI report this G1b evidence
-            // test as passing on a host (or network outage) where Lean never ran; under
-            // CI, or when explicitly required, fail hard instead.
+            // test as passing on a host (or network outage) where Lean never ran.
+            // Review a64324fd F8: the gate keys ONLY on TURBO_LEAN_REQUIRE_LEAN — the
+            // workflow sets it on the jobs that install Lean — never on the generic
+            // `CI`, which any CI job running `cargo test` without elan would trip.
             assert!(
-                std::env::var_os("CI").is_none()
-                    && std::env::var_os("TURBO_LEAN_REQUIRE_LEAN").is_none(),
+                std::env::var_os("TURBO_LEAN_REQUIRE_LEAN").is_none(),
                 "no runnable Lean toolchain (`elan`/`lean`) on PATH; refusing to skip the \
-                 real-`.olean` compile under CI / TURBO_LEAN_REQUIRE_LEAN"
+                 real-`.olean` compile under TURBO_LEAN_REQUIRE_LEAN"
             );
             eprintln!(
                 "no runnable Lean toolchain (`elan`/`lean`) on PATH; cannot compile a real `{module}.olean`"
