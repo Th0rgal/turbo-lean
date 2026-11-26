@@ -882,12 +882,15 @@ pub(crate) fn dep_pkg_lake_targets_owned_by_project(
 /// * a clean git-pinned package (a manifest `git` entry, clean at its rev) is never
 ///   project-owned: its own workspace refreshes it from the pin (#434);
 /// * a root inside another package's `.lake/packages` is a nested checkout, never ours;
-/// * everything else is owned exactly when its canonical root lies inside the project
-///   root. Canonicalization resolves symlinks, so a `path` entry or a
+/// * a `path` manifest entry is editable project state wherever its directory
+///   resolves (review finding 6: #434's damage came from shared GIT checkouts, and
+///   un-owning an editable `../sibling` turns its edited `include_str` targets into
+///   silent skips that nothing refreshes);
+/// * everything else (no matching manifest entry — a hand-built or synthesized
+///   package — or a git entry whose checkout is not clean at its pin) falls back to
+///   location: a canonical root inside the project root is ours, and a symlinked
 ///   `.lake/packages` directory that points at a checkout elsewhere (#434's damaged
-///   shared Mathlib) resolves outside the root and stays refused, whatever the
-///   manifest says; an editable sibling (`require foo from "../foo"`) is likewise
-///   another checkout, refreshed from its own workspace.
+///   shared Mathlib) resolves outside the root and stays refused.
 fn pkg_root_owned_by_project(
     cfg: &ProjectConfig,
     pkg_name: &str,
@@ -900,6 +903,9 @@ fn pkg_root_owned_by_project(
     if pkg_root_inside_foreign_lake_packages(cfg, pkg_root) {
         return false;
     }
+    if manifest_entry_is_path_dep(cfg, pkg_name, pkg_base_name, pkg_root) {
+        return true;
+    }
     match (
         fs::canonicalize(pkg_root),
         fs::canonicalize(&cfg.root_pkg.pkg_root),
@@ -907,6 +913,27 @@ fn pkg_root_owned_by_project(
         (Ok(pkg), Ok(root)) => pkg.starts_with(&root),
         _ => false,
     }
+}
+
+fn manifest_entry_is_path_dep(
+    cfg: &ProjectConfig,
+    pkg_name: &str,
+    pkg_base_name: &str,
+    pkg_root: &Path,
+) -> bool {
+    let pkg_canon = pkg_root.canonicalize().ok();
+    cfg.manifest_packages.iter().any(|mp| {
+        mp.pkg_type == "path"
+            && (mp.name == pkg_name
+                || (!pkg_base_name.is_empty() && mp.name == pkg_base_name)
+                || mp.dir == pkg_root
+                || mp
+                    .dir
+                    .canonicalize()
+                    .ok()
+                    .zip(pkg_canon.as_ref())
+                    .is_some_and(|(a, b)| a == *b))
+    })
 }
 
 /// A package root inside a *different* package's `.lake/packages` is a nested checkout
@@ -3142,12 +3169,13 @@ mod host_effect_taint_tests {
         Ok(())
     }
 
-    /// A `path` dependency whose directory resolves outside the project root is
-    /// another checkout, whatever the manifest says: #434's damage came from deleting
-    /// and lake-building shared checkouts from this project, and a `../sibling` (or a
-    /// symlinked `.lake/packages` entry) is refreshed by its own workspace.
+    /// An editable `path` dependency (`require foo from "../foo"`) is project state
+    /// wherever its directory resolves: #434's damage came from shared GIT checkouts
+    /// (a pinned Mathlib behind a symlinked `.lake/packages` entry), not from path
+    /// entries, and un-owning siblings turned every edited `include_str` target there
+    /// into a silent skip that nothing refreshes (review finding 6).
     #[test]
-    fn host_effects_shared_sibling_path_dep_is_not_project_owned() -> Result<()> {
+    fn host_effects_editable_sibling_path_dep_is_project_owned() -> Result<()> {
         let dir = temp_dir("sibling_path");
         let proj = dir.join("proj");
         let dep = dir.join("lintlib");
@@ -3192,14 +3220,14 @@ mod host_effect_taint_tests {
         let spec = resolve_module_in_package(dep_pkg, false, "LintLib")
             .expect("LintLib module resolves in sibling lintlib");
         assert!(
-            !spec_artifacts_purgeable_from_project_root(&cfg, &spec),
-            "a path dependency outside the project root is another checkout; its \
-             artifacts are never purged from this project (#434)"
+            spec_artifacts_purgeable_from_project_root(&cfg, &spec),
+            "an editable sibling path dependency is project state; its edited \
+             include_str targets are purged and rebuilt from here (finding 6)"
         );
         assert!(
-            !dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
-            "a path dependency outside the project root is not lake-built from this \
-             project (#434)"
+            dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
+            "an editable sibling path dependency's targets are project-driven \
+             (finding 6)"
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())
