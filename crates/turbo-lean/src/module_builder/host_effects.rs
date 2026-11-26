@@ -54,13 +54,15 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
     // verified-source stamps and Lake traces, so a rebuilt artifact still invalidates
     // them without deleting whole import closures up front. Deletion honors the #434
     // ownership guard: a module the project does not own is never deleted here. A
-    // refusal is keyed on that module's OWN artifact: when it is fresh (what the pin
-    // built, or nothing on disk at all), the module is marked spreading instead, so
-    // the owned importers are purged and rebuilt against its digest and the refresh
-    // completes — a pinned `#eval` or `run_cmd` is a static property of the source,
-    // and bailing on it would brick every later refresh. Only a stale unowned
-    // artifact fails the walk closed (below) instead of skipping silently, because a
-    // later build could reuse it as fresh and only its own workspace may rebuild it.
+    // refusal is keyed on that module's OWN artifact — a pinned `#eval` or `run_cmd`
+    // is a static property of the source, and bailing on it would brick every later
+    // refresh. When the unowned artifact is fresh (what the pin built, or nothing on
+    // disk at all): a module with SPREADING taint is still marked spreading, so the
+    // owned importers are purged and rebuilt against its digest; a `SelfOnly` module
+    // is skipped outright, because its digest does not change and the digest pin
+    // already covers its importers. Only a stale unowned artifact fails the walk
+    // closed (below), because a later build could reuse it as fresh and only its own
+    // workspace may rebuild it.
     let mut spreading: HashSet<(PathBuf, String)> = HashSet::new();
     let mut purged_any = false;
     for spec in postorder {
@@ -124,12 +126,12 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
                 purged_any = true;
             } else if spec_own_artifact_stale_on_disk(&spec) {
                 refuse_purge(&spec)?;
-            } else {
-                // Unowned, fresh, `SelfOnly`: the artifact stays (its own workspace
-                // owns it), and the owned importers are purged so nothing downstream
-                // reuses a verdict built on top of it.
-                spreading.insert(key);
             }
+            // Unowned, fresh, `SelfOnly`: skipped outright. The artifact is what the
+            // pin built, its digest does not change, and importers are pinned to that
+            // digest by the verified-source stamps and Lake traces, so purging them
+            // would rebuild identical artifacts while forcing the no-cache path on
+            // every refresh (DA 71add786 finding 3).
         }
     }
     Ok(purged_any)
@@ -3428,9 +3430,10 @@ mod host_effect_taint_tests {
     /// ownership, and a refusal is keyed on the unowned module's own artifact. A
     /// definition-only linter module (registration included) purges nothing;
     /// project-owned path-dependency artifacts are purged in place along with the
-    /// importer cone; a pinned (unowned) tainted module whose own artifact is FRESH is
-    /// marked spreading instead — its artifact stays, the owned importers are purged,
-    /// and the refresh completes; only a pinned module whose own artifact is actually
+    /// importer cone; a pinned (unowned) module with FRESH artifacts completes the
+    /// refresh — spreading taint still purges the owned importers, while a `SelfOnly`
+    /// one is skipped outright (its unchanged digest already pins the importers, DA
+    /// 71add786 finding 3); only a pinned module whose own artifact is actually
     /// stale fails the walk closed, deleting nothing, because clearing that needs a
     /// rebuild in the dependency's own workspace.
     #[test]
@@ -3443,8 +3446,8 @@ mod host_effect_taint_tests {
             ("path_importtime", IMPORT_TIME_SHAPE, false, false, Ok((true, true))),
             ("pinned_elabread_fresh", ELAB_BLOCK_HOST_READ_SHAPE, true, false, Ok((false, true))),
             ("pinned_importtime_fresh", IMPORT_TIME_SHAPE, true, false, Ok((false, true))),
-            ("pinned_selfonly_fresh", RUN_CMD_HELPER_SHAPE, true, false, Ok((false, true))),
-            ("pinned_eval_fresh", EVAL_SHAPE, true, false, Ok((false, true))),
+            ("pinned_selfonly_fresh", RUN_CMD_HELPER_SHAPE, true, false, Ok((false, false))),
+            ("pinned_eval_fresh", EVAL_SHAPE, true, false, Ok((false, false))),
             ("pinned_importtime_stale", IMPORT_TIME_SHAPE, true, true, Err(())),
             ("pinned_selfonly_stale", RUN_CMD_HELPER_SHAPE, true, true, Err(())),
         ];
