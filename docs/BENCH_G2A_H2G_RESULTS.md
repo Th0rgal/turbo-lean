@@ -147,6 +147,62 @@ With the revert the telemetry mode strings were renamed (`warm_default` to
 contract change; no external consumer of the old strings was found
 (pr_verify and the integration tests read zero occurrences).
 
+## G2b: build-shaped warm loop, the opt-in's own cost
+
+The first forward option above, taken: `scripts/bench_build_loop.py` drives
+the `build` path that the check-loop bench cannot reach. It generates a Lake
+fixture of 4 independent modules with 50 distinct `omega` theorems each, runs
+one cold `turbo-lean build --seed-shards` into a fresh CAS, then 1 warmup and
+20 measured rounds of warm `turbo-lean build`. A round is one call per side,
+and the side order alternates ABBA (ON,OFF then OFF,ON) so drift lands on both
+sides. Every call is a fresh process with no daemon, telemetry off, and a
+private `TURBO_LEAN_HOME`, staging dir and `TMPDIR`. ON sets
+`TURBO_LEAN_WARM_CAS_REPLAY=1`; OFF sets neither switch. Each call is held to
+its side's expectation: ON must report `cache_hit`, `warm_opt_in` and one
+replayed shard per seeded receipt, OFF must report `off`, and any other answer
+fails the run. That is the assert the check-loop delta lacked: a side whose
+opt-in never reaches the replay cannot pass as a measured null.
+
+Setup: commit `0a593169` (clean tree), binary `target/release/turbo-lean`
+sha256 `1abed53058499c27d6a5287002f772902c51742d583d08c7a41383670a2bc93e`,
+Lean 4.35.0, machine label `g2b-build-192c` (192 CPUs), run started
+2026-11-26T18:58:15Z, `/proc/loadavg` `53.18 55.35 84.11` at start and
+`66.83 57.98 84.05` at end (`busy_allowed` true), PSI not contended
+(memory.some and io.some at most 3.63). Cold seeded build: 26.4 s, 5 modules
+compiled, 200 shards seeded. Artifact: `scripts/bench_build_loop_g2b.json`.
+Command:
+
+```
+python3 scripts/bench_build_loop.py --turbo-lean-bin target/release/turbo-lean \
+    --machine-label g2b-build-192c --allow-busy-node \
+    --out scripts/bench_build_loop_g2b.json
+```
+
+Warm cache-hit builds, 20 measured calls per side:
+
+| side | external wall median ms | IQR ms | tool `elapsed_ms` median | IQR ms | replay per call |
+|---|---|---|---|---|---|
+| OFF (no switch) | 98.8 | 97.5–102.0 | 87.5 | 86.0–89.5 | `off`, 0 shards |
+| ON (`TURBO_LEAN_WARM_CAS_REPLAY=1`) | 113.6 | 110.8–120.9 | 102.5 | 99.8–105.5 | `warm_opt_in`, 200 shards |
+
+ON minus OFF: +14.8 ms (+14.98%) on the external wall and +15.0 ms (+17.14%)
+on `elapsed_ms`. Paired by round, the median difference is +14.2 ms (IQR
+11.7–18.4) on the wall and +13.5 ms (IQR 11.8–16.0) on `elapsed_ms`; ON was
+slower in 17 and 18 of the 20 rounds. That is about 0.07 ms per replayed
+shard, which on a receipt-seeded store is a CAS lookup plus a receipt check,
+not a kernel replay.
+
+The bench's own tolerance rule (OFF as the baseline, the rule the check-loop
+G2b table above used) classes both deltas `unchanged`, with bands of ±148.1 ms
+and ±149.0 ms. The bands are that wide because the rule scales with OFF's
+max-min spread, and one 154.2 ms OFF call stretches it (OFF ranged 92.6–154.2
+ms). The quartiles separate the sides where the band cannot: they do not
+overlap, so the opt-in's measured cost is about 15 ms per warm build of this
+fixture. Limits: one run, on a loaded node, on a synthetic 200-shard fixture;
+the cost should scale with the replayed shard count of a real warm build,
+which this run does not measure. Nothing here changes a default, and the
+leaf's own branches (on by default for warm `check`, or deleted) stay open.
+
 ## Per-cell peak RSS across the 5 trials (MB, trial order)
 
 From `peak_rss_mb_trials` (the tool's own `peak_rss_mb` reading per check). No
