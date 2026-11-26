@@ -179,7 +179,12 @@ def deepReceipt : SuperoptEvolveReceipt := executeSuperoptEvolve canonCfg (.modu
 #eval show IO Unit from do
   let payload := cachedStochasticBundle.toJson.toUTF8
   let digest := TurboLean.Blake3.blake3Bytes payload
-  let path := "/tmp/stochastic-evolve-integrity.tlpack"
+  -- Under $TMPDIR (not a literal /tmp): two concurrent builds of this module
+  -- sharing one temp directory overwrite or remove each other's fixture
+  -- mid-check, failing elaboration with "pack integrity regression" or ENOENT
+  -- (measured by the H1.4 mutant matrix, scripts/proof_mutant_matrix.py).
+  let tmpDir := (← IO.getEnv "TMPDIR").getD "/tmp"
+  let path := tmpDir ++ "/stochastic-evolve-integrity.tlpack"
   let compressed := path ++ ".zst"
   for tamper in [false, true] do
     let hash := if tamper then (if digest.startsWith "0" then "1" else "0") ++ digest.drop 1
