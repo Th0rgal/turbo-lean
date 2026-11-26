@@ -1446,17 +1446,19 @@ pub(crate) fn input_closure_sweep_mods(
             // meant thousands of file reads on every sweep just to decide whether to
             // print a warning.
             if !node_owned(n) {
-                if crate::module_builder::input_bearing_libs_for_module(cfg, m).is_empty()
-                    && crate::module_builder::input_bearing_exes_for_module(cfg, m).is_empty()
-                {
-                    return None;
-                }
                 // cf31dd1e F6: an EXCLUDED non-owned input-bearing seed used to fail
                 // the freshness check loudly; now that the sweep skips it, a stale one
                 // must not go silent while the purge path fails closed on the same
-                // state. Said once per module per process (a64324fd F6: the sweep runs
-                // on every freshness probe, and an un-deduped eprintln repeated each
-                // time).
+                // state. Review bfa9d056 F4 orders the work by cost: the artifact
+                // STALENESS check (resolver + mtimes) runs first, and the per-module
+                // SOURCE reads that decide `include_str` input-bearing run only for
+                // nodes that came out stale — so a fresh Mathlib import still costs no
+                // file reads per sweep, while a stale include_str-only module keeps
+                // its warning (the purge path fails closed on exactly that state).
+                let config_input_bearing =
+                    !crate::module_builder::input_bearing_libs_for_module(cfg, m).is_empty()
+                        || !crate::module_builder::input_bearing_exes_for_module(cfg, m)
+                            .is_empty();
                 let spec =
                     crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, m)
                         .or_else(|| {
@@ -1465,30 +1467,67 @@ pub(crate) fn input_closure_sweep_mods(
                                 _ => None,
                             }
                         });
-                if spec
+                let stale = spec
                     .as_ref()
-                    .is_some_and(crate::module_builder::spec_own_artifact_stale_on_disk)
-                {
-                    static WARNED_STALE_NON_OWNED: std::sync::OnceLock<
-                        std::sync::Mutex<std::collections::BTreeSet<String>>,
-                    > = std::sync::OnceLock::new();
-                    let first_time = WARNED_STALE_NON_OWNED
-                        .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
-                        .lock()
-                        .map(|mut warned| warned.insert(m.clone()))
-                        .unwrap_or(true);
-                    if first_time {
-                        eprintln!(
-                            "[turbo-lean] input-bearing module `{}` lives in a non-owned checkout and its artifacts are stale on disk; the freshness sweep does not cover it — {}",
-                            m,
-                            crate::module_builder::non_owned_dep_refresh_remedy(
-                                m,
-                                &cfg.root_pkg.pkg_root,
-                                &n.pkg_root,
-                                crate::module_builder::OwnerMarkerSite::PkgRootOrParent,
-                            )
-                        );
+                    .is_some_and(crate::module_builder::spec_own_artifact_stale_on_disk);
+                // Review bfa9d056 F5: the dedupe key carries the package root (two
+                // packages may share a module name), and a node seen FRESH clears its
+                // entry, so a module the user refreshes and later lets go stale again
+                // is warned about again, even in a long-lived daemon.
+                static WARNED_STALE_NON_OWNED: std::sync::OnceLock<
+                    std::sync::Mutex<std::collections::BTreeSet<(std::path::PathBuf, String)>>,
+                > = std::sync::OnceLock::new();
+                let warned = WARNED_STALE_NON_OWNED
+                    .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+                let key = (n.pkg_root.clone(), m.clone());
+                if !stale {
+                    if let Ok(mut guard) = warned.lock() {
+                        guard.remove(&key);
                     }
+                    return None;
+                }
+                let input_bearing = config_input_bearing
+                    || spec.as_ref().is_some_and(|spec| {
+                        fs::read_to_string(&spec.src_path)
+                            .map(|s| {
+                                crate::module_builder::module_directly_depends_on_lake_inputs(
+                                    cfg,
+                                    &spec.pkg_root,
+                                    &spec.module_name,
+                                    &s,
+                                )
+                            })
+                            .unwrap_or(true)
+                    })
+                    || fs::read_to_string(&n.src_path)
+                        .map(|s| crate::module_builder::source_uses_include_str(&s))
+                        .unwrap_or(false);
+                if !input_bearing {
+                    return None;
+                }
+                let first_time = warned
+                    .lock()
+                    .map(|mut guard| guard.insert(key))
+                    .unwrap_or(true);
+                if first_time {
+                    eprintln!(
+                        "[turbo-lean] input-bearing module `{}` lives in a non-owned checkout and its artifacts are stale on disk; the freshness sweep does not cover it — {}",
+                        m,
+                        crate::module_builder::non_owned_dep_refresh_remedy(
+                            m,
+                            &cfg.root_pkg.pkg_root,
+                            &n.pkg_root,
+                            crate::module_builder::OwnerMarkerSite::PkgRootOrParent {
+                                clean_git_pinned:
+                                    crate::module_builder::pkg_is_clean_git_pinned(
+                                        cfg,
+                                        &n.pkg_name,
+                                        &n.pkg_base_name,
+                                        &n.pkg_root,
+                                    ),
+                            },
+                        )
+                    );
                 }
                 return None;
             }
