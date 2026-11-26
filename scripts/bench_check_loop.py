@@ -207,16 +207,44 @@ def binary_record(binary: Path, repo_path, sha256: str) -> dict:
     return {"path": rel, "sha256": sha256}
 
 
+# A character that continues a path component, so a root right before or after
+# one is part of a longer name (`/home/u` in `/home/u2` or `/data/home/u`).
+_PATH_NAME_CHAR = r"[\w.\-~+@%]"
+
+
 def scrub_host_paths(text: str, roots) -> str:
     """Replace each (root, placeholder) host root in free text, longest root first.
 
-    A root that is empty or the filesystem root itself is skipped, so a bare `/`
-    (a sandbox's home, say) never rewrites every path in the text.
+    A root is replaced only as whole path components: not where a name character
+    follows it (`/home/u2` keeps its name under a root `/home/u`) or precedes it
+    (`/data/home/u`). A root that is empty or the filesystem root itself is
+    skipped, so a bare `/` (a sandbox's home, say) never rewrites every path.
     """
     for root, placeholder in sorted(roots, key=lambda r: len(r[0] or ""), reverse=True):
         if root and len(Path(root).parts) > 1:
-            text = text.replace(root, placeholder)
+            pattern = (rf"(?<!{_PATH_NAME_CHAR}){re.escape(root)}(?!{_PATH_NAME_CHAR})")
+            text = re.sub(pattern, lambda _m: placeholder, text)
     return text
+
+
+def host_path_roots(scratch, dirs, bin_path, git_bin) -> list:
+    """The (root, placeholder) pairs a recorded stderr excerpt may name.
+
+    Each root appears as written and as resolved, since a symlinked home or temp
+    dir prints either way. The directory of an absolute TURBO_LEAN_GIT is one,
+    because the setting itself is recorded only as a digest.
+    """
+    roots = [(str(scratch), "<scratch>"),
+             (str(dirs["batteries"]), "<batteries>"),
+             (str(dirs["pfr"]), "<pfr>"),
+             (str(Path(bin_path).parent), "<bin-dir>"),
+             (str(Path(__file__).resolve().parent.parent), "<repo>"),
+             (os.getcwd(), "<cwd>"),
+             (tempfile.gettempdir(), "<tmp>"),
+             (os.path.expanduser("~"), "<home>")]
+    if git_bin and os.path.isabs(git_bin):
+        roots.append((str(Path(git_bin).parent), "<git-dir>"))
+    return roots + [(os.path.realpath(r), p) for r, p in roots if os.path.isabs(r)]
 
 
 def remove_tree(root) -> None:
@@ -1372,18 +1400,7 @@ class Runner:
         # --check-timeout-s; getattr keeps stub args objects in tests working.
         self.check_timeout_s = getattr(args, "check_timeout_s", None) or CHECK_TIMEOUT_S
         self.scratch = Path(tempfile.mkdtemp(prefix="m1-bench-")).resolve()
-        # Host roots a recorded stderr excerpt may name, each as written and as
-        # resolved (a symlinked home or temp dir prints either way).
-        roots = [(str(self.scratch), "<scratch>"),
-                 (str(self.dirs["batteries"]), "<batteries>"),
-                 (str(self.dirs["pfr"]), "<pfr>"),
-                 (str(self.bin.parent), "<bin-dir>"),
-                 (str(Path(__file__).resolve().parent.parent), "<repo>"),
-                 (os.getcwd(), "<cwd>"),
-                 (tempfile.gettempdir(), "<tmp>"),
-                 (os.path.expanduser("~"), "<home>")]
-        self.path_roots = roots + [(os.path.realpath(r), p) for r, p in roots
-                                   if os.path.isabs(r)]
+        self.path_roots = host_path_roots(self.scratch, self.dirs, self.bin, self.git_bin)
         self.revs = {}
         self.oleans_guard_violated = False
         self._edited_path = None      # source file currently holding a bench edit

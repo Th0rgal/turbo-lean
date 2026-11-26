@@ -1959,6 +1959,13 @@ class CommittedArtifactIsPathFree(unittest.TestCase):
                                         ("/", "<root>"), ("", "<empty>")]),
             "failed in <scratch>/w/cold_0 and <tmp>/other, see /")
 
+    def test_scrub_replaces_a_root_only_as_whole_path_components(self):
+        mod = load_script()
+        roots = [("/home/u", "<home>")]
+        text = "in /home/u/x, /home/u2/x, /data/home/u/x and /home/u"
+        self.assertEqual(mod.scrub_host_paths(text, roots),
+                         "in <home>/x, /home/u2/x, /data/home/u/x and <home>")
+
     def test_binary_is_recorded_relative_to_its_repository_or_by_name(self):
         mod = load_script()
         with tempfile.TemporaryDirectory() as td:
