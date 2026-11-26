@@ -2252,17 +2252,23 @@ pub(super) fn node_source_has_disallowed_elab_host_effects(
 /// spreading has to be chased through their source headers; one hop was not enough
 /// (`Dep.B` importing a host-reading `Dep.A` never marked the root). Lean import
 /// graphs are acyclic; a resolver cycle is cut by the in-progress memo entry. An
-/// unreadable source or broken header fails closed, as in the purge walk. Verdicts are
-/// also cached across calls, keyed by source content: the warm loop calls this per
-/// check, and the walk would otherwise re-read and re-classify a whole external
-/// source closure (a Mathlib import graph) every time.
+/// unreadable source or broken header fails closed, as in the purge walk. Only the
+/// PER-FILE facts (the own-source spread verdict and the parsed header) are cached
+/// across calls, keyed by source content: the transitive verdict always recurses, so
+/// an edit below an unchanged importer still flips the importer's verdict in a
+/// long-lived daemon. The recursion costs one read and one hash per already-seen file
+/// per call and is bounded by the per-call `memo`.
 pub(super) fn spec_spreads_host_effects_transitively(
     cfg: &ProjectConfig,
     spec: &DiscoveredModuleSpec,
     memo: &mut HashMap<(PathBuf, String), bool>,
 ) -> bool {
-    static SPREAD_VERDICTS: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<(PathBuf, String, [u8; 32]), bool>>,
+    // Per-file facts only: whether the module's OWN source spreads, whether its header
+    // failed to parse, and its imports. Never the transitive verdict, which depends on
+    // every file below the module while this key covers only the one file.
+    #[allow(clippy::type_complexity)]
+    static SPREAD_FILE_FACTS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<(PathBuf, String, [u8; 32]), (bool, bool, Vec<String>)>>,
     > = std::sync::OnceLock::new();
     let key = (spec.pkg_root.clone(), spec.module_name.clone());
     if let Some(&v) = memo.get(&key) {
@@ -2272,7 +2278,7 @@ pub(super) fn spec_spreads_host_effects_transitively(
     let v = match fs::read_to_string(&spec.src_path) {
         Err(_) => true,
         Ok(src) => {
-            let cache = SPREAD_VERDICTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+            let cache = SPREAD_FILE_FACTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
             let content_key = (
                 spec.pkg_root.clone(),
                 spec.module_name.clone(),
@@ -2282,36 +2288,35 @@ pub(super) fn spec_spreads_host_effects_transitively(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&content_key)
-                .copied();
-            if let Some(v) = cached {
-                v
-            } else {
-                let v = spec_source_host_effect_taint(cfg, spec, &src).spreads_to_importers()
-                    || {
-                        let hdr = parse_header_info(&src);
-                        hdr.header_error.is_some()
-                            || hdr.imports.iter().any(|sub| {
-                                let site =
-                                    match resolve_module_in_package(&cfg.root_pkg, true, sub) {
-                                        Some(rs) => ImportSite::Module(Box::new(rs)),
-                                        None => resolve_import_site(cfg, sub),
-                                    };
-                                match site {
-                                    ImportSite::Module(sub_spec) => {
-                                        spec_spreads_host_effects_transitively(
-                                            cfg, &sub_spec, memo,
-                                        )
-                                    }
-                                    _ => false,
-                                }
-                            })
+                .cloned();
+            let (own_spreads, header_broken, imports) = match cached {
+                Some(facts) => facts,
+                None => {
+                    let own =
+                        spec_source_host_effect_taint(cfg, spec, &src).spreads_to_importers();
+                    let hdr = parse_header_info(&src);
+                    let facts = (own, hdr.header_error.is_some(), hdr.imports);
+                    cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(content_key, facts.clone());
+                    facts
+                }
+            };
+            own_spreads
+                || header_broken
+                || imports.iter().any(|sub| {
+                    let site = match resolve_module_in_package(&cfg.root_pkg, true, sub) {
+                        Some(rs) => ImportSite::Module(Box::new(rs)),
+                        None => resolve_import_site(cfg, sub),
                     };
-                cache
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(content_key, v);
-                v
-            }
+                    match site {
+                        ImportSite::Module(sub_spec) => {
+                            spec_spreads_host_effects_transitively(cfg, &sub_spec, memo)
+                        }
+                        _ => false,
+                    }
+                })
         }
     };
     memo.insert(key, v);
@@ -3541,6 +3546,34 @@ mod host_effect_taint_tests {
         assert!(
             spec_spreads_host_effects_transitively(&cfg, &spec, &mut memo),
             "a spreading initialize below LintLib must reach it through its own imports"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// The daemon outlives edits: when an imported module's source gains an
+    /// `initialize` host read while the importer's own content is unchanged, the
+    /// importer's recomputed transitive verdict must flip. A verdict cached under the
+    /// importer's own content hash would come back stale without recursing.
+    #[test]
+    fn host_effects_transitive_spread_verdict_tracks_edited_imports() -> Result<()> {
+        let (dir, cfg, spec) = dep_fixture_with(
+            "spread_recompute",
+            "import LintLib.A\ndef l : Nat := 0\n",
+            false,
+            &[("LintLib/A.lean", "def a : Nat := 1\n")],
+        )?;
+        let mut memo = HashMap::new();
+        assert!(
+            !spec_spreads_host_effects_transitively(&cfg, &spec, &mut memo),
+            "a clean two-module dependency must not spread"
+        );
+        fs::write(spec.pkg_root.join("LintLib/A.lean"), IMPORT_TIME_SHAPE)?;
+        let mut memo2 = HashMap::new();
+        assert!(
+            spec_spreads_host_effects_transitively(&cfg, &spec, &mut memo2),
+            "an initialize host read added below an unchanged importer must flip the \
+             importer's transitive verdict"
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())
