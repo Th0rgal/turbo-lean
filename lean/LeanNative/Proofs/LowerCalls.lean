@@ -244,15 +244,20 @@ open LeanNative.Semantics
 def reservedRuntimeName (s : String) : Bool :=
   s.startsWith "lean_native_" || s == "lean_mark_mt"
 
-/-- The given (caller) context's mangled-name map agrees with the environment pairing:
-    position by position it maps the source declaration's name to the lowered
-    declaration's name. The top-level theorems take it for the top caller's context;
-    `DeclEnvLowers` carries it per entry for that entry's OWN context, so nested call
-    sites resolve against the same pairing. -/
+/-- The given (caller) context's mangled-name map COHERES with the environment pairing:
+    position by position, WHEN it maps the source declaration's name it maps it to the
+    lowered declaration's name (partial coherence; review F1 of e82678627: the strong
+    equality `findLocalCallee? sd.name = some ld.name` fails for an `a → b → c` chain
+    under per-declaration `localCallees` — the top context need not know `c`, which is
+    exactly test 3b's environment). The top-level theorems take it for the top caller's
+    context; `DeclEnvLowers` carries it per entry for that entry's OWN context, so
+    nested call sites resolve against the same pairing; at a RESOLVED call site the
+    caller's map hit plus this coherence pins the mangled symbol to the entry's name,
+    and the pairwise freshness clause then lands the `Φ` lookup at the same position. -/
 def CtxMapsEnv (ctx : RealBridgeCtx) : DeclEnv → FuncEnv → Prop
   | [], [] => True
   | (sd, _, _) :: Δ, (ld, _) :: Φ =>
-      ctx.findLocalCallee? sd.name = some ld.name ∧ CtxMapsEnv ctx Δ Φ
+      (∀ m, ctx.findLocalCallee? sd.name = some m → m = ld.name) ∧ CtxMapsEnv ctx Δ Φ
   | _, _ => False
 
 /-- Pointwise "Δ lowers to Φ": positionally, each source declaration lowers UNDER ITS OWN

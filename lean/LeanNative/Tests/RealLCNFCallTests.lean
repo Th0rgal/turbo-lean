@@ -65,9 +65,11 @@ private def runCodeF (Φ : FuncEnv) (body : LNIRCode) (arg : Val) : Except UBErr
         | .ok (v, hst) => v == .u64 11 && hst == HeapState.empty
         | .error _ => false)
 
--- 2. Arity mismatch errors (review F4): a 0-argument call to a 1-parameter callee.
+-- 2. Arity mismatch errors (reviews F4/F3): TWO arguments to a 1-parameter callee.
+--    A too-many pin on purpose: an empty argument list errors through the unbound
+--    parameter either way, so a deleted arity check would survive it.
 #guard (runCodeF [(calleeL, 32)]
-  (.letBind 1 .i64 (.call "f_sym" [] .i64 false) (.ret 1)) (.u64 5)).isOk == false
+  (.letBind 1 .i64 (.call "f_sym" [0, 0] .i64 false) (.ret 1)) (.u64 5)).isOk == false
 
 -- 3. Per-entry fuel: the callee runs at ITS entry's fuel. With entry fuel 32 the chain
 --    succeeds (guard 1); the LNIR fuel is pass-through (loops only), so the per-entry
