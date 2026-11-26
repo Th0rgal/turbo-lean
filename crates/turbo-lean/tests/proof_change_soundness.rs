@@ -10,8 +10,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Whether a runnable `lean` is on PATH. Under `TURBO_LEAN_REQUIRE_LEAN` a missing toolchain is a
+/// failure, not a skip, so a CI job that installs Lean cannot report these tests as passing without
+/// running them (the gate keys only on that variable, as in `pluggable_kernel_cli.rs`).
 fn lean_available() -> bool {
-    Command::new("lean").arg("--version").output().is_ok()
+    let ok = Command::new("lean")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    assert!(
+        ok || std::env::var_os("TURBO_LEAN_REQUIRE_LEAN").is_none(),
+        "no runnable `lean` on PATH; refusing to skip under TURBO_LEAN_REQUIRE_LEAN"
+    );
+    ok
 }
 
 struct TestWorkspace {
@@ -223,30 +234,27 @@ fn git_in(dir: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
-/// `pr-verify` variant of the Acc.rec case: the only change against `--base` is the proof body of
-/// `accProof` in `W8/U.lean`; the statement is unchanged, but the importer `W8/D3.lean` stops verifying.
-#[test]
-fn pr_verify_rechecks_importer_after_non_constructive_proof_edit() {
-    if !lean_available() {
-        return;
-    }
-    let ws = TestWorkspace::new("acc_rec_pr_verify");
+/// Commits `W8/U.lean` and `W8/D3.lean` in the fixture project, warms the cache under the base sources,
+/// and checks that `pr-verify` (1) passes at the base in `mode`, then (2) rejects an edit of
+/// `W8/U.lean` to `u_edited` and names the importer `W8.D3` in its failure.
+fn assert_pr_verify_rejects_proof_edit(
+    label: &str,
+    u_base: &str,
+    u_edited: &str,
+    d3_src: &str,
+    mode: &str,
+) {
+    let ws = TestWorkspace::new(label);
     let proj = ws.proj();
-
-    fs::write(proj.join("W8/U.lean"), U_CONSTRUCTIVE).unwrap();
-    fs::write(proj.join("W8/D3.lean"), D3_SRC).unwrap();
-    assert!(git_in(&proj, &["init", "-q"]).status.success());
-    assert!(git_in(&proj, &["add", "-A"]).status.success());
-    let commit = git_in(&proj, &["commit", "-q", "-m", "base"]);
-    assert!(
-        commit.status.success(),
-        "fixture commit failed: {}",
-        String::from_utf8_lossy(&commit.stderr)
-    );
+    fs::write(proj.join("W8/U.lean"), u_base).unwrap();
+    fs::write(proj.join("W8/D3.lean"), d3_src).unwrap();
+    git_ok(&proj, &["init", "-q"]);
+    git_ok(&proj, &["add", "-A"]);
+    git_ok(&proj, &["commit", "-q", "-m", "base"]);
     let head = git_in(&proj, &["rev-parse", "HEAD"]);
     let base = String::from_utf8_lossy(&head.stdout).trim().to_string();
 
-    // Warm the cache under the constructive proof so a stale cache entry could be reused.
+    // Warm the cache under the base proof so a stale cache entry could be reused.
     let warm = ws.run(&["build", "+W8.D3"]);
     assert!(
         warm.status.success(),
@@ -254,13 +262,103 @@ fn pr_verify_rechecks_importer_after_non_constructive_proof_edit() {
         String::from_utf8_lossy(&warm.stderr)
     );
 
-    fs::write(proj.join("W8/U.lean"), U_NONCONSTRUCTIVE).unwrap();
-    let out = ws.run(&["pr-verify", "--project-dir", ".", "--base", &base]);
+    // Positive control: with nothing changed against the base, pr-verify passes in this mode.
+    let control = ws.run(&["pr-verify", "--project-dir", ".", "--base", &base, "--mode", mode]);
     assert!(
-        !out.status.success(),
-        "SOUNDNESS: `pr-verify --base {base}` passed after an edit that makes the importer's `decide +kernel` stuck: stdout={} stderr={}",
+        control.status.success(),
+        "control: pr-verify --mode {mode} at the base must pass; stdout={} stderr={}",
+        String::from_utf8_lossy(&control.stdout),
+        String::from_utf8_lossy(&control.stderr)
+    );
+
+    fs::write(proj.join("W8/U.lean"), u_edited).unwrap();
+    let out = ws.run(&["pr-verify", "--project-dir", ".", "--base", &base, "--mode", mode]);
+    let combined = format!(
+        "stdout={} stderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "SOUNDNESS: `pr-verify --mode {mode} --base {base}` passed after an edit that makes the importer's `decide +kernel` stuck: {combined}"
+    );
+    assert!(
+        combined.contains("W8.D3") || combined.contains("W8/D3"),
+        "the failure must come from re-checking the importer W8.D3, not from an unrelated error: {combined}"
+    );
+}
+
+/// `pr-verify` variant of the Acc.rec case: the only change against `--base` is the proof body of
+/// `accProof` in a classic `W8/U.lean`; the statement is unchanged, but the importer `W8/D3.lean` stops
+/// verifying. Both trust modes.
+#[test]
+fn pr_verify_rechecks_importer_after_non_constructive_proof_edit() {
+    if !lean_available() {
+        return;
+    }
+    for mode in ["trusted", "untrusted"] {
+        assert_pr_verify_rejects_proof_edit(
+            &format!("acc_rec_pr_verify_{mode}"),
+            U_CONSTRUCTIVE,
+            U_NONCONSTRUCTIVE,
+            D3_SRC,
+            mode,
+        );
+    }
+}
+
+const U_MODULE_CONSTRUCTIVE: &str = "\
+module
+
+@[expose] public section
+
+theorem accProof : Acc (fun _ _ : Unit => False) () :=
+  Acc.intro () (fun _ h => False.elim h)
+
+def g : Nat :=
+  Acc.rec (motive := fun _ _ => Nat) (fun _ _ _ => 5) accProof
+";
+
+const U_MODULE_NONCONSTRUCTIVE: &str = "\
+module
+
+@[expose] public section
+
+theorem accProof : Acc (fun _ _ : Unit => False) () :=
+  Classical.choice ⟨Acc.intro () (fun _ h => False.elim h)⟩
+
+def g : Nat :=
+  Acc.rec (motive := fun _ _ => Nat) (fun _ _ _ => 5) accProof
+";
+
+/// Visibility is the importer's property, not the edited file's: a proof-only edit of a `module` file
+/// is visible to a classic importer, so the importer must be re-checked.
+#[test]
+fn pr_verify_rechecks_classic_importer_of_a_module_file_after_proof_edit() {
+    if !lean_available() {
+        return;
+    }
+    assert_pr_verify_rejects_proof_edit(
+        "acc_rec_module_classic_importer",
+        U_MODULE_CONSTRUCTIVE,
+        U_MODULE_NONCONSTRUCTIVE,
+        D3_SRC,
+        "trusted",
+    );
+}
+
+/// The same for a `module` importer that uses `import all`, which sees proof bodies.
+#[test]
+fn pr_verify_rechecks_import_all_importer_after_proof_edit() {
+    if !lean_available() {
+        return;
+    }
+    assert_pr_verify_rejects_proof_edit(
+        "acc_rec_module_import_all",
+        U_MODULE_CONSTRUCTIVE,
+        U_MODULE_NONCONSTRUCTIVE,
+        "module\n\nimport all W8.U\n\ntheorem t : g = 5 := by decide +kernel\n",
+        "trusted",
     );
 }
 
