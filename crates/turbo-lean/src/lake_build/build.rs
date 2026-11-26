@@ -943,13 +943,25 @@ pub(super) fn verify_cas_expr_shard_payload(bytes: &[u8], expected_decl: &str) -
     false
 }
 
-pub fn replay_project_cas_expr_shards(
+/// Replay statistics for CAS `expr_shard` proof-blob verification (G2b).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CasExprReplayStats {
+    /// Shards whose cached payload was found and verified.
+    pub replayed: usize,
+    /// Shards with no cached `expr_shard` entry in the CAS.
+    pub missing: usize,
+    /// Shards whose cached payload failed `verify_cas_expr_shard_payload`.
+    pub invalid: usize,
+}
+
+fn replay_project_cas_expr_shards_inner(
     store: &mut TurboStore,
     canon_dir: &Path,
     toolchain: &str,
     trust_domain: &str,
     scoped_files: Option<&[PathBuf]>,
-) -> Result<usize> {
+    fail_closed: bool,
+) -> Result<CasExprReplayStats> {
     let lean_files: Vec<PathBuf> = match scoped_files {
         Some(files) if !files.is_empty() => files.to_vec(),
         _ => collect_lean_files(canon_dir),
@@ -957,7 +969,7 @@ pub fn replay_project_cas_expr_shards(
     let (split_entries, _) = load_and_split_files_cached(store, &lean_files)?;
     let _ = crate::module_builder::try_project_lake_inputs_tag(canon_dir)?;
     let pkg_cfg_opt = crate::module_builder::optional_package_config(canon_dir)?;
-    let mut replayed = 0usize;
+    let mut stats = CasExprReplayStats::default();
     for (lf, _src, split) in &split_entries {
         if split.shards.is_empty() || !split.hygiene.is_clean_for_certification() {
             continue;
@@ -975,31 +987,153 @@ pub fn replay_project_cas_expr_shards(
                 continue;
             }
             let shard_key = compute_shard_key_with_args(toolchain, shard, &file_lean_args);
-            let entries = store
-                .get_cached_action_no_hit_bump(&shard_key, trust_domain)?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
+            let Some(entries) = store.get_cached_action_no_hit_bump(&shard_key, trust_domain)?
+            else {
+                if fail_closed {
+                    anyhow::bail!(
                         "--replay-cas-expr failed closed: missing cached expr_shard in CAS for theorem `{}` (key={})",
                         shard.name,
                         shard_key
-                    )
-                })?;
+                    );
+                }
+                stats.missing += 1;
+                continue;
+            };
             let valid = entries.iter().any(|entry| {
                 store
                     .read_verified_blob(&entry.blob_hash)
                     .is_some_and(|b| verify_cas_expr_shard_payload(&b, &shard.name))
             });
             if !valid {
-                anyhow::bail!(
-                    "--replay-cas-expr failed closed: corrupted or invalid CAS expr_shard blob for theorem `{}` (key={})",
-                    shard.name,
-                    shard_key
-                );
+                if fail_closed {
+                    anyhow::bail!(
+                        "--replay-cas-expr failed closed: corrupted or invalid CAS expr_shard blob for theorem `{}` (key={})",
+                        shard.name,
+                        shard_key
+                    );
+                }
+                stats.invalid += 1;
+                continue;
             }
-            replayed += 1;
+            stats.replayed += 1;
         }
     }
-    Ok(replayed)
+    Ok(stats)
+}
+
+/// Fail-closed CAS proof replay behind the explicit `--replay-cas-expr` flag: a missing or
+/// corrupted blob is a build error. Returns the number of replayed shards.
+pub fn replay_project_cas_expr_shards(
+    store: &mut TurboStore,
+    canon_dir: &Path,
+    toolchain: &str,
+    trust_domain: &str,
+    scoped_files: Option<&[PathBuf]>,
+) -> Result<usize> {
+    Ok(replay_project_cas_expr_shards_inner(
+        store,
+        canon_dir,
+        toolchain,
+        trust_domain,
+        scoped_files,
+        true,
+    )?
+    .replayed)
+}
+
+/// Best-effort CAS proof replay for the G2b warm-hit default: a missing or corrupted blob
+/// is counted and skipped (the build transparently keeps its already-materialized
+/// baseline), never a failure.
+pub fn replay_project_cas_expr_shards_best_effort(
+    store: &mut TurboStore,
+    canon_dir: &Path,
+    toolchain: &str,
+    trust_domain: &str,
+    scoped_files: Option<&[PathBuf]>,
+) -> Result<CasExprReplayStats> {
+    replay_project_cas_expr_shards_inner(
+        store,
+        canon_dir,
+        toolchain,
+        trust_domain,
+        scoped_files,
+        false,
+    )
+}
+
+/// G2b opt-out: `TURBO_LEAN_NO_WARM_CAS_REPLAY=1` disables the warm-hit default replay
+/// (same relaxed-bool grammar as the other `TURBO_LEAN_NO_*` switches).
+pub(crate) fn warm_cas_replay_disabled() -> bool {
+    crate::shm_cache::parse_relaxed_bool(
+        &std::env::var("TURBO_LEAN_NO_WARM_CAS_REPLAY").unwrap_or_default(),
+    ) == Some(true)
+}
+
+/// G2b decision: CAS proof replay runs by default exactly on a warm (cache-hit) build
+/// path, unless the explicit fail-closed flag already runs it or the operator opted out.
+pub(crate) fn should_replay_cas_expr_on_warm_hit(
+    explicit_replay: bool,
+    cache_hit: bool,
+    opt_out: bool,
+) -> bool {
+    !explicit_replay && cache_hit && !opt_out
+}
+
+/// What one `run_build_command_with_cas_replay` branch did about CAS expr replay (G2b).
+#[derive(Debug)]
+pub(crate) struct CasExprBuildReplay {
+    pub(crate) replayed: usize,
+    /// Warm-default shards skipped because their CAS entry was missing or invalid.
+    pub(crate) skipped: usize,
+    /// `"explicit"` (fail-closed flag), `"warm_default"` (G2b), or `"off"`.
+    pub(crate) mode: &'static str,
+}
+
+/// The one selector every `run_build_command_with_cas_replay` branch calls (G2b):
+/// the explicit flag keeps the fail-closed wrapper; a warm (cache-hit) path gets the
+/// best-effort replay by default; a cold path replays nothing.
+pub(crate) fn run_cas_expr_replay_for_build(
+    store: &mut TurboStore,
+    canon_dir: &Path,
+    toolchain: &str,
+    trust_domain: &str,
+    scoped_files: Option<&[PathBuf]>,
+    explicit_replay: bool,
+    cache_hit: bool,
+) -> Result<CasExprBuildReplay> {
+    if explicit_replay {
+        let replayed = replay_project_cas_expr_shards(
+            store,
+            canon_dir,
+            toolchain,
+            trust_domain,
+            scoped_files,
+        )?;
+        return Ok(CasExprBuildReplay {
+            replayed,
+            skipped: 0,
+            mode: "explicit",
+        });
+    }
+    if should_replay_cas_expr_on_warm_hit(explicit_replay, cache_hit, warm_cas_replay_disabled()) {
+        let stats = replay_project_cas_expr_shards_best_effort(
+            store,
+            canon_dir,
+            toolchain,
+            trust_domain,
+            scoped_files,
+        )?;
+        return Ok(CasExprBuildReplay {
+            replayed: stats.replayed,
+            skipped: stats.missing + stats.invalid,
+            mode: "warm_default",
+        });
+    }
+    Ok(CasExprBuildReplay {
+        replayed: 0,
+        skipped: 0,
+        mode: "off",
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1083,20 +1217,19 @@ pub fn run_build_command_with_cas_replay(
             } else {
                 0
             };
-            let cas_expr_replayed = if replay_cas_expr {
-                replay_project_cas_expr_shards(
-                    store,
-                    &canon_dir,
-                    &toolchain,
-                    &trust_domain,
-                    Some(&build_report.cone_source_paths),
-                )?
-            } else {
-                0
-            };
-            let dur_ms = t0.elapsed().as_millis() as i64;
             let cache_hit = build_report.modules_compiled == 0
                 && (build_report.modules_cached > 0 || build_report.modules_up_to_date_reused > 0);
+            // G2b: on a warm target-cone hit, CAS proof replay runs by default (best-effort).
+            let cas_replay = run_cas_expr_replay_for_build(
+                store,
+                &canon_dir,
+                &toolchain,
+                &trust_domain,
+                Some(&build_report.cone_source_paths),
+                replay_cas_expr,
+                cache_hit,
+            )?;
+            let dur_ms = t0.elapsed().as_millis() as i64;
             emit_build_telemetry(serde_json::json!({
                 "schema": "turbo-lean.telemetry.v1",
                 "tool_name": "build",
@@ -1112,7 +1245,9 @@ pub fn run_build_command_with_cas_replay(
                 "modules_compiled": build_report.modules_compiled,
                 "modules_cached": build_report.modules_cached,
                 "shards_seeded": seeded_shards,
-                "cas_expr_replayed": cas_expr_replayed,
+                "cas_expr_replayed": cas_replay.replayed,
+                "cas_expr_replay_skipped": cas_replay.skipped,
+                "cas_expr_replay_mode": cas_replay.mode,
                 "elapsed_ms": dur_ms,
             }));
             if json_output {
@@ -1128,7 +1263,9 @@ pub fn run_build_command_with_cas_replay(
                         "modules_compiled": build_report.modules_compiled,
                         "modules_cached": build_report.modules_cached,
                         "shards_seeded": seeded_shards,
-                        "cas_expr_replayed": cas_expr_replayed,
+                        "cas_expr_replayed": cas_replay.replayed,
+                        "cas_expr_replay_skipped": cas_replay.skipped,
+                        "cas_expr_replay_mode": cas_replay.mode,
                         "config_digest": build_report.config_digest,
                         "elapsed_ms": dur_ms
                     }))?
@@ -1248,11 +1385,17 @@ pub fn run_build_command_with_cas_replay(
             } else {
                 0
             };
-            let cas_expr_replayed = if replay_cas_expr {
-                replay_project_cas_expr_shards(store, &canon_dir, &toolchain, &trust_domain, None)?
-            } else {
-                0
-            };
+            // G2b: this is the warm singleflight cache-hit path, so CAS proof replay runs
+            // by default (best-effort) even without `--replay-cas-expr`.
+            let cas_replay = run_cas_expr_replay_for_build(
+                store,
+                &canon_dir,
+                &toolchain,
+                &trust_domain,
+                None,
+                replay_cas_expr,
+                true,
+            )?;
             let elapsed_ms = t0.elapsed().as_millis();
             emit_build_telemetry(serde_json::json!({
                 "schema": "turbo-lean.telemetry.v1",
@@ -1267,7 +1410,9 @@ pub fn run_build_command_with_cas_replay(
                 "interface_hash": interface_hash,
                 "materialized_files": linked,
                 "shards_seeded": seeded_shards,
-                "cas_expr_replayed": cas_expr_replayed,
+                "cas_expr_replayed": cas_replay.replayed,
+                "cas_expr_replay_skipped": cas_replay.skipped,
+                "cas_expr_replay_mode": cas_replay.mode,
                 "elapsed_ms": elapsed_ms,
             }));
             if json_output {
@@ -1280,7 +1425,9 @@ pub fn run_build_command_with_cas_replay(
                         "interface_hash": interface_hash,
                         "materialized_files": linked,
                         "shards_seeded": seeded_shards,
-                        "cas_expr_replayed": cas_expr_replayed,
+                        "cas_expr_replayed": cas_replay.replayed,
+                        "cas_expr_replay_skipped": cas_replay.skipped,
+                        "cas_expr_replay_mode": cas_replay.mode,
                         "elapsed_ms": elapsed_ms
                     }))?
                 );
@@ -1430,21 +1577,23 @@ pub fn run_build_command_with_cas_replay(
             } else {
                 0
             };
-            let cas_expr_replayed = if replay_cas_expr {
+            // G2b: a leader (cold) build just ran elaboration, so there is nothing to
+            // skip; replay here stays behind the explicit fail-closed flag.
+            let cas_replay = {
                 let scoped = if !targets.is_empty() && !build_report.cone_source_paths.is_empty() {
                     Some(build_report.cone_source_paths.as_slice())
                 } else {
                     None
                 };
-                replay_project_cas_expr_shards(
+                run_cas_expr_replay_for_build(
                     store,
                     &canon_dir,
                     &toolchain,
                     &trust_domain,
                     scoped,
+                    replay_cas_expr,
+                    false,
                 )?
-            } else {
-                0
             };
             let shards_ms = t_shards.elapsed().as_millis();
             if profile_phases {
@@ -1473,7 +1622,9 @@ pub fn run_build_command_with_cas_replay(
                 "artifacts_stored": outputs.len(),
                 "materialized_files": linked,
                 "shards_seeded": seeded_shards,
-                "cas_expr_replayed": cas_expr_replayed,
+                "cas_expr_replayed": cas_replay.replayed,
+                "cas_expr_replay_skipped": cas_replay.skipped,
+                "cas_expr_replay_mode": cas_replay.mode,
                 "elapsed_ms": dur_ms,
             }));
 
@@ -1489,7 +1640,9 @@ pub fn run_build_command_with_cas_replay(
                         "artifacts_stored": outputs.len(),
                         "materialized_files": linked,
                         "shards_seeded": seeded_shards,
-                        "cas_expr_replayed": cas_expr_replayed,
+                        "cas_expr_replayed": cas_replay.replayed,
+                        "cas_expr_replay_skipped": cas_replay.skipped,
+                        "cas_expr_replay_mode": cas_replay.mode,
                         "modules_total": build_report.modules_total,
                         "modules_up_to_date_reused": build_report.modules_up_to_date_reused,
                         "modules_compiled": build_report.modules_compiled,

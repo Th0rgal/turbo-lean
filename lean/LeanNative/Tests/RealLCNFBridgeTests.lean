@@ -150,6 +150,39 @@ private def recJpDecl : Decl .impure :=
 
 #guard (lowerRealLCNFDecl 32 { arch := .x86_64 } recJpDecl).isOk == false
 
+/-! ### L1 (`roadmap/HORIZONS.md` rung L1): executable mutant kills for the driver post-pass gate
+
+`applyValidatedCompression` accepts a candidate only through the kernel-proved
+`runSymbolicValidatedDecl` checker. A gate mutant that accepts without the checker flips the
+reject guards below; one that never accepts flips the accept guards. The default `LNIRDecl`
+assurance is `.verifiedKernelProof`, so acceptance is visible as the conservative
+`AssuranceLevel.combine` downgrade to `.translationValidated`. -/
+
+private def l1GateBase : LNIRDecl :=
+  { name := "l1_gate_base"
+    params := [{ id := 0, name := "x", ty := .i64 }]
+    retTy := .i64
+    body := .letBind 2 .i64 (.scalar (.binOp .add (.var 0) (.constU64 1))) (.ret 2) }
+
+-- Accepted: a structure-preserving, symbolically equal rewrite (operand commute).
+private def l1CandCommute : LNIRCode :=
+  .letBind 2 .i64 (.scalar (.binOp .add (.constU64 1) (.var 0))) (.ret 2)
+#guard (applyValidatedCompression l1GateBase l1CandCommute).body == l1CandCommute
+#guard (applyValidatedCompression l1GateBase l1CandCommute).params == l1GateBase.params
+#guard (applyValidatedCompression l1GateBase l1CandCommute).assurance == .translationValidated
+
+-- Rejected (algebraic-swap mutant): a wrong-value candidate never replaces the body.
+private def l1CandWrong : LNIRCode := .letBind 2 .i64 (.scalar (.constU64 7)) (.ret 2)
+#guard (applyValidatedCompression l1GateBase l1CandWrong).body == l1GateBase.body
+#guard (applyValidatedCompression l1GateBase l1CandWrong).assurance == l1GateBase.assurance
+
+-- Fail-closed (measured 2026-11-26): a fresh-variable collapse — the shape `compressScalarCode`
+-- produces when it folds an `ite` or renames the result — is not admitted by the kernel-proved
+-- checker, and the base body is kept.
+private def l1CandFreshCollapse : LNIRCode :=
+  .letBind 9 .i64 (.scalar (.binOp .add (.var 0) (.constU64 1))) (.ret 9)
+#guard (applyValidatedCompression l1GateBase l1CandFreshCollapse).body == l1GateBase.body
+
 private def evalDeclProduces (fuel : Nat) (d : LNIRDecl) (args : List Val) (expected : Val) : Bool :=
   match evalLoweredDecl fuel d args with
   | .ok (v, hst) => v == expected && hst == HeapState.empty
