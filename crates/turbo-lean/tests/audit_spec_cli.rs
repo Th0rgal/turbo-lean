@@ -1867,8 +1867,9 @@ fn audit_spec_kernel_witness_replay_certifies_or_reports_unavailable() {
             kw["mode"]
                 .as_str()
                 .unwrap_or("")
-                .starts_with("unavailable"),
-            "without a Lean toolchain the summary must say the replay was unavailable: {json}"
+                .starts_with("unavailable(no_lean_toolchain"),
+            "without a Lean toolchain the summary must name the missing toolchain, not a \
+             generic or infrastructure unavailability: {json}"
         );
         assert!(
             pos.starts_with("satisfied_states=")
