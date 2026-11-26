@@ -499,20 +499,28 @@ def validate_baseline(base):
 def host_matches(base, res) -> bool:
     bh, rh = base.get("host") or {}, res.get("host") or {}
     bf, rf = bh.get("host_fingerprint"), rh.get("host_fingerprint")
+    lb, lr = bh.get("machine_label"), rh.get("machine_label")
+    if (lb or lr) and not (bf and rf):
+        # A labeled host records the label AS its hostname, and without a
+        # machine-id it records no fingerprint, so two machine-id-less
+        # machines sharing a label would pass the hostname fallback below.
+        # A label on either side therefore requires both fingerprints; a
+        # missing one is a host mismatch.
+        return False
     if bf and rf:
         if bf != rf:
             return False
     elif bh.get("hostname") != rh.get("hostname"):
-        # Legacy entries carry no fingerprint, so hostnames are compared as
-        # before. An old baseline (real hostname) against a new labeled run
-        # therefore mismatches; the migration path is --rebaseline.
+        # Legacy unlabeled entries carry no fingerprint, and their hostname
+        # is the real node name, so hostnames are compared as before. An old
+        # baseline (real hostname) against a new labeled run therefore
+        # mismatches; the migration path is --rebaseline.
         return False
-    # The label narrows the match: it never admits two machines (the
-    # fingerprint check above already refused them), and a label present on
-    # only one side is a condition mismatch too — the help promises a
-    # baseline from a different label is never compared, and "no label" is
-    # a different condition.
-    lb, lr = bh.get("machine_label"), rh.get("machine_label")
+    # The label narrows the match further: both-fingerprints is already
+    # required above whenever a label is present, so a shared label never
+    # admits two machines, and a label present on only one side is a
+    # condition mismatch — the help promises a baseline from a different
+    # label is never compared, and "no label" is a different condition.
     if bool(lb) != bool(lr):
         return False
     if lb and lr and lb != lr:

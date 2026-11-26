@@ -134,6 +134,10 @@ def sample_baseline(mod, **overrides):
     return mod.make_baseline(
         turbo_lean_commit="8a1d67dba051f59440c91df828584657efd12605",
         host={"hostname": "bench-host", "machine_label": "lab-node-1",
+              # A labeled host must carry a fingerprint (a label on either
+              # side requires both); fixtures compared against copies of this
+              # host say "same machine, same condition".
+              "host_fingerprint": "c" * 64,
               "kernel": "Linux 6.8", "cpu_model": "test-cpu", "nproc": 8, "mem_gb": 62},
         trials=5,
         settings={"TURBO_LEAN_GIT": "/fake/git", "TURBO_LEAN_ALLOWED_CSIMP": "*",
@@ -1617,6 +1621,20 @@ class HostFingerprint(unittest.TestCase):
         self.assertFalse(mod.host_matches(self._host("uruk", None, None),
                                           self._host("g2a-ro-192c", "g2a-ro-192c",
                                                      "a" * 64)))
+
+    def test_label_requires_fingerprints_on_both_sides(self):
+        # host_id writes the label into hostname and records no fingerprint
+        # without a machine-id, so two machine-id-less containers sharing a
+        # label would pass the legacy hostname fallback. A label on either
+        # side therefore requires both fingerprints; a missing one is a host
+        # mismatch.
+        mod = load_script()
+        self.assertFalse(mod.host_matches(self._host("quiet", "quiet", None),
+                                          self._host("quiet", "quiet", None)))
+        labeled_fp = self._host("quiet", "quiet", "a" * 64)
+        labeled_no_fp = self._host("quiet", "quiet", None)
+        self.assertFalse(mod.host_matches(labeled_no_fp, labeled_fp))
+        self.assertFalse(mod.host_matches(labeled_fp, labeled_no_fp))
 
     def test_label_on_one_side_only_does_not_match(self):
         # The help promises a labeled baseline is never compared with a run
