@@ -2427,7 +2427,26 @@ use super::*;
             assert!(WorkerBudget::error_names_memory_cap(&err));
             assert!(
                 !WorkerBudget::error_names_definite_memory_cap(&err),
-                "a signal death is never a DEFINITE cap hit: {note}"
+                "a signal death with no allocation signature is never a DEFINITE cap \
+                 hit: {note}"
+            );
+            // Review bfa9d056 F2: an ABORT that delivers an allocation failure (an
+            // uncaught `std::bad_alloc` reaches `std::terminate` and dies SIGABRT with
+            // the signature on stderr) is a DEFINITE cap hit — the stderr check runs
+            // before the signal check, so the abort does not mask it.
+            let abort_status = std::process::ExitStatus::from_raw(6);
+            let abort_note =
+                WorkerBudget::memory_kill_note(&abort_status, "std::bad_alloc", Some(4096));
+            assert!(
+                abort_note.contains("per-worker memory cap of")
+                    && abort_note.contains("signal 6"),
+                "abort-with-signature note text: {abort_note}"
+            );
+            let abort_err = anyhow::anyhow!("{}", abort_note.trim_start());
+            assert!(WorkerBudget::error_names_memory_cap(&abort_err));
+            assert!(
+                WorkerBudget::error_names_definite_memory_cap(&abort_err),
+                "SIGABRT delivering bad_alloc is definite: {abort_note}"
             );
             // A raw wait status of 1 << 8 is "exited with code 1".
             let fail_status = std::process::ExitStatus::from_raw(1 << 8);

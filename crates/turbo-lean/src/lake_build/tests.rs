@@ -4914,164 +4914,25 @@ public def api := by
         Ok(())
     }
 
-    // ---- G2b: CAS expr replay, opt-in for warm hits (reverted from on-by-default
-    // per the H2 bench-delta rule; roadmap/HORIZONS.md G2b) ----
+    // ---- CAS expr replay: the explicit fail-closed `--replay-cas-expr` path, the only
+    // replay left. The G2b warm-build trigger (its env switches, its best-effort counters
+    // and its mode reporting) was deleted; roadmap/HORIZONS.md row G2b. ----
 
-    /// Panic-safe env guard (the `module_builder.rs` `ScopedEnvVar` shape): restores the
-    /// previous value on drop, so a failed assertion cannot leak the variable into later
-    /// warm-path tests through the `into_inner` lock recovery.
-    struct ScopedEnvVar {
-        key: &'static str,
-        prev: Option<std::ffi::OsString>,
-    }
-
-    impl ScopedEnvVar {
-        fn set(key: &'static str, val: &str) -> Self {
-            let prev = std::env::var_os(key);
-            std::env::set_var(key, val);
-            Self { key, prev }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            let prev = std::env::var_os(key);
-            std::env::remove_var(key);
-            Self { key, prev }
-        }
-    }
-
-    impl Drop for ScopedEnvVar {
-        fn drop(&mut self) {
-            if let Some(ref p) = self.prev {
-                std::env::set_var(self.key, p);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-
-    /// G2b red→green: the pure replay decision. Replay runs only on a warm
-    /// (cache-hit) path with the opt-in enabled. The explicit flag is
-    /// not a parameter: the selector's early return owns that case, so the decision
-    /// function has no dead argument.
+    /// The explicit replay fails closed with its verbatim texts, counts what it replayed,
+    /// treats a `Some` scope as exact (an empty scope replays nothing), and walks the
+    /// whole project for `None`.
     #[test]
-    fn g2b_warm_default_cas_replay_decision_table() {
-        // (cache_hit, enabled) -> replay?  `enabled` is the caller's
-        // warm_cas_replay_opted_in(): the opt-in since the revert.
-        for (cache_hit, enabled, want) in [
-            (true, true, true),    // warm hit, opted in: replays
-            (false, true, false),  // cold build: elaboration ran anyway, no replay
-            (true, false, false),  // not opted in (or explicitly opted out)
-            (false, false, false),
-        ] {
-            assert_eq!(
-                should_replay_cas_expr_on_warm_hit(cache_hit, enabled),
-                want,
-                "decision (cache_hit={cache_hit}, enabled={enabled})"
-            );
-        }
-    }
-
-    /// G2b round-1 addendum red→green (review finding 4): the leader / no-singleflight
-    /// branch is not always cold. Its cache-hit answer comes from this pure helper: warm
-    /// when the project's oleans were already up to date (no build ran), or when the
-    /// native build compiled nothing and served everything from cache or reuse.
-    #[test]
-    fn g2b_leader_branch_cache_hit_table() {
-        use crate::module_builder::NativeBuildReport;
-        let report = |compiled: usize, cached: usize, reused: usize| NativeBuildReport {
-            modules_compiled: compiled,
-            modules_cached: cached,
-            modules_up_to_date_reused: reused,
-            ..Default::default()
-        };
-        // Oleans already up to date: no build ran at all — warm whatever the report says.
-        assert!(leader_branch_cache_hit(true, &report(0, 0, 0)));
-        // Nothing compiled, everything cached or reused: warm.
-        assert!(leader_branch_cache_hit(false, &report(0, 1, 0)));
-        assert!(leader_branch_cache_hit(false, &report(0, 0, 2)));
-        // Anything compiled: cold, even when siblings came from cache.
-        assert!(!leader_branch_cache_hit(false, &report(1, 5, 5)));
-        // No evidence of warmth (an external-dep project's first visit): cold.
-        assert!(!leader_branch_cache_hit(false, &report(0, 0, 0)));
-    }
-
-    /// G2b revert red→green (fm-g2a r2): the on-vs-off delta on the pinned
-    /// benchmark moved no cell outside the noise band (12/12 unchanged,
-    /// artifacts bench_check_loop_g2b_{on,off}.json), so per the H2 rule the
-    /// warm default is reverted to OPT-IN: `TURBO_LEAN_WARM_CAS_REPLAY`
-    /// enables, the explicit opt-out still forces off, and unset means OFF.
-    /// The KEPT replay path itself is unchanged (the G2a 20/20 warm hit-rate
-    /// evidence stays valid for the opt-in path).
-    #[test]
-    fn g2b_revert_warm_cas_replay_is_opt_in() {
-        let _guard = crate::pack::tests::env_test_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _off = ScopedEnvVar::unset("TURBO_LEAN_NO_WARM_CAS_REPLAY");
-        {
-            let _on = ScopedEnvVar::unset("TURBO_LEAN_WARM_CAS_REPLAY");
-            assert!(!warm_cas_replay_opted_in(), "unset must mean OFF");
-        }
-        for (val, want) in [
-            ("1", true),
-            ("true", true),
-            ("yes", true),
-            ("0", false),
-            ("off", false),
-            ("bogus", false),
-        ] {
-            let _on = ScopedEnvVar::set("TURBO_LEAN_WARM_CAS_REPLAY", val);
-            assert_eq!(warm_cas_replay_opted_in(), want, "value {val:?}");
-        }
-        let _on = ScopedEnvVar::set("TURBO_LEAN_WARM_CAS_REPLAY", "1");
-        let _no = ScopedEnvVar::set("TURBO_LEAN_NO_WARM_CAS_REPLAY", "1");
-        assert!(
-            !warm_cas_replay_opted_in(),
-            "the explicit opt-out wins over the opt-in"
-        );
-    }
-
-    /// G2b red→green: `TURBO_LEAN_NO_WARM_CAS_REPLAY` is the opt-out, parsed with the
-    /// same relaxed-bool grammar as the other `TURBO_LEAN_NO_*` switches.
-    #[test]
-    fn g2b_warm_cas_replay_env_opt_out() {
-        let _guard = crate::pack::tests::env_test_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _env = ScopedEnvVar::unset("TURBO_LEAN_NO_WARM_CAS_REPLAY");
-        assert!(
-            !warm_cas_replay_disabled(),
-            "unset means not explicitly disabled (the default is the opt-in's call)"
-        );
-        for (val, want) in [
-            ("1", true),
-            ("true", true),
-            ("yes", true),
-            ("0", false),
-            ("off", false),
-            ("bogus", false),
-        ] {
-            let _val = ScopedEnvVar::set("TURBO_LEAN_NO_WARM_CAS_REPLAY", val);
-            assert_eq!(warm_cas_replay_disabled(), want, "value {val:?}");
-        }
-    }
-
-    /// G2b red→green: the warm default is best-effort — a missing or corrupted CAS blob is
-    /// counted and skipped (transparent fallback to the baseline elaboration), never a
-    /// build failure — while the explicit `--replay-cas-expr` wrapper keeps its verbatim
-    /// fail-closed errors and its replayed count.
-    #[test]
-    fn g2b_best_effort_replay_counts_missing_and_invalid_without_failing() -> Result<()> {
+    fn cas_expr_replay_explicit_fails_closed_with_exact_scope() -> Result<()> {
         let dir = std::env::temp_dir().join(format!(
-            "turbo_g2b_replay_{}_{}",
+            "turbo_cas_replay_{}_{}",
             std::process::id(),
             crate::pack::next_tmp_id()
         ));
         let project = dir.join("project");
         fs::create_dir_all(&project)?;
-        let seeded_src = "theorem g2b_seeded : True := by trivial\n";
-        let invalid_src = "theorem g2b_invalid : 1 = 1 := by rfl\n";
-        let missing_src = "theorem g2b_missing : 2 = 2 := by rfl\n";
+        let seeded_src = "theorem cas_replay_seeded : True := by trivial\n";
+        let invalid_src = "theorem cas_replay_invalid : 1 = 1 := by rfl\n";
+        let missing_src = "theorem cas_replay_missing : 2 = 2 := by rfl\n";
         let seeded = project.join("Seeded.lean");
         let invalid = project.join("Invalid.lean");
         let missing = project.join("Missing.lean");
@@ -5106,20 +4967,16 @@ public def api := by
             )],
         )?;
 
-        // Best-effort (the warm default): one replayed, one missing, one invalid; no error.
-        let stats = replay_project_cas_expr_shards_best_effort(
-            &mut store, &project, "test", "trusted", None,
-        )?;
-        assert_eq!(
-            stats,
-            CasExprReplayStats {
-                replayed: 1,
-                missing: 1,
-                invalid: 1
-            }
+        // `None` walks the whole project, so the unseeded and the corrupted shard fail it.
+        let whole_err =
+            replay_project_cas_expr_shards(&mut store, &project, "test", "trusted", None)
+                .unwrap_err();
+        assert!(
+            format!("{whole_err:#}").contains("--replay-cas-expr failed closed"),
+            "a whole-project replay over unseeded and corrupted shards must fail closed: {whole_err:#}"
         );
 
-        // The explicit wrapper keeps its verbatim fail-closed error texts.
+        // Each failure keeps its verbatim fail-closed error text.
         let missing_err = replay_project_cas_expr_shards(
             &mut store,
             &project,
@@ -5147,7 +5004,7 @@ public def api := by
             ),
             "fail-closed corrupted text changed: {invalid_err:#}"
         );
-        // And the fail-closed wrapper still counts replayed shards on a fully seeded scope.
+        // The replayed count on a fully seeded scope.
         assert_eq!(
             replay_project_cas_expr_shards(
                 &mut store,
@@ -5160,17 +5017,7 @@ public def api := by
         );
         // `Some(scope)` is exact: an EMPTY scope replays nothing instead of silently
         // widening to the whole project (only `None` means "the whole project"), so a
-        // target-cone build whose cone resolved empty never scans every file by default.
-        assert_eq!(
-            replay_project_cas_expr_shards_best_effort(
-                &mut store,
-                &project,
-                "test",
-                "trusted",
-                Some(&[]),
-            )?,
-            CasExprReplayStats::default()
-        );
+        // target-cone build whose cone resolved empty never scans, or fails on, every file.
         assert_eq!(
             replay_project_cas_expr_shards(&mut store, &project, "test", "trusted", Some(&[]))?,
             0
@@ -5179,22 +5026,12 @@ public def api := by
         Ok(())
     }
 
-    /// G2b round-1 addendum red→green (review finding 1): an internal error inside the
-    /// opted-in warm replay (here a lakefile that fails option resolution) must not fail a
-    /// warm build that already materialized its outputs. The selector contains it as mode
-    /// `"warm_opt_in_error"` with zero counts; the explicit fail-closed flag still
-    /// propagates the same error.
+    /// The explicit replay propagates an internal error (here a lakefile that fails option
+    /// resolution) instead of reporting a replayed count.
     #[test]
-    fn g2b_warm_default_replay_error_is_contained() -> Result<()> {
-        let _guard = crate::pack::tests::env_test_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _env = ScopedEnvVar::unset("TURBO_LEAN_NO_WARM_CAS_REPLAY");
-        // The warm path is opt-in since the G2b revert; this test covers the
-        // KEPT path, so it opts in.
-        let _opt_in = ScopedEnvVar::set("TURBO_LEAN_WARM_CAS_REPLAY", "1");
+    fn cas_expr_replay_explicit_propagates_internal_errors() -> Result<()> {
         let dir = std::env::temp_dir().join(format!(
-            "turbo_g2b_err_{}_{}",
+            "turbo_cas_replay_err_{}_{}",
             std::process::id(),
             crate::pack::next_tmp_id()
         ));
@@ -5202,166 +5039,18 @@ public def api := by
         fs::create_dir_all(&project)?;
         fs::write(
             project.join("Demo.lean"),
-            "theorem g2b_err_demo : True := by trivial\n",
+            "theorem cas_replay_err_demo : True := by trivial\n",
         )?;
         // An invalid Lake config makes option resolution fail inside the replay walk.
         fs::write(project.join("lakefile.toml"), "name = [")?;
         let mut store = TurboStore::open(Some(&dir.join("store")))?;
 
-        // Warm default: the error is contained, logged, and reported as a mode — never a
-        // failed warm build.
-        let warm = run_cas_expr_replay_for_build(
-            &mut store, &project, "test", "trusted", None, false, true,
-        )?;
-        assert_eq!(
-            (warm.mode, warm.replayed, warm.missing, warm.invalid),
-            ("warm_opt_in_error", 0, 0, 0)
-        );
-        // The explicit fail-closed flag still surfaces the same error.
-        let explicit_err = run_cas_expr_replay_for_build(
-            &mut store, &project, "test", "trusted", None, true, true,
-        )
-        .unwrap_err();
+        let explicit_err =
+            replay_project_cas_expr_shards(&mut store, &project, "test", "trusted", None)
+                .unwrap_err();
         assert!(
             format!("{explicit_err:#}").contains("Failed to resolve Lean options"),
-            "explicit mode must keep propagating internal errors: {explicit_err:#}"
-        );
-        fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    /// G2b red→green: the one build-side selector every `run_build_command_with_cas_replay`
-    /// branch calls. Explicit flag → fail-closed `"explicit"`; warm hit WITH THE OPT-IN
-    /// (`TURBO_LEAN_WARM_CAS_REPLAY=1`, the reverted default) → best-effort
-    /// `"warm_opt_in"` with "never seeded" (`missing`) and "corrupted or tampered"
-    /// (`invalid`) counted separately, never merged (the explicit opt-out still wins);
-    /// warm hit with the opt-in unset → `"off"`; cold build → `"off"`.
-    #[test]
-    fn g2b_cas_replay_build_mode_selection() -> Result<()> {
-        let _guard = crate::pack::tests::env_test_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _env = ScopedEnvVar::unset("TURBO_LEAN_NO_WARM_CAS_REPLAY");
-        // The warm path is opt-in since the G2b revert; this test covers the
-        // KEPT selector behavior, so it opts in (the cold case still reads
-        // "off": the selector gates on the cache hit, not only the opt-in).
-        let _opt_in = ScopedEnvVar::set("TURBO_LEAN_WARM_CAS_REPLAY", "1");
-        let dir = std::env::temp_dir().join(format!(
-            "turbo_g2b_mode_{}_{}",
-            std::process::id(),
-            crate::pack::next_tmp_id()
-        ));
-        let project = dir.join("project");
-        fs::create_dir_all(&project)?;
-        let seeded_src = "theorem g2b_mode_seeded : True := by trivial\n";
-        let missing_src = "theorem g2b_mode_missing : 3 = 3 := by rfl\n";
-        let invalid_src = "theorem g2b_mode_invalid : 4 = 4 := by rfl\n";
-        let seeded = project.join("Seeded.lean");
-        fs::write(&seeded, seeded_src)?;
-        fs::write(project.join("Missing.lean"), missing_src)?;
-        fs::write(project.join("Invalid.lean"), invalid_src)?;
-        let mut store = TurboStore::open(Some(&dir.join("store")))?;
-        let split = split_lean_source(seeded_src, &[]);
-        assert_eq!(split.shards.len(), 1);
-        seed_project_theorem_shards_from_splits(
-            &mut store,
-            &project,
-            "test",
-            "trusted",
-            false,
-            &[(seeded.clone(), seeded_src.to_string(), split)],
-        )?;
-        // A corrupted (tamper-evidence) payload for `Invalid.lean`'s shard.
-        let bad_split = split_lean_source(invalid_src, &[]);
-        assert_eq!(bad_split.shards.len(), 1);
-        let bad_key = compute_shard_key("test", &bad_split.shards[0]);
-        store.batch_publish_theorem_shards(
-            "test",
-            "trusted",
-            &[(
-                bad_key,
-                bad_split.shards[0].name.clone(),
-                b"garbage: not a valid LNE1 / receipt / decl payload".to_vec(),
-                1,
-            )],
-        )?;
-
-        // Warm hit, no explicit flag: best-effort warm default; "never seeded" and
-        // "corrupted" are separate counts.
-        let warm = run_cas_expr_replay_for_build(
-            &mut store, &project, "test", "trusted", None, false, true,
-        )?;
-        assert_eq!(
-            (warm.mode, warm.replayed, warm.missing, warm.invalid),
-            ("warm_opt_in", 1, 1, 1)
-        );
-        // Cold build, no flag: off.
-        let cold = run_cas_expr_replay_for_build(
-            &mut store, &project, "test", "trusted", None, false, false,
-        )?;
-        assert_eq!(
-            (cold.mode, cold.replayed, cold.missing, cold.invalid),
-            ("off", 0, 0, 0)
-        );
-        // Opt-in unset (the G2b revert's own behavior): even a warm hit reads
-        // "off" — the selector is gated on the opt-in, not only the opt-out.
-        {
-            let _no_opt_in = ScopedEnvVar::unset("TURBO_LEAN_WARM_CAS_REPLAY");
-            let warm_unset = run_cas_expr_replay_for_build(
-                &mut store, &project, "test", "trusted", None, false, true,
-            )?;
-            assert_eq!(
-                (
-                    warm_unset.mode,
-                    warm_unset.replayed,
-                    warm_unset.missing,
-                    warm_unset.invalid
-                ),
-                ("off", 0, 0, 0)
-            );
-        }
-        // Explicit flag: fail-closed, even on a warm hit with a missing shard.
-        let explicit_err = run_cas_expr_replay_for_build(
-            &mut store, &project, "test", "trusted", None, true, true,
-        )
-        .unwrap_err();
-        assert!(
-            format!("{explicit_err:#}").contains("--replay-cas-expr failed closed"),
-            "explicit mode must stay fail-closed: {explicit_err:#}"
-        );
-        // Explicit flag on a fully seeded scope reports mode "explicit".
-        let scoped = vec![seeded.clone()];
-        let explicit = run_cas_expr_replay_for_build(
-            &mut store,
-            &project,
-            "test",
-            "trusted",
-            Some(&scoped),
-            true,
-            true,
-        )?;
-        assert_eq!(
-            (
-                explicit.mode,
-                explicit.replayed,
-                explicit.missing,
-                explicit.invalid
-            ),
-            ("explicit", 1, 0, 0)
-        );
-        // Opt-out: a warm hit stays off (the guard restores the variable even on a panic).
-        let _opt_out = ScopedEnvVar::set("TURBO_LEAN_NO_WARM_CAS_REPLAY", "1");
-        let opted_out = run_cas_expr_replay_for_build(
-            &mut store, &project, "test", "trusted", None, false, true,
-        )?;
-        assert_eq!(
-            (
-                opted_out.mode,
-                opted_out.replayed,
-                opted_out.missing,
-                opted_out.invalid
-            ),
-            ("off", 0, 0, 0)
+            "the explicit replay must propagate internal errors: {explicit_err:#}"
         );
         fs::remove_dir_all(dir)?;
         Ok(())
@@ -5392,16 +5081,6 @@ public def api := by
             as fn(&mut TurboStore, &Path, &str, &str, Option<&[PathBuf]>) -> Result<usize>;
         let _ = crate::lake_build::run_build_command_with_cas_replay
             as fn(&mut TurboStore, bool, Vec<String>, PathBuf, String, i64, bool, bool) -> Result<()>;
-        // G2b: best-effort opted-in warm replay surface.
-        let _ = crate::lake_build::replay_project_cas_expr_shards_best_effort
-            as fn(
-                &mut TurboStore,
-                &Path,
-                &str,
-                &str,
-                Option<&[PathBuf]>,
-            ) -> Result<crate::lake_build::CasExprReplayStats>;
-        let _ = std::mem::size_of::<crate::lake_build::CasExprReplayStats>();
         let _ = crate::lake_build::run_hydrate_traces_command as fn(bool, PathBuf) -> Result<()>;
         assert!(!crate::validate_lnir_expr_v1_blob(b""));
     }

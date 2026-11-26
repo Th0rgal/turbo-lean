@@ -12,6 +12,14 @@ The run JSON also records the G2a number (roadmap/HORIZONS.md): the CAS replay
 hit rate over the recorded warm edit sequences, per mode (`cas_replay` inside
 each measured mode result) and run-wide (top-level `cas_replay`).
 
+A results JSON is meant to be committed, so it records no host path: the
+binary is recorded relative to its repository (else by file name), the
+repository and scratch root are left out, path-valued settings
+(PATH_VALUED_SETTINGS) are recorded as a `<sha256:...>` digest of the value,
+and a recorded stderr excerpt names the scratch root, the checkouts, the
+binary's directory, this repository, the working directory, the temp dir and
+the home dir by placeholder.
+
 Typical before/after on one machine (the only comparison this script trusts),
 with the environment it requires (TURBO_LEAN_GIT must be git >= 2.46) and the
 checkout arguments it needs:
@@ -43,7 +51,8 @@ Exit codes:
     4  environment/setup failure (missing env, wrong revs, wrong git, missing
        or malformed baseline, ...).
 
-Required environment (validated, fail-closed; all recorded in the output):
+Required environment (validated, fail-closed; all recorded in the output,
+TURBO_LEAN_GIT as the digest of its path):
     TURBO_LEAN_GIT                     git >= 2.46 binary (system git is refused)
     TURBO_LEAN_ALLOWED_CSIMP=*         imported @[csimp] allowed until P9 lands
     TURBO_LEAN_ALLOWED_UNSAFE=*        imported unsafe defs allowed until P9
@@ -138,11 +147,57 @@ RECORDED_ENV_VARS = [
     "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY", "TURBO_LEAN_HOME", "TURBO_LEAN_STAGING_DIR",
     "TURBO_LEAN_NO_DAEMON", "TURBO_LEAN_NO_REMOTE_TELEMETRY", "TURBO_LEAN_TELEMETRY",
     "TURBO_LEAN_DAEMON_IDLE_SECS", "TURBO_LEAN_BENCH_CHECK_TIMEOUT_S",
-    # The warm CAS-expr replay switches: recorded so paired on-vs-off runs
-    # self-describe in their settings blocks (the G2b delta artifacts were
-    # indistinguishable without this) and settings-mismatch across sides.
-    "TURBO_LEAN_WARM_CAS_REPLAY", "TURBO_LEAN_NO_WARM_CAS_REPLAY",
 ]
+# Recorded settings whose values are host paths. A results JSON is committed, so
+# these are recorded as a digest of the value, never the path itself; the digest
+# still tells two different paths apart, so settings_match keeps comparing them.
+PATH_VALUED_SETTINGS = ("TURBO_LEAN_GIT", "TURBO_LEAN_HOME", "TURBO_LEAN_STAGING_DIR")
+PATH_DIGEST_PREFIX = "<sha256:"
+
+
+def recorded_setting(var: str, val):
+    """The committed form of one recorded setting.
+
+    A path-valued setting becomes `<sha256:` + the first 12 hex digits of the
+    value's SHA-256 + `>`; an already-digested value is kept as it is, so a raw
+    path in an older artifact and the digest of the same path compare equal.
+    Other settings are recorded verbatim.
+    """
+    if var not in PATH_VALUED_SETTINGS or not val:
+        return val
+    if isinstance(val, str) and val.startswith(PATH_DIGEST_PREFIX):
+        return val
+    return f"{PATH_DIGEST_PREFIX}{hashlib.sha256(str(val).encode()).hexdigest()[:12]}>"
+
+
+def recorded_settings(environ=None) -> dict:
+    """Every RECORDED_ENV_VARS setting of `environ` (default os.environ), committed form."""
+    env = os.environ if environ is None else environ
+    return {v: recorded_setting(v, env.get(v)) for v in RECORDED_ENV_VARS}
+
+
+def binary_record(binary: Path, repo_path, sha256: str) -> dict:
+    """The binary relative to its repository, else by file name: never a host path."""
+    rel = Path(binary).name
+    if repo_path:
+        try:
+            rel = str(Path(binary).relative_to(Path(repo_path).resolve()))
+        except ValueError:
+            pass
+    return {"path": rel, "sha256": sha256}
+
+
+def scrub_host_paths(text: str, roots) -> str:
+    """Replace each (root, placeholder) host root in free text, longest root first.
+
+    A root that is empty or the filesystem root itself is skipped, so a bare `/`
+    (a sandbox's home, say) never rewrites every path in the text.
+    """
+    for root, placeholder in sorted(roots, key=lambda r: len(r[0] or ""), reverse=True):
+        if root and len(Path(root).parts) > 1:
+            text = text.replace(root, placeholder)
+    return text
+
 
 VERDICT_EXIT = {
     "pass": 0, "not_compared": 0,
@@ -538,8 +593,11 @@ def host_matches(base, res) -> bool:
 
 
 def settings_match(base, res) -> bool:
-    """Every recorded TURBO_LEAN_* setting must agree, not just four keys."""
-    key = lambda s: {v: s.get(v) for v in RECORDED_ENV_VARS}
+    """Every recorded TURBO_LEAN_* setting must agree, not just four keys.
+
+    Both sides are read in committed form (recorded_setting), so a raw path in an
+    older artifact and the digest of the same path compare equal."""
+    key = lambda s: {v: recorded_setting(v, s.get(v)) for v in RECORDED_ENV_VARS}
     return key(base.get("settings") or {}) == key(res.get("settings") or {})
 
 
@@ -1087,6 +1145,18 @@ class Runner:
         # --check-timeout-s; getattr keeps stub args objects in tests working.
         self.check_timeout_s = getattr(args, "check_timeout_s", None) or CHECK_TIMEOUT_S
         self.scratch = Path(tempfile.mkdtemp(prefix="m1-bench-")).resolve()
+        # Host roots a recorded stderr excerpt may name, each as written and as
+        # resolved (a symlinked home or temp dir prints either way).
+        roots = [(str(self.scratch), "<scratch>"),
+                 (str(self.dirs["batteries"]), "<batteries>"),
+                 (str(self.dirs["pfr"]), "<pfr>"),
+                 (str(self.bin.parent), "<bin-dir>"),
+                 (str(Path(__file__).resolve().parent.parent), "<repo>"),
+                 (os.getcwd(), "<cwd>"),
+                 (tempfile.gettempdir(), "<tmp>"),
+                 (os.path.expanduser("~"), "<home>")]
+        self.path_roots = roots + [(os.path.realpath(r), p) for r, p in roots
+                                   if os.path.isabs(r)]
         self.revs = {}
         self.oleans_guard_violated = False
         self._edited_path = None      # source file currently holding a bench edit
@@ -1362,7 +1432,7 @@ class Runner:
                 runs.append(r["external_wall_ms"])
                 statuses.append(f"exit_{r['exit_code']}")
                 if not stderr_excerpt and r["stderr"]:
-                    stderr_excerpt = r["stderr"][:500]
+                    stderr_excerpt = scrub_host_paths(r["stderr"], self.path_roots)[:500]
         probe_classes = set(probe_class_list)
         m = mode_result(runs, [], statuses, psi_lists=psis)
         m["error_classes"] = sorted(probe_classes)
@@ -1663,14 +1733,15 @@ def main(argv=None):
         binary_sha = hashlib.sha256(runner.bin.read_bytes()).hexdigest()
         toolchain = detect_toolchain(runner.dirs)
         h = host_id(args.machine_label)
-        settings = {v: os.environ.get(v) for v in RECORDED_ENV_VARS}
+        # The results JSON is a committed artifact: no host path goes in it. The
+        # repository and scratch root are left out, the binary is recorded relative
+        # to its repository, and path-valued settings as digests.
+        settings = recorded_settings()
         settings["git_version"] = git_human
-        settings["scratch_root"] = str(runner.scratch)
         results = empty_run_result(WORKLOADS, args.trials)
         results.update({
             "turbo_lean_commit": commit, "turbo_lean_dirty": dirty,
-            "turbo_lean_repo": repo_path,
-            "turbo_lean_binary": {"path": str(runner.bin), "sha256": binary_sha},
+            "turbo_lean_binary": binary_record(runner.bin, repo_path, binary_sha),
             "toolchain": toolchain,
             "host": h, "settings": settings, "workload_revs": dict(runner.revs),
             "revs_pinned": (not args.skip_rev_check),

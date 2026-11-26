@@ -1762,6 +1762,69 @@ name = "CasReplayPkg"
     );
     let warm_json = parse_json_stdout(&warm, "warm_cas_replay");
     assert_eq!(warm_json["cas_expr_replayed"].as_u64(), Some(1));
+
+    // 3. The explicit flag is the only replay: the warm-build trigger is deleted
+    //    (roadmap/HORIZONS.md row G2b), so a warm cache-hit `build` without the flag
+    //    replays nothing even with the former opt-in switch exported, and the build
+    //    JSON carries no replay-mode fields.
+    let gone_fields = [
+        "cas_expr_replay_mode",
+        "cas_expr_replay_missing",
+        "cas_expr_replay_invalid",
+    ];
+    let warm_unflagged = fx
+        .cli("cas-replay-warm")
+        .args(["--json", "build", "--project-dir"])
+        .arg(&fx.root)
+        .env("TURBO_LEAN_WARM_CAS_REPLAY", "1")
+        .output()
+        .unwrap();
+    assert!(
+        warm_unflagged.status.success(),
+        "expected warm `build` without the flag to succeed, stderr:\n{}",
+        String::from_utf8_lossy(&warm_unflagged.stderr)
+    );
+    let warm_unflagged_json = parse_json_stdout(&warm_unflagged, "warm_unflagged_build");
+    assert_eq!(
+        warm_unflagged_json["status"].as_str(),
+        Some("cache_hit"),
+        "the unflagged call must take the warm cache-hit path: {warm_unflagged_json}"
+    );
+    assert_eq!(
+        warm_unflagged_json["cas_expr_replayed"].as_u64(),
+        Some(0),
+        "a warm build without --replay-cas-expr must not replay: {warm_unflagged_json}"
+    );
+    for field in gone_fields {
+        assert!(
+            warm_unflagged_json.get(field).is_none(),
+            "`{field}` belonged to the deleted warm trigger: {warm_unflagged_json}"
+        );
+    }
+
+    // 4. The former opt-out switch does not touch the explicit flag: it still replays
+    //    the seeded shard, and its JSON carries the replayed count alone.
+    let warm_flagged = fx
+        .cli("cas-replay-warm")
+        .args(["--json", "build", "--project-dir"])
+        .arg(&fx.root)
+        .arg("--replay-cas-expr")
+        .env("TURBO_LEAN_NO_WARM_CAS_REPLAY", "1")
+        .output()
+        .unwrap();
+    assert!(
+        warm_flagged.status.success(),
+        "expected warm `build --replay-cas-expr` to succeed, stderr:\n{}",
+        String::from_utf8_lossy(&warm_flagged.stderr)
+    );
+    let warm_flagged_json = parse_json_stdout(&warm_flagged, "warm_flagged_build");
+    assert_eq!(warm_flagged_json["cas_expr_replayed"].as_u64(), Some(1));
+    for field in gone_fields {
+        assert!(
+            warm_flagged_json.get(field).is_none(),
+            "`{field}` belonged to the deleted warm trigger: {warm_flagged_json}"
+        );
+    }
 }
 
 /// A2 (#367, Contract V3): every audited spec carries an honest `witness_provenance`

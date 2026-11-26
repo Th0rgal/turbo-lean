@@ -1846,14 +1846,104 @@ class CheckTimeoutMainPath(unittest.TestCase):
             self.assertEqual(data["args"]["check_timeout_s"], 77)
 
 
-class ProvenanceEnvVars(unittest.TestCase):
-    def test_warm_replay_switches_are_recorded_settings(self):
-        # The G2b on-vs-off artifacts were indistinguishable by their settings
-        # blocks: neither replay switch was recorded. Both are provenance now,
-        # so paired runs self-describe and settings-mismatch across sides.
+class CommittedArtifactIsPathFree(unittest.TestCase):
+    """A results JSON is committed, so it carries no host path."""
+
+    @staticmethod
+    def digest(value):
+        import hashlib
+        return "<sha256:" + hashlib.sha256(value.encode()).hexdigest()[:12] + ">"
+
+    def test_recorded_settings_digest_path_values_and_keep_the_rest(self):
         mod = load_script()
-        self.assertIn("TURBO_LEAN_NO_WARM_CAS_REPLAY", mod.RECORDED_ENV_VARS)
-        self.assertIn("TURBO_LEAN_WARM_CAS_REPLAY", mod.RECORDED_ENV_VARS)
+        got = mod.recorded_settings({"TURBO_LEAN_GIT": "/usr/bin/git",
+                                     "TURBO_LEAN_HOME": "/home/someone/.cache/tl",
+                                     "TURBO_LEAN_ALLOWED_CSIMP": "*"})
+        self.assertEqual(got["TURBO_LEAN_GIT"], self.digest("/usr/bin/git"))
+        self.assertEqual(got["TURBO_LEAN_HOME"], self.digest("/home/someone/.cache/tl"))
+        self.assertEqual(got["TURBO_LEAN_ALLOWED_CSIMP"], "*")
+        self.assertIsNone(got["TURBO_LEAN_STAGING_DIR"])
+        self.assertEqual(set(got), set(mod.RECORDED_ENV_VARS))
+        # A digest is kept as it is, so re-recording an artifact changes nothing.
+        d = got["TURBO_LEAN_GIT"]
+        self.assertEqual(mod.recorded_setting("TURBO_LEAN_GIT", d), d)
+
+    def test_settings_match_reads_a_raw_path_and_its_digest_alike(self):
+        mod = load_script()
+        base = full_valid_baseline(mod)
+        base["settings"]["TURBO_LEAN_GIT"] = "/usr/bin/git"
+        res = {"settings": dict(base["settings"])}
+        res["settings"]["TURBO_LEAN_GIT"] = self.digest("/usr/bin/git")
+        self.assertTrue(mod.settings_match(base, res))
+        # A different path is still a different setting.
+        res["settings"]["TURBO_LEAN_GIT"] = self.digest("/opt/git/bin/git")
+        self.assertFalse(mod.settings_match(base, res))
+        res["settings"]["TURBO_LEAN_GIT"] = "/opt/git/bin/git"
+        self.assertFalse(mod.settings_match(base, res))
+
+    def test_scrub_replaces_the_longest_root_first_and_never_the_filesystem_root(self):
+        mod = load_script()
+        text = "failed in /tmp/m1-bench-x/w/cold_0 and /tmp/other, see /"
+        self.assertEqual(
+            mod.scrub_host_paths(text, [("/tmp", "<tmp>"), ("/tmp/m1-bench-x", "<scratch>"),
+                                        ("/", "<root>"), ("", "<empty>")]),
+            "failed in <scratch>/w/cold_0 and <tmp>/other, see /")
+
+    def test_binary_is_recorded_relative_to_its_repository_or_by_name(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            b = root / "target" / "release" / "turbo-lean"
+            self.assertEqual(mod.binary_record(b, str(root), "s"),
+                             {"path": "target/release/turbo-lean", "sha256": "s"})
+            self.assertEqual(mod.binary_record(b, None, "s")["path"], "turbo-lean")
+            self.assertEqual(mod.binary_record(b, str(root / "elsewhere"), "s")["path"],
+                             "turbo-lean")
+
+    def test_results_json_names_no_host_path(self):
+        with tempfile.TemporaryDirectory(prefix="m1-pathfree-") as td:
+            root = Path(td)
+            stub, _ = make_stub_binary(root)
+            # The PFR probe's stderr names its working directory and the file it
+            # checked: the excerpt recorded from it must name them by placeholder.
+            marker = "    print(json.dumps({'error': 'stale imports: import_refresh fail-closed'}))\n"
+            default = stub.read_text()
+            self.assertIn(marker, default)
+            body = default.replace(
+                marker,
+                "    sys.stderr.write('probe failed in ' + os.getcwd() + ' on '"
+                " + ' '.join(a for a in args if a.endswith('.lean'))"
+                " + ' home ' + os.environ.get('TURBO_LEAN_HOME', '') + '\\n')\n" + marker)
+            out = root / "o.json"
+            r = run_bench(root, ["--no-baseline", "--out", str(out)], stub_body=body,
+                          env_extra={"TURBO_LEAN_HOME": str(root / "tl-home")})
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            text = out.read_text()
+            data = json.loads(text)
+            for host_path in {str(root), os.path.realpath(str(root))}:
+                self.assertNotIn(host_path, text)
+            self.assertNotIn("turbo_lean_repo", data)
+            self.assertNotIn("scratch_root", data["settings"])
+            self.assertEqual(data["turbo_lean_binary"]["path"], "fake-turbo-lean")
+            self.assertTrue(data["settings"]["TURBO_LEAN_GIT"].startswith("<sha256:"))
+            self.assertEqual(data["settings"]["TURBO_LEAN_HOME"],
+                             self.digest(str(root / "tl-home")))
+
+            def excerpts(node):
+                if isinstance(node, dict):
+                    for k, v in node.items():
+                        if k == "stderr_excerpt":
+                            yield v
+                        else:
+                            yield from excerpts(v)
+                elif isinstance(node, list):
+                    for v in node:
+                        yield from excerpts(v)
+            found = list(excerpts(data))
+            self.assertTrue(found, "the PFR probe recorded no stderr excerpt")
+            for e in found:
+                self.assertIn(" on <pfr>/", e)
+                self.assertIn(" home <scratch>/", e)
 
 
 class OnlyWorkloadsPartialRun(unittest.TestCase):
