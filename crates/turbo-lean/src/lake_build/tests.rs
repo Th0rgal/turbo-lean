@@ -5188,9 +5188,7 @@ public def api := by
         assert_eq!(standalone_merge_rel_base("TurboLean/Spec.trace"), None);
     }
 
-/// Review f9807eb0 F8 fixtures: a project `P3` (owned lib `P3.A` importing `D.D`) whose
-/// single dependency `dep` carries a Lake file input. `dep_dir` is where the checkout
-/// lives relative to the project root, `declared` the path the `require` names.
+/// Temp-dir root of an [`ownership_fixture`] tree, removed on drop.
 #[cfg(test)]
 struct OwnershipFixture {
     root: PathBuf,
@@ -5203,6 +5201,12 @@ impl Drop for OwnershipFixture {
     }
 }
 
+/// Review f9807eb0 F8 fixtures: a project `P3` (owned lib `P3.A` importing `D.D`) whose
+/// single dependency `dep` carries a Lake file input. `tag` makes the temp dir name
+/// unique, `dep_rel` is the dependency checkout's path (relative to the project root
+/// when `dep_in_project`, else relative to the fixture root, declared to Lake by its
+/// absolute path), and `dep_in_project` says whether the checkout sits inside the
+/// project tree.
 #[cfg(test)]
 fn ownership_fixture(tag: &str, dep_rel: &str, dep_in_project: bool) -> Result<OwnershipFixture> {
     let root = std::env::temp_dir().join(format!(
@@ -5335,12 +5339,22 @@ mod freshness_ownership_tests {
         let c1 = input_closure_sweep_mods(&cfg, &dag);
         assert!(!c1.contains("D.D"), "a non-owned module never enters the closure: {c1:?}");
         assert!(warned.lock().unwrap().contains(&key), "a stale non-owned input-bearing module is recorded");
-        let _ = input_closure_sweep_mods(&cfg, &dag);
-        assert_eq!(
-            warned.lock().unwrap().iter().filter(|k| **k == key).count(),
-            1,
-            "repeated sweeps keep one entry (no repeat warning)"
+        // The first sweep already consumed the first-time decision for this key, so the
+        // decision step reports "not first time" now, and again after a second sweep.
+        assert!(
+            !record_stale_non_owned_warning(warned, key.clone()),
+            "the first sweep recorded the key, so a repeat is not a first-time warning"
         );
+        let _ = input_closure_sweep_mods(&cfg, &dag);
+        assert!(
+            !record_stale_non_owned_warning(warned, key.clone()),
+            "a second sweep must not make the key first-time again (no repeat warning)"
+        );
+        // Control: the decision step does report true for a key it has not seen.
+        let fresh_key = (key.0.join("__control__"), key.1.clone());
+        assert!(record_stale_non_owned_warning(warned, fresh_key.clone()), "an unseen key is first-time");
+        assert!(!record_stale_non_owned_warning(warned, fresh_key.clone()), "its repeat is not");
+        warned.lock().unwrap().remove(&fresh_key);
         // Olean newer than every input: fresh -> entry cleared.
         set_olean_age(3600)?;
         let _ = input_closure_sweep_mods(&cfg, &dag);
