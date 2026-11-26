@@ -24,12 +24,14 @@ run here measures the same kind of store as that artifact's OFF side.
 
 Every call is a fresh process with TURBO_LEAN_NO_DAEMON=1, telemetry off, and a
 private TURBO_LEAN_HOME, staging dir and TMPDIR under the run's scratch root.
-The former warm-replay switches (TURBO_LEAN_WARM_CAS_REPLAY,
-TURBO_LEAN_NO_WARM_CAS_REPLAY) are removed from every call's environment, so a
-binary built before their deletion also measures a plain warm build. A call
-that exits non-zero, prints no JSON object, or does not report its expected
-status is a failed trial: it is kept out of the medians, counted, and the
-verdict is `measurement_failed` (exit 1).
+The former warm-replay opt-in (TURBO_LEAN_WARM_CAS_REPLAY) is removed from every
+call's environment and its force-off switch (TURBO_LEAN_NO_WARM_CAS_REPLAY) is
+set to 1, so a binary built before their deletion also measures a plain warm
+build. A call that exits non-zero, prints no JSON object, does not report its
+expected status, or reports that a replay ran is a failed trial: it is kept out
+of the medians, counted, and the verdict is `measurement_failed` (exit 1). A call
+that outlives --build-timeout-s is killed together with the processes it started
+(each call runs in its own session).
 
 Typical run (one machine, one binary, `lean` on PATH through elan):
 
@@ -48,7 +50,8 @@ Exit codes:
     1  measurement failed: an unhealthy cold build or a failed warm trial
     2  usage error
     4  environment/setup failure (missing binary or `lean`, a busy node without
-       --allow-busy-node, ...)
+       --allow-busy-node, an --out directory that cannot be written, a binary
+       that cannot be launched, ...)
 
 Python standard library only. Host identity, PSI sampling and the statistics
 are scripts/bench_check_loop.py's own, loaded from beside this file.
@@ -62,6 +65,7 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -98,12 +102,16 @@ DEFAULT_MODULES = 4
 DEFAULT_THEOREMS_PER_MODULE = 50
 BUILD_TIMEOUT_S = 900
 FIXTURE_LIB = "BenchFixture"
-# The deleted G2b warm-replay switches. No current binary reads them; they are
-# removed from every call so an older binary cannot replay either.
-RETIRED_SWITCHES = ("TURBO_LEAN_WARM_CAS_REPLAY", "TURBO_LEAN_NO_WARM_CAS_REPLAY")
+# The deleted G2b warm-replay opt-in. No current binary reads it; it is removed
+# from every call, and the force-off switch is set in CHILD_COMMON, so an older
+# binary cannot replay either.
+RETIRED_SWITCHES = ("TURBO_LEAN_WARM_CAS_REPLAY",)
 # What every child call gets on top of the caller's environment, with the
 # scratch root written as a placeholder (the real paths stay out of the JSON).
+# child_env builds the real environment from this table, so the recorded
+# settings are what the calls ran with.
 CHILD_COMMON = {
+    "TURBO_LEAN_NO_WARM_CAS_REPLAY": "1",
     "TURBO_LEAN_HOME": "<scratch>/home",
     "TURBO_LEAN_STAGING_DIR": "<scratch>/staging",
     "TURBO_LEAN_NO_REMOTE_TELEMETRY": "1",
@@ -233,12 +241,8 @@ def child_env(scratch: Path) -> dict:
     env = dict(os.environ)
     for var in RETIRED_SWITCHES:
         env.pop(var, None)
-    env["TURBO_LEAN_HOME"] = str(scratch / "home")
-    env["TURBO_LEAN_STAGING_DIR"] = str(scratch / "staging")
-    env["TURBO_LEAN_NO_REMOTE_TELEMETRY"] = "1"
-    env["TURBO_LEAN_TELEMETRY"] = "off"
-    env["TURBO_LEAN_NO_DAEMON"] = "1"
-    env["TMPDIR"] = str(scratch / "tmp")
+    env.update({key: value.replace("<scratch>", str(scratch))
+                for key, value in CHILD_COMMON.items()})
     return env
 
 
@@ -250,25 +254,35 @@ def build_argv(binary, scratch: Path, seed: bool) -> list:
     return argv
 
 
-def _text(v) -> str:
-    # TimeoutExpired carries bytes whatever `text=` said, or None.
-    if v is None:
-        return ""
-    if isinstance(v, bytes):
-        return v.decode("utf-8", "replace")
-    return v
+def _kill_group(proc) -> None:
+    """SIGKILL the call's whole process group (it leads its own session)."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def run_build(argv, env, timeout_s):
+    """One build call, in its own session so a timeout takes lake and lean with it."""
     psi_before = bcl.sample_psi()
     t0 = time.perf_counter_ns()
     try:
-        proc = subprocess.run(argv, env=env, capture_output=True, text=True,
-                              timeout=timeout_s)
-        rc, out, err = proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired as e:
-        rc, out = -1, _text(e.stdout)
-        err = _text(e.stderr) + f"\ntimeout after {timeout_s}s"
+        proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, start_new_session=True)
+    except OSError as e:
+        raise BenchEnvError(f"failed to launch {argv[0]}: {e}") from e
+    try:
+        out, err = proc.communicate(timeout=timeout_s)
+        rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        out, err = proc.communicate()
+        rc = -1
+        err = (err or "") + f"\ntimeout after {timeout_s}s"
+    except BaseException:
+        _kill_group(proc)
+        proc.wait()
+        raise
     wall_ms = (time.perf_counter_ns() - t0) / 1e6
     psi_after = bcl.sample_psi()
     return {"exit_code": rc, "external_wall_ms": wall_ms,
@@ -276,18 +290,22 @@ def run_build(argv, env, timeout_s):
             "psi_before": psi_before, "psi_after": psi_after}
 
 
-def _failure_head(r):
+def _failure_head(r, scratch=None):
     if r.get("exit_code") != 0:
-        tail = (r.get("stderr") or "")[-300:].strip()
+        stderr = r.get("stderr") or ""
+        if scratch is not None:
+            # Scrub before cutting the tail, so a path split by the cut cannot leak.
+            stderr = stderr.replace(str(scratch), "<scratch>")
+        tail = stderr[-300:].strip()
         return f"exit {r.get('exit_code')}" + (f": {tail}" if tail else "")
     if not isinstance(r.get("json"), dict):
         return "no JSON object on stdout"
     return None
 
 
-def cold_problem(r, theorems: int):
+def cold_problem(r, theorems: int, scratch=None):
     """None when the cold seeded build met its expectation, else why not."""
-    head = _failure_head(r)
+    head = _failure_head(r, scratch)
     if head:
         return head
     j = r["json"]
@@ -299,14 +317,20 @@ def cold_problem(r, theorems: int):
     return None
 
 
-def trial_problem(r):
-    """None when a warm call was a healthy cache hit, else why not."""
-    head = _failure_head(r)
+def trial_problem(r, scratch=None):
+    """None when a warm call was a healthy cache hit that replayed nothing, else why not."""
+    head = _failure_head(r, scratch)
     if head:
         return head
-    status = r["json"].get("status")
+    j = r["json"]
+    status = j.get("status")
     if status != "cache_hit":
         return f"status {status!r}, expected 'cache_hit'"
+    replayed, mode = j.get("cas_expr_replayed"), j.get("cas_expr_replay_mode")
+    if replayed not in (None, 0) or mode not in (None, "off"):
+        return (f"a warm replay ran (cas_expr_replayed {replayed!r}, "
+                f"cas_expr_replay_mode {mode!r}); the bench measures a build that "
+                "replays nothing")
     return None
 
 
@@ -427,6 +451,12 @@ def main(argv=None) -> int:
         binary = validate_environment(args)
         if args.scratch_dir and not Path(args.scratch_dir).is_dir():
             raise BenchEnvError(f"--scratch-dir is not a directory: {args.scratch_dir}")
+        if args.out:
+            # Fail before the cold build, not after the last warm call.
+            out_dir = Path(args.out).resolve().parent
+            if not out_dir.is_dir() or not os.access(out_dir, os.W_OK | os.X_OK):
+                raise BenchEnvError(
+                    f"--out: {out_dir} is not a writable directory")
         loadavg_at_start = read_loadavg()
         load_at_start = bcl.require_quiet_node(args)
         toolchain_line = args.lean_toolchain or repo_lean_toolchain()
@@ -470,7 +500,7 @@ def main(argv=None) -> int:
         print(f"[{bcl.utc_now_iso()}] cold seeded build ({args.modules} modules x "
               f"{args.theorems_per_module} theorems) ...", flush=True)
         cold = run_build(build_argv(binary, scratch, True), env, args.build_timeout_s)
-        problem = cold_problem(cold, theorems)
+        problem = cold_problem(cold, theorems, scratch)
         results["cold"] = cold_record(cold, problem)
         problems = [f"cold: {problem}"] if problem else []
         if not problem:
@@ -480,7 +510,8 @@ def main(argv=None) -> int:
             trials = []
             for call in range(args.warmup + args.trials):
                 r = run_build(build_argv(binary, scratch, False), env, args.build_timeout_s)
-                r.update(call=call, measured=call >= args.warmup, problem=trial_problem(r))
+                r.update(call=call, measured=call >= args.warmup,
+                         problem=trial_problem(r, scratch))
                 trials.append(r)
             results["sequence"] = [{"call": t["call"], "measured": t["measured"],
                                     "ok": t["problem"] is None} for t in trials]
