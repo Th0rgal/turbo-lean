@@ -1409,6 +1409,19 @@ pub(crate) fn warned_stale_non_owned()
     WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
 }
 
+/// Records `key` in the dedupe set and returns whether the stale-module warning should
+/// be printed now: true the first time a key is seen (or when the lock is poisoned, so
+/// the user is warned rather than silenced), false for a repeat.
+pub(crate) fn record_stale_non_owned_warning(
+    warned: &std::sync::Mutex<std::collections::BTreeSet<(std::path::PathBuf, String)>>,
+    key: (std::path::PathBuf, String),
+) -> bool {
+    warned
+        .lock()
+        .map(|mut guard| guard.insert(key))
+        .unwrap_or(true)
+}
+
 /// The Lake-inputs sweep's module closure over `dag`: every OWNED module whose own
 /// build reads a Lake file input (an input-bearing library or executable can build
 /// it, or its source uses `include_str`), plus every transitive OWNED dependent,
@@ -1518,11 +1531,7 @@ pub(crate) fn input_closure_sweep_mods(
                 if !input_bearing {
                     return None;
                 }
-                let first_time = warned
-                    .lock()
-                    .map(|mut guard| guard.insert(key))
-                    .unwrap_or(true);
-                if first_time {
+                if record_stale_non_owned_warning(warned, key) {
                     eprintln!(
                         "[turbo-lean] input-bearing module `{}` lives in a non-owned checkout and its artifacts are stale on disk; the freshness sweep does not cover it — {}",
                         m,
