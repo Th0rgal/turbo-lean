@@ -601,13 +601,28 @@ def safe_run_one(scratch, pristine: Dict[str, str], mutant: Mutant,
         }
 
 
-def load_progress(jsonl_path: Path, commit: str) -> Dict[str, Dict[str, object]]:
-    """Resume rows from a prior interrupted run at the SAME commit. Only
-    measured outcomes (KILLED/SURVIVED) and stillborns are reused; TIMEOUT,
-    INFRA and ERROR re-run."""
+def operator_table_hash() -> str:
+    """Fingerprint of the operator table, stamped into every progress row and
+    checked on resume (review r2 F2): an edit to OPERATORS can re-point an
+    occurrence id like RB-x-02 at a different site, so rows written under
+    another table must never be reused."""
+    blob = json.dumps([[o.name, o.file_tag, o.pattern, o.replacement,
+                        o.expected_count] for o in OPERATORS])
+    return sha256_bytes(blob.encode("utf-8"))[:16]
+
+
+def load_progress(jsonl_path: Path, commit: str,
+                  selected_ids: set) -> Dict[str, Dict[str, object]]:
+    """Resume rows from a prior interrupted run at the SAME commit and the
+    SAME operator table, restricted to the ids this run was asked for
+    (review r2 F2: a --sample or --mutants resume after a partial --full must
+    not mix unrelated rows into the summary). Only measured outcomes
+    (KILLED/SURVIVED) and stillborns are reused; TIMEOUT, INFRA and ERROR
+    re-run."""
     done: Dict[str, Dict[str, object]] = {}
     if not jsonl_path.exists():
         return done
+    op_hash = operator_table_hash()
     for ln in jsonl_path.read_text(encoding="utf-8").splitlines():
         ln = ln.strip()
         if not ln:
@@ -618,6 +633,14 @@ def load_progress(jsonl_path: Path, commit: str) -> Dict[str, Dict[str, object]]
                 f"{jsonl_path}: progress rows are for commit "
                 f"{str(rec.get('measured_commit'))[:12]}, this run measures "
                 f"{commit[:12]}; move the file aside")
+        if rec.get("op_table_hash") != op_hash:
+            raise RuntimeError(
+                f"{jsonl_path}: progress rows were written under operator "
+                f"table {rec.get('op_table_hash')}, this script's table is "
+                f"{op_hash} (ids may point at different sites); move the "
+                f"file aside")
+        if str(rec.get("id")) not in selected_ids:
+            continue
         if rec.get("outcome") in TERMINAL_OUTCOMES + ("NOT_APPLICABLE",):
             done[str(rec["id"])] = rec
     return done
@@ -625,14 +648,22 @@ def load_progress(jsonl_path: Path, commit: str) -> Dict[str, Dict[str, object]]
 
 def run_matrix(mutants: List[Mutant], pristine: Dict[str, str], commit: str,
                workers: int, timeout_s: int, keep_scratch: bool,
-               jsonl_path: Path, resume: bool) -> List[Dict[str, object]]:
+               jsonl_path: Path, resume: bool,
+               fresh: bool = False) -> List[Dict[str, object]]:
     base = ROOT / SCRATCH_DIRNAME
-    done = load_progress(jsonl_path, commit) if resume else {}
+    selected_ids = {m.mid for m in mutants}
+    done = load_progress(jsonl_path, commit, selected_ids) if resume else {}
     todo = [m for m in mutants if m.mid not in done]
     if done:
         print(f"[resume] {len(done)} mutant(s) carried from {jsonl_path}, "
               f"{len(todo)} to run")
     if not resume and jsonl_path.exists():
+        # Review r2 F2: a casual run must not wipe another run's checkpoint
+        # (a local --sample ci used to delete a multi-hour --full's progress).
+        if not fresh:
+            raise RuntimeError(
+                f"{jsonl_path} already exists; pass --resume to reuse its "
+                f"measured rows or --fresh to overwrite it")
         jsonl_path.unlink()
     workers = max(1, min(workers, max(1, len(todo))))  # review F7
     scratches = [Scratch(ROOT, base, i, commit, timeout_s) for i in range(workers)]
@@ -662,6 +693,7 @@ def run_matrix(mutants: List[Mutant], pristine: Dict[str, str], commit: str,
             for m in chunks[idx]:
                 rec = safe_run_one(scratches[idx], pristine, m)
                 rec["measured_commit"] = commit
+                rec["op_table_hash"] = operator_table_hash()
                 with jsonl_lock:
                     with jsonl_path.open("a", encoding="utf-8") as f:
                         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -908,6 +940,54 @@ def self_test() -> int:
               err_rec["outcome"] == "ERROR" and
               "planted scratch failure" in str(err_rec["reason"]), str(err_rec))
 
+    # Review r2 F2 controls: progress-file hygiene, on concrete planted rows.
+    st_tmp = ROOT / ".h14-selftest-tmp"
+    st_tmp.mkdir(exist_ok=True)
+    try:
+        if m0 is not None:
+            prog = st_tmp / "progress.jsonl"
+            op_hash = operator_table_hash()
+            rows = [
+                {"id": m0.mid, "outcome": "KILLED",
+                 "measured_commit": commit, "op_table_hash": op_hash},
+                {"id": "RB-not-in-selection-99", "outcome": "KILLED",
+                 "measured_commit": commit, "op_table_hash": op_hash},
+            ]
+            prog.write_text("\n".join(json.dumps(r) for r in rows) + "\n",
+                            encoding="utf-8")
+            got = load_progress(prog, commit, {m0.mid})
+            check("resume filters progress rows to the selected ids",
+                  list(got.keys()) == [m0.mid], str(list(got.keys())))
+            bad_hash = dict(rows[0])
+            bad_hash["op_table_hash"] = "deadbeefdeadbeef"
+            prog.write_text(json.dumps(bad_hash) + "\n", encoding="utf-8")
+            try:
+                load_progress(prog, commit, {m0.mid})
+                check("resume refuses rows from another operator table", False)
+            except RuntimeError as e:
+                check("resume refuses rows from another operator table",
+                      "operator" in str(e), str(e))
+            bad_commit = dict(rows[0])
+            bad_commit["measured_commit"] = "0" * 40
+            prog.write_text(json.dumps(bad_commit) + "\n", encoding="utf-8")
+            try:
+                load_progress(prog, commit, {m0.mid})
+                check("resume refuses rows from another commit", False)
+            except RuntimeError as e:
+                check("resume refuses rows from another commit",
+                      "commit" in str(e), str(e))
+            prog.write_text(json.dumps(rows[0]) + "\n", encoding="utf-8")
+            try:
+                run_matrix([m0], srcs, commit, 1, 1, False, prog,
+                           resume=False, fresh=False)
+                check("a non-resume run refuses to overwrite existing "
+                      "progress without --fresh", False)
+            except RuntimeError as e:
+                check("a non-resume run refuses to overwrite existing "
+                      "progress without --fresh", "--fresh" in str(e), str(e))
+    finally:
+        shutil.rmtree(st_tmp, ignore_errors=True)
+
     # The committed results artifact backs the CI sample's KILLED claims
     # (review F9): every pinned id must be recorded KILLED at the pinned shas.
     if RESULTS_PATH.exists():
@@ -971,10 +1051,16 @@ def main() -> int:
     ap.add_argument("--json-out", default="",
                     help="write the results JSON to this path")
     ap.add_argument("--jsonl", default="",
-                    help="per-mutant progress JSONL (default: "
-                         "h14-matrix-progress.jsonl in the repo root)")
+                    help="per-mutant progress JSONL (default: a per-selection-"
+                         "mode file in the repo root, h14-matrix-progress-"
+                         "<full|sample|mutants>.jsonl, so a quick sample run "
+                         "cannot touch a full run's checkpoint)")
     ap.add_argument("--resume", action="store_true",
                     help="reuse measured rows from the progress JSONL")
+    ap.add_argument("--fresh", action="store_true",
+                    help="allow overwriting an existing progress JSONL "
+                         "(without it, a non-resume run refuses rather than "
+                         "deleting earlier progress)")
     ap.add_argument("--keep-scratch", action="store_true")
     args = ap.parse_args()
 
@@ -1022,13 +1108,18 @@ def main() -> int:
         ap.print_help()
         return 64
 
-    jsonl_path = Path(args.jsonl) if args.jsonl else ROOT / "h14-matrix-progress.jsonl"
+    # Review r2 F2: each selection mode checkpoints to its own default file,
+    # so a quick local --sample ci cannot collide with (or be refused by) a
+    # multi-hour --full run's progress.
+    mode = "full" if args.full else ("sample" if args.sample else "mutants")
+    jsonl_path = (Path(args.jsonl) if args.jsonl
+                  else ROOT / f"h14-matrix-progress-{mode}.jsonl")
     print(f"[proof-mutant-matrix] running {len(selected)} mutant(s) at "
           f"{commit[:12]}, {min(max(1, args.workers), len(selected))} worker(s), "
           f"progress -> {jsonl_path}")
     results = run_matrix(selected, srcs, commit, max(1, args.workers),
                          args.timeout, args.keep_scratch, jsonl_path,
-                         args.resume)
+                         args.resume, args.fresh)
     summary = summarize(results)
     print(json.dumps(summary, indent=2))
 
