@@ -72,8 +72,8 @@ retTy mutants (1-2 of 3 identical runs each). Every kill attributed to either mo
 the pre-r1 passes is therefore environment, not the mutant; per the non-inflation rule
 ("a mutant killed only by flakiness or build nondeterminism is SURVIVED") neither pre-r1
 number is reused. The fixes: the r1 harness gives every scratch a private TMPDIR and
-TURBO_LEAN_HOME, and this leaf's one Tests edit derives the pack fixture path from
-`$TMPDIR` (the same convention `EvalLCNFCLITests` already uses). The number of record
+TURBO_LEAN_HOME, and this leaf's Tests edit gives the pack fixture a per-run unique name under `$TMPDIR`
+with `finally` cleanup, collision-free even under one shared TMPDIR. The number of record
 comes from the r1 harness over the fixed tree, measured at commit 88324526 with a
 3-repetition determinism read of all five implicated ids first (identical verdicts 3/3
 each: four KILLED by this file's pins, the budget mutant SURVIVED 3/3):
@@ -153,11 +153,13 @@ means untested, never defended), stay closed by this file's pins:
   `$TMPDIR` and shells into the CLI, so its verdict is only deterministic when nothing
   else builds this library under the same TMPDIR concurrently. The r1 harness isolates
   TMPDIR per scratch, and this leaf re-pointed `Tests/StochasticEvolveTests.lean`'s pack
-  fixture from a literal `/tmp` to `$TMPDIR` (measured false kills; see the record above).
-  A unique-name fixture inside EvalLCNFCLITests itself is the H1.1 file owner's fix,
-  recorded here as a handoff, not edited by this leaf; until it lands, two plain
-  single-TMPDIR builds of this library on one host can still fail each other's
-  elaboration — a repo-wide flake independent of this matrix.
+  fixture from a literal `/tmp` to a per-run UNIQUE name under `$TMPDIR` with `finally`
+  cleanup (measured false kills; see the record above), so that fixture no longer
+  collides even between two builds sharing one TMPDIR. A unique-name fixture inside
+  EvalLCNFCLITests itself is the H1.1 file owner's fix, recorded here as a handoff, not
+  edited by this leaf; until it lands, two plain single-TMPDIR builds of this library on
+  one host can still fail each other's elaboration through THAT module — a repo-wide
+  flake independent of this matrix.
 - The matrix measures the closure at its recorded commit; it is re-measured (and the
   script's pins re-set) whenever the two enumerated files change — they are sha-pinned in
   the harness exactly so a stale matrix fails closed instead of reading as current.
