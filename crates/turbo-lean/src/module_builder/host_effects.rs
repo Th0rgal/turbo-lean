@@ -884,10 +884,13 @@ pub(crate) fn dep_pkg_lake_targets_owned_by_project(
 /// * a clean git-pinned package (a manifest `git` entry, clean at its rev) is never
 ///   project-owned: its own workspace refreshes it from the pin (#434);
 /// * a root inside another package's `.lake/packages` is a nested checkout, never ours;
-/// * a `path` manifest entry is editable project state wherever its directory
-///   resolves (review finding 6: #434's damage came from shared GIT checkouts, and
-///   un-owning an editable `../sibling` turns its edited `include_str` targets into
-///   silent skips that nothing refreshes);
+/// * a `path` manifest entry is editable project state when it resolves inside the
+///   project root, or when its directory is not itself a git checkout (an editable
+///   scratch sibling, review finding 6: un-owning one turns its edited `include_str`
+///   targets into silent skips that nothing refreshes); an out-of-tree GIT clone
+///   behind a `path` entry (`require mathlib from "/abs/mathlib4"`, one clone shared
+///   across projects) is refreshed by its own workspace, exactly the #434 class
+///   (DA 71add786 finding 4);
 /// * everything else (no matching manifest entry — a hand-built or synthesized
 ///   package — or a git entry whose checkout is not clean at its pin) falls back to
 ///   location: a canonical root inside the project root is ours, and a symlinked
@@ -905,16 +908,21 @@ fn pkg_root_owned_by_project(
     if pkg_root_inside_foreign_lake_packages(cfg, pkg_root) {
         return false;
     }
-    if manifest_entry_is_path_dep(cfg, pkg_name, pkg_base_name, pkg_root) {
-        return true;
-    }
-    match (
+    let inside_root = match (
         fs::canonicalize(pkg_root),
         fs::canonicalize(&cfg.root_pkg.pkg_root),
     ) {
         (Ok(pkg), Ok(root)) => pkg.starts_with(&root),
         _ => false,
+    };
+    if manifest_entry_is_path_dep(cfg, pkg_name, pkg_base_name, pkg_root) {
+        // Inside the root it is project state; outside, only a directory that is not
+        // itself a git checkout counts as editable scratch (finding 6). An
+        // out-of-tree git clone shared across projects is #434's shape whatever the
+        // manifest entry type says (DA 71add786 finding 4).
+        return inside_root || !pkg_root.join(".git").exists();
     }
+    inside_root
 }
 
 fn manifest_entry_is_path_dep(
@@ -3230,6 +3238,72 @@ mod host_effect_taint_tests {
             dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
             "an editable sibling path dependency's targets are project-driven \
              (finding 6)"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// A `path` entry pointing at an out-of-tree GIT clone is a shared checkout
+    /// (`require mathlib from "/abs/mathlib4"` shares one clone across projects):
+    /// deleting its artifacts or lake-building its targets from this project is the
+    /// #434 class, whatever the manifest entry type says (DA 71add786 finding 4). The
+    /// editable-sibling test above stays owned because that fixture is not itself a
+    /// git checkout.
+    #[test]
+    fn host_effects_out_of_tree_path_dep_git_clone_is_not_project_owned() -> Result<()> {
+        let dir = temp_dir("shared_clone_path");
+        let proj = dir.join("proj");
+        let dep = dir.join("lintlib");
+        fs::create_dir_all(&proj)?;
+        fs::create_dir_all(&dep)?;
+        let tc = include_str!("../../../../lean/lean-toolchain");
+        fs::write(dep.join("lean-toolchain"), tc)?;
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"lintlib\"\ndefaultTargets = [\"LintLib\"]\n[[lean_lib]]\nname = \"LintLib\"\n",
+        )?;
+        fs::write(dep.join("LintLib.lean"), LINTER_SHAPE)?;
+        git_init_commit(&dep)?;
+        fs::write(proj.join("lean-toolchain"), tc)?;
+        fs::write(
+            proj.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage proj where\nrequire lintlib from \"../lintlib\"\n@[default_target]\nlean_lib Proj where\n",
+        )?;
+        fs::write(proj.join("Proj.lean"), "import LintLib\ndef p : Nat := 1\n")?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [{
+                    "type": "path",
+                    "name": "lintlib",
+                    "dir": "../lintlib",
+                    "manifestFile": "lake-manifest.json",
+                    "inherited": false,
+                    "configFile": "lakefile.toml"
+                }]
+            }))?,
+        )?;
+        let canon = fs::canonicalize(&proj)?;
+        reset_lake_inputs_tag_memo();
+        let cfg = resolve_project_config(&canon)?;
+        let dep_pkg = cfg
+            .dep_pkgs
+            .iter()
+            .find(|dp| dp.name == "lintlib")
+            .expect("shared-clone lintlib dependency resolves");
+        let spec = resolve_module_in_package(dep_pkg, false, "LintLib")
+            .expect("LintLib module resolves in the shared clone");
+        assert!(
+            !spec_artifacts_purgeable_from_project_root(&cfg, &spec),
+            "an out-of-tree git clone behind a path entry is a shared checkout; its \
+             artifacts are never purged from this project (#434, DA finding 4)"
+        );
+        assert!(
+            !dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
+            "an out-of-tree git clone behind a path entry is not lake-built from this \
+             project (#434, DA finding 4)"
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())
