@@ -2574,6 +2574,29 @@ pub(super) fn discover_standalone_project_modules(
     Ok(out)
 }
 
+/// Whether any other module of the project imports the project file `rel`. A project whose import
+/// graph cannot be resolved is an error (fail closed, with the resolution error). A project without a
+/// Lake config has no import graph to read, so it reports none: the dependent recheck cannot run there.
+pub(crate) fn project_file_has_importers(canon_dir: &Path, rel: &str) -> Result<bool> {
+    if !has_lake_config(canon_dir) {
+        return Ok(false);
+    }
+    // Strict graph: an unresolvable import graph is an error here, not a silent fallback to
+    // "every standalone module", which would read as importers that do not exist.
+    let closure =
+        compute_project_dependent_closure_inner(canon_dir, &[rel.to_string()], false, true)?;
+    let target = canon_dir.join(rel);
+    let target = target.canonicalize().unwrap_or(target);
+    let is_other = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()) != target;
+    Ok(match closure.dag_files.as_ref() {
+        Some(files) => {
+            files.iter().any(|p| is_other(p))
+                || closure.standalone_modules.iter().any(|s| is_other(&s.src_path))
+        }
+        None => true,
+    })
+}
+
 pub(super) fn compute_project_dependent_closure(
     canon_dir: &Path,
     edits: &[String],
