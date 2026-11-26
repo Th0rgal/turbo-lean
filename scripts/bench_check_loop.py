@@ -72,7 +72,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+# 2: check_calls renamed classified_calls (a check_calls alias stays in every
+#    bucket for old readers), cold modes carry no cas_replay block, fission
+#    sums can be None, host blocks carry host_fingerprint, filtered workloads
+#    read skipped_by_filter with a partial_run verdict.
+SCHEMA_VERSION = 2
 NOISE_FLOOR_MS = 25.0
 # Between-run floor for the gate: two runs of one binary on one node drift by
 # up to ~13% on cold workloads (import_refresh is page-cache sensitive), while
@@ -209,10 +213,11 @@ def selected_workloads(args):
     """WORKLOADS filtered by --only-workloads, in table order.
 
     The filter applies only to the measurement loop: validate_baseline and
-    compare_run keep seeing the full table so baseline files stay complete, and
-    unselected workloads keep the same "pending" entry an unreached workload
-    has today. Name validation (exit 2 on an unknown id) happens in main's
-    argparse stage; this helper assumes the names are valid.
+    compare_run keep seeing the full table so baseline files stay complete.
+    main marks unselected workloads `skipped_by_filter` after the loop, and
+    compare_run reports such a run as `partial_run`. Name validation (exit 2
+    on an unknown id) happens in main's argparse stage; this helper assumes
+    the names are valid.
     """
     raw = getattr(args, "only_workloads", None)
     if not raw:
@@ -383,7 +388,10 @@ def summarize_cas_replay(results):
                 if wid not in workloads:
                     workloads.append(wid)
         calls = hits + misses
+        # check_calls is a schema-1 alias of classified_calls, kept for old
+        # readers; new code reads classified_calls.
         return {"workloads": workloads, "classified_calls": calls,
+                "check_calls": calls,
                 "hits": hits, "misses": misses,
                 "hit_rate": round(hits / calls, 4) if calls else None,
                 "failed_trials": failed,
@@ -1511,8 +1519,10 @@ def main(argv=None):
                          f"used as the subprocess timeout (default {CHECK_TIMEOUT_S})")
     ap.add_argument("--only-workloads",
                     help="comma-separated workload ids; only these are measured, the "
-                         "rest stay pending. For targeted re-measurement; normally "
-                         "used with --no-baseline.")
+                         "rest are recorded as skipped_by_filter and the run verdict "
+                         "is partial_run (exit 0; exit 1 under --strict-comparison). "
+                         "For targeted re-measurement; normally used with "
+                         "--no-baseline. Not combinable with --rebaseline.")
     ap.add_argument("--out", help="write the full results JSON here")
     ap.add_argument("--baseline", help="baseline or prior results JSON to compare against "
                                        "(default: scripts/bench_check_loop_baseline.json "

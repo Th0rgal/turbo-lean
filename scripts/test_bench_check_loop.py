@@ -1665,6 +1665,17 @@ class ReplaySummaryHonesty(unittest.TestCase):
         self.assertIsNone(un["fission_verified_subshards"])
         self.assertEqual(rep["non_ok_workloads"], ["w1"])
 
+    def test_schema_bumped_and_buckets_carry_check_calls_alias(self):
+        # The count field was renamed classified_calls and cold modes lost
+        # their cas_replay block: a schema change, so SCHEMA_VERSION moves to
+        # 2 and old readers keep a check_calls alias in every bucket.
+        mod = load_script()
+        self.assertEqual(mod.SCHEMA_VERSION, 2)
+        rep = mod.summarize_cas_replay({"trials": 2, "workloads": {}})
+        for bucket in ("unedited_recheck", "edited_recheck", "overall"):
+            self.assertEqual(rep[bucket]["check_calls"],
+                             rep[bucket]["classified_calls"])
+
     def test_fission_counters_keep_none_distinct_from_zero(self):
         mod = load_script()
         m = mod.mode_result([100.0], [0.99], ["theorem_verified"],
