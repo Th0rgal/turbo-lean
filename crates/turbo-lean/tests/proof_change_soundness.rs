@@ -602,3 +602,104 @@ fn assert_rejected_or_modulo_sorry(out: &Output, what: &str) {
     );
     assert_eq!(j["used_sorry"], true, "{what}: used_sorry must be true: {stdout}");
 }
+
+/// `export --cone +W8.ModA` must not carry the identically named `theorem shared_name` of `W8.ModB`:
+/// after importing the pack into a fresh cache, ModA is rebuilt from the pack and ModB is compiled.
+///
+/// Ported from the owner's closed draft PR #342 (the cone-export half of its gate test).
+#[test]
+fn cli_export_cone_isolates_same_decl_names_across_modules() {
+    if !lean_available() {
+        return;
+    }
+    let ws = TestWorkspace::new("cone_export");
+    let proj = ws.proj();
+
+    fs::write(
+        proj.join("W8/ModA.lean"),
+        "def aConst : Nat := 11\ntheorem shared_name : aConst = 11 := rfl\n",
+    )
+    .unwrap();
+    fs::write(
+        proj.join("W8/ModB.lean"),
+        "def bConst : Nat := 22\ntheorem shared_name : bConst = 22 := rfl\n",
+    )
+    .unwrap();
+
+    for target in ["+W8.ModA", "+W8.ModB"] {
+        let out = ws.run(&["--json", "build", target]);
+        assert!(
+            out.status.success(),
+            "build {target} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let pack_file = ws.root.join("moda.tlpack");
+    let sk_hex = "4444444444444444444444444444444444444444444444444444444444444444";
+    let exp_out = ws.run(&[
+        "--json",
+        "export",
+        "--output",
+        pack_file.to_str().unwrap(),
+        "--cone",
+        "+W8.ModA",
+        "--signing-key",
+        sk_hex,
+    ]);
+    assert!(
+        exp_out.status.success(),
+        "export --cone failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&exp_out.stdout),
+        String::from_utf8_lossy(&exp_out.stderr)
+    );
+    let exported: Value = serde_json::from_slice(&exp_out.stdout).unwrap();
+    assert_eq!(
+        exported["exported_actions"], 1,
+        "the ModA cone must export exactly ModA's module action, not ModB's: {exported}"
+    );
+
+    let fresh_cache = ws.root.join("fresh_cache");
+    let imp_out = ws.run_in_with_env(
+        &proj,
+        &fresh_cache,
+        &[
+            "--json",
+            "import",
+            pack_file.to_str().unwrap(),
+            "--trust-domain",
+            "trusted",
+            "--allow-unattested-trusted",
+        ],
+        &[],
+    );
+    assert!(
+        imp_out.status.success(),
+        "import failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&imp_out.stdout),
+        String::from_utf8_lossy(&imp_out.stderr)
+    );
+
+    // Drop the on-disk artifacts so a build can only be satisfied from the imported cache.
+    fs::remove_dir_all(proj.join(".lake")).unwrap();
+    let build_in_fresh_cache = |target: &str| -> Value {
+        let out = ws.run_in_with_env(&proj, &fresh_cache, &["--json", "build", target], &[]);
+        assert!(
+            out.status.success(),
+            "build {target} against the imported cache failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    let ja = build_in_fresh_cache("+W8.ModA");
+    assert_eq!(ja["modules_cached"], 1, "in-cone module must come from the imported pack: {ja}");
+    assert_eq!(ja["modules_compiled"], 0, "in-cone module must not recompile: {ja}");
+    let jb = build_in_fresh_cache("+W8.ModB");
+    assert_eq!(
+        jb["modules_cached"], 0,
+        "out-of-cone module with a colliding decl name must not hit the cone pack: {jb}"
+    );
+    assert_eq!(jb["modules_compiled"], 1, "out-of-cone module must compile: {jb}");
+}
