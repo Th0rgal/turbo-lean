@@ -1,4 +1,11 @@
 use anyhow::{Context, Result};
+
+/// The schema this build writes, the ONE source for every site that spells it: the
+/// newer-store guard, the cold-create DDL, the final migration bump and the warm-template
+/// name (review b6409bc4 F5: hand-written copies let a future bump move the DDL and forget
+/// the guard, making a build refuse the store it just created). A test asserts a fresh
+/// store reads exactly this version.
+pub(crate) const DB_SCHEMA_USER_VERSION: i64 = 9;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -658,12 +665,14 @@ fn template_shm_path() -> (PathBuf, u32) {
     };
     let uid = unsafe { libc::geteuid() };
     (
-        // The template name's `v9` tracks the schema's `PRAGMA user_version` (9).
-        // Earlier builds of this branch published `v10`-named templates while the
-        // schema was still at 9, so that name is burned: the NEXT schema bump must
-        // take user_version 11 and name `v11`, never 10.
+        // The template name tracks the schema's `PRAGMA user_version` through the one
+        // shared const (review b6409bc4 F5). The embedded `build_epoch_short()` already
+        // separates templates per build, so a name an earlier build used with another
+        // schema cannot be picked up by this one; the earlier "skip v10" caution is
+        // thereby moot and the version follows the const.
         shm_base.join(format!(
-            "turbo_lean_template_state_v9_{}_{}.db",
+            "turbo_lean_template_state_v{}_{}_{}.db",
+            DB_SCHEMA_USER_VERSION,
             crate::build_epoch_short(),
             uid
         )),
@@ -820,14 +829,11 @@ impl TurboStore {
                 let uver: i64 = conn
                     .query_row("PRAGMA user_version", [], |r| r.get(0))
                     .unwrap_or(0);
-                // The schema this build writes; the migrations below only move
-                // forward, so a store stamped by a NEWER build is refused rather
-                // than reinterpreted. (The next bump must take user_version 11,
-                // never 10; see the comment beside `turbo_lean_template_state_v9`.)
-                const SCHEMA_USER_VERSION: i64 = 9;
-                if uver > SCHEMA_USER_VERSION {
+                // The migrations below only move forward, so a store stamped by a
+                // NEWER build is refused rather than reinterpreted.
+                if uver > DB_SCHEMA_USER_VERSION {
                     anyhow::bail!(
-                        "state DB at {} has user_version {uver}, newer than this build's schema {SCHEMA_USER_VERSION}; refusing to open it",
+                        "state DB at {} has user_version {uver}, newer than this build's schema {DB_SCHEMA_USER_VERSION}; refusing to open it. A newer build migrated this store; to keep using this build, remove that file and its -wal/-shm siblings (the store is a re-derivable cache) or point the store root elsewhere (review b6409bc4 F3)",
                         db_path.display()
                     );
                 }
@@ -873,7 +879,8 @@ impl TurboStore {
                     conn.execute_batch("PRAGMA user_version = 8;")?;
                 }
                 if uver < 9 {
-                    // G1a: `kernel_audited_oleans_auth` gained the MAC-attested
+                    // G1a: `kernel_audited_oleans_auth` gained the (NOT MAC-covered;
+                    // the v4 domain in `compute_kernel_audit_mac` dropped it)
                     // `csimp_posture_digest` column; audited rows are re-derivable, so the table
                     // is rebuilt rather than migrated in place. The DROP, CREATE and version
                     // bump run in ONE transaction with the error propagated (review 22ae951a
@@ -883,8 +890,8 @@ impl TurboStore {
                     // the missing column, permanently. A failed migration now leaves the store
                     // at the old version and retries on the next open.
                     conn.execute_batch(&format!(
-                        "BEGIN IMMEDIATE;\nDROP TABLE IF EXISTS kernel_audited_oleans_auth;\n{}\nPRAGMA user_version = 9;\nCOMMIT;",
-                        KERNEL_AUDITED_OLEANS_AUTH_DDL
+                        "BEGIN IMMEDIATE;\nDROP TABLE IF EXISTS kernel_audited_oleans_auth;\n{}\nPRAGMA user_version = {};\nCOMMIT;",
+                        KERNEL_AUDITED_OLEANS_AUTH_DDL, DB_SCHEMA_USER_VERSION
                     ))?;
                 }
             }
@@ -941,13 +948,14 @@ impl TurboStore {
                      path_key TEXT PRIMARY KEY, mtime_sec INTEGER NOT NULL, mtime_nsec INTEGER NOT NULL,
                      size_bytes INTEGER NOT NULL, split_key TEXT NOT NULL, updated_at INTEGER NOT NULL
                  );
-                 PRAGMA user_version = 9;
+                 PRAGMA user_version = {};
                  COMMIT;
                  PRAGMA wal_checkpoint(TRUNCATE);",
                 WORKTREE_LEASES_DDL,
                 KERNEL_REPLAYED_OLEANS_DDL,
                 KERNEL_REPLAYED_OLEANS_AUTH_DDL,
-                KERNEL_AUDITED_OLEANS_AUTH_DDL
+                KERNEL_AUDITED_OLEANS_AUTH_DDL,
+                DB_SCHEMA_USER_VERSION
             ))?;
             if !template_path.exists() {
                 if let Some(shm_base) = template_path.parent() {
@@ -3059,9 +3067,11 @@ impl TurboStore {
         let now = now_unix();
         self.conn.execute(
             // `csimp_posture_digest` is written as an explicit empty string rather
-            // than left to the column DEFAULT: the audited-authority MAC is derived
-            // over an empty posture, and the write site should say so instead of
-            // depending on the DDL staying in sync.
+            // than left to the column DEFAULT, so the write site states the value
+            // instead of depending on the DDL staying in sync. The column is NOT
+            // covered by the audit MAC: `compute_kernel_audit_mac`'s v4 domain
+            // dropped it (it keyed nothing, and (artifact, environment, policy)
+            // already binds every byte it was derived from; review b6409bc4 F4).
             "INSERT INTO kernel_audited_oleans_auth (
                 artifact_digest, environment_digest, replay_version, toolchain_hash, policy_digest, module_name, audit_mac, verified_at, csimp_posture_digest
              )
@@ -9176,6 +9186,30 @@ mod tests {
     }
 
     #[test]
+    fn test_fresh_store_user_version_matches_schema_const() -> Result<()> {
+        // Review b6409bc4 F5: the cold-create DDL and the schema const are written in one
+        // place now; this pins that a store THIS build creates reads back exactly the
+        // version the newer-store guard compares against, so a future bump cannot move one
+        // without the other.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_db_fresh_ver_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let cache_dir = tmp_dir.join("cache");
+        fs::create_dir_all(&cache_dir)?;
+        let store = TurboStore::open(Some(&cache_dir))?;
+        let uv: i64 = store
+            .conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
+        assert_eq!(uv, DB_SCHEMA_USER_VERSION);
+        drop(store);
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
     fn test_kernel_replayed_oleans_table_and_v2_migration() -> Result<()> {
         let tmp_dir = std::env::temp_dir().join(format!(
             "turbo_lean_db_replay_authority_{}_{}",
@@ -9200,7 +9234,7 @@ mod tests {
         let uv: i64 = store
             .conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
-        assert_eq!(uv, 9);
+        assert_eq!(uv, DB_SCHEMA_USER_VERSION);
         assert!(!store.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
         assert!(store
             .record_kernel_replayed_olean("", "env1", 2, "tc1", "M", &[])
@@ -9362,7 +9396,7 @@ mod tests {
         let uv: i64 = migrated
             .conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
-        assert_eq!(uv, 9);
+        assert_eq!(uv, DB_SCHEMA_USER_VERSION);
         assert!(migrated.get_lake_env("proj_v7")?.is_none());
         assert!(migrated
             .batch_get_file_splits(&["split_v7".to_string()])?

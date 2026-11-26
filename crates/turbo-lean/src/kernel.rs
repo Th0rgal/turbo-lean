@@ -625,12 +625,15 @@ impl ResolvedConLecheBinary {
         })
     }
 
-    /// Open the pinned path (`O_NOFOLLOW`), hash the OPENED bytes, and fail closed when they no
-    /// longer match the selection-time digest. The returned handle is what the runner executes
-    /// (review 4f80161c U3): a path re-hash alone leaves a window in which a rebuild or rename
-    /// can swap the binary between the hash and the spawn.
+    /// Open the pinned path (`O_NOFOLLOW`), hash the opened bytes while copying them into a
+    /// SEALED in-memory file, and fail closed when the digest no longer matches the
+    /// selection-time one. On Linux the runner execs the sealed copy, so the executed bytes
+    /// are the hashed bytes by construction — even against an in-place `O_TRUNC` rewrite of
+    /// the source inode, which a `/proc/self/fd/N` of the SOURCE would not stop, since that
+    /// path pins the inode, not its bytes (review b6409bc4 F1). Elsewhere the canonical path
+    /// is spawned after the fd hash, the pre-U3 behavior with its small open-to-exec window.
     fn open_execution_verified(&self) -> Result<VerifiedConLecheBinary> {
-        let (file, now) = open_nofollow_and_hash(&self.path)?;
+        let (file, now) = open_hash_and_seal_for_exec(&self.path)?;
         anyhow::ensure!(
             now == self.blake3_hex,
             "`con-leche` binary `{}` changed between selection and execution: selected blake3 `{}`, opened blake3 `{}` (fail-closed; review b08785bc F3)",
@@ -645,15 +648,16 @@ impl ResolvedConLecheBinary {
     }
 }
 
-/// An open, digest-verified `con-leche` binary. On Linux the spawn goes through
-/// `/proc/self/fd/<N>` of this handle, so the EXECUTED bytes are the HASHED bytes whatever
-/// happens to the path meanwhile; elsewhere the canonical path is spawned after the fd hash,
-/// the pre-U3 behavior (review 4f80161c U3).
+/// A digest-verified `con-leche` binary ready to execute. On Linux `file` is a SEALED
+/// `memfd` holding the exact bytes the digest covered, spawned through `/proc/self/fd/<N>`
+/// (review b6409bc4 F1); elsewhere `file` is the source handle the hash was taken from and
+/// the canonical path is spawned.
 #[derive(Debug)]
 struct VerifiedConLecheBinary {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     file: std::fs::File,
-    /// Spawned directly on non-Linux targets; on Linux the spawn goes through the fd and the
-    /// path is carried for the `Debug` rendering of refusals alone.
+    /// Spawned directly on non-Linux targets; on Linux the spawn goes through the sealed fd
+    /// and the path is carried for the `Debug` rendering of refusals alone.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     path: PathBuf,
 }
@@ -670,7 +674,8 @@ impl VerifiedConLecheBinary {
             // shebang target's INTERPRETER re-opens the `/proc/self/fd/N` argument after it
             // (measured: `bash: /proc/self/fd/N: No such file or directory`, exit 127), so the
             // fd must survive the exec. Clear `FD_CLOEXEC` in the child alone: the parent's
-            // handle keeps close-on-exec for every other spawn.
+            // handle keeps close-on-exec for every other spawn. This spawn needs `/proc`
+            // mounted; without it every run fails to spawn, which is fail-closed.
             unsafe {
                 cmd.pre_exec(move || {
                     let flags = libc::fcntl(fd, libc::F_GETFD);
@@ -689,6 +694,82 @@ impl VerifiedConLecheBinary {
         {
             Command::new(&self.path)
         }
+    }
+}
+
+/// Open `path` (`O_NOFOLLOW`) and produce the handle the runner will execute together with
+/// the blake3 of exactly those bytes. On Linux one read pass feeds BOTH the hasher and a
+/// `memfd` that is then sealed against every write and resize, so the sealed copy IS the
+/// hashed bytes by construction (review b6409bc4 F1); on other targets the source handle and
+/// a streamed hash are returned, as before.
+fn open_hash_and_seal_for_exec(path: &Path) -> Result<(std::fs::File, String)> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[allow(unused_mut)]
+    let mut src = opts.open(path).with_context(|| {
+        format!(
+            "Failed to open `con-leche` binary `{}` for the execution digest (symlink final components are refused)",
+            path.display()
+        )
+    })?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let memfd_raw = unsafe {
+            libc::memfd_create(
+                c"turbo-lean-con-leche-verified".as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            )
+        };
+        anyhow::ensure!(
+            memfd_raw >= 0,
+            "memfd_create failed for the verified `con-leche` copy: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut memfd = unsafe { std::fs::File::from_raw_fd(memfd_raw) };
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = src.read(&mut buf).with_context(|| {
+                format!(
+                    "Failed to read `con-leche` binary `{}` for the execution digest",
+                    path.display()
+                )
+            })?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            memfd.write_all(&buf[..n]).context(
+                "Failed to copy the `con-leche` binary into the sealed in-memory file",
+            )?;
+        }
+        let seals =
+            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        let rc = unsafe { libc::fcntl(memfd.as_raw_fd(), libc::F_ADD_SEALS, seals) };
+        anyhow::ensure!(
+            rc == 0,
+            "sealing the verified `con-leche` copy failed: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok((memfd, hasher.finalize().to_hex().to_string()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update_reader(&mut src).with_context(|| {
+            format!(
+                "Failed to read `con-leche` binary `{}` for the execution digest",
+                path.display()
+            )
+        })?;
+        Ok((src, hasher.finalize().to_hex().to_string()))
     }
 }
 
@@ -2695,6 +2776,40 @@ mod tests {
                 .contains("changed between selection and execution"),
             "a swapped binary must be refused: {err:#}"
         );
+        // Review b6409bc4 F1/F6: the verified handle runs the HASHED bytes even when the
+        // path's inode is rewritten in place AND a different file is renamed over the path
+        // after verification — the sealed in-memory copy is immune to both.
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let resolved2 = ResolvedConLecheBinary::resolve(
+                &bin,
+                ConLecheBinaryProvenance::ProvisionedPinnedRev,
+            )
+            .unwrap();
+            let verified = resolved2.open_execution_verified().unwrap();
+            // In-place rewrite of the same inode...
+            std::fs::write(&bin, b"#!/bin/sh\nexit 1\n").unwrap();
+            // ...and a rename swap over the path.
+            let other = tmp.join("other.sh");
+            std::fs::write(&other, b"#!/bin/sh\nexit 2\n").unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+            std::fs::rename(&other, &bin).unwrap();
+            let status = verified.command().status().unwrap();
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "the sealed verified copy must run the hashed bytes, not the rewritten or renamed-over file"
+            );
+        }
         // A symlink final component at the pinned path is refused by `O_NOFOLLOW`.
         #[cfg(unix)]
         {
@@ -2713,11 +2828,15 @@ mod tests {
     // bail (DA b08785bc F6).
     #[test]
     fn real_tracked_gate_refuses_tree_delivered_bridge_binary() {
-        // This test mutates process env (ELAN_HOME), like the bundled-binary test above:
+        // This test mutates process env (it removes TURBO_CON_LECHE_BIN for its duration):
         // hold the shared env lock so concurrent kernel tests read a stable environment.
         let _env = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // A host-set TURBO_CON_LECHE_BIN would short-circuit the discovery under test and
+        // the error would not be the tracked refusal (review b6409bc4 F2). No ELAN_HOME
+        // isolation is needed: explicit `ConLeche` never consults the bundled binary.
+        let _bin_guard = ScopedEnvVar::remove(CON_LECHE_BIN_ENV);
         let tmp = std::env::temp_dir().join(format!("turbo-lean-tracked-{}", std::process::id()));
         let co = tmp.join("checkout");
         let bridge = co.join(BRIDGE_CON_LECHE_BIN_REL);
@@ -2728,11 +2847,15 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&bridge, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        // An isolated ELAN_HOME, as in the bundled-binary test above, so no toolchain-bundled
-        // binary can satisfy the selection in this environment.
-        let elan = tmp.join("elan");
-        std::fs::create_dir_all(&elan).unwrap();
-        let _elan_guard = ScopedEnvVar::set("ELAN_HOME", elan.as_os_str());
+        // Skip (with a message) when no trusted git resolves on this host, as the check
+        // tests do: an old or absent git would surface as a confusing assertion failure
+        // instead of what this test measures (review b6409bc4 F2).
+        if crate::trusted_tools::git(&co).is_err() {
+            eprintln!(
+                "skipping real_tracked_gate_refuses_tree_delivered_bridge_binary: no trusted git on this host"
+            );
+            return;
+        }
         let git = |args: &[&str]| {
             let st = std::process::Command::new("git")
                 .args(args)
