@@ -1399,6 +1399,16 @@ fn lake_refresh_targets_inner(
     input_lib_targets
 }
 
+/// Process-wide dedupe set for the stale non-owned input-bearing module warning,
+/// keyed by (package root, module): two packages may share a module name.
+pub(crate) fn warned_stale_non_owned()
+-> &'static std::sync::Mutex<std::collections::BTreeSet<(std::path::PathBuf, String)>> {
+    static WARNED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeSet<(std::path::PathBuf, String)>>,
+    > = std::sync::OnceLock::new();
+    WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
+}
+
 /// The Lake-inputs sweep's module closure over `dag`: every OWNED module whose own
 /// build reads a Lake file input (an input-bearing library or executable can build
 /// it, or its source uses `include_str`), plus every transitive OWNED dependent,
@@ -1411,6 +1421,13 @@ fn lake_refresh_targets_inner(
 /// checkout's `.lake/build`, the #434 write the emission filter cannot catch. The
 /// dependency's own workspace refreshes it; the stale-import refresh then covers the
 /// owned importers.
+///
+/// Ownership here is decided by package ROOT identity (a set of raw and canonical
+/// roots). `lake_refresh_targets_inner` decides ownership for the emitted targets by
+/// package target BASE NAME instead, because a target string carries no root. Both
+/// ask `dep_pkg_lake_targets_owned_by_project` per dependency, so they agree on
+/// which packages are owned; they differ only in the key used to look a node or
+/// target back up. Change the ownership predicate in that one function.
 pub(crate) fn input_closure_sweep_mods(
     cfg: &crate::module_builder::ProjectConfig,
     dag: &crate::module_builder::ModuleDag,
@@ -1440,11 +1457,10 @@ pub(crate) fn input_closure_sweep_mods(
         .iter()
         .filter_map(|(m, n)| {
             // Review a64324fd F6 (reshaping cf31dd1e F6): ownership is decided FIRST.
-            // A non-owned node runs only the config-walking gates (an input-bearing
-            // library or executable can build it) before it is dismissed — never the
-            // module resolvers or per-module source reads, which on a Mathlib import
-            // meant thousands of file reads on every sweep just to decide whether to
-            // print a warning.
+            // A non-owned node runs the module resolvers and the artifact staleness
+            // check (mtime stats) so a stale one can be warned about; the config walk
+            // and the per-module SOURCE reads run only for nodes that came out stale.
+            // A fresh Mathlib import therefore costs no source reads per sweep.
             if !node_owned(n) {
                 // cf31dd1e F6: an EXCLUDED non-owned input-bearing seed used to fail
                 // the freshness check loudly; now that the sweep skips it, a stale one
@@ -1455,10 +1471,6 @@ pub(crate) fn input_closure_sweep_mods(
                 // nodes that came out stale — so a fresh Mathlib import still costs no
                 // file reads per sweep, while a stale include_str-only module keeps
                 // its warning (the purge path fails closed on exactly that state).
-                let config_input_bearing =
-                    !crate::module_builder::input_bearing_libs_for_module(cfg, m).is_empty()
-                        || !crate::module_builder::input_bearing_exes_for_module(cfg, m)
-                            .is_empty();
                 let spec =
                     crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, m)
                         .or_else(|| {
@@ -1474,11 +1486,7 @@ pub(crate) fn input_closure_sweep_mods(
                 // packages may share a module name), and a node seen FRESH clears its
                 // entry, so a module the user refreshes and later lets go stale again
                 // is warned about again, even in a long-lived daemon.
-                static WARNED_STALE_NON_OWNED: std::sync::OnceLock<
-                    std::sync::Mutex<std::collections::BTreeSet<(std::path::PathBuf, String)>>,
-                > = std::sync::OnceLock::new();
-                let warned = WARNED_STALE_NON_OWNED
-                    .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+                let warned = warned_stale_non_owned();
                 let key = (n.pkg_root.clone(), m.clone());
                 if !stale {
                     if let Ok(mut guard) = warned.lock() {
@@ -1486,6 +1494,11 @@ pub(crate) fn input_closure_sweep_mods(
                     }
                     return None;
                 }
+                // Only stale nodes reach the config walk (fresh nodes returned above).
+                let config_input_bearing =
+                    !crate::module_builder::input_bearing_libs_for_module(cfg, m).is_empty()
+                        || !crate::module_builder::input_bearing_exes_for_module(cfg, m)
+                            .is_empty();
                 let input_bearing = config_input_bearing
                     || spec.as_ref().is_some_and(|spec| {
                         fs::read_to_string(&spec.src_path)

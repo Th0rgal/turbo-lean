@@ -5187,3 +5187,169 @@ public def api := by
         assert_eq!(standalone_merge_rel_base("TurboLean/Spec.c"), None);
         assert_eq!(standalone_merge_rel_base("TurboLean/Spec.trace"), None);
     }
+
+/// Review f9807eb0 F8 fixtures: a project `P3` (owned lib `P3.A` importing `D.D`) whose
+/// single dependency `dep` carries a Lake file input. `dep_dir` is where the checkout
+/// lives relative to the project root, `declared` the path the `require` names.
+#[cfg(test)]
+struct OwnershipFixture {
+    root: PathBuf,
+}
+
+#[cfg(test)]
+impl Drop for OwnershipFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[cfg(test)]
+fn ownership_fixture(tag: &str, dep_rel: &str, dep_in_project: bool) -> Result<OwnershipFixture> {
+    let root = std::env::temp_dir().join(format!(
+        "turbo_lake_own_{tag}_{}_{}",
+        std::process::id(),
+        pack::next_tmp_id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let proj = root.join("proj");
+    let dep = if dep_in_project {
+        proj.join(dep_rel)
+    } else {
+        root.join(dep_rel)
+    };
+    fs::create_dir_all(dep.join("D"))?;
+    fs::create_dir_all(dep.join("Data"))?;
+    fs::create_dir_all(proj.join(".lake/packages"))?;
+    fs::create_dir_all(proj.join("P3"))?;
+    let tc = include_str!("../../../../lean/lean-toolchain");
+    fs::write(dep.join("lean-toolchain"), tc)?;
+    fs::write(proj.join("lean-toolchain"), tc)?;
+    fs::write(
+        dep.join("lakefile.lean"),
+        "import Lake\nopen Lake DSL\npackage dep\ninput_dir depSources where\n  path := \"Data\"\n  filter := .extension \"sol\"\n@[default_target]\nlean_lib «D» where\n  globs := #[.submodules `D]\n  needs := #[depSources]\n",
+    )?;
+    fs::write(dep.join("D/D.lean"), "def gen := include_str \"../Data/a.sol\"\n")?;
+    fs::write(dep.join("Data/a.sol"), "contract A {}")?;
+    let declared = if dep_in_project {
+        dep_rel.to_string()
+    } else {
+        // An ABSOLUTE declared dir carries no editable-scratch evidence: non-owned.
+        dep.canonicalize()?.to_string_lossy().into_owned()
+    };
+    fs::write(
+        proj.join("lakefile.lean"),
+        format!(
+            "import Lake\nopen Lake DSL\npackage p3\nrequire dep from \"{declared}\"\n@[default_target]\nlean_lib «P3» where\n  globs := #[.one `P3.A]\n"
+        ),
+    )?;
+    fs::write(proj.join("P3/A.lean"), "import D.D\ndef a3 : Nat := 1\n")?;
+    fs::write(
+        proj.join("lake-manifest.json"),
+        format!(
+            "{{\"version\":\"1.1.0\",\"packagesDir\":\".lake/packages\",\"packages\":[{{\"type\":\"path\",\"name\":\"dep\",\"dir\":\"{declared}\"}}]}}\n"
+        ),
+    )?;
+    Ok(OwnershipFixture { root })
+}
+
+#[cfg(test)]
+mod freshness_ownership_tests {
+    use super::*;
+
+    fn closure_for(proj: &Path) -> Result<(BTreeSetStr, crate::module_builder::ModuleDag)> {
+        let cfg = crate::module_builder::resolve_project_config(proj)?;
+        let dag = crate::module_builder::build_module_dag_with_trust(
+            &cfg,
+            &["P3".to_string()],
+            false,
+        )?;
+        assert!(
+            dag.nodes.contains_key("D.D"),
+            "fixture: the dag must reach the dependency module"
+        );
+        Ok((input_closure_sweep_mods(&cfg, &dag), dag))
+    }
+    type BTreeSetStr = std::collections::BTreeSet<String>;
+
+    /// An OWNED dependency (a path checkout inside the project root) enters the
+    /// closure whichever root form the dag recorded: the canonical project path and a
+    /// symlinked spelling of the same project, whose raw dependency root differs.
+    #[test]
+    fn test_input_closure_sweep_keeps_owned_dep_by_raw_and_canonical_root() -> Result<()> {
+        let fx = ownership_fixture("owned", "deps/dep", true)?;
+        let canon = fx.root.join("proj").canonicalize()?;
+        let (closure, _) = closure_for(&canon)?;
+        assert!(
+            closure.contains("D.D"),
+            "an owned input-bearing dependency must be in the closure (canonical root): {closure:?}"
+        );
+        let link = fx.root.join("proj_link");
+        std::os::unix::fs::symlink(fx.root.join("proj"), &link)?;
+        let (closure_link, _) = closure_for(&link)?;
+        assert!(
+            closure_link.contains("D.D"),
+            "an owned dependency must not drop out when the project is spelled through a symlink (raw root): {closure_link:?}"
+        );
+        Ok(())
+    }
+
+    /// The stale non-owned warning: recorded when a non-owned input-bearing module is
+    /// stale, kept as ONE entry across repeated sweeps (the dedupe), and cleared once
+    /// the module is fresh again so a later staleness warns again.
+    #[test]
+    fn test_stale_non_owned_input_module_warning_dedupes_and_clears_on_fresh() -> Result<()> {
+        // `dep` lives outside the project and nothing claims it: non-owned (#434).
+        let fx = ownership_fixture("stale", "extdep", false)?;
+        let proj = fx.root.join("proj").canonicalize()?;
+        let cfg = crate::module_builder::resolve_project_config(&proj)?;
+        let dag = crate::module_builder::build_module_dag_with_trust(
+            &cfg,
+            &["P3".to_string()],
+            false,
+        )?;
+        let node = dag.nodes.get("D.D").expect("fixture reaches D.D");
+        let key = (node.pkg_root.clone(), "D.D".to_string());
+        let spec = crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, "D.D")
+            .or_else(|| match crate::module_builder::resolve_import_site(&cfg, "D.D") {
+                crate::module_builder::ImportSite::Module(s) => Some(*s),
+                _ => None,
+            })
+            .expect("fixture: the module resolves");
+        let olean = crate::module_builder::spec_olean_path(&spec);
+        fs::create_dir_all(olean.parent().expect("olean has a parent"))?;
+        fs::write(&olean, b"")?;
+        let set_olean_age = |secs: i64| -> Result<()> {
+            let now = std::time::SystemTime::now();
+            let t = if secs >= 0 {
+                now + std::time::Duration::from_secs(secs as u64)
+            } else {
+                now - std::time::Duration::from_secs((-secs) as u64)
+            };
+            fs::File::options().write(true).open(&olean)?.set_modified(t)?;
+            Ok(())
+        };
+        let warned = warned_stale_non_owned();
+        warned.lock().unwrap().remove(&key);
+        // Olean older than the source: stale -> warned, and never in the closure.
+        set_olean_age(-3600)?;
+        let c1 = input_closure_sweep_mods(&cfg, &dag);
+        assert!(!c1.contains("D.D"), "a non-owned module never enters the closure: {c1:?}");
+        assert!(warned.lock().unwrap().contains(&key), "a stale non-owned input-bearing module is recorded");
+        let _ = input_closure_sweep_mods(&cfg, &dag);
+        assert_eq!(
+            warned.lock().unwrap().iter().filter(|k| **k == key).count(),
+            1,
+            "repeated sweeps keep one entry (no repeat warning)"
+        );
+        // Olean newer than every input: fresh -> entry cleared.
+        set_olean_age(3600)?;
+        let _ = input_closure_sweep_mods(&cfg, &dag);
+        assert!(!warned.lock().unwrap().contains(&key), "a fresh module clears its entry");
+        // Stale again -> recorded again, so the user is warned again.
+        set_olean_age(-3600)?;
+        let _ = input_closure_sweep_mods(&cfg, &dag);
+        assert!(warned.lock().unwrap().contains(&key), "going stale again warns again");
+        warned.lock().unwrap().remove(&key);
+        Ok(())
+    }
+}
