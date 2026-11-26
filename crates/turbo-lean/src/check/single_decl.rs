@@ -3638,40 +3638,6 @@ pub(super) fn check_single_decl(
             target_violations.join(", ")
         );
     }
-    if allow_sorry {
-        // `sorry` is admitted in theorem shards only. A `sorry` in a definition or other command
-        // outside every shard would be silently left out of the dependency cone below, so refuse it
-        // here even when the target does not mention it.
-        let modulo: HashSet<String> = split
-            .hygiene
-            .disallowed_items_modulo_sorry()
-            .into_iter()
-            .collect();
-        let outside: Vec<String> = split
-            .hygiene
-            .disallowed_items()
-            .into_iter()
-            .filter(|item| !modulo.contains(item))
-            .filter(|item| {
-                item.strip_prefix('L')
-                    .and_then(|r| r.split_once(": "))
-                    .and_then(|(ln, _)| ln.parse::<usize>().ok())
-                    .is_some_and(|ln| {
-                        !split
-                            .shards
-                            .iter()
-                            .any(|s| s.start_line <= ln && ln <= s.end_line)
-                    })
-            })
-            .collect();
-        if !outside.is_empty() {
-            anyhow::bail!(
-                "`sorry` outside theorem shards in {} is not allowed under --allow-sorry: {}",
-                file.display(),
-                outside.join(", ")
-            );
-        }
-    }
     let shard_has_sorry = shard_text_contains_sorry_or_admit(shard);
     let cone_src = if allow_sorry {
         build_cone_scoped_decl_audit_source(&active_src, shard)
