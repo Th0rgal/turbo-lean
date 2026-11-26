@@ -2753,12 +2753,13 @@ fn test_uver7_migration_purges_locks_sidecars_and_pending_deferred_spools() -> R
     store.conn.execute_batch("PRAGMA user_version = 7;")?;
     drop(store);
 
-    // Reopen triggers uver < 8 migration BEFORE replay_pending_deferred_packs.
+    // Reopen triggers the uver < 8 migration BEFORE replay_pending_deferred_packs; the
+    // migration chain then continues to the current schema version.
     let migrated = TurboStore::open(Some(&dst_dir))?;
     let uv: i64 = migrated
         .conn
         .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
-    assert_eq!(uv, 8);
+    assert_eq!(uv, 9);
     assert!(
         !migrated.has_cached_action_readonly("pre-epoch-v7-action", "trusted")?,
         "pre-v8 pending deferred-pack spools must be purged before replay_pending_deferred_packs"

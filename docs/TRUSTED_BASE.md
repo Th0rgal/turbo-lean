@@ -21,8 +21,10 @@
   resolver probes support for `auto` too. Since G1c r2 the selection probe
   (`probe_con_leche_support_for_selection`) and every executing site (`ci-verify`, `pr-verify`
   head statements, `check --emit-olean`) share ONE discovery,
-  `discover_con_leche_binary_for_selection` (`crates/turbo-lean/src/kernel.rs`), so the binary the
-  probe accepts is the binary the runner executes: it checks the pinned toolchain and the
+  `discover_con_leche_binary_for_selection_with_provenance` (`crates/turbo-lean/src/kernel.rs`),
+  which pins the accepted binary's bytes at selection time (`ResolvedConLecheBinary`, a blake3
+  digest the runners re-verify immediately before each spawn), so the binary the
+  probe accepts is byte-for-byte the binary the runner executes: it checks the pinned toolchain and the
   provisioned (`TURBO_CON_LECHE_BIN` / bridge) binaries, and for `auto` only it additionally
   accepts the toolchain-bundled binary at `$ELAN_HOME/toolchains/<pinned>/bin/con-leche`
   (`bundled_toolchain_con_leche_binary`), canonicalized, rejected when it lies under the
@@ -31,7 +33,10 @@
   fall back to standard). An accepted bundled binary's rev is NOT verified, so its recorded
   `con_leche_rev` is the probed-capability marker
   (`BUNDLED_CON_LECHE_PROVENANCE_MARKER`), never the pinned rev, which is recorded for the
-  identity-gated provisioned binaries only. Explicit `con-leche`/`both` selections keep failing
+  identity-gated provisioned binaries only; a bundled binary reached through the provisioning
+  path records the distinct `BUNDLED_CON_LECHE_PROVISIONED_MARKER`
+  (`toolchain-bundled:rev-unverified:provisioned`), so the two acceptance routes stay
+  distinguishable in recorded provenance. Explicit `con-leche`/`both` selections keep failing
   closed on the provisioned binaries only. Pinned both ways by
   `test_kernel_auto_selects_bundled_con_leche_on_pinned_toolchain` and the env-free selection
   matrix over `discover_con_leche_binary_for_selection_impl` (`kernel.rs`).

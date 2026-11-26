@@ -548,14 +548,9 @@ struct WirePostureReply {
     targets: Vec<WirePostureTarget>,
 }
 
-/// Marker that the early import-policy pre-pass ran and decided (allowed) the audited module
-/// set. G1a r2 (review 22ae951a F2): the pre-pass no longer computes per-root csimp posture
-/// digests for cache-key folding; the digest keyed nothing, and the (artifact, environment,
-/// policy) key already binds every byte it was derived from.
-pub(crate) struct ImportPolicyPrepass;
-
 /// Decide the imported-`.olean` policy (csimp / unsafe / implemented_by / axioms allowlists)
-/// before the expensive audit. `Ok(None)` means the pass did not decide (untrusted mode, the
+/// before the expensive audit. `Ok(())` means the audit proceeds: either the pass decided the
+/// set is allowed, or it did not decide (untrusted mode, the
 /// `TURBO_LEAN_EARLY_IMPORT_POLICY=off` opt-out, or an infrastructure failure of the posture
 /// scan) and the authoritative audit decides as before; an `Err` is the decided early refusal.
 fn early_import_policy_prepass(
@@ -565,15 +560,15 @@ fn early_import_policy_prepass(
     lean_path_env: &str,
     extra_ro_binds: &[PathBuf],
     is_untrusted: bool,
-) -> Result<Option<ImportPolicyPrepass>> {
+) -> Result<()> {
     if is_untrusted || sorted_mods.is_empty() || !crate::kernel::early_import_policy_enabled() {
-        return Ok(None);
+        return Ok(());
     }
     let undecided = |why: String| {
         eprintln!(
             "[turbo-lean] early import-policy posture scan did not decide ({why}); the in-kernel audit decides"
         );
-        Ok(None)
+        Ok(())
     };
     let (mut cmd, timeout) =
         match kernel_reader_command(store_root, cfg, lean_path_env, extra_ro_binds, false) {
@@ -616,19 +611,15 @@ fn early_import_policy_prepass(
         ));
     }
 
-    let mut scan_map: std::collections::BTreeMap<String, crate::kernel::CompiledModuleCsimpObservation> =
-        std::collections::BTreeMap::new();
     let mut decision_modules: std::collections::BTreeMap<String, crate::kernel::ImportPostureModule> =
         std::collections::BTreeMap::new();
     for m in &reply.modules {
-        let mut observations = Vec::with_capacity(m.csimp.len());
         let mut entries = Vec::with_capacity(m.csimp.len());
         for we in &m.csimp {
             let observation = match crate::kernel::parse_public_signature_csimp_entry(&we.e) {
                 Ok(o) => o,
                 Err(e) => return undecided(format!("malformed posture csimp entry: {e:#}")),
             };
-            observations.push(observation.clone());
             entries.push(crate::kernel::PostureCsimpEntry {
                 observation,
                 thm_user_name: we.u.clone(),
@@ -636,13 +627,6 @@ fn early_import_policy_prepass(
                 touches_target: we.t,
             });
         }
-        scan_map.insert(
-            m.m.clone(),
-            crate::kernel::CompiledModuleCsimpObservation {
-                imports: m.imports.clone(),
-                entries: observations,
-            },
-        );
         decision_modules.insert(
             m.m.clone(),
             crate::kernel::ImportPostureModule {
@@ -705,7 +689,7 @@ fn early_import_policy_prepass(
             decision.violations.join("\n  ")
         );
     }
-    Ok(Some(ImportPolicyPrepass))
+    Ok(())
 }
 
 pub(crate) fn audit_compiled_modules_with_zygote(
@@ -765,7 +749,7 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
     sorted.dedup();
     // P9: decide the import policy (csimp / unsafe / implemented_by / axioms allowlists) before
     // the expensive snapshot + whole-closure replay + per-declaration audit work below.
-    let _early_decision = early_import_policy_prepass(
+    early_import_policy_prepass(
         &store.root,
         cfg,
         &sorted,

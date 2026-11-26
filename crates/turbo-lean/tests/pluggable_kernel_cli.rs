@@ -31,12 +31,22 @@ mod lake_build {
 mod pack {
     pub mod tests {
         // Stub matching `crate::pack::tests::env_test_lock()` so the #[path]-included
-        // `kernel.rs` tests module compiles in this integration crate; within this binary it
-        // serializes the same env-mutating tests.
+        // `kernel.rs` tests module compiles in this integration crate. The env-mutating
+        // integration tests below take the same lock, so included and local tests that
+        // touch process env serialize against each other.
         pub fn env_test_lock() -> &'static std::sync::Mutex<()> {
             static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
             &LOCK
         }
+    }
+}
+
+mod trusted_tools {
+    // Stub matching `crate::trusted_tools::git(...)` so the #[path]-included `kernel.rs`
+    // compiles in this integration crate; the fixtures here are repo-local temp checkouts,
+    // so the PATH `git` is the right tool for them.
+    pub fn git(_project: &std::path::Path) -> anyhow::Result<std::process::Command> {
+        Ok(std::process::Command::new("git"))
     }
 }
 
@@ -641,6 +651,9 @@ fn compile_real_olean_module(dir: &Path, module: &str) -> PathBuf {
 #[cfg(unix)]
 #[test]
 fn con_leche_exit_code_protocol_and_verified_cli_flags() {
+    // Held across every child spawn and in-process probe below: this test mutates process
+    // env (MOCK_CODE), and the included `kernel.rs` tests mutate the same process env.
+    let _env_guard = pack::tests::env_test_lock().lock().unwrap();
     let f = KernelTestFixture::new("con_leche_runner");
     let mock_bin = f.root.join("mock-con-leche.sh");
     let args_log = f.root.join("args.log");
@@ -676,14 +689,18 @@ fn con_leche_exit_code_protocol_and_verified_cli_flags() {
         ),
     );
 
+    let resolved_mock = kernel::ResolvedConLecheBinary::resolve(
+        &mock_bin,
+        kernel::ConLecheBinaryProvenance::ProvisionedPinnedRev,
+    )
+    .unwrap();
     let search_paths = vec![sp_dir.clone()];
     let roots = vec!["DemoMod".to_string()];
 
     // Exit 0 -> Accepted, parses declaration count, passes --verified and never --trusted.
     std::env::set_var("MOCK_CODE", "0");
     let rep_ok = kernel::verify_olean_modules_with_con_leche(
-        &mock_bin,
-        kernel::ConLecheBinaryProvenance::ProvisionedPinnedRev,
+        &resolved_mock,
         &search_paths,
         &roots,
         &["DemoMod.thm".to_string()],
@@ -720,8 +737,7 @@ fn con_leche_exit_code_protocol_and_verified_cli_flags() {
     // Exit 1 -> Rejected
     std::env::set_var("MOCK_CODE", "1");
     let rep_rej = kernel::verify_olean_modules_with_con_leche(
-        &mock_bin,
-        kernel::ConLecheBinaryProvenance::ProvisionedPinnedRev,
+        &resolved_mock,
         &search_paths,
         &roots,
         &[],
@@ -736,8 +752,7 @@ fn con_leche_exit_code_protocol_and_verified_cli_flags() {
     // Exit 2 -> Declined
     std::env::set_var("MOCK_CODE", "2");
     let rep_dec = kernel::verify_olean_modules_with_con_leche(
-        &mock_bin,
-        kernel::ConLecheBinaryProvenance::ProvisionedPinnedRev,
+        &resolved_mock,
         &search_paths,
         &roots,
         &[],
@@ -752,8 +767,7 @@ fn con_leche_exit_code_protocol_and_verified_cli_flags() {
     for fatal_mode in ["3", "134", "sigabrt"] {
         std::env::set_var("MOCK_CODE", fatal_mode);
         let err = kernel::verify_olean_modules_with_con_leche(
-            &mock_bin,
-            kernel::ConLecheBinaryProvenance::ProvisionedPinnedRev,
+            &resolved_mock,
             &search_paths,
             &roots,
             &[],
@@ -774,8 +788,7 @@ fn con_leche_exit_code_protocol_and_verified_cli_flags() {
     fs::write(&ndjson_path, "{}\n").unwrap();
     std::env::set_var("MOCK_CODE", "0");
     let nd_ok = kernel::verify_ndjson_with_con_leche(
-        &mock_bin,
-        kernel::ConLecheBinaryProvenance::ProvisionedPinnedRev,
+        &resolved_mock,
         &ndjson_path,
         Some(2),
         Some(&scratch_dir),
@@ -1115,9 +1128,13 @@ fn real_con_leche_binary_verifies_valid_and_rejects_adversarial_olean_if_built()
         .unwrap();
     assert_ok(&comp_valid, "compile ValidPrelude.lean");
 
-    let rep_valid = kernel::verify_olean_modules_with_con_leche(
+    let resolved_con_leche = kernel::ResolvedConLecheBinary::resolve(
         &con_leche_bin,
         kernel::ConLecheBinaryProvenance::ProvisionedPinnedRev,
+    )
+    .unwrap();
+    let rep_valid = kernel::verify_olean_modules_with_con_leche(
+        &resolved_con_leche,
         std::slice::from_ref(&olean_dir),
         &["ValidPrelude".to_string()],
         &[],
@@ -1150,8 +1167,7 @@ fn real_con_leche_binary_verifies_valid_and_rejects_adversarial_olean_if_built()
     assert_ok(&comp_spoof, "compile SpoofNatDiv.lean");
 
     let rep_spoof = kernel::verify_olean_modules_with_con_leche(
-        &con_leche_bin,
-        kernel::ConLecheBinaryProvenance::ProvisionedPinnedRev,
+        &resolved_con_leche,
         std::slice::from_ref(&olean_dir),
         &["SpoofNatDiv".to_string()],
         &[],
@@ -1164,8 +1180,7 @@ fn real_con_leche_binary_verifies_valid_and_rejects_adversarial_olean_if_built()
 
     // Missing module on search path -> exit 3 -> fail-closed Err.
     let err_missing = kernel::verify_olean_modules_with_con_leche(
-        &con_leche_bin,
-        kernel::ConLecheBinaryProvenance::ProvisionedPinnedRev,
+        &resolved_con_leche,
         std::slice::from_ref(&olean_dir),
         &["NoSuchModuleAnywhere".to_string()],
         &[],

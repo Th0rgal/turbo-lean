@@ -4481,18 +4481,17 @@ pub fn run_ci_verify_command(
         let search_paths: Vec<PathBuf> = std::env::split_paths(&lp)
             .filter(|p| !p.as_os_str().is_empty())
             .collect();
-        // G1c r2 + DA 388e906a F2: execution runs EXACTLY the binary selection resolved and
-        // stored in the provenance. No second discovery after the build, which could otherwise
-        // pick up a binary created mid-flow.
-        let Some((bin, bin_provenance)) = kernel_prov.con_leche_binary.clone() else {
+        // G1c r2 + DA 388e906a F2 + review b08785bc F3: execution runs EXACTLY the binary
+        // selection resolved and stored in the provenance, byte-pinned at selection and
+        // re-verified by the runner before the spawn.
+        let Some(resolved) = kernel_prov.con_leche_binary.clone() else {
             anyhow::bail!(
                 "Kernel routing invariant violated: `{}` resolved without a resolved `con-leche` binary (fail-closed)",
                 kernel_prov.kernel_engine.as_str()
             );
         };
         let rep = crate::kernel::verify_olean_modules_with_con_leche(
-            &bin,
-            bin_provenance,
+            &resolved,
             &search_paths,
             &root_mods,
             &[],
@@ -7812,6 +7811,9 @@ fn certify_head_statement_modules_and_replay(
     overlay_lib_dir: Option<&Path>,
     overlay_rebuilt_hint: Option<&std::collections::HashSet<String>>,
     pre_resolved_cfg: Option<&crate::module_builder::ProjectConfig>,
+    // DA b08785bc F1: the kernel provenance (and its byte-pinned con-leche binary) is resolved
+    // by the CALLER before the head build, so nothing the build writes can swap into execution.
+    head_kernel_prov: &crate::kernel::KernelProvenance,
 ) -> Result<(
     Option<std::collections::HashSet<String>>,
     Option<crate::zygote::ClosureSnapshot>,
@@ -7961,12 +7963,9 @@ fn certify_head_statement_modules_and_replay(
 
     let verify_head_snap_with_con_leche =
         |snap_opt: &Option<crate::zygote::ClosureSnapshot>| -> Result<()> {
-            let sel = crate::kernel::resolve_kernel_selection_from_env(None)?;
-            let prov = crate::kernel::resolve_kernel_engine_in_workspace(
-                sel,
-                &cfg.toolchain,
-                Some(head_project),
-            )?;
+            // DA b08785bc F1: the provenance was resolved by the caller BEFORE the head build;
+            // this closure performs no discovery of its own.
+            let prov = head_kernel_prov;
             if !matches!(
                 prov.kernel_engine,
                 crate::kernel::ResolvedKernelEngine::ConLeche
@@ -7985,18 +7984,17 @@ fn certify_head_statement_modules_and_replay(
             let search_paths: Vec<PathBuf> = std::env::split_paths(&search_path_str)
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect();
-            // G1c r2 + DA 388e906a F2: execution runs EXACTLY the binary selection resolved
-            // and stored in the provenance. No second discovery after the build, which could
-            // otherwise pick up a binary created mid-flow.
-            let Some((bin, bin_provenance)) = prov.con_leche_binary.clone() else {
+            // G1c r2 + DA 388e906a F2 + review b08785bc F1/F3: execution runs EXACTLY the
+            // binary the caller resolved before the head build, byte-pinned at selection and
+            // re-verified by the runner before the spawn.
+            let Some(resolved) = prov.con_leche_binary.clone() else {
                 anyhow::bail!(
                     "Kernel routing invariant violated: `{}` resolved without a resolved `con-leche` binary (fail-closed)",
                     prov.kernel_engine.as_str()
                 );
             };
             let rep = crate::kernel::verify_olean_modules_with_con_leche(
-                &bin,
-                bin_provenance,
+                &resolved,
                 &search_paths,
                 &all_mods,
                 &[],
@@ -9372,6 +9370,15 @@ fn kernel_statement_changes_and_csimp_with_trust(
             .ok()?;
             let mut rebuilt_hint: std::collections::HashSet<String> =
                 dirty_mods.iter().cloned().collect();
+            // DA b08785bc F1: resolve the head-statement con-leche binary BEFORE any head
+            // source is compiled (lean elaboration can run IO), so nothing the compiles
+            // write can swap into execution.
+            let head_kernel_prov = crate::kernel::resolve_kernel_engine_in_workspace(
+                crate::kernel::resolve_kernel_selection_from_env(None).ok()?,
+                &detect_toolchain(&head_project),
+                Some(&head_project),
+            )
+            .ok()?;
             if !standalone.is_empty() {
                 let base_lib_dir = head_project.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
                 let (base_lp, _) = crate::module_builder::build_lean_search_path(cfg, true);
@@ -9552,6 +9559,7 @@ fn kernel_statement_changes_and_csimp_with_trust(
                 Some(&ov_lib),
                 Some(&rebuilt_hint),
                 Some(cfg),
+                &head_kernel_prov,
             )
             .ok()?;
             let head_key = ov_cert_snap.as_ref().and_then(|snap| {
@@ -9613,6 +9621,13 @@ fn kernel_statement_changes_and_csimp_with_trust(
         } else {
             head_project
         };
+        // DA b08785bc F1: resolve the head-statement con-leche binary BEFORE the head build,
+        // so a file the build writes at the bridge path cannot swap into execution.
+        let head_kernel_prov = crate::kernel::resolve_kernel_engine_in_workspace(
+            crate::kernel::resolve_kernel_selection_from_env(None)?,
+            &detect_toolchain(&head_project),
+            Some(&head_project),
+        )?;
         let _snap_head_exclude_root_guard = ExcludeRootEnvGuard::enter(&head_project);
         if is_untrusted {
             stock_statement_build_with_trust(&head_project, statement_scope, true)?;
@@ -9633,6 +9648,7 @@ fn kernel_statement_changes_and_csimp_with_trust(
             None,
             None,
             snapshot_cfg,
+            &head_kernel_prov,
         )?;
         let snapshot_resolved_cfg = if head_snapshot.is_some() && !is_untrusted {
             crate::module_builder::resolve_project_config_with_trust(&head_project, false).ok()
@@ -18321,6 +18337,11 @@ end ParityNs
 
         let store = TurboStore::open(Some(&tree.root.join("cache")))?;
         let policy = StatementPolicy::at(&tree.project, "HEAD");
+        let head_kernel_prov = crate::kernel::resolve_kernel_engine_in_workspace(
+            crate::kernel::resolve_kernel_selection_from_env(None)?,
+            &detect_toolchain(&tree.project),
+            Some(&tree.project),
+        )?;
         let (_, cert_snap_opt) = certify_head_statement_modules_and_replay(
             &store,
             &tree.project,
@@ -18330,6 +18351,7 @@ end ParityNs
             None,
             None,
             None,
+            &head_kernel_prov,
         )?;
         let cert_snap = cert_snap_opt.expect("certified head closure snapshot");
         let cfg = crate::module_builder::resolve_project_config_with_trust(&tree.project, false)?;
@@ -18395,6 +18417,7 @@ end ParityNs
             Some(&ov_dir),
             None,
             Some(&cfg),
+            &head_kernel_prov,
         )?;
         assert_eq!(
             rebuilt_opt,
