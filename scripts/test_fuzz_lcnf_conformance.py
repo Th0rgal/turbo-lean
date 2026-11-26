@@ -486,6 +486,47 @@ class PinnedEnvReachesToolchainSubprocesses(unittest.TestCase):
                     os.environ.get("ELAN_TOOLCHAIN"),
                     f"{mod.__name__}.tearDownModule must restore the saved env",
                 )
+            # Had-previous-value branch: a preset ambient value is pinned over
+            # and then restored verbatim, not popped.
+            with mock.patch.dict(os.environ, {"ELAN_TOOLCHAIN": "ambient/toolchain:v0.0.0"}):
+                importlib.reload(mod)
+                mod.setUpModule()
+                self.assertEqual(
+                    os.environ.get("ELAN_TOOLCHAIN"),
+                    fuzzer.repo_pinned_toolchain(),
+                    f"{mod.__name__}.setUpModule must pin over a preset value",
+                )
+                mod.tearDownModule()
+                self.assertEqual(
+                    os.environ.get("ELAN_TOOLCHAIN"),
+                    "ambient/toolchain:v0.0.0",
+                    f"{mod.__name__}.tearDownModule must restore the preset value",
+                )
+            # The save/pin/restore logic is the shared fuzzer helper pair, not
+            # a per-module copy.
+            self.assertFalse(
+                hasattr(mod, "_HAD_ELAN_TOOLCHAIN"),
+                f"{mod.__name__} must delegate to fuzzer.pin_elan_toolchain / "
+                "restore_elan_toolchain instead of a copied save/restore block",
+            )
+
+    def test_shared_elan_pin_helper_pair_covers_both_restore_branches(self):
+        sentinel = "ambient/toolchain:v0.0.0"
+        with mock.patch.dict(os.environ, {"ELAN_TOOLCHAIN": sentinel}):
+            saved = fuzzer.pin_elan_toolchain()
+            self.assertEqual(
+                os.environ.get("ELAN_TOOLCHAIN"), fuzzer.repo_pinned_toolchain()
+            )
+            fuzzer.restore_elan_toolchain(saved)
+            self.assertEqual(os.environ.get("ELAN_TOOLCHAIN"), sentinel)
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop("ELAN_TOOLCHAIN", None)
+            saved = fuzzer.pin_elan_toolchain()
+            self.assertEqual(
+                os.environ.get("ELAN_TOOLCHAIN"), fuzzer.repo_pinned_toolchain()
+            )
+            fuzzer.restore_elan_toolchain(saved)
+            self.assertNotIn("ELAN_TOOLCHAIN", os.environ)
 
     def test_p0_module_imports_and_skips_on_unsupported_host_arch(self):
         """Importing test_p0_trust_boundary must not require a supported host

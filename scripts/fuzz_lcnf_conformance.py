@@ -541,6 +541,32 @@ def repo_pinned_toolchain(toolchain_file: Path = LEAN_TOOLCHAIN_FILE) -> str | N
     return text or None
 
 
+def pin_elan_toolchain() -> tuple[bool, str | None]:
+    """Pin ELAN_TOOLCHAIN in os.environ to the repo pin; returns the saved
+    prior state for restore_elan_toolchain.
+
+    Shared by the test modules' setUpModule/tearDownModule: an elan-shimmed
+    child (lean, lake, leanc, lean-native) spawned on files in a temp dir
+    outside the repo otherwise resolves elan's DEFAULT toolchain, failing with
+    an incompatible Init.olean header. With no repo pin the environment is
+    left unchanged."""
+    saved = ("ELAN_TOOLCHAIN" in os.environ, os.environ.get("ELAN_TOOLCHAIN"))
+    pin = repo_pinned_toolchain()
+    if pin:
+        os.environ["ELAN_TOOLCHAIN"] = pin
+    return saved
+
+
+def restore_elan_toolchain(saved: tuple[bool, str | None]) -> None:
+    """Restore the state captured by pin_elan_toolchain: the previous value
+    when one existed, otherwise unset."""
+    had, value = saved
+    if had:
+        os.environ["ELAN_TOOLCHAIN"] = value
+    else:
+        os.environ.pop("ELAN_TOOLCHAIN", None)
+
+
 def elan_toolchain_dir_name(toolchain: str) -> str:
     """elan stores `leanprover/lean4:v4.35.0` as `leanprover--lean4---v4.35.0`."""
     return toolchain.replace("/", "--").replace(":", "---")
