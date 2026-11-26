@@ -1680,6 +1680,11 @@ class HostFingerprint(unittest.TestCase):
 
     def test_host_id_records_hex_fingerprint_never_node_name(self):
         mod = load_script()
+        # Stubbed like its sibling test_no_machine_id_means_no_fingerprint:
+        # without this the test demands a 64-hex fingerprint from the real
+        # /etc/machine-id and fails on any host that lacks one, a case the
+        # script's own docstring calls common in containers.
+        mod.read_machine_id = lambda: "fixture-machine-id"
         h = mod.host_id("g2a-ro-192c")
         fp = h.get("host_fingerprint")
         self.assertTrue(isinstance(fp, str) and re.fullmatch(r"[0-9a-f]{64}", fp), fp)
