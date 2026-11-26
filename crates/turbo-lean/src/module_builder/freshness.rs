@@ -2069,9 +2069,9 @@ pub(super) fn lake_closure_export_info_inner(
             false
         };
 
-        // One taint classification feeds both checks (review F4): stamp eligibility
-        // keeps its narrower host-read meaning, and the gated clause below is what
-        // polices pure elaborator / `@[extern]` shapes.
+        // One taint classification feeds both checks: stamp eligibility keeps its
+        // narrower host-read meaning, and the gated clause below is what polices pure
+        // elaborator / `@[extern]` shapes.
         let host_taint = spec_source_host_effect_taint(cfg, spec, &src_raw);
         if ((!cache.post_lake_refresh || has_valid_turbo_entry)
             && spec_source_stamp_ineligible_given_taint(cfg, spec, &src_raw, host_taint))
@@ -2651,7 +2651,7 @@ pub(crate) fn dep_pkg_import_pins_consistent(
         let Ok(src) = fs::read_to_string(&cur.src_path) else {
             return false;
         };
-        // Review F4: one classification per module; see the matching caller above.
+        // One classification per module; see the matching caller above.
         let host_taint = spec_source_host_effect_taint(cfg, &cur, &src);
         if spec_source_stamp_ineligible_given_taint(cfg, &cur, &src, host_taint)
             || (!cache.post_lake_refresh

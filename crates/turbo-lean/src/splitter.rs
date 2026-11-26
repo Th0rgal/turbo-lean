@@ -1474,7 +1474,7 @@ pub(crate) fn contains_lean_ident_segment(haystack: &str, seg: &str) -> bool {
     lean_word_ends(haystack, seg, false).next().is_some()
 }
 
-fn contains_lean_attribute_word(unquoted: &str, attrs: &[&str]) -> bool {
+pub(crate) fn contains_lean_attribute_word(unquoted: &str, attrs: &[&str]) -> bool {
     let mut rest = unquoted;
     while !rest.is_empty() {
         let at_pos = rest.find("@[");
