@@ -1,0 +1,574 @@
+{
+ "aa": {
+  "committed_on_vs_off": [
+   {
+    "a_median_ms": 6428.7,
+    "b_median_ms": 6327.0,
+    "cell": "batteries_list_lemmas_top/cold_no_daemon",
+    "delta_ms": 101.7,
+    "rel_delta": 0.0161
+   },
+   {
+    "a_median_ms": 2461.7,
+    "b_median_ms": 2351.3,
+    "cell": "batteries_list_lemmas_top/warm_cache_hit_daemon",
+    "delta_ms": 110.4,
+    "rel_delta": 0.047
+   },
+   {
+    "a_median_ms": 2773.3,
+    "b_median_ms": 2688.3,
+    "cell": "batteries_list_lemmas_top/warm_edited_proof_daemon",
+    "delta_ms": 85.0,
+    "rel_delta": 0.0316
+   },
+   {
+    "a_median_ms": 14745.4,
+    "b_median_ms": 14495.4,
+    "cell": "batteries_rbtree_lemmas_mid/cold_no_daemon",
+    "delta_ms": 250.0,
+    "rel_delta": 0.0172
+   },
+   {
+    "a_median_ms": 3088.7,
+    "b_median_ms": 3029.5,
+    "cell": "batteries_rbtree_lemmas_mid/warm_cache_hit_daemon",
+    "delta_ms": 59.2,
+    "rel_delta": 0.0195
+   },
+   {
+    "a_median_ms": 3706.3,
+    "b_median_ms": 3677.7,
+    "cell": "batteries_rbtree_lemmas_mid/warm_edited_proof_daemon",
+    "delta_ms": 28.6,
+    "rel_delta": 0.0078
+   },
+   {
+    "a_median_ms": 16574.1,
+    "b_median_ms": 16576.7,
+    "cell": "batteries_string_lemmas_top/cold_no_daemon",
+    "delta_ms": -2.6,
+    "rel_delta": -0.0002
+   },
+   {
+    "a_median_ms": 2532.3,
+    "b_median_ms": 2586.0,
+    "cell": "batteries_string_lemmas_top/warm_cache_hit_daemon",
+    "delta_ms": -53.7,
+    "rel_delta": -0.0208
+   },
+   {
+    "a_median_ms": 2837.0,
+    "b_median_ms": 2772.0,
+    "cell": "batteries_string_lemmas_top/warm_edited_proof_daemon",
+    "delta_ms": 65.0,
+    "rel_delta": 0.0234
+   },
+   {
+    "a_median_ms": 6536.3,
+    "b_median_ms": 6440.7,
+    "cell": "batteries_unionfind_top/cold_no_daemon",
+    "delta_ms": 95.6,
+    "rel_delta": 0.0148
+   },
+   {
+    "a_median_ms": 2241.9,
+    "b_median_ms": 2233.8,
+    "cell": "batteries_unionfind_top/warm_cache_hit_daemon",
+    "delta_ms": 8.1,
+    "rel_delta": 0.0036
+   },
+   {
+    "a_median_ms": 2429.0,
+    "b_median_ms": 2439.7,
+    "cell": "batteries_unionfind_top/warm_edited_proof_daemon",
+    "delta_ms": -10.7,
+    "rel_delta": -0.0044
+   }
+  ],
+  "fresh_a_vs_b": [
+   {
+    "a_median_ms": 7390.7,
+    "b_median_ms": 6378.0,
+    "cell": "batteries_unionfind_top/cold_no_daemon",
+    "delta_ms": 1012.7,
+    "rel_delta": 0.1588
+   },
+   {
+    "a_median_ms": 2404.5,
+    "b_median_ms": 2358.5,
+    "cell": "batteries_unionfind_top/warm_cache_hit_daemon",
+    "delta_ms": 46.0,
+    "rel_delta": 0.0195
+   },
+   {
+    "a_median_ms": 2599.5,
+    "b_median_ms": 2603.0,
+    "cell": "batteries_unionfind_top/warm_edited_proof_daemon",
+    "delta_ms": -3.5,
+    "rel_delta": -0.0013
+   }
+  ]
+ },
+ "bands": {
+  "cold_no_daemon": {
+   "current_floor_pct": 20,
+   "max_abs": 0.1588,
+   "n_aa_cells": 5,
+   "recorded": "not narrowed: the rule gives 24%, above the 20% floor, which stays",
+   "rel_deltas": [
+    0.0161,
+    0.0172,
+    -0.0002,
+    0.0148,
+    0.1588
+   ],
+   "rms": 0.0721,
+   "rule_1p5_max_pct": 24,
+   "rule_3_rms_pct": 22,
+   "rule_pct": 24
+  },
+  "warm_cache_hit_daemon": {
+   "current_floor_pct": 10,
+   "max_abs": 0.047,
+   "n_aa_cells": 5,
+   "recorded": "narrowed: +/-8% of the baseline median + 25 ms, replacing max(10% floor, 2 * (max-min)/median)",
+   "rel_deltas": [
+    0.047,
+    0.0195,
+    -0.0208,
+    0.0036,
+    0.0195
+   ],
+   "rms": 0.0261,
+   "rule_1p5_max_pct": 8,
+   "rule_3_rms_pct": 8,
+   "rule_pct": 8
+  },
+  "warm_edited_proof_daemon": {
+   "current_floor_pct": 10,
+   "max_abs": 0.0316,
+   "n_aa_cells": 5,
+   "recorded": "narrowed: +/-6% of the baseline median + 25 ms, replacing max(10% floor, 2 * (max-min)/median)",
+   "rel_deltas": [
+    0.0316,
+    0.0078,
+    0.0234,
+    -0.0044,
+    -0.0013
+   ],
+   "rms": 0.018,
+   "rule_1p5_max_pct": 5,
+   "rule_3_rms_pct": 6,
+   "rule_pct": 6
+  }
+ },
+ "command": "python3 -B scripts/bench_check_loop.py --turbo-lean-bin target/release/turbo-lean --batteries-dir /path/to/batteries --pfr-dir /path/to/pfr --only-workloads batteries_unionfind_top --trials 5 --warmup 1 --check-timeout-s 2400 --allow-busy-node --machine-label g2a-ro-192c --no-baseline --out /path/to/out.json, run twice back to back",
+ "committed_pair": {
+  "off": {
+   "path": "scripts/bench_check_loop_g2b_off.json",
+   "sha256": "e0af122856bb0918d620476b2478cbd93fe500ac11d92d781e81f2216e71c28b"
+  },
+  "on": {
+   "path": "scripts/bench_check_loop_g2b_on.json",
+   "sha256": "e6910f6553af85acfe73eea6355269cfa5124ce6ed3f24d8b2d8fd40ea349462"
+  },
+  "why_aa": "one binary (e4fccb25...) at a3ad5f4d on this host; the toggled warm CAS replay is unreachable from the check path the bench drives (HORIZONS G2b)"
+ },
+ "created_utc": "2026-11-26T19:09:33Z",
+ "fresh_pair": [
+  {
+   "args": {
+    "check_timeout_s": 2400,
+    "only_workloads": "batteries_unionfind_top",
+    "skip_rev_check": false,
+    "trials": 5,
+    "warmup": 1
+   },
+   "created_utc": "2026-11-26T18:49:37Z",
+   "host": {
+    "cpu_model": "AMD EPYC 9R14",
+    "host_fingerprint": "a311449512ac7ba9aefe01016d434d61785301b6dc4f7fb66642a50bfc6d59c2",
+    "hostname": "g2a-ro-192c",
+    "kernel": "Linux 6.12.115-140.210.amzn2023.x86_64",
+    "machine_label": "g2a-ro-192c",
+    "mem_gb": 1552.1,
+    "nproc": 192
+   },
+   "label": "fresh_a",
+   "loadavg_around_run": [
+    "before 2026-11-26T18:49:37Z loadavg=[38.35 53.36 104.70 37/144843 722201] io=[some avg10=0.44 avg60=0.12 avg300=0.12 total=17663309881] cpu=[some avg10=0.00 avg60=0.06 avg300=1.46 total=2916303151]",
+    "after 2026-11-26T18:53:11Z rc=0 loadavg=[56.44 57.05 95.88 52/145549 1237577] io=[some avg10=0.00 avg60=0.07 avg300=0.10 total=17663896633] cpu=[some avg10=0.63 avg60=0.43 avg300=0.94 total=2918195295]"
+   ],
+   "modes": {
+    "cold_no_daemon": {
+     "failed_trials": 0,
+     "load1_per_trial_before_after": [
+      43.12,
+      41.46,
+      41.46,
+      64.08,
+      64.08,
+      70.7,
+      70.7,
+      75.32,
+      75.32,
+      74.81
+     ],
+     "median_ms": 7390.7,
+     "rel_spread": 1.3707,
+     "runs_ms": [
+      7390.7,
+      7353.9,
+      16791.8,
+      10992.1,
+      6661.8
+     ],
+     "statuses_observed": [
+      "theorem_verified"
+     ],
+     "trials": 5
+    },
+    "warm_cache_hit_daemon": {
+     "failed_trials": 0,
+     "load1_per_trial_before_after": [
+      72.02,
+      72.02,
+      72.02,
+      70.49,
+      70.49,
+      70.49,
+      70.49,
+      70.49,
+      70.49,
+      67.49
+     ],
+     "median_ms": 2404.5,
+     "rel_spread": 0.1689,
+     "runs_ms": [
+      2482.9,
+      2664.0,
+      2395.1,
+      2257.8,
+      2404.5
+     ],
+     "statuses_observed": [
+      "theorem_cache_hit"
+     ],
+     "trials": 5
+    },
+    "warm_edited_proof_daemon": {
+     "failed_trials": 0,
+     "load1_per_trial_before_after": [
+      67.93,
+      67.93,
+      67.93,
+      65.06,
+      65.06,
+      65.06,
+      65.06,
+      62.81,
+      62.81,
+      62.81
+     ],
+     "median_ms": 2599.5,
+     "rel_spread": 0.2564,
+     "runs_ms": [
+      2387.7,
+      2344.4,
+      2599.5,
+      3011.0,
+      2923.3
+     ],
+     "statuses_observed": [
+      "theorem_verified"
+     ],
+     "trials": 5
+    }
+   },
+   "node": {
+    "busy_allowed": true,
+    "load1_at_end": 56.44,
+    "load1_at_start": 38.35
+   },
+   "raw_results_note": "the raw bench output also carries three host-path fields (turbo_lean_repo, turbo_lean_binary.path, settings.scratch_root), left out here",
+   "raw_results_sha256": "4133c5c2483bb4af7fb725c0514e3181cebd84c67795c339833962c6d8560249",
+   "revs_pinned": true,
+   "settings": {
+    "TURBO_LEAN_ALLOWED_CSIMP": "*",
+    "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY": "*",
+    "TURBO_LEAN_ALLOWED_UNSAFE": "*",
+    "TURBO_LEAN_BENCH_CHECK_TIMEOUT_S": null,
+    "TURBO_LEAN_DAEMON_IDLE_SECS": null,
+    "TURBO_LEAN_GIT": "/usr/bin/git",
+    "TURBO_LEAN_HOME": null,
+    "TURBO_LEAN_NO_DAEMON": null,
+    "TURBO_LEAN_NO_REMOTE_TELEMETRY": null,
+    "TURBO_LEAN_NO_WARM_CAS_REPLAY": null,
+    "TURBO_LEAN_STAGING_DIR": null,
+    "TURBO_LEAN_TELEMETRY": null,
+    "TURBO_LEAN_WARM_CAS_REPLAY": null,
+    "git_version": "git version 2.50.1"
+   },
+   "toolchain": {
+    "by_repo": {
+     "batteries": "leanprover/lean4:v4.35.0",
+     "pfr": "leanprover/lean4:v4.35.0"
+    },
+    "lean_toolchain": "leanprover/lean4:v4.35.0",
+    "lean_version": "Lean (version 4.35.0, x86_64-unknown-linux-gnu, commit eb6cafb7290e8bd5f2937522d8d804f58f02bafc, Release)"
+   },
+   "turbo_lean_binary_sha256": "82004650641dab7eb48e30c2fd2bcf6fe2e996502ff0c38494a6d0849f7e3fa2",
+   "turbo_lean_commit": "911febfd3769643a04f70b8c6db8f22ee2f55be9",
+   "turbo_lean_dirty": false,
+   "verdict": "partial_run",
+   "workload": "batteries_unionfind_top",
+   "workload_revs": {
+    "batteries": "66e469188fe07963e5cf666c7d4433f45b8131c5",
+    "pfr": "ebe2d96230b1abb190f74592aace441a0f10fe09"
+   }
+  },
+  {
+   "args": {
+    "check_timeout_s": 2400,
+    "only_workloads": "batteries_unionfind_top",
+    "skip_rev_check": false,
+    "trials": 5,
+    "warmup": 1
+   },
+   "created_utc": "2026-11-26T18:53:22Z",
+   "host": {
+    "cpu_model": "AMD EPYC 9R14",
+    "host_fingerprint": "a311449512ac7ba9aefe01016d434d61785301b6dc4f7fb66642a50bfc6d59c2",
+    "hostname": "g2a-ro-192c",
+    "kernel": "Linux 6.12.115-140.210.amzn2023.x86_64",
+    "machine_label": "g2a-ro-192c",
+    "mem_gb": 1552.1,
+    "nproc": 192
+   },
+   "label": "fresh_b",
+   "loadavg_around_run": [
+    "before 2026-11-26T18:53:22Z loadavg=[50.40 55.69 94.81 25/145195 1265460] io=[some avg10=0.67 avg60=0.24 avg300=0.14 total=17664049522] cpu=[some avg10=0.35 avg60=0.39 avg300=0.91 total=2918253147]",
+    "after 2026-11-26T18:55:35Z rc=0 loadavg=[63.34 56.44 89.81 39/146169 1662076] io=[some avg10=0.09 avg60=0.11 avg300=0.10 total=17664439790] cpu=[some avg10=0.41 avg60=0.49 avg300=0.74 total=2919524040]"
+   ],
+   "modes": {
+    "cold_no_daemon": {
+     "failed_trials": 0,
+     "load1_per_trial_before_after": [
+      49.0,
+      47.72,
+      47.72,
+      46.62,
+      46.62,
+      49.53,
+      49.53,
+      47.96,
+      47.96,
+      46.2
+     ],
+     "median_ms": 6378.0,
+     "rel_spread": 0.0486,
+     "runs_ms": [
+      6228.9,
+      6378.0,
+      6351.3,
+      6538.7,
+      6539.0
+     ],
+     "statuses_observed": [
+      "theorem_verified"
+     ],
+     "trials": 5
+    },
+    "warm_cache_hit_daemon": {
+     "failed_trials": 0,
+     "load1_per_trial_before_after": [
+      43.18,
+      43.18,
+      43.18,
+      43.18,
+      43.18,
+      42.61,
+      42.61,
+      42.61,
+      42.61,
+      43.04
+     ],
+     "median_ms": 2358.5,
+     "rel_spread": 0.0904,
+     "runs_ms": [
+      2464.7,
+      2335.6,
+      2515.7,
+      2358.5,
+      2302.6
+     ],
+     "statuses_observed": [
+      "theorem_cache_hit"
+     ],
+     "trials": 5
+    },
+    "warm_edited_proof_daemon": {
+     "failed_trials": 0,
+     "load1_per_trial_before_after": [
+      41.36,
+      41.36,
+      41.36,
+      40.45,
+      40.45,
+      40.45,
+      40.45,
+      40.17,
+      40.17,
+      40.17
+     ],
+     "median_ms": 2603.0,
+     "rel_spread": 0.1287,
+     "runs_ms": [
+      2393.2,
+      2400.4,
+      2603.0,
+      2717.9,
+      2728.1
+     ],
+     "statuses_observed": [
+      "theorem_verified"
+     ],
+     "trials": 5
+    }
+   },
+   "node": {
+    "busy_allowed": true,
+    "load1_at_end": 63.34,
+    "load1_at_start": 50.4
+   },
+   "raw_results_note": "the raw bench output also carries three host-path fields (turbo_lean_repo, turbo_lean_binary.path, settings.scratch_root), left out here",
+   "raw_results_sha256": "c3c903e27a4d300d5c7e407cb6b425dcfa7adb03a1714a16e50c694b3ab016be",
+   "revs_pinned": true,
+   "settings": {
+    "TURBO_LEAN_ALLOWED_CSIMP": "*",
+    "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY": "*",
+    "TURBO_LEAN_ALLOWED_UNSAFE": "*",
+    "TURBO_LEAN_BENCH_CHECK_TIMEOUT_S": null,
+    "TURBO_LEAN_DAEMON_IDLE_SECS": null,
+    "TURBO_LEAN_GIT": "/usr/bin/git",
+    "TURBO_LEAN_HOME": null,
+    "TURBO_LEAN_NO_DAEMON": null,
+    "TURBO_LEAN_NO_REMOTE_TELEMETRY": null,
+    "TURBO_LEAN_NO_WARM_CAS_REPLAY": null,
+    "TURBO_LEAN_STAGING_DIR": null,
+    "TURBO_LEAN_TELEMETRY": null,
+    "TURBO_LEAN_WARM_CAS_REPLAY": null,
+    "git_version": "git version 2.50.1"
+   },
+   "toolchain": {
+    "by_repo": {
+     "batteries": "leanprover/lean4:v4.35.0",
+     "pfr": "leanprover/lean4:v4.35.0"
+    },
+    "lean_toolchain": "leanprover/lean4:v4.35.0",
+    "lean_version": "Lean (version 4.35.0, x86_64-unknown-linux-gnu, commit eb6cafb7290e8bd5f2937522d8d804f58f02bafc, Release)"
+   },
+   "turbo_lean_binary_sha256": "82004650641dab7eb48e30c2fd2bcf6fe2e996502ff0c38494a6d0849f7e3fa2",
+   "turbo_lean_commit": "911febfd3769643a04f70b8c6db8f22ee2f55be9",
+   "turbo_lean_dirty": false,
+   "verdict": "partial_run",
+   "workload": "batteries_unionfind_top",
+   "workload_revs": {
+    "batteries": "66e469188fe07963e5cf666c7d4433f45b8131c5",
+    "pfr": "ebe2d96230b1abb190f74592aace441a0f10fe09"
+   }
+  }
+ ],
+ "gate_constants_changed": false,
+ "kind": "m1b_noise_evidence",
+ "method": {
+  "aa_pair": "two runs of one binary on one host; rel_delta = (median_a - median_b) / median_b",
+  "band_rule": "per mode, the larger of 1.5 * max|rel_delta| and 3 * RMS(rel_delta) over the A/A cells, rounded up to a whole percent, plus 25 ms; a mode whose rule result exceeds its current floor is not narrowed",
+  "current_gate_band": "median * max(MIN_REL_TOLERANCE[mode], 2 * (max-min)/median) + 25 ms (tolerance_ms in scripts/bench_check_loop.py), applied both ways",
+  "quartiles": "statistics.quantiles(n=4, method='inclusive') over each cell's 5 runs_ms"
+ },
+ "pooled_within_same_host": {
+  "by_mode": {
+   "cold_no_daemon": {
+    "gate_band_rel": {
+     "max": 2.7448,
+     "median": 0.2039,
+     "min": 0.2015
+    },
+    "n_cells": 14,
+    "n_trials": 70,
+    "rel_iqr": {
+     "max": 0.4923,
+     "median": 0.0159,
+     "min": 0.0006
+    },
+    "rel_spread": {
+     "max": 1.3706,
+     "median": 0.0377,
+     "min": 0.0183
+    }
+   },
+   "warm_cache_hit_daemon": {
+    "gate_band_rel": {
+     "max": 0.4361,
+     "median": 0.1126,
+     "min": 0.1081
+    },
+    "n_cells": 14,
+    "n_trials": 70,
+    "rel_iqr": {
+     "max": 0.1769,
+     "median": 0.0188,
+     "min": 0.0037
+    },
+    "rel_spread": {
+     "max": 0.2127,
+     "median": 0.0508,
+     "min": 0.0183
+    }
+   },
+   "warm_edited_proof_daemon": {
+    "gate_band_rel": {
+     "max": 3.9416,
+     "median": 0.1096,
+     "min": 0.1067
+    },
+    "n_cells": 14,
+    "n_trials": 70,
+    "rel_iqr": {
+     "max": 1.2634,
+     "median": 0.0174,
+     "min": 0.0044
+    },
+    "rel_spread": {
+     "max": 1.9683,
+     "median": 0.0394,
+     "min": 0.0128
+    }
+   }
+  },
+  "runs": [
+   "scripts/bench_check_loop_g2a_replay.json",
+   "scripts/bench_check_loop_g2b_on.json",
+   "scripts/bench_check_loop_g2b_off.json",
+   "fresh_a",
+   "fresh_b"
+  ]
+ },
+ "prerequisite": "a fresh Batteries clone at the pinned rev needs `lake build Batteries.Data.UnionFind.Basic` first: without the import closure built, the identity probe exits 1 with 'produced no .olean' and every cold trial fails",
+ "roadmap_row": "roadmap/HORIZONS.md M1b",
+ "schema_version": 1,
+ "validity": {
+  "host_fingerprint": "a311449512ac7ba9aefe01016d434d61785301b6dc4f7fb66642a50bfc6d59c2",
+  "load1_per_trial_range_over_aa_runs": [
+   40.17,
+   81.0
+  ],
+  "machine_label": "g2a-ro-192c",
+  "not_valid_for": "another host (the committed baseline's uruk included), load outside the range above, or a cell noisier than the IQR/median above; such a cell is re-measured rather than gated",
+  "toolchain": "leanprover/lean4:v4.35.0",
+  "warm_rel_iqr_max_over_aa_cells": 0.206,
+  "workload_revs": "batteries 66e46918, pfr ebe2d962 (PINNED_REVS)"
+ }
+}
