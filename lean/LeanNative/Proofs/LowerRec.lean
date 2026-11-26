@@ -31,6 +31,26 @@ The sha-pinned files (`scripts/lcnf_coverage_results.json` pins
 `IR/BridgeHelpers*.lean`, `Proofs/RealLCNFBridgeProofs.lean`) are read, cited and proved
 ABOUT, never edited; every new definition goes in new files, as L2's layering prescribes.
 
+Amendment (2026-11-26, w-l3; names unchanged, entry/hypothesis shape only): environment
+ENTRIES carry their own context and lowering fuel. The driver builds a PER-DECLARATION
+`RealBridgeCtx` — `buildRealBridgeCtxM` derives `paramTypeMap`, `allowStage1DHeap`,
+`ctorLayouts` and `typeOverrides` from each declaration's own code
+(`BridgeHelpers/RealBridgeCtxAndSlices.lean:276-531`) — so a `DeclEnvLowersR` fixing ONE
+`ctx` and ONE `fuel` across every entry, and a call rule running the callee under the
+CALLER'S `ctx`, would describe module environments the driver never builds; the first cut
+of this contract did exactly that. Amended shape: `DeclEnvLowersR` is indexed by
+`List (Decl .impure × RealBridgeCtx × Nat)` with the per-entry lowering hypothesis
+`lowerRealLCNFDecl fuel_i ctx_i sd ld.name = .ok ld`; the R evaluators take
+`Δ : List (Decl .impure × RealBridgeCtx)` (`declEnvR` projects the lowering environment
+onto it) and run a callee's body under ITS OWN paired context, the caller's `ctx` binder
+governing only the caller's own clauses; the EVALUATION fuel stays the single step budget
+— distinct from the per-entry LOWERING fuel, never per-entry. `CodeRefinesR` (the LNIR
+side carries no `RealBridgeCtx`) and `lowerRealLCNFDecl_soundR_base` (already one
+declaration with its own context and the pointwise freshness hypothesis) are unchanged;
+every Part II frozen name stays. The L2 lane is applying the same-shape correction to its
+`DeclEnv`/`DeclEnvLowers` (entries `Decl × RealBridgeCtx × Nat`), so the two lanes stay
+parallel and the fold meets one entry shape.
+
 ### What the AST actually carries for recursion and loops (read first, stated only if it exists)
 
 - `LNIRExpr.call fn args retTy isExtern` (`IR/AST.lean:80`) — the one LNIR construct a
@@ -109,43 +129,49 @@ An extern call (`isExtern = true`), a lookup miss, and every non-call binding de
 In `lean/LeanNative/IR/RealLCNFRecSemantics.lean` (NEW file; namespace
 `LeanNative.IR.RealLCNFSemantics`; imports `LeanNative.IR.RealLCNFSemantics` only, so the
 H1.1 separation pin (`Tests/RealLCNFSeparationPin.lean`) is preserved — the same layering
-L2 contracts for its `IR/RealLCNFCallSemantics.lean`, which this file does not touch):
+L2 contracts for its `IR/RealLCNFCallSemantics.lean`, which this file does not touch).
+Environment entries are PAIRS carrying each callee's own context, per the amendment note:
 
 ```
-/-- First declaration whose `.name` is `fn`. The hit alone (no suffix). -/
-def lookupDeclRec? : List (Lean.Compiler.LCNF.Decl .impure) → Lean.Name →
-    Option (Lean.Compiler.LCNF.Decl .impure)
+/-- First entry whose declaration's `.name` is `fn`. The hit alone (no suffix), paired
+    with the callee's own context. -/
+def lookupDeclRec? : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx) → Lean.Name →
+    Option (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx)
 
-def evalStepR (Δ : List (Lean.Compiler.LCNF.Decl .impure)) (fuel : Nat)
+def evalStepR (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx)) (fuel : Nat)
     (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
     (target : Lean.Compiler.LCNF.Code .impure ⊕
       (Val × Bool × Nat × Option Lean.FVarId × List (Lean.Compiler.LCNF.Alt .impure))) :
     Except UBError (Val × HeapState)
 
-def evalRealLCNFCodeR (Δ : List (Lean.Compiler.LCNF.Decl .impure)) (fuel : Nat)
-    (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
+def evalRealLCNFCodeR (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx))
+    (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
     (code : Lean.Compiler.LCNF.Code .impure) : Except UBError (Val × HeapState)
 
-def evalRealLCNFDeclR (Δ : List (Lean.Compiler.LCNF.Decl .impure)) (fuel : Nat)
-    (ctx : RealBridgeCtx) (decl : Lean.Compiler.LCNF.Decl .impure) (args : List Val)
-    (st : HeapState := HeapState.empty) : Except UBError (Val × HeapState)
+def evalRealLCNFDeclR (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx))
+    (fuel : Nat) (ctx : RealBridgeCtx) (decl : Lean.Compiler.LCNF.Decl .impure)
+    (args : List Val) (st : HeapState := HeapState.empty) : Except UBError (Val × HeapState)
 ```
 
 `evalStepR` mirrors `evalStep` clause for clause (same fuel-structural recursion with
 `.error .fuelExhausted` at `0`, same `evalLetValue`, same `storedTy`/`storedCtor`
 machinery, same join-point, `cases`, rc and mutation handling, every recursive occurrence
-at the step's decremented fuel and the same `Δ`) with ONE new rule, replacing exactly the
-arm the old semantics deliberately errors on: on `.let decl k` with
-`decl.value = .fap fn args _` and `(ctx.findLocalCallee? fn).isSome`,
+at the step's decremented fuel, the same `Δ` and — on the caller's own clauses — the same
+`ctx`) with ONE new rule, replacing exactly the arm the old semantics deliberately errors
+on: on `.let decl k` with `decl.value = .fap fn args _` and
+`(ctx.findLocalCallee? fn).isSome`,
 
-- `lookupDeclRec? Δ fn = some sd`: `evalArgs env.vals args.toList`; `sd.value` must be
-  `.code c` (`.extern _` errors `.unsupportedCall fn.toString`); then
-  `bindParams ctx true LEnv.empty sd.params.toList vals` (the declaration-entry convention
-  of `evalRealLCNFDecl`); the callee body runs as `evalStepR Δ fuel ctx env' st (.inl c)`
-  at the step's decremented fuel UNDER THE FULL `Δ` — the one difference from L2's rule,
-  and what makes a self or mutual call evaluate; its `.ok (v, st')` binds into the caller
-  exactly as the old `.fap` arm would (`storedTy := if isUnboxedScalarOrTuple rawTy then
-  rawTy else .i64`, no ctor) and continues with `k` at the decremented fuel under `Δ`.
+- `lookupDeclRec? Δ fn = some (sd, sdCtx)`: `evalArgs env.vals args.toList`; `sd.value`
+  must be `.code c` (`.extern _` errors `.unsupportedCall fn.toString`); then
+  `bindParams sdCtx true LEnv.empty sd.params.toList vals` (the declaration-entry
+  convention of `evalRealLCNFDecl`, under the CALLEE'S OWN context); the callee body runs
+  as `evalStepR Δ fuel sdCtx env' st (.inl c)` at the step's decremented fuel UNDER THE
+  FULL `Δ` and the callee's paired `sdCtx` — the differences from L2's rule, and what
+  makes a self or mutual call evaluate under the context the driver actually builds for
+  that callee; its `.ok (v, st')` binds into the caller exactly as the old `.fap` arm
+  would (`storedTy := if isUnboxedScalarOrTuple rawTy then rawTy else .i64`, no ctor;
+  `rawTy` from the CALLER'S `ctx`) and continues with `k` at the decremented fuel under
+  `Δ` and the caller's `ctx`.
 - lookup miss: `.error (.unsupportedCall fn.toString)` — byte-for-byte the old behavior,
   so `Δ = []` is the old semantics (theorem `evalStepR_nil`).
 
@@ -162,22 +188,34 @@ In this file, namespace `LeanNative.Proofs`:
     the fold keeps one spelling. -/
 def reservedRuntimeCallee (s : String) : Bool
 
-/-- Pointwise "Δ lowers to Φ" for the FULL-environment semantics. Clause-for-clause the
-    shape of L2's `DeclEnvLowers` (pointwise lowering under the driver's mangled-name map,
-    unreserved names, tail freshness): tail freshness over the whole list plus the
-    functionality of `ctx.findLocalCallee?` is exactly what makes `lookupDeclRec?` and
-    `lookupFuncRec?` find corresponding positions WITHOUT stratification. -/
-inductive DeclEnvLowersR (fuel : Nat) (ctx : RealBridgeCtx) :
-    List (Lean.Compiler.LCNF.Decl .impure) → List LNIRDecl → Prop
-  | nil : DeclEnvLowersR fuel ctx [] []
-  | cons : ∀ {sd : Lean.Compiler.LCNF.Decl .impure} {ld : LNIRDecl}
-      {Δ : List (Lean.Compiler.LCNF.Decl .impure)} {Φ : List LNIRDecl},
+/-- The evaluation-side environment of a lowering environment: each entry keeps its
+    declaration and its own context; the per-entry LOWERING fuel is a lowering-time
+    quantity, not an evaluation input (the evaluation fuel stays the single step
+    budget). -/
+def declEnvR (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) :
+    List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx) :=
+  Δ.map fun e => (e.1, e.2.1)
+
+/-- Pointwise "Δ lowers to Φ" for the FULL-environment semantics, with PER-ENTRY context
+    and lowering fuel (the driver builds a per-declaration `RealBridgeCtx`; the amendment
+    note above). Clause-for-clause the shape of L2's `DeclEnvLowers` under the same
+    per-entry correction: each entry's own context maps its own declaration's name to its
+    LNIR name, the lowering hypothesis holds at the entry's own fuel, lowered names are
+    unreserved, and tail freshness over the whole list is exactly what makes
+    `lookupDeclRec?` and `lookupFuncRec?` find corresponding positions WITHOUT
+    stratification. -/
+inductive DeclEnvLowersR :
+    List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat) → List LNIRDecl → Prop
+  | nil : DeclEnvLowersR [] []
+  | cons : ∀ {sd : Lean.Compiler.LCNF.Decl .impure} {ctx : RealBridgeCtx} {fuel : Nat}
+      {ld : LNIRDecl} {Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)}
+      {Φ : List LNIRDecl},
       ctx.findLocalCallee? sd.name = some ld.name →
       lowerRealLCNFDecl fuel ctx sd ld.name = .ok ld →
       reservedRuntimeCallee ld.name = false →
       (∀ ld' ∈ Φ, ld'.name ≠ ld.name) →
-      DeclEnvLowersR fuel ctx Δ Φ →
-      DeclEnvLowersR fuel ctx (sd :: Δ) (ld :: Φ)
+      DeclEnvLowersR Δ Φ →
+      DeclEnvLowersR ((sd, ctx, fuel) :: Δ) (ld :: Φ)
 
 /-- `CodeRefines` with the recursion-capable environment (the L3 form of refinement). -/
 def CodeRefinesR (Φ : List LNIRDecl) (src tgt : LNIRCode) : Prop :=
@@ -237,14 +275,14 @@ theorem evalCodeR_call_unfold (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
         | .error e => .error e
         | .ok (v, st') => evalCodeR Φ (fuel + 1) (env.bind dst v) st' k
 
-theorem evalStepR_localCall_unfold (Δ : List (Lean.Compiler.LCNF.Decl .impure))
+theorem evalStepR_localCall_unfold (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx))
     (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
     (decl : Lean.Compiler.LCNF.LetDecl .impure) (k : Lean.Compiler.LCNF.Code .impure)
     (fn : Lean.Name) (args : Array (Lean.Compiler.LCNF.Arg .impure))
-    (sd : Lean.Compiler.LCNF.Decl .impure)
+    (sd : Lean.Compiler.LCNF.Decl .impure) (sdCtx : RealBridgeCtx)
     (hval : decl.value = .fap fn args rfl)
     (hloc : (ctx.findLocalCallee? fn).isSome = true)
-    (hlk : lookupDeclRec? Δ fn = some sd) :
+    (hlk : lookupDeclRec? Δ fn = some (sd, sdCtx)) :
     evalStepR Δ (fuel + 1) ctx env st (.inl (.let decl k)) =
       match evalArgs env.vals args.toList with
       | .error e => .error e
@@ -252,10 +290,10 @@ theorem evalStepR_localCall_unfold (Δ : List (Lean.Compiler.LCNF.Decl .impure))
         match sd.value with
         | .extern _ => .error (.unsupportedCall fn.toString)
         | .code c =>
-          match bindParams ctx true LEnv.empty sd.params.toList vals with
+          match bindParams sdCtx true LEnv.empty sd.params.toList vals with
           | .error e => .error e
           | .ok env' =>
-            match evalStepR Δ fuel ctx env' st (.inl c) with
+            match evalStepR Δ fuel sdCtx env' st (.inl c) with
             | .error e => .error e
             | .ok (v, st') =>
               evalStepR Δ fuel ctx
@@ -264,7 +302,7 @@ theorem evalStepR_localCall_unfold (Δ : List (Lean.Compiler.LCNF.Decl .impure))
                          then lowerGroundImpureTypeWith ctx decl.type else .i64)))
                 st' (.inl k)
 
-theorem evalStepR_localCall_miss (Δ : List (Lean.Compiler.LCNF.Decl .impure))
+theorem evalStepR_localCall_miss (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx))
     (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
     (decl : Lean.Compiler.LCNF.LetDecl .impure) (k : Lean.Compiler.LCNF.Code .impure)
     (fn : Lean.Name) (args : Array (Lean.Compiler.LCNF.Arg .impure))
@@ -291,9 +329,9 @@ theorem evalCodeR_extend_of_ok (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
     (h : evalCode fuel env st c = .ok (v, st')) :
     evalCodeR Φ fuel env st c = .ok (v, st')
 
-theorem DeclEnvLowersR.fresh (fuel : Nat) (ctx : RealBridgeCtx)
-    (Δ : List (Lean.Compiler.LCNF.Decl .impure)) (Φ : List LNIRDecl)
-    (h : DeclEnvLowersR fuel ctx Δ Φ) :
+theorem DeclEnvLowersR.fresh
+    (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) (Φ : List LNIRDecl)
+    (h : DeclEnvLowersR Δ Φ) :
     ∀ ld ∈ Φ, reservedRuntimeCallee ld.name = false
 
 theorem lowerRealLCNFDecl_soundR_base (fuel : Nat) (ctx : RealBridgeCtx)
@@ -359,43 +397,43 @@ its code- and declaration-level corollaries. These are the L3 names H1.4 dispatc
 
 ```
 theorem lowerImpureStepPure_soundR (fuel : Nat) (ctx : RealBridgeCtx)
-    (Δ : List (Lean.Compiler.LCNF.Decl .impure)) (Φ : List LNIRDecl)
+    (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) (Φ : List LNIRDecl)
     (st st' : RealBridgeState)
     (lenv : LEnv) (venv : VarEnv) (hst hst' : HeapState) (v : Val)
     (target : Lean.Compiler.LCNF.Code .impure ⊕
       (VarId × Bool × Nat × Option Lean.FVarId × List (Lean.Compiler.LCNF.Alt .impure)))
     (code : LNIRCode) :
-    DeclEnvLowersR fuel ctx Δ Φ →
+    DeclEnvLowersR Δ Φ →
     BridgeStateInv st lenv venv →
     lowerImpureStepPure fuel ctx st target = .ok (code, st') →
     (match target with
-      | .inl c => evalStepR Δ fuel ctx lenv hst (.inl c) = .ok (v, hst')
+      | .inl c => evalStepR (declEnvR Δ) fuel ctx lenv hst (.inl c) = .ok (v, hst')
       | .inr (condVar, isBool, idx, discr?, alts) =>
         condVar < st.nextVarId ∧
         (∀ dx, discr? = some dx → (st.lookupFVar? dx).isSome = true) ∧
         (lnirTypeEq (st.getVarType condVar) .i1 = true → isBool = true) ∧
         ∃ cond, venv condVar = some cond ∧
-          evalStepR Δ fuel ctx lenv hst (.inr (cond, isBool, idx, discr?, alts)) = .ok (v, hst')) →
+          evalStepR (declEnvR Δ) fuel ctx lenv hst (.inr (cond, isBool, idx, discr?, alts)) = .ok (v, hst')) →
     evalCodeR Φ fuel venv hst code = .ok (v, hst')
 
 theorem lowerRealLCNFCode_soundR (fuel : Nat) (ctx : RealBridgeCtx)
-    (Δ : List (Lean.Compiler.LCNF.Decl .impure)) (Φ : List LNIRDecl)
+    (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) (Φ : List LNIRDecl)
     (st : RealBridgeState)
     (lenv : LEnv) (venv : VarEnv) (hst hst' : HeapState) (v : Val)
     (code : Lean.Compiler.LCNF.Code .impure) (lnir : LNIRCode) (st' : RealBridgeState)
-    (h_env : DeclEnvLowersR fuel ctx Δ Φ)
+    (h_env : DeclEnvLowersR Δ Φ)
     (h_inv : BridgeStateInv st lenv venv)
     (h_lower : lowerRealLCNFCode fuel ctx st code = .ok (lnir, st'))
-    (h_eval : evalRealLCNFCodeR Δ fuel ctx lenv hst code = .ok (v, hst')) :
+    (h_eval : evalRealLCNFCodeR (declEnvR Δ) fuel ctx lenv hst code = .ok (v, hst')) :
     evalCodeR Φ fuel venv hst lnir = .ok (v, hst')
 
 theorem lowerRealLCNFDecl_soundR (fuel : Nat) (ctx : RealBridgeCtx)
-    (Δ : List (Lean.Compiler.LCNF.Decl .impure)) (Φ : List LNIRDecl)
+    (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) (Φ : List LNIRDecl)
     (decl : Lean.Compiler.LCNF.Decl .impure) (args : List Val) (hst hst' : HeapState)
     (v : Val) (d : LNIRDecl) (mangled : String)
-    (h_env : DeclEnvLowersR fuel ctx Δ Φ)
+    (h_env : DeclEnvLowersR Δ Φ)
     (h_lower : lowerRealLCNFDecl fuel ctx decl mangled = .ok d)
-    (h_eval : evalRealLCNFDeclR Δ fuel ctx decl args hst = .ok (v, hst')) :
+    (h_eval : evalRealLCNFDeclR (declEnvR Δ) fuel ctx decl args hst = .ok (v, hst')) :
     evalCodeR Φ fuel
       ((d.params.zip args).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
       hst d.body = .ok (v, hst')
@@ -438,12 +476,14 @@ theorem evalRealLCNFDeclF_toR (Δ : DeclEnv) (fuel : Nat) (ctx : RealBridgeCtx)
     (decl : Lean.Compiler.LCNF.Decl .impure) (args : List Val) (st : HeapState)
     (v : Val) (st' : HeapState) :
     evalRealLCNFDeclF Δ fuel ctx decl args st = .ok (v, st') →
-    evalRealLCNFDeclR Δ fuel ctx decl args st = .ok (v, st')
+    evalRealLCNFDeclR (declEnvR Δ) fuel ctx decl args st = .ok (v, st')
 ```
 
 (The second needs no fuel padding: on the LCNF side both semantics burn the step budget
 identically and R's lookup is a superset of F's stratified lookup on `DeclEnvLowersR`
-environments, whose names are duplicate-free.)
+environments, whose names are duplicate-free. Its `Δ : DeclEnv` is L2's, under the same
+per-entry correction — entries `Decl × RealBridgeCtx × Nat` — so `declEnvR` applies to it
+unchanged; elaborable once L2's definitions exist.)
 
 ### Named exclusions (recorded, not silently dropped)
 
