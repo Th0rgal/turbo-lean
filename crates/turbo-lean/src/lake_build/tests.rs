@@ -4634,24 +4634,24 @@ public def api := by
         }
     }
 
-    /// G2b red→green: the pure warm-default decision. Replay runs by default only on a
-    /// warm (cache-hit) path and never when the operator opted out. The explicit flag is
+    /// G2b red→green: the pure replay decision. Replay runs only on a warm
+    /// (cache-hit) path with the opt-in enabled. The explicit flag is
     /// not a parameter: the selector's early return owns that case, so the decision
     /// function has no dead argument.
     #[test]
     fn g2b_warm_default_cas_replay_decision_table() {
-        // (cache_hit, opt_out) -> warm default replay?
-        for (cache_hit, opt_out, want) in [
-            (true, false, true),   // warm hit, not opted out: replays (the caller's
-                                   // opt_out carries !opted_in since the revert)
-            (false, false, false), // cold build: elaboration ran anyway, no replay
-            (true, true, false),   // TURBO_LEAN_NO_WARM_CAS_REPLAY=1 opts out
-            (false, true, false),
+        // (cache_hit, enabled) -> replay?  `enabled` is the caller's
+        // warm_cas_replay_opted_in(): the opt-in since the revert.
+        for (cache_hit, enabled, want) in [
+            (true, true, true),    // warm hit, opted in: replays
+            (false, true, false),  // cold build: elaboration ran anyway, no replay
+            (true, false, false),  // not opted in (or explicitly opted out)
+            (false, false, false),
         ] {
             assert_eq!(
-                should_replay_cas_expr_on_warm_hit(cache_hit, opt_out),
+                should_replay_cas_expr_on_warm_hit(cache_hit, enabled),
                 want,
-                "decision (cache_hit={cache_hit}, opt_out={opt_out})"
+                "decision (cache_hit={cache_hit}, enabled={enabled})"
             );
         }
     }
@@ -4865,9 +4865,9 @@ public def api := by
     }
 
     /// G2b round-1 addendum red→green (review finding 1): an internal error inside the
-    /// warm-default replay (here a lakefile that fails option resolution) must not fail a
+    /// opted-in warm replay (here a lakefile that fails option resolution) must not fail a
     /// warm build that already materialized its outputs. The selector contains it as mode
-    /// `"warm_default_error"` with zero counts; the explicit fail-closed flag still
+    /// `"warm_opt_in_error"` with zero counts; the explicit fail-closed flag still
     /// propagates the same error.
     #[test]
     fn g2b_warm_default_replay_error_is_contained() -> Result<()> {
@@ -4900,7 +4900,7 @@ public def api := by
         )?;
         assert_eq!(
             (warm.mode, warm.replayed, warm.missing, warm.invalid),
-            ("warm_default_error", 0, 0, 0)
+            ("warm_opt_in_error", 0, 0, 0)
         );
         // The explicit fail-closed flag still surfaces the same error.
         let explicit_err = run_cas_expr_replay_for_build(
@@ -4918,7 +4918,7 @@ public def api := by
     /// G2b red→green: the one build-side selector every `run_build_command_with_cas_replay`
     /// branch calls. Explicit flag → fail-closed `"explicit"`; warm hit WITH THE OPT-IN
     /// (`TURBO_LEAN_WARM_CAS_REPLAY=1`, the reverted default) → best-effort
-    /// `"warm_default"` with "never seeded" (`missing`) and "corrupted or tampered"
+    /// `"warm_opt_in"` with "never seeded" (`missing`) and "corrupted or tampered"
     /// (`invalid`) counted separately, never merged (the explicit opt-out still wins);
     /// warm hit with the opt-in unset → `"off"`; cold build → `"off"`.
     #[test]
@@ -4978,7 +4978,7 @@ public def api := by
         )?;
         assert_eq!(
             (warm.mode, warm.replayed, warm.missing, warm.invalid),
-            ("warm_default", 1, 1, 1)
+            ("warm_opt_in", 1, 1, 1)
         );
         // Cold build, no flag: off.
         let cold = run_cas_expr_replay_for_build(
@@ -5077,7 +5077,7 @@ public def api := by
             as fn(&mut TurboStore, &Path, &str, &str, Option<&[PathBuf]>) -> Result<usize>;
         let _ = crate::lake_build::run_build_command_with_cas_replay
             as fn(&mut TurboStore, bool, Vec<String>, PathBuf, String, i64, bool, bool) -> Result<()>;
-        // G2b: best-effort warm-default replay surface.
+        // G2b: best-effort opted-in warm replay surface.
         let _ = crate::lake_build::replay_project_cas_expr_shards_best_effort
             as fn(
                 &mut TurboStore,

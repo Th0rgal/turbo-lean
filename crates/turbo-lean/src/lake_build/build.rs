@@ -1069,7 +1069,8 @@ pub fn replay_project_cas_expr_shards_best_effort(
     )
 }
 
-/// G2b opt-out: `TURBO_LEAN_NO_WARM_CAS_REPLAY=1` disables the warm-hit default replay
+/// G2b opt-out: `TURBO_LEAN_NO_WARM_CAS_REPLAY=1` forces the warm-hit replay off,
+/// overriding the `TURBO_LEAN_WARM_CAS_REPLAY=1` opt-in
 /// (same relaxed-bool grammar as the other `TURBO_LEAN_NO_*` switches).
 pub(crate) fn warm_cas_replay_disabled() -> bool {
     crate::shm_cache::parse_relaxed_bool(
@@ -1094,8 +1095,8 @@ pub(crate) fn warm_cas_replay_opted_in() -> bool {
 /// the pinned benchmark moved no cell outside its noise band, so the H2 rule
 /// reverted the on-by-default. The explicit fail-closed flag never reaches this
 /// decision: the selector's early return owns it, so there is no dead parameter here.
-pub(crate) fn should_replay_cas_expr_on_warm_hit(cache_hit: bool, opt_out: bool) -> bool {
-    cache_hit && !opt_out
+pub(crate) fn should_replay_cas_expr_on_warm_hit(cache_hit: bool, enabled: bool) -> bool {
+    cache_hit && enabled
 }
 
 /// G2b (review finding 4): the leader / no-singleflight branch of
@@ -1121,15 +1122,17 @@ pub(crate) struct CasExprBuildReplay {
     /// tamper evidence, counted on its own and warned about, never folded into
     /// `missing`.
     pub(crate) invalid: usize,
-    /// `"explicit"` (fail-closed flag), `"warm_default"` (G2b), `"warm_default_error"`
-    /// (an internal error during the warm default, contained so the warm build goes on),
-    /// or `"off"`.
+    /// `"explicit"` (fail-closed flag), `"warm_opt_in"` (G2b, an opted-in warm hit),
+    /// `"warm_opt_in_error"` (an internal error during the opted-in warm replay,
+    /// contained so the warm build goes on), or `"off"`. Renamed from
+    /// `"warm_default"` / `"warm_default_error"` with the opt-in revert; no external
+    /// consumer of the old strings existed.
     pub(crate) mode: &'static str,
 }
 
 /// The one selector every `run_build_command_with_cas_replay` branch calls (G2b):
-/// the explicit flag keeps the fail-closed wrapper; a warm (cache-hit) path gets the
-/// best-effort replay by default; a cold path replays nothing.
+/// the explicit flag keeps the fail-closed wrapper; an opted-in warm (cache-hit)
+/// path gets the best-effort replay; a cold or not-opted-in path replays nothing.
 pub(crate) fn run_cas_expr_replay_for_build(
     store: &mut TurboStore,
     canon_dir: &Path,
@@ -1154,7 +1157,7 @@ pub(crate) fn run_cas_expr_replay_for_build(
             mode: "explicit",
         });
     }
-    if should_replay_cas_expr_on_warm_hit(cache_hit, !warm_cas_replay_opted_in()) {
+    if should_replay_cas_expr_on_warm_hit(cache_hit, warm_cas_replay_opted_in()) {
         // Review finding 1: an internal error here (a split-cache or config read failing)
         // must never fail a warm build whose outputs are already materialized. Contain it
         // as a mode instead of propagating through `?`.
@@ -1174,7 +1177,7 @@ pub(crate) fn run_cas_expr_replay_for_build(
                     replayed: 0,
                     missing: 0,
                     invalid: 0,
-                    mode: "warm_default_error",
+                    mode: "warm_opt_in_error",
                 });
             }
         };
@@ -1188,7 +1191,7 @@ pub(crate) fn run_cas_expr_replay_for_build(
             replayed: stats.replayed,
             missing: stats.missing,
             invalid: stats.invalid,
-            mode: "warm_default",
+            mode: "warm_opt_in",
         });
     }
     Ok(CasExprBuildReplay {
@@ -1282,7 +1285,7 @@ pub fn run_build_command_with_cas_replay(
             };
             let cache_hit = build_report.modules_compiled == 0
                 && (build_report.modules_cached > 0 || build_report.modules_up_to_date_reused > 0);
-            // G2b: on a warm target-cone hit, CAS proof replay runs by default
+            // G2b: on an opted-in warm target-cone hit, CAS proof replay runs
             // (best-effort). The cone is the exact scope: an empty cone replays nothing.
             let cas_replay = run_cas_expr_replay_for_build(
                 store,
@@ -1452,7 +1455,7 @@ pub fn run_build_command_with_cas_replay(
                 0
             };
             // G2b: this is the warm singleflight cache-hit path, so CAS proof replay runs
-            // by default (best-effort) even without `--replay-cas-expr`.
+            // when opted in (best-effort) even without `--replay-cas-expr`.
             let cas_replay = run_cas_expr_replay_for_build(
                 store,
                 &canon_dir,
