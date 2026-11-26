@@ -226,10 +226,21 @@ pub fn probe_con_leche_support_for_selection(
         return None;
     }
     // G1c r2: selection and execution share one discovery, so the binary this probe accepts is
-    // the binary the executing sites run (review 22ae951a F1).
-    discover_con_leche_binary_for_selection(requested, lean_toolchain, workspace_root)
-        .ok()
-        .map(|_| PINNED_CON_LECHE_REV.to_string())
+    // the binary the executing sites run (review 22ae951a F1). The recorded string is honest to
+    // the provenance: the pinned rev only for provisioned (identity-gated) binaries; the
+    // capability-probe marker for the toolchain-bundled binary, whose rev is unverified.
+    discover_con_leche_binary_for_selection_with_provenance(
+        requested,
+        lean_toolchain,
+        workspace_root,
+    )
+    .ok()
+    .map(|(_, provenance)| match provenance {
+        ConLecheBinaryProvenance::ProvisionedPinnedRev => PINNED_CON_LECHE_REV.to_string(),
+        ConLecheBinaryProvenance::ToolchainBundledProbed => {
+            BUNDLED_CON_LECHE_PROVENANCE_MARKER.to_string()
+        }
+    })
 }
 
 pub fn resolve_kernel_selection(
@@ -462,6 +473,57 @@ fn bundled_toolchain_con_leche_binary(
     )
 }
 
+/// The provenance the recorded `con_leche_rev` string rests on (G1c r2): never record `PINNED_CON_LECHE_REV` for a binary whose rev was
+/// not verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConLecheBinaryProvenance {
+    /// A provisioned binary (`TURBO_CON_LECHE_BIN`, or the checkout's bridge binary behind the
+    /// identity gate): built at the pinned rev by the provisioning contract.
+    ProvisionedPinnedRev,
+    /// The toolchain-bundled binary: accepted only after the `--help` capability probe, and its
+    /// rev is NOT verified, so runs record [`BUNDLED_CON_LECHE_PROVENANCE_MARKER`], never the
+    /// pinned rev.
+    ToolchainBundledProbed,
+}
+
+/// The `con_leche_rev` value recorded for a toolchain-bundled binary: a probed-capability
+/// marker, because the capability probe establishes the CLI surface, not the rev.
+pub const BUNDLED_CON_LECHE_PROVENANCE_MARKER: &str =
+    "toolchain-bundled:rev-unverified:olean-help-probed";
+
+/// The capability probe for the bundled candidate (G1c r2):
+/// selection accepts a toolchain-bundled binary only when its `--help` advertises the `--olean`
+/// mode the executing sites require (`verify_olean_modules_with_con_leche`). Measured live on
+/// 2026-11-26: the v4.35.0 toolchain ships a con-leche whose usage has no `--olean` ("unknown
+/// option --olean", exit 3), so on such a host `auto` falls back to standard, the pre-G1c
+/// behavior.
+fn con_leche_help_advertises_olean(binary_path: &Path) -> bool {
+    let Ok(out) = Command::new(binary_path).arg("--help").output() else {
+        return false;
+    };
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    text.contains("--olean")
+}
+
+/// The rev claim recorded for an EXECUTED binary: the probe marker when the binary is the
+/// toolchain-bundled candidate (its rev is unverified), the pinned rev otherwise (provisioned
+/// binaries are pinned-rev by the provisioning contract).
+fn executed_con_leche_rev_claim(binary_path: &Path) -> String {
+    let bundled = bundled_toolchain_con_leche_binary(
+        PINNED_CON_LECHE_TOOLCHAIN,
+        elan_home_dir().as_deref(),
+    )
+    .and_then(|p| p.canonicalize().ok());
+    if bundled.is_some()
+        && (bundled.as_deref() == Some(binary_path) || bundled == binary_path.canonicalize().ok())
+    {
+        BUNDLED_CON_LECHE_PROVENANCE_MARKER.to_string()
+    } else {
+        PINNED_CON_LECHE_REV.to_string()
+    }
+}
+
 /// G1c r2: the ONE discovery used by both the selection probe and every executing site
 /// (`ci-verify`, `pr-verify` head statements, `check --emit-olean`), so selection and execution
 /// cannot disagree about which binary provisions a resolved engine (review 22ae951a F1).
@@ -470,6 +532,21 @@ pub fn discover_con_leche_binary_for_selection(
     lean_toolchain: &str,
     workspace_root: Option<&Path>,
 ) -> Result<PathBuf> {
+    discover_con_leche_binary_for_selection_with_provenance(
+        requested,
+        lean_toolchain,
+        workspace_root,
+    )
+    .map(|(bin, _)| bin)
+}
+
+/// [`discover_con_leche_binary_for_selection`] plus the provenance of the accepted binary, for
+/// callers that record a `con_leche_rev` (the selection probe).
+pub fn discover_con_leche_binary_for_selection_with_provenance(
+    requested: KernelEngineSelection,
+    lean_toolchain: &str,
+    workspace_root: Option<&Path>,
+) -> Result<(PathBuf, ConLecheBinaryProvenance)> {
     let env_provisioned = std::env::var(CON_LECHE_BIN_ENV)
         .map(|raw| !raw.trim().is_empty())
         .unwrap_or(false);
@@ -480,11 +557,13 @@ pub fn discover_con_leche_binary_for_selection(
         discover_con_leche_binary(workspace_root),
         env_provisioned,
         elan_home_dir().as_deref(),
+        &con_leche_help_advertises_olean,
     )
 }
 
 /// The env-free core of [`discover_con_leche_binary_for_selection`], with the provisioned
-/// discovery outcome and the elan home injected for unit testing (review 22ae951a F6).
+/// discovery outcome, the elan home and the `--olean` capability probe injected for unit
+/// testing (review 22ae951a F6).
 fn discover_con_leche_binary_for_selection_impl(
     requested: KernelEngineSelection,
     lean_toolchain: &str,
@@ -492,7 +571,8 @@ fn discover_con_leche_binary_for_selection_impl(
     provisioned: Result<PathBuf>,
     env_provisioned: bool,
     elan_home: Option<&Path>,
-) -> Result<PathBuf> {
+    bundled_olean_capable: &dyn Fn(&Path) -> bool,
+) -> Result<(PathBuf, ConLecheBinaryProvenance)> {
     // The checkout the identity and containment gates measure against. A workspace root that
     // cannot be canonicalized fails the gates closed for every selection.
     let checkout: Option<PathBuf> = match workspace_root {
@@ -512,7 +592,7 @@ fn discover_con_leche_binary_for_selection_impl(
             ),
         },
     };
-    let bundled_fallback = |err: anyhow::Error| -> Result<PathBuf> {
+    let bundled_fallback = |err: anyhow::Error| -> Result<(PathBuf, ConLecheBinaryProvenance)> {
         // Only `auto` consults the bundled binary, and never while `TURBO_CON_LECHE_BIN` is set:
         // a set-but-invalid provisioning env is a reported misconfiguration, not a silent switch
         // to another binary (review 22ae951a F4).
@@ -534,7 +614,16 @@ fn discover_con_leche_binary_for_selection_impl(
                 return Err(err);
             }
         }
-        Ok(canon)
+        // Capability gate (G1c r2): the bundled binary is
+        // accepted only when it advertises the `--olean` mode the executing sites require;
+        // otherwise `auto` falls back to standard, the pre-G1c behavior.
+        if !bundled_olean_capable(&canon) {
+            return Err(err.context(format!(
+                "toolchain-bundled `con-leche` at `{}` rejected: its `--help` does not advertise `--olean` (capability probe; `auto` falls back to standard)",
+                canon.display()
+            )));
+        }
+        Ok((canon, ConLecheBinaryProvenance::ToolchainBundledProbed))
     };
     let bin = match provisioned {
         Ok(bin) => bin,
@@ -554,7 +643,7 @@ fn discover_con_leche_binary_for_selection_impl(
             }
         }
     }
-    Ok(bin)
+    Ok((bin, ConLecheBinaryProvenance::ProvisionedPinnedRev))
 }
 
 fn parse_accepted_declarations(stdout: &str) -> Option<u64> {
@@ -636,11 +725,12 @@ fn classify_con_leche_status(
     } else {
         None
     };
+    let con_leche_rev = executed_con_leche_rev_claim(&binary_path);
     Ok(ConLecheRunReport {
         verdict,
         exit_code: code,
         binary_path,
-        con_leche_rev: PINNED_CON_LECHE_REV.to_string(),
+        con_leche_rev,
         jobs,
         accepted_declarations,
         stdout,
@@ -1742,7 +1832,8 @@ mod tests {
     #[test]
     fn test_selection_discovery_matrix_bundled_and_provisioned() {
         // G1c r2: the env-free injected-lookup matrix over the shared selection discovery
-        // (review 22ae951a F1/F4/F6). No environment variable is read or written.
+        // (review 22ae951a F1/F4/F6; --olean capability probe, G1c r2). No environment variable is read or written, and no binary
+        // is executed: the capability probe is injected.
         let tmp = std::env::temp_dir().join(format!(
             "turbo_lean_g1c_selmx_{}_{}",
             std::process::id(),
@@ -1757,6 +1848,8 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::create_dir_all(&bin_dir).unwrap();
         let not_found = || anyhow::anyhow!("no provisioned con-leche");
+        let olean_capable: &dyn Fn(&Path) -> bool = &|_| true;
+        let olean_incapable: &dyn Fn(&Path) -> bool = &|_| false;
         let write_exec = |p: &Path| {
             std::fs::write(p, b"#!/bin/sh\nexit 0\n").unwrap();
             #[cfg(unix)]
@@ -1774,24 +1867,45 @@ mod tests {
             Err(not_found()),
             false,
             Some(&elan),
+            olean_capable,
         )
         .is_err());
 
-        // 2. auto with the bundled executable present: selected, canonicalized.
+        // 2. auto with a bundled executable that passes the capability probe: selected,
+        //    canonicalized, recorded as probed bundled provenance (never the pinned rev).
         let bundled = bin_dir.join("con-leche");
         write_exec(&bundled);
-        let got = discover_con_leche_binary_for_selection_impl(
+        let (got, provenance) = discover_con_leche_binary_for_selection_impl(
             KernelEngineSelection::Auto,
             PINNED_CON_LECHE_TOOLCHAIN,
             Some(&ws),
             Err(not_found()),
             false,
             Some(&elan),
+            olean_capable,
         )
         .unwrap();
         assert_eq!(got, bundled.canonicalize().unwrap());
+        assert_eq!(provenance, ConLecheBinaryProvenance::ToolchainBundledProbed);
 
-        // 3. explicit selections never take the bundled binary.
+        // 2b. auto with a bundled executable that FAILS the --olean capability probe: rejected,
+        //     with both the probe rejection and the original provisioned error reported
+        //     (auto falls back to standard, the pre-G1c behavior).
+        let err = discover_con_leche_binary_for_selection_impl(
+            KernelEngineSelection::Auto,
+            PINNED_CON_LECHE_TOOLCHAIN,
+            Some(&ws),
+            Err(not_found()),
+            false,
+            Some(&elan),
+            olean_incapable,
+        )
+        .unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("does not advertise `--olean`"), "{chain}");
+        assert!(chain.contains("no provisioned con-leche"), "{chain}");
+
+        // 3. explicit selections never take the bundled binary, however capable.
         for req in [KernelEngineSelection::ConLeche, KernelEngineSelection::Both] {
             assert!(
                 discover_con_leche_binary_for_selection_impl(
@@ -1801,6 +1915,7 @@ mod tests {
                     Err(not_found()),
                     false,
                     Some(&elan),
+                    olean_capable,
                 )
                 .is_err(),
                 "explicit {req} must not take the bundled binary"
@@ -1816,6 +1931,7 @@ mod tests {
             Err(anyhow::anyhow!("`TURBO_CON_LECHE_BIN` points to missing or non-executable")),
             true,
             Some(&elan),
+            olean_capable,
         )
         .unwrap_err();
         assert!(err.to_string().contains("points to missing"));
@@ -1828,6 +1944,7 @@ mod tests {
             Err(not_found()),
             false,
             Some(&elan),
+            olean_capable,
         )
         .is_err());
 
@@ -1839,10 +1956,12 @@ mod tests {
             Err(not_found()),
             false,
             Some(Path::new("relative/elan")),
+            olean_capable,
         )
         .is_err());
 
-        // 7. a bundled binary under the checkout is rejected (review 22ae951a F4).
+        // 7. a bundled binary under the checkout is rejected (review 22ae951a F4), before the
+        //    capability probe is ever consulted.
         let ws2 = tmp.join("co");
         std::fs::create_dir_all(ws2.join(".git")).unwrap();
         let elan2 = ws2.join("elan");
@@ -1856,24 +1975,28 @@ mod tests {
             Err(not_found()),
             false,
             Some(&elan2),
+            olean_capable,
         )
         .is_err());
 
-        // 8. a provisioned binary outside any checkout is accepted as-is.
+        // 8. a provisioned binary outside any checkout is accepted as-is, with pinned-rev
+        //    provenance and no capability probe (the probe is for the bundled candidate only).
         let prov = tmp.join("prov").join("con-leche");
         std::fs::create_dir_all(prov.parent().unwrap()).unwrap();
         write_exec(&prov);
         let prov = prov.canonicalize().unwrap();
-        let got = discover_con_leche_binary_for_selection_impl(
+        let (got, provenance) = discover_con_leche_binary_for_selection_impl(
             KernelEngineSelection::ConLeche,
             PINNED_CON_LECHE_TOOLCHAIN,
             Some(&ws),
             Ok(prov.clone()),
             true,
             None,
+            olean_incapable,
         )
         .unwrap();
         assert_eq!(got, prov);
+        assert_eq!(provenance, ConLecheBinaryProvenance::ProvisionedPinnedRev);
 
         // 9. a provisioned binary inside the checkout that is not that checkout's bridge binary
         //    is refused for explicit selections, and auto then tries the bundled binary
@@ -1889,15 +2012,17 @@ mod tests {
             Ok(inside.clone()),
             false,
             Some(&elan),
+            olean_capable,
         )
         .is_err());
-        let got = discover_con_leche_binary_for_selection_impl(
+        let (got, provenance) = discover_con_leche_binary_for_selection_impl(
             KernelEngineSelection::Auto,
             PINNED_CON_LECHE_TOOLCHAIN,
             Some(&ws2),
             Ok(inside),
             false,
             Some(&elan),
+            olean_capable,
         )
         .unwrap();
         assert_eq!(
@@ -1905,6 +2030,7 @@ mod tests {
             bundled.canonicalize().unwrap(),
             "auto must try the bundled binary when the identity gate rejects a discovered one"
         );
+        assert_eq!(provenance, ConLecheBinaryProvenance::ToolchainBundledProbed);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1912,8 +2038,9 @@ mod tests {
     #[test]
     fn test_kernel_auto_selects_bundled_con_leche_on_pinned_toolchain() {
         // G1c: `--kernel auto` performs the real support probe through the env-reading wrapper.
-        // On the pinned toolchain with a bundled binary under ELAN_HOME it resolves con-leche at
-        // the pinned rev whether or not the host carries a provisioned bridge binary (an
+        // On the pinned toolchain with a bundled, --olean-capable binary under ELAN_HOME it
+        // resolves con-leche with the probed bundled-provenance marker (never the unverified
+        // pinned rev) whether or not the host carries a provisioned bridge binary (an
         // identity-rejected discovery falls back to the bundled binary); off the pin it resolves
         // standard; explicit selections keep failing closed on provisioned binaries only. Env
         // mutation is RAII-guarded and serialized (review 22ae951a F6).
@@ -1946,14 +2073,36 @@ mod tests {
         assert_eq!(std_prov.kernel_engine, ResolvedKernelEngine::Standard);
         assert!(std_prov.fallback_reason.is_some());
 
-        // Bundled executable present: auto selects con-leche with the pinned rev, no fallback.
+        // A bundled executable whose --help does NOT advertise --olean (the live v4.35.0
+        // toolchain's measured shape) fails the capability probe: auto stays standard with a
+        // reason (G1c r2 capability gate).
         let bundled = bin_dir.join("con-leche");
-        std::fs::write(&bundled, b"#!/bin/sh\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bundled, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let make_bundled = |usage: &str| {
+            std::fs::write(
+                &bundled,
+                format!("#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo \"{usage}\"; fi\nexit 0\n"),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&bundled, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+        };
+        make_bundled("usage: con-leche [--verified|--trusted] FILE.ndjson");
+        let incapable_prov = resolve_kernel_engine_in_workspace(
+            KernelEngineSelection::Auto,
+            PINNED_CON_LECHE_TOOLCHAIN,
+            Some(&ws),
+        )
+        .unwrap();
+        assert_eq!(incapable_prov.kernel_engine, ResolvedKernelEngine::Standard);
+        assert!(incapable_prov.fallback_reason.is_some());
+
+        // Bundled executable advertising --olean: auto selects con-leche, recording the probed
+        // bundled-provenance marker, no fallback.
+        make_bundled("usage: con-leche [--verified|--trusted] [--olean] FILE.ndjson");
         let auto_prov = resolve_kernel_engine_in_workspace(
             KernelEngineSelection::Auto,
             PINNED_CON_LECHE_TOOLCHAIN,
@@ -1967,7 +2116,7 @@ mod tests {
         );
         assert_eq!(
             auto_prov.con_leche_rev.as_deref(),
-            Some(PINNED_CON_LECHE_REV)
+            Some(BUNDLED_CON_LECHE_PROVENANCE_MARKER)
         );
         assert_eq!(auto_prov.fallback_reason, None);
 

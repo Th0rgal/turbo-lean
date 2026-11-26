@@ -25,9 +25,14 @@
   probe accepts is the binary the runner executes: it checks the pinned toolchain and the
   provisioned (`TURBO_CON_LECHE_BIN` / bridge) binaries, and for `auto` only it additionally
   accepts the toolchain-bundled binary at `$ELAN_HOME/toolchains/<pinned>/bin/con-leche`
-  (`bundled_toolchain_con_leche_binary`), canonicalized and rejected when it lies under the
-  checkout. Explicit `con-leche`/`both` selections keep failing closed on the provisioned
-  binaries only. Pinned both ways by
+  (`bundled_toolchain_con_leche_binary`), canonicalized, rejected when it lies under the
+  checkout, and accepted only when its `--help` advertises the `--olean` mode the executing
+  sites require (`con_leche_help_advertises_olean`; a bundled binary without it makes `auto`
+  fall back to standard). An accepted bundled binary's rev is NOT verified, so its recorded
+  `con_leche_rev` is the probed-capability marker
+  (`BUNDLED_CON_LECHE_PROVENANCE_MARKER`), never the pinned rev, which is recorded for the
+  identity-gated provisioned binaries only. Explicit `con-leche`/`both` selections keep failing
+  closed on the provisioned binaries only. Pinned both ways by
   `test_kernel_auto_selects_bundled_con_leche_on_pinned_toolchain` and the env-free selection
   matrix over `discover_con_leche_binary_for_selection_impl` (`kernel.rs`).
 - **Not yet inventoried**: end-to-end confirmation of the engine that executes for each CLI entrypoint

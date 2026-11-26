@@ -330,11 +330,13 @@ fn pr_and_ci_verify_base_policy_isolation_and_receipt_verification() {
     assert_eq!(ci_json["kernel_requested"], "auto");
     assert_eq!(ci_json["lean_toolchain"], toolchain);
     // Host-honest resolved-engine assertion (G1c r2): `auto` accepts the toolchain-bundled
-    // con-leche when the host has one, so compute bundled-binary presence the way the
-    // resolver's probe computes it (`ELAN_HOME` else `$HOME/.elan`, elan's mangling of the
-    // pinned toolchain, an executable file at `bin/con-leche`) and assert the resolved
-    // engine / rev against that presence instead of pinning one host's answer.
-    let bundled_present = kernel::normalize_lean_toolchain(toolchain)
+    // con-leche when the host has a CAPABLE one, so compute bundled-binary acceptance the way
+    // the resolver's probe computes it (`ELAN_HOME` else `$HOME/.elan`, elan's mangling of the
+    // pinned toolchain, an executable file at `bin/con-leche`, whose `--help` advertises the
+    // `--olean` mode the executing sites require) and assert the resolved engine / recorded
+    // provenance against that, instead of pinning one host's answer. A capable bundled binary
+    // records the probed-capability marker, never the unverified pinned rev (G1c r2).
+    let bundled_accepted = kernel::normalize_lean_toolchain(toolchain)
         == kernel::PINNED_CON_LECHE_TOOLCHAIN
         && std::env::var_os("ELAN_HOME")
             .map(PathBuf::from)
@@ -349,18 +351,32 @@ fn pr_and_ci_verify_base_policy_isolation_and_receipt_verification() {
                     .join(dir_name)
                     .join("bin")
                     .join("con-leche");
-                bin.metadata()
+                let executable = bin
+                    .metadata()
                     .map(|m| {
                         m.is_file()
                             && std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o111
                                 != 0
                     })
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                executable
+                    && Command::new(&bin)
+                        .arg("--help")
+                        .output()
+                        .map(|out| {
+                            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+                            text.push_str(&String::from_utf8_lossy(&out.stderr));
+                            text.contains("--olean")
+                        })
+                        .unwrap_or(false)
             })
             .unwrap_or(false);
-    if bundled_present {
+    if bundled_accepted {
         assert_eq!(ci_json["kernel_engine"], "con-leche");
-        assert_eq!(ci_json["con_leche_rev"], kernel::PINNED_CON_LECHE_REV);
+        assert_eq!(
+            ci_json["con_leche_rev"],
+            kernel::BUNDLED_CON_LECHE_PROVENANCE_MARKER
+        );
     } else {
         assert_eq!(ci_json["kernel_engine"], "standard");
         assert!(ci_json["con_leche_rev"].is_null());
