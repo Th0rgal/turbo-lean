@@ -3954,8 +3954,9 @@ fn kernel_witness_probe_theorems(
 /// original sources of the local `def`/`abbrev` commands the candidate texts
 /// (transitively) reference, and the side/gate theorems, never the audited source
 /// itself. This is the fallback for audited sources whose verbatim embedding does not
-/// re-elaborate in the probe module (their own elaboration errors, or imports that
-/// resolve only inside their package build): the witness replay needs the definitions a
+/// re-elaborate in the probe module because of its OWN elaboration errors; a pure
+/// header-import failure aborts as `imports_unresolved` and never reaches this
+/// fallback (A2 r3; review 29baa2ab F6): the witness replay needs the definitions a
 /// candidate text mentions, not the audited file's proofs or imports.
 pub(super) fn build_kernel_witness_minimal_probe_src(
     local_def_srcs: &[(String, String, bool)],
@@ -4310,6 +4311,9 @@ fn audited_src_declares_probe_hostile_commands(clean_src: &str) -> bool {
                 if rest[..end].contains("instance")
                     || rest[..end].contains("macro")
                     || rest[..end].contains("elab")
+                    // Review 29baa2ab F4 residual: `@[tactic k]` registers a tactic
+                    // elaborator without carrying any of the three substrings above.
+                    || rest[..end].contains("tactic")
                 {
                     return true;
                 }
@@ -5183,8 +5187,9 @@ fn audit_spec_file_or_source_with_policy_inner(
         // sides-only (one fragile gate must not discard every certification); then the
         // self-contained fallback (the harness plus the local defs the candidate texts
         // reference, nothing else), gated then sides-only, for audited sources whose
-        // verbatim embedding does not re-elaborate in the probe module (their own
-        // elaboration errors, or imports that resolve only inside their package build).
+        // verbatim embedding does not re-elaborate in the probe module because of its
+        // OWN elaboration errors (a pure header-import failure aborts earlier as
+        // `imports_unresolved` and never reaches this fallback; review 29baa2ab F6).
         // A batch that still rejects is retried candidate by candidate (one
         // non-replaying candidate must not poison the batch). A rejected probe
         // downgrades nothing: the eval-level labels simply stand.
