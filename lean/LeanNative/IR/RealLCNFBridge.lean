@@ -529,7 +529,7 @@ def lowerImpureLetValuePure (ctx : RealBridgeCtx) (st : RealBridgeState)
     if isUnboxedScalarOrTuple (st.getVarType v) then return (.scalar (.var v), st)
     throw "[lean-native] Unsupported heap reset instruction in Stage 1B"
 
-/-- Pure type inference for a lowered impure right-hand side (`BridgeHelpers.inferImpureRhsType`). -/
+/-- Pure type inference for a lowered impure right-hand side. -/
 def inferImpureRhsTypePure (st : RealBridgeState) (rhs : LNIRExpr) (declTy : LNIRType) (isBox : Bool) : LNIRType :=
   if isBox then
     match rhs with
@@ -552,7 +552,7 @@ def inferImpureRhsTypePure (st : RealBridgeState) (rhs : LNIRExpr) (declTy : LNI
       | _ => declTy
     | _ => declTy
 
-/-- Pure reference-counting instruction lowering (`Code.inc` / `Code.dec`, shared with `BridgeHelpers.lowerRefOp`). -/
+/-- Pure reference-counting instruction lowering (`Code.inc` / `Code.dec`). -/
 def lowerRefOpPure (isInc : Bool) (vid : VarId) (vt : LNIRType) (n : Nat) (kCode : LNIRCode) :
     Except String LNIRCode :=
   if isUnboxedScalarOrTuple vt then .ok kCode

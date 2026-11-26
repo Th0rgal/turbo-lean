@@ -38,43 +38,6 @@ def collectLetValueFVarsImpure (acc : List Lean.FVarId) (lv : Lean.Compiler.LCNF
   | .oproj _ id _ | .uproj _ id _ | .sproj _ _ id _ | .box _ id _ | .unbox id _
   | .isShared id _ | .reset _ id _ => add acc id
 
-/-- Collect free operand `FVarId`s in `Code .impure` (excluding `.jmp` join-point targets and locally bound vars). -/
-partial def collectFreeCodeFVarsImpure (bound : Std.HashSet Lean.FVarId) (acc : List Lean.FVarId)
-    (code : Lean.Compiler.LCNF.Code .impure) : List Lean.FVarId :=
-  let addIfFree (xs : List Lean.FVarId) (id : Lean.FVarId) :=
-    if bound.contains id || xs.contains id then xs else xs ++ [id]
-  let addArg (xs : List Lean.FVarId) : Lean.Compiler.LCNF.Arg .impure → List Lean.FVarId
-    | .fvar id => addIfFree xs id
-    | _ => xs
-  match code with
-  | .let decl k =>
-    let acc1 := (collectLetValueFVarsImpure [] decl.value).foldl addIfFree acc
-    collectFreeCodeFVarsImpure (bound.insert decl.fvarId) acc1 k
-  | .jp decl k =>
-    let boundJp := decl.params.foldl (fun s p => s.insert p.fvarId) (bound.insert decl.fvarId)
-    let acc1 := collectFreeCodeFVarsImpure boundJp acc decl.value
-    collectFreeCodeFVarsImpure (bound.insert decl.fvarId) acc1 k
-  | .fun decl k _ =>
-    let boundFn := decl.params.foldl (fun s p => s.insert p.fvarId) (bound.insert decl.fvarId)
-    let acc1 := collectFreeCodeFVarsImpure boundFn acc decl.value
-    collectFreeCodeFVarsImpure (bound.insert decl.fvarId) acc1 k
-  | .jmp _ args => args.foldl addArg acc
-  | .inc id _ _ _ k _ | .dec id _ _ _ _ k _ | .del id k _ | .setTag id _ k _ =>
-    collectFreeCodeFVarsImpure bound (addIfFree acc id) k
-  | .oset id _ y k _ =>
-    collectFreeCodeFVarsImpure bound (addArg (addIfFree acc id) y) k
-  | .uset id _ y k _ | .sset id _ _ y _ k _ =>
-    collectFreeCodeFVarsImpure bound (addIfFree (addIfFree acc id) y) k
-  | .cases c =>
-    let acc1 := addIfFree acc c.discr
-    c.alts.foldl (fun a alt =>
-      let bAlt := match alt with
-        | .alt _ ps _ _ => ps.foldl (fun s p => s.insert p.fvarId) bound
-        | _ => bound
-      collectFreeCodeFVarsImpure bAlt a alt.getCode) acc1
-  | .return id => addIfFree acc id
-  | .unreach _ => acc
-
 private partial def collectCodeTypeExprs (acc : List Lean.Expr) (code : Lean.Compiler.LCNF.Code .impure) : List Lean.Expr :=
   let addExpr (xs : List Lean.Expr) (e : Lean.Expr) := if xs.contains e then xs else xs ++ [e]
   match code with
@@ -389,48 +352,6 @@ def syncRealToBridgeStateM (rst : RealLCNFBridge.RealBridgeState) : BridgeM Unit
     nextVarId := max st.nextVarId rst.nextVarId
   }
 
-/-- Delegate `LetValue .impure` lowering directly to `RealLCNFBridge.lowerImpureLetValuePure`. -/
-def lowerImpureLetValueViaRealM (lv : Lean.Compiler.LCNF.LetValue .impure) (retTy : LNIRType) : BridgeM LNIRExpr := do
-  if let .fvar fvarId args := lv then
-    if args.isEmpty && (← get).localFunMap.contains fvarId then
-      Lean.throwError "[lean-native] Unsupported escaping local function value"
-  let freeFVars := collectLetValueFVarsImpure [] lv
-  let (ctors, callees) := collectLetValueCtorAndCalleeNames [] [] lv
-  let st ← get
-  let ctx ← buildRealBridgeCtxM [] (ctors ++ st.fvarCtor.toList.map Prod.snd ++ st.activeCtor.toList.map Prod.snd)
-    callees [] st.fvarCtor.toList
-  let rst ← bridgeStateToRealM freeFVars
-  match RealLCNFBridge.lowerImpureLetValuePure ctx rst lv retTy with
-  | .ok (expr, rst') =>
-    syncRealToBridgeStateM rst'
-    return expr
-  | .error msg => Lean.throwError msg
-
-/-- Delegate `Code .impure` lowering directly to `RealLCNFBridge.lowerRealLCNFCode`. -/
-def lowerImpureCodeViaRealM (rawCode : Lean.Compiler.LCNF.Code .impure) : BridgeM LNIRCode := do
-  let code ← if (← get).arch.isFreestandingEmbedded then
-    normalizeEmbeddedSliceGetBang {} {} rawCode
-  else pure rawCode
-  checkImpureLetTypesM code
-  let freeFVars := collectFreeCodeFVarsImpure {} [] code
-  for fv in freeFVars do
-    if (← get).localFunMap.contains fv then
-      Lean.throwError "[lean-native] Unsupported higher-order / escaping local function value"
-  let typeExprs := collectCodeTypeExprs [] code
-  let (ctors, callees) := collectCodeCtorAndCalleeNames [] [] code
-  let st ← get
-  let knownCtors := (collectFVarCtors code).fold (fun m k v => m.insert k v) st.fvarCtor
-  let ctx ← buildRealBridgeCtxM typeExprs
-    (ctors ++ knownCtors.toList.map Prod.snd ++ st.activeCtor.toList.map Prod.snd)
-    callees [] knownCtors.toList
-  let rst ← bridgeStateToRealM freeFVars
-  let fuel := codeAstFuel code + 64
-  match RealLCNFBridge.lowerRealLCNFCode fuel ctx rst code with
-  | .ok (lnir, rst') =>
-    syncRealToBridgeStateM rst'
-    return lnir
-  | .error msg => Lean.throwError msg
-
 partial def pureCodeAstFuel : Lean.Compiler.LCNF.Code .pure → Nat
   | .let _ k => 1 + pureCodeAstFuel k
   | .fun d k _ | .jp d k => 1 + pureCodeAstFuel d.value + pureCodeAstFuel k
@@ -507,17 +428,6 @@ def attachBaseDeclFactsM (declName : Lean.Name) (d : LNIRDecl) : Lean.CoreM LNIR
         pure (rawFacts.filter (factVarsInScope paramTys))
   let merged := (sigFacts ++ baseFacts).foldl LeanNative.IR.consFact d.retainedFacts
   return { d with retainedFacts := merged }
-
-def extractPureDeclFactsWithBridgeState (decl : Lean.Compiler.LCNF.Decl .pure)
-    (st : BridgeState) (d : LNIRDecl) : LNIRDecl :=
-  let seedMap := st.fvarToVar.toList
-  let fuel := decl.params.size +
-    (match decl.value with | .code c => pureCodeAstFuel c | .extern _ => 0) + 128
-  let liveVarTys := collectDeclVarTys (d.params.map fun p => (p.id, p.ty)) d.body
-  let facts := (LeanNative.Frontend.ProofRetention.retainedPureDeclFactsWithSeed
-    fuel seedMap st.nextVarId decl).filter (factVarsInScope liveVarTys)
-  let merged := facts.foldl LeanNative.IR.consFact d.retainedFacts
-  { d with retainedFacts := merged }
 
 /-- Effective return type of a compression candidate: the returned tuple shape when the body
     returns a freshly built tuple, the base declaration's `retTy` otherwise. -/
