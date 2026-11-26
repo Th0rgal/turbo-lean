@@ -42,19 +42,31 @@ GUARD_REFUSAL = "test guard refused"
 BENCH_CMD = [sys.executable, str(Path(__file__).resolve()), "--run-guarded", str(SCRIPT)]
 
 
-# Pids of processes a test started through Popen and recorded here, so the guard
-# admits them even when /proc cannot show the parent chain (a sandbox that hides
-# parents, or a subreaper that adopted them).
+# Processes a test started through Popen and recorded here as (pid, start time),
+# so the guard admits them even when /proc cannot show the parent chain (a sandbox
+# that hides parents, or a subreaper that adopted them). The start time keeps a
+# reused pid of an unrelated process out.
 RECORDED_PIDS = set()
 
 
+def _start_time(pid: int):
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rpartition(") ")[2].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
 def record_started(popen) -> None:
-    RECORDED_PIDS.add(popen.pid)
+    RECORDED_PIDS.add((popen.pid, _start_time(popen.pid)))
+
+
+def forget_started(popen) -> None:
+    RECORDED_PIDS.difference_update({r for r in RECORDED_PIDS if r[0] == popen.pid})
 
 
 def started_by_this_run(pid: int) -> bool:
     """True when `pid` is this test process, a recorded child, or a descendant."""
-    if pid in RECORDED_PIDS:
+    if any(pid == p and t is not None and t == _start_time(pid) for p, t in RECORDED_PIDS):
         return True
     me = os.getpid()
     for _ in range(64):
@@ -2036,8 +2048,37 @@ class CommittedArtifactIsPathFree(unittest.TestCase):
             self.assertNotIn(str(root), scrubbed)
             self.assertIn("<git-dir>/git", scrubbed)
             # A bare `git` found on PATH has no directory to scrub.
-            self.assertIsNotNone(mod.host_path_roots(root / "scratch", dirs,
-                                                     root / "bin" / "turbo-lean", "git"))
+            bare = mod.host_path_roots(root / "scratch", dirs, root / "bin" / "turbo-lean", "git")
+            self.assertNotIn("<git-dir>", [p for _r, p in bare])
+
+    def test_a_baseline_in_any_earlier_form_still_matches_the_live_environment(self):
+        # The baseline was recorded in the raw, the unkeyed-digest or the keyed era;
+        # the run being compared reads the live environment, whose value is the same.
+        mod = self.load()
+        live = "/usr/bin/git"
+        base = full_valid_baseline(mod)
+        res = {"settings": dict(base["settings"])}
+        res["settings"]["TURBO_LEAN_GIT"] = mod.recorded_setting("TURBO_LEAN_GIT", live)
+        for form in (live, self.legacy_digest(live), self.digest(live), "<set>"):
+            with self.subTest(form=form), mock.patch.dict(os.environ, {"TURBO_LEAN_GIT": live}):
+                base["settings"]["TURBO_LEAN_GIT"] = form
+                self.assertTrue(mod.settings_match(base, res))
+        # A baseline of a different path, in any form, still differs.
+        other = "/opt/git/bin/git"
+        for form in (other, self.legacy_digest(other), self.digest(other)):
+            with self.subTest(other=form), mock.patch.dict(os.environ, {"TURBO_LEAN_GIT": live}):
+                base["settings"]["TURBO_LEAN_GIT"] = form
+                self.assertFalse(mod.settings_match(base, res))
+
+    def test_the_grace_knobs_reject_non_finite_values_and_are_recorded(self):
+        mod = load_script()
+        for name in ("TURBO_LEAN_BENCH_DAEMON_TERM_GRACE_S", "TURBO_LEAN_BENCH_DAEMON_KILL_GRACE_S"):
+            self.assertIn(name, mod.RECORDED_ENV_VARS)
+            for bad in ("inf", "-inf", "nan", "-1", "x"):
+                with mock.patch.dict(os.environ, {name: bad}):
+                    self.assertEqual(mod._grace_from_env(name, 2.5), 2.5, bad)
+            with mock.patch.dict(os.environ, {name: "7.5"}):
+                self.assertEqual(mod._grace_from_env(name, 2.5), 7.5)
 
     def test_scrub_replaces_the_longest_root_first_and_never_the_filesystem_root(self):
         mod = load_script()
@@ -2186,6 +2227,7 @@ class ForeignSignalGuard(unittest.TestCase):
                         sent = mod._signal_scanned(child.pid, start, signal.SIGTERM)
                     self.assertEqual(sent, signalled)
                 finally:
+                    forget_started(child)
                     child.kill()
                     child.wait(timeout=10)
 
@@ -2193,12 +2235,26 @@ class ForeignSignalGuard(unittest.TestCase):
         REFUSED_SIGNALS.clear()
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         try:
-            with mock.patch.object(Path, "read_text", side_effect=OSError("no /proc parents")):
-                self.assertFalse(started_by_this_run(child.pid))
-                record_started(child)
+            record_started(child)
+            real_chain = Path.read_text
+
+            def no_parents(self, *a, **kw):
+                # The parent chain is unreadable; the start time (field 22) still is.
+                if self.name == "stat":
+                    text = real_chain(self, *a, **kw)
+                    head, sep, rest = text.rpartition(") ")
+                    fields = rest.split()
+                    fields[1] = "1"  # a parent the walk will not find in the test tree
+                    return head + sep + " ".join(fields)
+                return real_chain(self, *a, **kw)
+            with mock.patch.object(Path, "read_text", no_parents):
                 self.assertTrue(started_by_this_run(child.pid))
+                # The same pid with another start time is a different process.
+                forget_started(child)
+                RECORDED_PIDS.add((child.pid, "0"))
+                self.assertFalse(started_by_this_run(child.pid))
         finally:
-            RECORDED_PIDS.discard(child.pid)
+            forget_started(child)
             child.kill()
             child.wait(timeout=10)
 
@@ -2250,6 +2306,7 @@ class DaemonCleanup(NoForeignSignals, unittest.TestCase):
         if p.poll() is None:
             p.kill()
         p.wait(timeout=10)
+        forget_started(p)
 
     @staticmethod
     def wait_until_listed(mod, staging, bin_path, n):
