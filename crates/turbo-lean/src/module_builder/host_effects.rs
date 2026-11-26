@@ -53,30 +53,32 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
     // alone. Its importers stay pinned to its artifact digest through the
     // verified-source stamps and Lake traces, so a rebuilt artifact still invalidates
     // them without deleting whole import closures up front. Deletion honors the #434
-    // ownership guard: a module the project does not own is never deleted here, and
-    // because its stale artifacts may embed host state that Lake's traces do not
-    // cover, such a refusal fails the walk closed (below) instead of skipping
-    // silently.
+    // ownership guard: a module the project does not own is never deleted here. A
+    // refusal is keyed on that module's OWN artifact: when it is fresh (what the pin
+    // built, or nothing on disk at all), the module is marked spreading instead, so
+    // the owned importers are purged and rebuilt against its digest and the refresh
+    // completes — a pinned `#eval` or `run_cmd` is a static property of the source,
+    // and bailing on it would brick every later refresh. Only a stale unowned
+    // artifact fails the walk closed (below) instead of skipping silently, because a
+    // later build could reuse it as fresh and only its own workspace may rebuild it.
     let mut spreading: HashSet<(PathBuf, String)> = HashSet::new();
     let mut purged_any = false;
     for spec in postorder {
         let key = (spec.pkg_root.clone(), spec.module_name.clone());
         let purgeable = spec_artifacts_purgeable_from_project_root(cfg, &spec);
-        // A refusal must never become a silent skip: these artifacts may embed host
-        // state, and Lake's traces do not cover host reads, so leaving them in place
-        // lets a later build reuse them as fresh — #438's original defect in another
-        // guise. A clean pin does not cover them either: a pinned `run_cmd` host read
-        // or untracked `include_str` target changes without moving the pin, and a
-        // pinned importer of a spreading module embeds the upstream reads. Deleting is
-        // not ours to do (#434: the package belongs to a shared or foreign checkout),
-        // so the walk fails closed, deletes nothing, and names the ways forward.
+        // The stale-and-unowned case: these artifacts may embed host state, Lake's
+        // traces do not cover host reads, and deleting is not ours to do (#434: the
+        // package belongs to a shared or foreign checkout), so the walk fails closed,
+        // deletes nothing, and names the action that clears the condition: an
+        // own-workspace rebuild refreshes the stale artifact, after which this walk
+        // takes the mark-spreading arm instead.
         let refuse_purge = |spec: &DiscoveredModuleSpec| -> Result<()> {
             anyhow::bail!(
-                "Failed to purge stale build artifact(s) of {} ({}): the package is not \
-                 purgeable from this project root (a shared or foreign checkout). \
-                 Rebuild it in its own workspace (`lake build {}` from {}), or rerun \
-                 with --no-auto-worktree-link to keep this project from refreshing \
-                 shared dependencies.",
+                "Failed to purge stale build artifact(s) of {} ({}): the module's \
+                 artifacts are stale and the package is not purgeable from this \
+                 project root (a shared or foreign checkout). Rebuild it in its own \
+                 workspace (`lake build {}` from {}) to refresh its artifacts, then \
+                 rerun.",
                 spec.module_name,
                 spec.pkg_root.display(),
                 spec.module_name,
@@ -88,7 +90,7 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
             if purgeable {
                 crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
                 purged_any = true;
-            } else {
+            } else if spec_own_artifact_stale_on_disk(&spec) {
                 refuse_purge(&spec)?;
             }
             continue;
@@ -113,19 +115,47 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
             if purgeable {
                 crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
                 purged_any = true;
-            } else {
+            } else if spec_own_artifact_stale_on_disk(&spec) {
                 refuse_purge(&spec)?;
             }
         } else if taint.is_tainted() {
             if purgeable {
                 crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
                 purged_any = true;
-            } else {
+            } else if spec_own_artifact_stale_on_disk(&spec) {
                 refuse_purge(&spec)?;
+            } else {
+                // Unowned, fresh, `SelfOnly`: the artifact stays (its own workspace
+                // owns it), and the owned importers are purged so nothing downstream
+                // reuses a verdict built on top of it.
+                spreading.insert(key);
             }
         }
     }
     Ok(purged_any)
+}
+
+/// Whether `spec`'s own on-disk `.olean` is stale by the cheap mtime gates the
+/// dependency freshness check also applies: present but older than the module source
+/// or a package config file. A missing artifact is NOT stale here — nothing is on
+/// disk for a later build to reuse, so a purge refusal would protect nothing.
+fn spec_own_artifact_stale_on_disk(spec: &DiscoveredModuleSpec) -> bool {
+    let olean = spec_olean_path(spec);
+    let Ok(om) = fs::metadata(&olean) else {
+        return false;
+    };
+    let Ok(ot) = om.modified() else {
+        return true;
+    };
+    let newer_than_olean = |p: &Path| {
+        fs::metadata(p)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| ot < t)
+    };
+    newer_than_olean(&spec.src_path)
+        || ["lakefile.toml", "lakefile.lean", "lean-toolchain"]
+            .iter()
+            .any(|f| newer_than_olean(&spec.pkg_root.join(f)))
 }
 
 /// #433: how a module's source can make its compiled artifacts depend on host state.
@@ -2861,6 +2891,9 @@ mod host_effect_taint_tests {
     /// A host read behind a command that runs only in this module's own build.
     const RUN_CMD_HELPER_SHAPE: &str =
         "def loadCfg : IO String := IO.FS.readFile \"cfg\"\nrun_cmd do let _ ← loadCfg\n";
+    /// A bare `#eval` runs arbitrary code during this module's own build only, so a
+    /// pinned dependency module holding one classifies `SelfOnly`.
+    const EVAL_SHAPE: &str = "def forty : Nat := 40\n#eval forty\n";
     /// Lean and Mathlib write the attribute on its own line above the definition it
     /// applies to; the two lines are one declaration.
     const SPLIT_ATTR_TACTIC_SHAPE: &str = "import Lean\n@[tactic fooTac]\ndef evalFoo : IO Nat := do\n  let _rows ← IO.FS.lines \"x\"\n  return 3\n";
@@ -3321,29 +3354,42 @@ mod host_effect_taint_tests {
     }
 
     /// #438 and #434 together: spreading follows execution, deletion follows
-    /// ownership, and a refusal is never a silent skip. A definition-only linter module
-    /// (registration included) purges nothing; project-owned path-dependency artifacts
-    /// are purged in place along with the importer cone; a pinned package whose
-    /// artifacts may embed host state fails the walk closed, deleting nothing, instead
-    /// of being kept silently as if fresh.
+    /// ownership, and a refusal is keyed on the unowned module's own artifact. A
+    /// definition-only linter module (registration included) purges nothing;
+    /// project-owned path-dependency artifacts are purged in place along with the
+    /// importer cone; a pinned (unowned) tainted module whose own artifact is FRESH is
+    /// marked spreading instead — its artifact stays, the owned importers are purged,
+    /// and the refresh completes; only a pinned module whose own artifact is actually
+    /// stale fails the walk closed, deleting nothing, because clearing that needs a
+    /// rebuild in the dependency's own workspace.
     #[test]
     fn host_effects_purge_follows_ownership_and_fails_closed_on_refusal() -> Result<()> {
         #[allow(clippy::type_complexity)]
-        let rows: [(&str, &str, bool, Result<(bool, bool), ()>); 7] = [
-            ("linter", LINTER_SHAPE, true, Ok((false, false))),
-            ("reglinter", REG_LINTER_SHAPE, true, Ok((false, false))),
-            ("path_elabread", ELAB_BLOCK_HOST_READ_SHAPE, false, Ok((true, true))),
-            ("path_importtime", IMPORT_TIME_SHAPE, false, Ok((true, true))),
-            ("pinned_elabread", ELAB_BLOCK_HOST_READ_SHAPE, true, Err(())),
-            ("pinned_importtime", IMPORT_TIME_SHAPE, true, Err(())),
-            ("pinned_selfonly", RUN_CMD_HELPER_SHAPE, true, Err(())),
+        let rows: [(&str, &str, bool, bool, Result<(bool, bool), ()>); 10] = [
+            ("linter", LINTER_SHAPE, true, false, Ok((false, false))),
+            ("reglinter", REG_LINTER_SHAPE, true, false, Ok((false, false))),
+            ("path_elabread", ELAB_BLOCK_HOST_READ_SHAPE, false, false, Ok((true, true))),
+            ("path_importtime", IMPORT_TIME_SHAPE, false, false, Ok((true, true))),
+            ("pinned_elabread_fresh", ELAB_BLOCK_HOST_READ_SHAPE, true, false, Ok((false, true))),
+            ("pinned_importtime_fresh", IMPORT_TIME_SHAPE, true, false, Ok((false, true))),
+            ("pinned_selfonly_fresh", RUN_CMD_HELPER_SHAPE, true, false, Ok((false, true))),
+            ("pinned_eval_fresh", EVAL_SHAPE, true, false, Ok((false, true))),
+            ("pinned_importtime_stale", IMPORT_TIME_SHAPE, true, true, Err(())),
+            ("pinned_selfonly_stale", RUN_CMD_HELPER_SHAPE, true, true, Err(())),
         ];
-        for (label, dep_source, git_pinned, expect) in rows {
+        for (label, dep_source, git_pinned, stale_dep, expect) in rows {
             let (dir, cfg, spec) =
                 dep_fixture(&format!("purge_{label}"), dep_source, git_pinned)?;
             let dep_olean = spec.build_lib_lean_dir.join("LintLib.olean");
             fs::create_dir_all(dep_olean.parent().unwrap())?;
             fs::write(&dep_olean, b"fake dep olean")?;
+            if stale_dep {
+                // Dial the artifact's mtime below the source's: the artifact itself
+                // is stale, independent of filesystem timestamp granularity.
+                fs::File::options().write(true).open(&dep_olean)?.set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+                )?;
+            }
             let root_spec = resolve_module_in_package(&cfg.root_pkg, true, "Proj")
                 .expect("root module resolves");
             let root_olean = root_spec.build_lib_lean_dir.join("Proj.olean");
@@ -3367,11 +3413,17 @@ mod host_effect_taint_tests {
                 }
                 Err(()) => {
                     let err = res.expect_err(
-                        "a stale unowned package must fail the walk closed, not be kept silently",
+                        "an unowned module whose own artifact is stale must fail the \
+                         walk closed, not be kept silently",
                     );
                     assert!(
                         format!("{err:#}").contains("Failed to purge stale build artifact"),
                         "{label}: refusal must name the purge failure, got: {err:#}"
+                    );
+                    assert!(
+                        format!("{err:#}").contains("its own workspace"),
+                        "{label}: refusal must name the action that clears the \
+                         condition (an own-workspace rebuild), got: {err:#}"
                     );
                     assert!(
                         dep_olean.is_file() && root_olean.is_file(),
