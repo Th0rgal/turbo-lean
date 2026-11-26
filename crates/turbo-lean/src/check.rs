@@ -902,15 +902,14 @@ pub(crate) fn run_check_command_inner(
                     // G1c r2 + DA 388e906a F2: execution runs EXACTLY the binary selection
                     // resolved and stored in the provenance. No second discovery after the
                     // build, which could otherwise pick up a binary created mid-flow.
-                    let Some((bin, bin_provenance)) = kernel_prov.con_leche_binary.clone() else {
+                    let Some(resolved_binary) = kernel_prov.con_leche_binary.clone() else {
                         anyhow::bail!(
                             "Kernel routing invariant violated: `{}` resolved without a resolved `con-leche` binary (fail-closed)",
                             kernel_prov.kernel_engine.as_str()
                         );
                     };
                     let rep = crate::kernel::verify_olean_modules_with_con_leche(
-                        &bin,
-                        bin_provenance,
+                        &resolved_binary,
                         &search_paths,
                         std::slice::from_ref(&mod_spec.module_name),
                         &[],
