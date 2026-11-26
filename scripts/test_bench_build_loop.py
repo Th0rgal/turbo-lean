@@ -315,6 +315,32 @@ class ExpectationTests(unittest.TestCase):
                                       "cas_expr_replay_mode": "warm_opt_in"}})
         self.assertIn("warm_opt_in", moded)
 
+    def test_a_negative_nan_or_fractional_replay_count_is_unrecognized(self):
+        for bad in (-1, float("nan"), float("inf"), 1.5, True, "3"):
+            with self.subTest(bad=bad):
+                msg = mod.trial_problem(
+                    {"exit_code": 0, "json": {"status": "cache_hit", "cas_expr_replayed": bad}})
+                self.assertIsNotNone(msg)
+                self.assertTrue("unrecognized" in msg or "a warm replay ran" in msg, msg)
+        self.assertIn("unrecognized", mod.trial_problem(
+            {"exit_code": 0, "json": {"status": "cache_hit", "cas_expr_replayed": -1}}))
+        self.assertIn("a warm replay ran", mod.trial_problem(
+            {"exit_code": 0, "json": {"status": "cache_hit", "cas_expr_replayed": 3}}))
+        self.assertIsNone(mod.trial_problem(
+            {"exit_code": 0, "json": {"status": "cache_hit", "cas_expr_replayed": 0}}))
+
+    def test_problem_texts_are_scrubbed_where_they_are_made(self):
+        roots = mod.path_roots(Path("/run/x/build-loop-ab12"), Path("/opt/tl/bin/turbo-lean"))
+        ok = {"exit_code": 0, "json": {"status": "/run/x/build-loop-ab12/odd",
+                                       "shards_seeded": 6}}
+        self.assertEqual(mod.trial_problem(ok, roots),
+                         "status '<scratch>/odd', expected 'cache_hit'")
+        self.assertEqual(mod.cold_problem(ok, 6, roots),
+                         "status '<scratch>/odd', expected 'built'")
+        warm = {"exit_code": 0, "json": {"status": "cache_hit",
+                                         "cas_expr_replay_mode": "/run/x/build-loop-ab12/m"}}
+        self.assertNotIn("/run/x", mod.trial_problem(warm, roots))
+
     def test_an_unknown_replay_mode_is_reported_as_unrecognized_not_as_a_replay(self):
         weird = mod.trial_problem(
             {"exit_code": 0, "json": {"status": "cache_hit", "cas_expr_replay_mode": "turbo"}})
@@ -611,6 +637,70 @@ class InProcessTests(unittest.TestCase):
                     self.assertIn("--out", err)
                     self.assertEqual(out.read_text(), text)
             self.assertEqual(list(scratch.iterdir()), [])
+
+    def test_an_existing_out_file_holding_non_object_json_is_a_clean_refusal(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "o.json"
+            for text in ("[]", "null", "42", '"x"'):
+                with self.subTest(text=text):
+                    out.write_text(text)
+                    with self.assertRaises(mod.BenchEnvError) as cm:
+                        mod.refuse_other_artifact(out)
+                    self.assertIn("not a JSON object", str(cm.exception))
+
+    def test_an_escaped_descendant_holding_the_pipes_is_ended_and_named(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            pid_file = root / "child.pid"
+            staging = root / "staging"
+            staging.mkdir()
+            code = ("import os, subprocess, sys, time\n"
+                    "c = subprocess.Popen(['sleep', '120'], start_new_session=True)\n"
+                    f"open({str(pid_file)!r}, 'w').write(str(c.pid))\n"
+                    "time.sleep(120)\n")
+            env = dict(os.environ, TURBO_LEAN_STAGING_DIR=str(staging))
+            real_scan = mod.bcl.scoped_daemon_processes
+            seen = {}
+
+            def scan(stg, binary, *a, **kw):
+                # The scan the bench makes is over its staging namespace; stand in for
+                # a zygote worker by reporting the escaped sleep.
+                seen["staging"] = str(stg)
+                pid = int(pid_file.read_text())
+                return [(pid, mod.bcl._proc_state_and_start(Path("/proc") / str(pid))[1])]
+            try:
+                with mock.patch.object(mod, "KILL_DRAIN_S", 1), \
+                        mock.patch.object(mod.bcl, "scoped_daemon_processes", scan):
+                    r = mod.run_build([sys.executable, "-c", code], env, 1)
+                self.assertEqual(seen["staging"], str(staging))
+                self.assertEqual(r["exit_code"], -1)
+                self.assertIn("escaped", r["stderr"])
+                self.assertFalse(r["contaminated"])
+                pid = int(pid_file.read_text())
+                for _ in range(100):
+                    if not process_is_alive(pid):
+                        break
+                    time.sleep(0.05)
+                self.assertFalse(process_is_alive(pid), "the escaped descendant still runs")
+            finally:
+                mod.bcl.scoped_daemon_processes = real_scan
+                if pid_file.is_file():
+                    stop_own_child(int(pid_file.read_text()))
+
+    def test_an_escaped_descendant_that_cannot_be_ended_stops_the_warm_loop(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            code = ("import subprocess, time\n"
+                    "subprocess.Popen(['sleep', '5'], start_new_session=True)\n"
+                    "time.sleep(60)\n")
+            env = dict(os.environ, TURBO_LEAN_STAGING_DIR=str(root))
+            with mock.patch.object(mod, "KILL_DRAIN_S", 1), \
+                    mock.patch.object(mod.bcl, "scoped_daemon_processes", return_value=[(1, "0")]), \
+                    mock.patch.object(mod.bcl, "terminate_scanned",
+                                      return_value=([], [(1, "0")])):
+                r = mod.run_build([sys.executable, "-c", code], env, 1)
+            self.assertTrue(r["contaminated"])
+            self.assertIn("could not be ended", r["stderr"])
 
     def test_an_out_path_that_is_a_directory_is_refused(self):
         with tempfile.TemporaryDirectory() as td:

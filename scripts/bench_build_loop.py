@@ -221,8 +221,11 @@ def refuse_other_artifact(out: Path) -> None:
         old = json.loads(out.read_text())
     except (OSError, ValueError) as e:
         raise BenchEnvError(f"--out: {out.name} exists and is not a results JSON ({e})") from e
-    if not isinstance(old, dict) or (old.get("schema_version"), old.get("kind")) != (
-            SCHEMA_VERSION, "build_loop_results"):
+    if not isinstance(old, dict):
+        raise BenchEnvError(
+            f"--out: {out.name} exists and holds {type(old).__name__} JSON, not a JSON "
+            "object; refusing to overwrite it")
+    if (old.get("schema_version"), old.get("kind")) != (SCHEMA_VERSION, "build_loop_results"):
         raise BenchEnvError(
             f"--out: {out.name} exists with schema_version {old.get('schema_version')!r} / "
             f"kind {old.get('kind')!r}, not this script's schema {SCHEMA_VERSION} "
@@ -297,6 +300,31 @@ def _kill_group(proc) -> None:
         pass
 
 
+def _end_escaped(argv, env):
+    """End what a timed-out call left in the run's staging namespace.
+
+    The group kill misses a worker that started its own session. The check-loop
+    bench's scope rule (the staging namespace and this binary) finds those, and
+    its SIGTERM-then-SIGKILL ends them. Returns (note for the trial's stderr,
+    contaminated): contaminated is True when a process could not be ended, and the
+    caller then stops measuring, because a stray process skews every later call.
+    """
+    staging = env.get("TURBO_LEAN_STAGING_DIR")
+    if not staging:
+        return "; a process may have escaped the call's group (no staging namespace to scan)", False
+    try:
+        left = bcl.scoped_daemon_processes(staging, Path(argv[0]).resolve())
+        if not left:
+            return "; the call's pipes stayed open after the kill but no process was found", False
+        _signalled, survivors = bcl.terminate_scanned(left)
+    except OSError as e:
+        return f"; a process escaped the call's group and the scan failed ({e})", True
+    if survivors:
+        return (f"; {len(survivors)} process(es) escaped the call's group and could not be "
+                "ended"), True
+    return f"; {len(left)} process(es) escaped the call's group and were ended", False
+
+
 def run_build(argv, env, timeout_s):
     """One build call, in its own session so a timeout takes lake and lean with it."""
     psi_before = bcl.sample_psi()
@@ -306,11 +334,13 @@ def run_build(argv, env, timeout_s):
                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
     except OSError as e:
         raise BenchEnvError(f"failed to launch {argv[0]}: {e}") from e
+    contaminated = False
     try:
         out, err = proc.communicate(timeout=timeout_s)
         rc = proc.returncode
     except subprocess.TimeoutExpired:
         _kill_group(proc)
+        note = ""
         try:
             out, err = proc.communicate(timeout=KILL_DRAIN_S)
         except subprocess.TimeoutExpired as e:
@@ -321,8 +351,9 @@ def run_build(argv, env, timeout_s):
                 if pipe is not None:
                     pipe.close()
             proc.wait()
+            note, contaminated = _end_escaped(argv, env)
         rc = -1
-        err = (err or "") + f"\ntimeout after {timeout_s}s"
+        err = (err or "") + f"\ntimeout after {timeout_s}s" + note
     except BaseException:
         _kill_group(proc)
         proc.wait()
@@ -331,7 +362,8 @@ def run_build(argv, env, timeout_s):
     psi_after = bcl.sample_psi()
     return {"exit_code": rc, "external_wall_ms": wall_ms,
             "json": bcl.parse_check_json(out or ""), "stderr": err or "",
-            "psi_before": psi_before, "psi_after": psi_after}
+            "psi_before": psi_before, "psi_after": psi_after,
+            "contaminated": contaminated}
 
 
 def path_roots(scratch: Path, binary: Path, git_bin=None) -> list:
@@ -359,8 +391,17 @@ def _failure_head(r, roots=None):
     return None
 
 
+def _scrubbed(text, roots):
+    """`text` with every host root replaced by its placeholder (None stays None)."""
+    return bcl.scrub_host_paths(text, roots) if text and roots else text
+
+
 def cold_problem(r, theorems: int, roots=None):
-    """None when the cold seeded build met its expectation, else why not."""
+    """None when the cold seeded build met its expectation, else why not (scrubbed)."""
+    return _scrubbed(_cold_problem(r, theorems, roots), roots)
+
+
+def _cold_problem(r, theorems: int, roots=None):
     head = _failure_head(r, roots)
     if head:
         return head
@@ -374,7 +415,12 @@ def cold_problem(r, theorems: int, roots=None):
 
 
 def trial_problem(r, roots=None):
-    """None when a warm call was a healthy cache hit that replayed nothing, else why not."""
+    """None when a warm call was a healthy cache hit that replayed nothing, else why
+    not (scrubbed)."""
+    return _scrubbed(_trial_problem(r, roots), roots)
+
+
+def _trial_problem(r, roots=None):
     head = _failure_head(r, roots)
     if head:
         return head
@@ -383,12 +429,14 @@ def trial_problem(r, roots=None):
     if status != "cache_hit":
         return f"status {status!r}, expected 'cache_hit'"
     replayed, mode = j.get("cas_expr_replayed"), j.get("cas_expr_replay_mode")
-    numeric = isinstance(replayed, (int, float)) and not isinstance(replayed, bool)
-    if (numeric and replayed > 0) or mode in REPLAYING_MODES:
+    count = replayed if isinstance(replayed, int) and not isinstance(replayed, bool) else None
+    if (count is not None and count > 0) or mode in REPLAYING_MODES:
         return (f"a warm replay ran (cas_expr_replayed {replayed!r}, "
                 f"cas_expr_replay_mode {mode!r}); the bench measures a build that "
                 "replays nothing")
-    if replayed is not None and not numeric:
+    # Anything but a non-negative integer (a negative, NaN, float, string, bool) is
+    # not a count this bench understands.
+    if replayed is not None and (count is None or count < 0):
         return f"unrecognized cas_expr_replayed {replayed!r}; cannot tell whether a replay ran"
     if mode not in (None, "off"):
         return (f"unrecognized cas_expr_replay_mode {mode!r}; cannot tell whether a "
@@ -577,6 +625,11 @@ def main(argv=None) -> int:
                 r.update(call=call, measured=call >= args.warmup,
                          problem=trial_problem(r, roots))
                 trials.append(r)
+                if r["contaminated"]:
+                    # A process the bench could not end skews every later call.
+                    print("  stopping the warm loop: a stray process could not be ended",
+                          flush=True)
+                    break
             results["sequence"] = [{"call": t["call"], "measured": t["measured"],
                                     "ok": t["problem"] is None} for t in trials]
             warm = summarize_warm([t for t in trials if t["measured"]])
@@ -585,8 +638,7 @@ def main(argv=None) -> int:
             warm_failed = [t for t in trials if not t["measured"] and t["problem"]]
             for t in warm_failed[:3]:
                 problems.append(f"warmup call {t['call']}: {t['problem']}")
-        # Every problem string passes the scrub once more, whatever built it.
-        problems = [bcl.scrub_host_paths(p, roots) for p in problems]
+        # The problem strings were scrubbed where cold_problem and trial_problem made them.
         results["verdict"] = {"verdict": "measurement_failed" if problems else "measured",
                               "problems": problems}
         results["run_duration_s"] = round(time.monotonic() - t_start, 1)
