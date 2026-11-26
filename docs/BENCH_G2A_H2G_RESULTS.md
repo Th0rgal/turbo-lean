@@ -41,8 +41,10 @@ trials. The call counts and health flags carry that information.
 
 Per workload and mode (hits/calls; statuses were uniform per cell:
 `theorem_verified` for cold and edited, `theorem_cache_hit` for warm cache-hit;
-the tool reported the fission subshard counters as explicit zeros in every
-counted reply):
+the fission subshard sums read 0 as recorded by the pre-change script, whose
+summing collapsed absent fields to 0, so a reported zero and a never-emitted
+field are not distinguishable in this artifact; the current script records
+None when no trial reported the field):
 
 | workload | cold_no_daemon | warm_cache_hit_daemon | warm_edited_proof_daemon |
 |---|---|---|---|
