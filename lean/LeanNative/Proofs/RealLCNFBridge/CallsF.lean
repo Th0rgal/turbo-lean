@@ -186,6 +186,161 @@ theorem evalCodeF_fuel_mono_step (Φ : FuncEnv) (f : Nat) :
   | .unreachable, venv, hst, v, hst', h => by
     unfold evalCodeF at h ⊢; exact h
 
+/-- Reserved runtime symbols `evalExpr` interprets as intrinsics (`lean_native_*`,
+    `lean_mark_mt`); a lowered local callee must not shadow them (clause of
+    `DeclEnvLowers` in `Proofs/LowerCalls.lean`, which uses THIS definition), so the
+    `Φ`-first lookup in `evalCodeF` never captures an intrinsic call the lowering
+    emitted. -/
+def reservedRuntimeName (s : String) : Bool :=
+  s.startsWith "lean_native_" || s == "lean_mark_mt"
+
+/-- A name bound by no entry misses `FuncEnv.lookup?`. -/
+theorem FuncEnv.lookup?_eq_none :
+    ∀ (Φ : FuncEnv) (fn : String), (∀ p ∈ Φ, p.1.name ≠ fn) →
+      LeanNative.Semantics.FuncEnv.lookup? Φ fn = none
+  | [], _, _ => rfl
+  | p :: Φ, fn, h => by
+    unfold LeanNative.Semantics.FuncEnv.lookup?
+    cases hbe : (p.1.name == fn) with
+    | true => exact absurd (eq_of_beq hbe) (h p (.head _))
+    | false =>
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      exact FuncEnv.lookup?_eq_none Φ fn (fun q hq => h q (.tail _ hq))
+
+/-- A reserved runtime intrinsic (`lean_native_*`, `lean_mark_mt`) is never captured by a
+    function environment whose names `DeclEnvLowers` admits (all unreserved). -/
+theorem FuncEnv.callTarget?_reserved {fn : String}
+    (hfn : reservedRuntimeName fn = true) {Φ : FuncEnv}
+    (hres : ∀ p ∈ Φ, reservedRuntimeName p.1.name = false)
+    (args : List VarId) (ty : LNIRType) (ext : Bool) :
+    LeanNative.Semantics.FuncEnv.callTarget? Φ (.call fn args ty ext) = none := by
+  cases ext
+  · unfold LeanNative.Semantics.FuncEnv.callTarget?
+    simp only []
+    rw [FuncEnv.lookup?_eq_none Φ fn
+      (fun p hp heq => by have h1 := hres p hp; rw [heq, hfn] at h1; exact nomatch h1)]
+    rfl
+  · rfl
+
+/-- Every `.call` that `evalExpr` interprets successfully names a reserved runtime
+    intrinsic (read off its name chain: extern calls and unknown names error), so under
+    `DeclEnvLowers`-admitted (unreserved) names the environment lookup misses — the
+    `Φ`-first dispatch in `evalCodeF` never captures an expression the old evaluator
+    succeeds on. This is the abstract-`rhs` fact the non-call let mirror consumes. -/
+theorem FuncEnv.callTarget?_of_evalExpr_ok {Φ : FuncEnv}
+    (hres : ∀ p ∈ Φ, reservedRuntimeName p.1.name = false)
+    {env : VarEnv} {st : HeapState} {e : LNIRExpr} {pr : Val × HeapState}
+    (hok : evalExpr env st e = .ok pr) :
+    LeanNative.Semantics.FuncEnv.callTarget? Φ e = none := by
+  have hrn : ∀ {s L : String}, (s == L) = true → reservedRuntimeName L = true →
+      reservedRuntimeName s = true := fun hbe hL => by rw [eq_of_beq hbe]; exact hL
+  cases e <;> try rfl
+  case call fn args ty ext =>
+    cases ext
+    · dsimp only [evalExpr] at hok
+      cases hvl : evalVarList env args <;> rw [hvl] at hok
+      · exact nomatch hok
+      · simp only [Bool.false_eq_true, ↓reduceIte] at hok
+        cases hc1 : (fn == "lean_native_box_u64" || fn == "lean_native_unbox_u64")
+        · rw [hc1] at hok
+          simp only [Bool.false_eq_true, ↓reduceIte] at hok
+          cases hc2 : (fn == "lean_native_ensure_exclusive")
+          · rw [hc2] at hok
+            simp only [Bool.false_eq_true, ↓reduceIte] at hok
+            cases hc3 : (fn == "lean_native_sarray_len")
+            · rw [hc3] at hok
+              simp only [Bool.false_eq_true, ↓reduceIte] at hok
+              cases hc4 : (fn == "lean_mark_mt")
+              · rw [hc4] at hok
+                simp only [Bool.false_eq_true, ↓reduceIte] at hok
+                cases hc5 : (fn == "lean_native_ctor_set" || fn == "lean_native_ctor_set_scalar")
+                · rw [hc5] at hok
+                  simp only [Bool.false_eq_true, ↓reduceIte] at hok
+                  cases hc6 : (fn == "lean_native_ctor_set_tag")
+                  · rw [hc6] at hok
+                    simp only [Bool.false_eq_true, ↓reduceIte] at hok
+                    cases hc7 : (fn == "lean_native_del_obj")
+                    · rw [hc7] at hok
+                      simp only [Bool.false_eq_true, ↓reduceIte] at hok
+                      cases hc8 : (fn == "lean_native_ctor_tag")
+                      · rw [hc8] at hok
+                        simp only [Bool.false_eq_true, ↓reduceIte] at hok
+                        exact nomatch hok
+                      · exact FuncEnv.callTarget?_reserved
+                          (hrn hc8 (by first | rfl | decide | simp [reservedRuntimeName]))
+                          hres args ty false
+                    · exact FuncEnv.callTarget?_reserved
+                        (hrn hc7 (by first | rfl | decide | simp [reservedRuntimeName]))
+                        hres args ty false
+                  · exact FuncEnv.callTarget?_reserved
+                      (hrn hc6 (by first | rfl | decide | simp [reservedRuntimeName]))
+                      hres args ty false
+                · rcases (Bool.or_eq_true _ _).mp hc5 with hbe | hbe
+                  · exact FuncEnv.callTarget?_reserved
+                      (hrn hbe (by first | rfl | decide | simp [reservedRuntimeName]))
+                      hres args ty false
+                  · exact FuncEnv.callTarget?_reserved
+                      (hrn hbe (by first | rfl | decide | simp [reservedRuntimeName]))
+                      hres args ty false
+              · exact FuncEnv.callTarget?_reserved
+                  (hrn hc4 (by first | rfl | decide | simp [reservedRuntimeName]))
+                  hres args ty false
+            · exact FuncEnv.callTarget?_reserved
+                (hrn hc3 (by first | rfl | decide | simp [reservedRuntimeName]))
+                hres args ty false
+          · exact FuncEnv.callTarget?_reserved
+              (hrn hc2 (by first | rfl | decide | simp [reservedRuntimeName]))
+              hres args ty false
+        · rcases (Bool.or_eq_true _ _).mp hc1 with hbe | hbe
+          · exact FuncEnv.callTarget?_reserved
+              (hrn hbe (by first | rfl | decide | simp [reservedRuntimeName]))
+              hres args ty false
+          · exact FuncEnv.callTarget?_reserved
+              (hrn hbe (by first | rfl | decide | simp [reservedRuntimeName]))
+              hres args ty false
+    · rfl
+
+/-- Mirror of `allocZeroScalarSlotsPure_rel`'s wrap conjunct carrier at a fixed `Φ`: the
+    zero-slot wrapper peels through `evalCodeF` exactly as through `evalCode`, because
+    every wrapped binding is a `.scalar` expression (`callTarget?` misses by `rfl`). -/
+theorem allocZeroScalarSlotsPure_relF (Φ : FuncEnv) :
+    ∀ (slots : List (Option Nat × LNIRType)) (st : RealBridgeState) (lenv : LEnv) (venv : VarEnv)
+      (fuel : Nat) (hst : HeapState),
+      BridgeStateInv st lenv venv →
+      ∃ venvZ,
+        BridgeStateInv (allocZeroScalarSlotsPure st slots).2 lenv venvZ ∧
+        (∀ u, u < st.nextVarId → venvZ u = venv u) ∧
+        evalVarList venvZ ((allocZeroScalarSlotsPure st slots).1.map Prod.fst) =
+          .ok (slots.map fun _ => Val.u64 0) ∧
+        ∀ body, evalCodeF Φ (fuel + 1) venv hst
+            (wrapZeroScalarSlotsPure (allocZeroScalarSlotsPure st slots).1 body) =
+          evalCodeF Φ (fuel + 1) venvZ hst body
+  | [], st, _, venv, _, _, hinv =>
+    ⟨venv, hinv, fun _ _ => rfl, rfl, fun _ => rfl⟩
+  | (_, sTy) :: rest, st, lenv, venv, fuel, hst, hinv => by
+    dsimp only [allocZeroScalarSlotsPure, wrapZeroScalarSlotsPure]
+    rcases freshVar_spec st sTy with ⟨hfv1, hfvNext, _, _, _, _⟩
+    let z := (st.freshVar sTy).1
+    let st1 := (st.freshVar sTy).2
+    let venv1 := venv.bind z (.u64 0)
+    have hinv1 : BridgeStateInv st1 lenv venv1 :=
+      bridgeInv_freshVar st lenv venv sTy (.u64 0) hinv
+    rcases allocZeroScalarSlotsPure_relF Φ rest st1 lenv venv1 fuel hst hinv1 with
+      ⟨venvZ, hinvZ, hagree1, hvlRest, hwrapRest⟩
+    have hzLt1 : z < st1.nextVarId := by
+      dsimp only [z, st1]; rw [hfv1, hfvNext]; exact Nat.lt_succ_self _
+    have hzZ : venvZ z = some (.u64 0) :=
+      (hagree1 z hzLt1).trans (VarEnv.bind_self venv z (.u64 0))
+    refine ⟨venvZ, hinvZ, fun u hu => ?_, ?_, fun body => ?_⟩
+    · have huLtZ : u < z := by dsimp only [z]; rw [hfv1]; exact hu
+      have huLt1 : u < st1.nextVarId := Nat.lt_trans huLtZ hzLt1
+      exact (hagree1 u huLt1).trans (venv_bind_fresh venv z u huLtZ (.u64 0))
+    · dsimp only [List.map, evalVarList]
+      rw [hzZ, hvlRest]
+    · rw [evalCodeF_letBind_evalExpr rfl]
+      dsimp only [evalExpr, evalScalarExpr]
+      exact hwrapRest body
+
 /-- Mirror of `evalCode_ite_asBool` (JpTag) at a fixed `Φ`. -/
 private theorem evalCodeF_ite_asBool (Φ : FuncEnv) (fuel : Nat) (venv : VarEnv) (hst : HeapState)
     (condVar : VarId) (cond : Val) (b : Bool) (thenB elseB : LNIRCode)
