@@ -2560,8 +2560,19 @@ fn eval_refutation_snippet_via_lean_kernel(
     let store = match store_opt {
         Some(s) => s,
         None => {
-            let Ok(s) = crate::db::TurboStore::open(None) else {
-                return false;
+            let s = match crate::db::TurboStore::open(None) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Fail closed, but never silently: an unusable store (for example a
+                    // state.db written by a newer build) would otherwise read as "the
+                    // kernel did not certify the witness", which sends callers chasing
+                    // the witness instead of the store.
+                    eprintln!(
+                        "warning: kernel certification could not open the turbo-lean store; \
+                         reporting the candidate as uncertified: {e:#}"
+                    );
+                    return false;
+                }
             };
             owned_store = s;
             &owned_store
@@ -3362,6 +3373,17 @@ pub(crate) fn certify_standalone_statement_witness_via_lean_kernel(
     }
     if build_decl_cex_refutation_body(&full_decl_src, &decl, &ce, "_turbo_cex_refute").is_none() {
         return (false, Some("witness_not_bound"));
+    }
+    // Probe the store before asking the kernel: certification runs its refutation
+    // snippets against the shared store, and an unusable store (for example a
+    // state.db stamped by a newer build) would otherwise surface as
+    // "not_a_counterexample", blaming the witness for an environment problem.
+    if let Err(e) = crate::db::TurboStore::open(None) {
+        eprintln!(
+            "warning: kernel certification could not open the turbo-lean store; \
+             reporting the witness as uncertified: {e:#}"
+        );
+        return (false, Some("store_unavailable"));
     }
     if certify_standalone_decl_cex_via_lean_kernel(&full_decl_src, &decl, &ce) {
         (true, None)
@@ -8224,6 +8246,52 @@ theorem _turbo_memo_retry_probe :
                 "_turbo_memo_retry_probe",
             ),
             "Transient standalone kernel-refutation failure must not poison MEMO"
+        );
+    }
+
+    #[test]
+    fn test_statement_certification_reports_store_unavailable_not_witness_blame() {
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "tl_uver_store_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let prev_home = std::env::var_os("TURBO_LEAN_HOME");
+        std::env::set_var("TURBO_LEAN_HOME", &root);
+        // Create a healthy store at this root, then stamp it one schema version
+        // ahead: exactly what a newer build leaves behind in a shared root, and
+        // what the open guard refuses.
+        drop(crate::db::TurboStore::open(None).expect("fresh store must open"));
+        {
+            let conn = rusqlite::Connection::open(root.join("state.db")).unwrap();
+            conn.pragma_update(
+                None,
+                "user_version",
+                crate::db::DB_SCHEMA_USER_VERSION + 1,
+            )
+            .unwrap();
+        }
+        let verdict = certify_standalone_statement_witness_via_lean_kernel(
+            "bad_u64_add",
+            "theorem bad_u64_add (a : UInt64) : a + 1 = a := by sorry",
+            Some(vec![("a".to_string(), "0".to_string())]),
+            None,
+            Some("1"),
+            Some("0"),
+        );
+        match prev_home {
+            Some(v) => std::env::set_var("TURBO_LEAN_HOME", v),
+            None => std::env::remove_var("TURBO_LEAN_HOME"),
+        }
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            verdict,
+            (false, Some("store_unavailable")),
+            "an unusable store must surface as store_unavailable, never as not_a_counterexample"
         );
     }
 
