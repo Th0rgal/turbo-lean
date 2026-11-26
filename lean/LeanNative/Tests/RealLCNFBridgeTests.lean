@@ -151,28 +151,44 @@ private def recJpDecl : Decl .impure :=
 
 #guard (lowerRealLCNFDecl 32 { arch := .x86_64 } recJpDecl).isOk == false
 
-/-! ### L1 round 1 (review a094d3a9 F4): explicit requests with no impure LCNF form fail closed
+/-! ### L1 rounds 1-2 (reviews a094d3a9 F4, 47512851 F2): explicit requests fail closed
 
-An explicitly requested declaration that has compiled code (a base or mono form) but no
-impure LCNF form raises the named `Unsupported` error instead of being dropped silently; a
-non-code constant (here: a theorem) is skipped silently. Red evidence: on the pre-fix tree
-the first case accepted an EMPTY module for `UInt64.add` (run recorded in the w-l1 r1
-commit message). -/
+An explicitly requested declaration whose constant kind carries compiled code (a computable
+`defnInfo`/`opaqueInfo`) but that the Stage 1B ingest cannot lower raises a named
+`Unsupported` error instead of being dropped silently — the "imported declarations are
+outside" wording for an imported name, "no impure LCNF form" for a local one; a constant
+with no compiled code (here: a theorem) is skipped silently. Red evidence, both recorded in
+the w-l1 commit messages: on the pre-r1 tree `UInt64.add` was accepted as an EMPTY module;
+on the pre-r2 tree the LOCAL type-alias case below was accepted as an empty module too. -/
 
 private theorem l1NonCodeProbe : True := trivial
 
-#eval show Lean.CoreM Unit from do
+/-- A local `def` with a compiled-code kind but no runtime code: `defnInfo`, computable,
+    and the LCNF pipeline compiles no impure form for a `Type`-valued definition
+    (measured, w-l1 r2). -/
+private def l1TypeAliasProbe : Type := UInt64
+
+private def expectIngestThrows (names : Array Lean.Name) (tag expected : String) :
+    Lean.CoreM Unit := do
   let threw ← try
-    let _ ← ingestModuleDecls #[``UInt64.add] "l1_f4_probe" .x86_64 false
+    let _ ← ingestModuleDecls names tag .x86_64 false
     pure false
   catch e =>
     let msg ← e.toMessageData.toString
-    unless (msg.splitOn "no impure LCNF form").length > 1 do
-      Lean.throwError s!"wrong rejection for UInt64.add: {msg}"
+    unless (msg.splitOn expected).length > 1 do
+      Lean.throwError s!"wrong rejection ({tag}): {msg}"
     pure true
   unless threw do
-    Lean.throwError "ingestModuleDecls accepted an explicit request with no impure LCNF form"
-  let m ← ingestModuleDecls #[``l1NonCodeProbe] "l1_f4_probe2" .x86_64 false
+    Lean.throwError s!"ingestModuleDecls accepted an explicit request it must refuse ({tag})"
+
+#eval show Lean.CoreM Unit from do
+  -- imported computable def: its home module may well have an impure form; this ingest
+  -- sees only the current module's, so the request fails closed with the real reason
+  expectIngestThrows #[``UInt64.add] "l1_f4_imported" "imported declarations are outside"
+  -- local declaration with a compiled-code kind but no impure LCNF form
+  expectIngestThrows #[``l1TypeAliasProbe] "l1_f4_local" "no impure LCNF form"
+  -- a constant with no compiled code stays silently skipped
+  let m ← ingestModuleDecls #[``l1NonCodeProbe] "l1_f4_noncode" .x86_64 false
   unless m.decls.isEmpty do
     Lean.throwError "non-code constant unexpectedly lowered"
 

@@ -11,9 +11,10 @@ the `partial def lowerPureCode` / `lowerPureAlts` family with its `BridgeM` call
 let-value helpers, the generic `ingestLCNFDeclGenericWithState` ingest it ran under, and
 caller-less `BridgeM` re-export wrappers. They are deleted: the one `LCNF → LNIR` lowering
 callee is `RealLCNFBridge.lowerRealLCNFDecl` (`lowerRealLCNFDecl_sound`,
-`lowerRealLCNFDecl_driver_sound`), reached through `ingestImpureDeclViaReal`. A declaration
-the proved path does not cover — including one with no impure LCNF form — is `Unsupported`
-and stays with the stock Lean backend.
+`lowerRealLCNFDecl_driver_sound`), reached through `ingestImpureDeclViaReal`. An explicitly
+requested declaration with compiled code but no local impure LCNF form makes the whole
+module ingest throw, naming the declaration (L1 r2, review 47512851 F4); constants with no
+compiled code are skipped.
 -/
 
 /-- Ingest one real `Lean.Compiler.LCNF.Decl .impure` through the single proved lowering path. -/
@@ -22,8 +23,9 @@ def ingestLCNFImpureDecl (decl : Lean.Compiler.LCNF.Decl .impure)
     (allowRcAdt : Bool := false) : Lean.CoreM LNIRDecl :=
   ingestImpureDeclViaReal decl localDeclNames arch allowRcAdt
 
-/-- Ingest the named declarations that have an impure LCNF form; the rest are `Unsupported`
-    on the proved path and are left to the stock backend. -/
+/-- Ingest the named declarations that have a local impure LCNF form. A requested name with
+    compiled code but no such form makes the whole call throw, naming the declaration
+    (imported names get their own message); constants with no compiled code are skipped. -/
 def ingestModuleDecls (declNames : Array Lean.Name) (moduleName : String := "LeanNative.Ingested")
     (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : Lean.CoreM LNIRModule :=
   ingestModuleDeclsWith (fun d ns a => ingestLCNFImpureDecl d ns a allowRcAdt) declNames moduleName arch

@@ -15,8 +15,11 @@ helpers are gone. The theorem is stated for the context the driver builds, with 
 post-pass (each one is proved, validated by a proved checker, or removed)." Accept:
 "one lowering callee; `ΔLOC < 0`".
 
-State after round 1 (fix round, review a094d3a9, F5 ruling): the driver applies NO
-post-pass to the lowered body at all — the rung's "or removed" option. Round 0 had gated a
+State after round 1 (fix round, review a094d3a9, F5 ruling): the per-declaration driver
+(`ingestImpureDeclViaReal`) applies NO post-pass to the lowered body at all — the rung's
+"or removed" option. The MODULE path (`ingestModuleDecls`) is narrower than that and OPEN:
+see `normalizeAndInlineLocalDefs` under Named exclusions (round 2, review 47512851 F1).
+Round 0 had gated a
 `compressScalarCode` candidate behind the kernel-proved `runSymbolicValidatedDecl` checker;
 the review showed the producer's candidates provably never pass that gate (straight-line
 candidates are byte-identical and early-return; `ite` candidates return a fresh variable,
@@ -60,11 +63,15 @@ post-pass.
    fields only those read. Zero-reference sweeps with planted positive controls are in
    the w-l1 commit messages; `lean/LeanNative/Tests/BridgeHelpersSplitPin.lean` pins the
    surviving inventory.
-3. A declaration explicitly requested with compiled code (a base or mono form) but no
-   impure LCNF form fails closed by name — `ingestModuleDeclsWith` throws
-   `[lean-native] Unsupported declaration ...: no impure LCNF form` — instead of being
-   dropped silently; a non-code constant is skipped silently (review a094d3a9 F4,
-   red-first; regression in `Tests/RealLCNFBridgeTests.lean`).
+3. A declaration explicitly requested with compiled code fails closed by name instead of
+   being dropped silently; a constant with no compiled code is skipped. Round 2 (review
+   47512851 F2): "has compiled code" is the constant kind (a computable
+   `defnInfo`/`opaqueInfo`), not base/mono LCNF visibility, and an imported name gets its
+   own message — `ingestModuleDeclsWith` throws
+   `[lean-native] Unsupported declaration ...: no impure LCNF form` for a local name and
+   `...: imported declarations are outside the Stage 1B ingest ...` for an imported one
+   (reviews a094d3a9 F4 and 47512851 F2, each red-first; regressions in
+   `Tests/RealLCNFBridgeTests.lean`).
 4. The axiom audit keeps `lowerRealLCNFCode_sound` / `lowerRealLCNFDecl_sound` /
    `lowerRealLCNFDecl_driver_sound` in its required set
    (`lean/LeanNative/Proofs/AxiomAudit.lean`, exact count pinned).
@@ -85,9 +92,15 @@ does not infer coverage:
 - `attachBaseDeclFactsM` — attaches `retainedFacts` metadata to the emitted declaration,
   matching base-declaration parameters to LNIR parameters by position; it changes neither
   `body` nor `params`, but downstream Transform passes may consume the facts.
-- `normalizeAndInlineLocalDefs` and `filterNonInternalHelperDecls` — module-level rewrite
-  and filtering in `ingestModuleDeclsWith`, checked by executable regressions
-  (`Tests/RealLCNFBridgeTests.lean`), not proved.
+- `normalizeAndInlineLocalDefs` — OPEN (round 2, review 47512851 F1): an unproved
+  LNIR-level inlining rewrite that `ingestModuleDeclsWith` applies to every lowered body on
+  the module path, so `lowerRealLCNFDecl_driver_sound` covers `ingestImpureDeclViaReal`
+  output, not `ingestModuleDecls` output. It has already had one shadowing bug (the test-6
+  regression in `Tests/RealLCNFBridgeTests.lean` pins the fix). Proving it, gating it per
+  declaration behind the kernel-proved `runSymbolicValidatedDecl`, or removing it is a
+  later rung's unit — recorded here, not silently kept.
+- `filterNonInternalHelperDecls` — module-level filtering in `ingestModuleDeclsWith`,
+  checked by executable regressions (`Tests/RealLCNFBridgeTests.lean`), not proved.
 
 ### Acceptance (quoted) and gates
 
