@@ -1083,8 +1083,12 @@ pub(crate) fn should_replay_cas_expr_on_warm_hit(
 #[derive(Debug)]
 pub(crate) struct CasExprBuildReplay {
     pub(crate) replayed: usize,
-    /// Warm-default shards skipped because their CAS entry was missing or invalid.
-    pub(crate) skipped: usize,
+    /// Warm-default shards skipped because they were never seeded into the CAS.
+    pub(crate) missing: usize,
+    /// Warm-default shards whose cached payload failed verification: corruption or
+    /// tamper evidence, counted on its own and warned about, never folded into
+    /// `missing`.
+    pub(crate) invalid: usize,
     /// `"explicit"` (fail-closed flag), `"warm_default"` (G2b), or `"off"`.
     pub(crate) mode: &'static str,
 }
@@ -1111,7 +1115,8 @@ pub(crate) fn run_cas_expr_replay_for_build(
         )?;
         return Ok(CasExprBuildReplay {
             replayed,
-            skipped: 0,
+            missing: 0,
+            invalid: 0,
             mode: "explicit",
         });
     }
@@ -1123,15 +1128,23 @@ pub(crate) fn run_cas_expr_replay_for_build(
             trust_domain,
             scoped_files,
         )?;
+        if stats.invalid > 0 {
+            eprintln!(
+                "[turbo-lean][warn] warm CAS replay: {} corrupted or invalid expr_shard blob(s) skipped (tamper/corruption evidence; run `turbo-lean build --replay-cas-expr` to fail closed)",
+                stats.invalid
+            );
+        }
         return Ok(CasExprBuildReplay {
             replayed: stats.replayed,
-            skipped: stats.missing + stats.invalid,
+            missing: stats.missing,
+            invalid: stats.invalid,
             mode: "warm_default",
         });
     }
     Ok(CasExprBuildReplay {
         replayed: 0,
-        skipped: 0,
+        missing: 0,
+        invalid: 0,
         mode: "off",
     })
 }
@@ -1246,7 +1259,8 @@ pub fn run_build_command_with_cas_replay(
                 "modules_cached": build_report.modules_cached,
                 "shards_seeded": seeded_shards,
                 "cas_expr_replayed": cas_replay.replayed,
-                "cas_expr_replay_skipped": cas_replay.skipped,
+                "cas_expr_replay_missing": cas_replay.missing,
+                "cas_expr_replay_invalid": cas_replay.invalid,
                 "cas_expr_replay_mode": cas_replay.mode,
                 "elapsed_ms": dur_ms,
             }));
@@ -1264,7 +1278,8 @@ pub fn run_build_command_with_cas_replay(
                         "modules_cached": build_report.modules_cached,
                         "shards_seeded": seeded_shards,
                         "cas_expr_replayed": cas_replay.replayed,
-                        "cas_expr_replay_skipped": cas_replay.skipped,
+                        "cas_expr_replay_missing": cas_replay.missing,
+                        "cas_expr_replay_invalid": cas_replay.invalid,
                         "cas_expr_replay_mode": cas_replay.mode,
                         "config_digest": build_report.config_digest,
                         "elapsed_ms": dur_ms
@@ -1411,7 +1426,8 @@ pub fn run_build_command_with_cas_replay(
                 "materialized_files": linked,
                 "shards_seeded": seeded_shards,
                 "cas_expr_replayed": cas_replay.replayed,
-                "cas_expr_replay_skipped": cas_replay.skipped,
+                "cas_expr_replay_missing": cas_replay.missing,
+                "cas_expr_replay_invalid": cas_replay.invalid,
                 "cas_expr_replay_mode": cas_replay.mode,
                 "elapsed_ms": elapsed_ms,
             }));
@@ -1426,7 +1442,8 @@ pub fn run_build_command_with_cas_replay(
                         "materialized_files": linked,
                         "shards_seeded": seeded_shards,
                         "cas_expr_replayed": cas_replay.replayed,
-                        "cas_expr_replay_skipped": cas_replay.skipped,
+                        "cas_expr_replay_missing": cas_replay.missing,
+                        "cas_expr_replay_invalid": cas_replay.invalid,
                         "cas_expr_replay_mode": cas_replay.mode,
                         "elapsed_ms": elapsed_ms
                     }))?
@@ -1623,7 +1640,8 @@ pub fn run_build_command_with_cas_replay(
                 "materialized_files": linked,
                 "shards_seeded": seeded_shards,
                 "cas_expr_replayed": cas_replay.replayed,
-                "cas_expr_replay_skipped": cas_replay.skipped,
+                "cas_expr_replay_missing": cas_replay.missing,
+                "cas_expr_replay_invalid": cas_replay.invalid,
                 "cas_expr_replay_mode": cas_replay.mode,
                 "elapsed_ms": dur_ms,
             }));
@@ -1641,7 +1659,8 @@ pub fn run_build_command_with_cas_replay(
                         "materialized_files": linked,
                         "shards_seeded": seeded_shards,
                         "cas_expr_replayed": cas_replay.replayed,
-                        "cas_expr_replay_skipped": cas_replay.skipped,
+                        "cas_expr_replay_missing": cas_replay.missing,
+                        "cas_expr_replay_invalid": cas_replay.invalid,
                         "cas_expr_replay_mode": cas_replay.mode,
                         "modules_total": build_report.modules_total,
                         "modules_up_to_date_reused": build_report.modules_up_to_date_reused,
