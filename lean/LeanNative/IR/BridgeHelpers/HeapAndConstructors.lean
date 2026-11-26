@@ -1,4 +1,4 @@
-import LeanNative.IR.BridgeHelpers.ScalarDagAndJoinPoints
+import LeanNative.IR.BridgeHelpers.StateAndIntrinsics
 
 set_option autoImplicit true
 

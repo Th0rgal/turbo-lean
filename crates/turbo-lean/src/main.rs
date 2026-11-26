@@ -471,6 +471,9 @@ enum Commands {
         /// Fail (`ok: false`, non-zero exit) when zero theorem/lemma specifications are recognized
         #[arg(long)]
         require_nonempty: bool,
+        /// Replay concrete audit witnesses through the Lean kernel (requires a Lean toolchain; slower)
+        #[arg(long)]
+        kernel_witness: bool,
     },
     #[command(
         about = "Source-level human spec card: contract surface, syntactic refs, hygiene, and audit witnesses"
@@ -1100,6 +1103,7 @@ fn run(cli: Cli) -> Result<()> {
         ref forbid_namespaces,
         ref forbid_decl_kinds,
         require_nonempty,
+        kernel_witness,
     } = cli.command
     {
         return gpu_fastcheck::run_audit_spec_command_with_options(
@@ -1111,6 +1115,7 @@ fn run(cli: Cli) -> Result<()> {
             forbid_namespaces,
             forbid_decl_kinds,
             require_nonempty,
+            kernel_witness,
         );
     }
     if let Commands::SpecCard {
@@ -2024,6 +2029,7 @@ fn run(cli: Cli) -> Result<()> {
             forbid_namespaces,
             forbid_decl_kinds,
             require_nonempty,
+            kernel_witness,
         } => gpu_fastcheck::run_audit_spec_command_with_options(
             &files,
             decl.as_deref(),
@@ -2033,6 +2039,7 @@ fn run(cli: Cli) -> Result<()> {
             &forbid_namespaces,
             &forbid_decl_kinds,
             require_nonempty,
+            kernel_witness,
         ),
 
         Commands::SpecCard {

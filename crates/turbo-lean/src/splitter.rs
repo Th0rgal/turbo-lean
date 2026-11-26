@@ -543,7 +543,7 @@ fn is_lean_id_first(c: char) -> bool {
 }
 
 #[inline]
-fn is_lean_id_rest(c: char) -> bool {
+pub(crate) fn is_lean_id_rest(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(c, '_' | '\'' | '!' | '?')
         || is_lean_letter_like(c)
@@ -1474,7 +1474,7 @@ pub(crate) fn contains_lean_ident_segment(haystack: &str, seg: &str) -> bool {
     lean_word_ends(haystack, seg, false).next().is_some()
 }
 
-fn contains_lean_attribute_word(unquoted: &str, attrs: &[&str]) -> bool {
+pub(crate) fn contains_lean_attribute_word(unquoted: &str, attrs: &[&str]) -> bool {
     let mut rest = unquoted;
     while !rest.is_empty() {
         let at_pos = rest.find("@[");
@@ -1575,12 +1575,61 @@ const ELAB_EXEC_ATTRS: &[&str] = &[
     "builtin_env_extension",
 ];
 
-fn unquoted_has_elab_exec_trigger(unquoted: &str) -> bool {
+pub(crate) fn unquoted_has_elab_exec_trigger(unquoted: &str) -> bool {
     ELAB_IO_WORDS.iter().any(|w| contains_lean_word(unquoted, w))
         || ELAB_EXEC_SEGMENTS
             .iter()
             .any(|w| contains_lean_ident_segment(unquoted, w))
         || contains_lean_attribute_word(unquoted, ELAB_EXEC_ATTRS)
+}
+
+/// True when the text *defines* code importers can invoke during their own elaboration:
+/// elaborators, tactics, simprocs, linters, and attribute / environment-extension
+/// registrations. A host read behind one of these executes in whichever module
+/// elaborates the invoking syntax, not only in the defining module.
+pub(crate) fn unquoted_has_invocable_definer_trigger(unquoted: &str) -> bool {
+    const DEFINER_WORDS: &[&str] = &[
+        "elab",
+        "elab_rules",
+        "simproc",
+        "dsimproc",
+        "simproc_decl",
+        "dsimproc_decl",
+    ];
+    const DEFINER_ATTRS: &[&str] = &[
+        "command_elab",
+        "term_elab",
+        "app_elab",
+        "tactic",
+        "env_linter",
+        "package_check",
+        "cpass",
+        "user_attr",
+        "env_extension",
+        "builtin_env_extension",
+    ];
+    DEFINER_WORDS.iter().any(|w| contains_lean_word(unquoted, w))
+        || ELAB_EXEC_SEGMENTS
+            .iter()
+            .any(|w| contains_lean_ident_segment(unquoted, w))
+        || contains_lean_attribute_word(unquoted, DEFINER_ATTRS)
+}
+
+/// True when the text holds a command that executes only while *this* module's own
+/// build elaborates it (`#eval`, `run_cmd`, ...), never inside an importer.
+pub(crate) fn unquoted_has_self_run_only_trigger(unquoted: &str) -> bool {
+    [
+        "run_cmd",
+        "run_elab",
+        "drun_elab",
+        "run_meta",
+        "run_tac",
+        "#eval",
+        "#eval!",
+        "#guard_msgs",
+    ]
+    .iter()
+    .any(|w| contains_lean_word(unquoted, w))
 }
 
 /// Returns true if `src` may execute arbitrary `IO` / `CoreM` / `CommandElabM` / `TermElabM` /
@@ -1674,7 +1723,7 @@ pub(crate) fn source_has_runtime_replacement_attribute(src: &str) -> bool {
     contains_lean_attribute_word(&unquoted, &["extern", "implemented_by", "csimp"])
 }
 
-fn unquoted_has_host_read_tokens(comment_free: &str, unquoted: &str) -> bool {
+pub(crate) fn unquoted_has_host_read_tokens(comment_free: &str, unquoted: &str) -> bool {
     const QUALIFIED_HOST_READS: &[&str] = &[
         "IO.FS",
         "IO.Prim",

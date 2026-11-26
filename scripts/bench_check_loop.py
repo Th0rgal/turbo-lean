@@ -8,6 +8,10 @@ medians against it. Every performance change in this project must show before
 and after numbers from this script; a change that does not move them is
 reverted.
 
+The run JSON also records the G2a number (roadmap/HORIZONS.md): the CAS replay
+hit rate over the recorded warm edit sequences, per mode (`cas_replay` inside
+each measured mode result) and run-wide (top-level `cas_replay`).
+
 Typical before/after on one machine (the only comparison this script trusts),
 with the environment it requires (TURBO_LEAN_GIT must be git >= 2.46) and the
 checkout arguments it needs:
@@ -50,6 +54,7 @@ Python standard library only.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import math
@@ -78,6 +83,11 @@ COVERAGE_GATE = 0.90
 BUSY_LOAD_THRESHOLD = 1.0  # one 100%-CPU tenant already poisons warm medians
 DEFAULT_TRIALS = 5
 DEFAULT_WARMUP = 1
+# Per-check wall budget. 900 s is the default; a loaded host can push a cold
+# Batteries warm-setup past it (measured 2026-11-25), so a run may widen the
+# budget through TURBO_LEAN_BENCH_CHECK_TIMEOUT_S. The override is validated in
+# validate_environment() so a malformed value is an environment error (exit 4),
+# never a bare crash; the value is recorded with the results.
 CHECK_TIMEOUT_S = 900
 
 PINNED_REVS = {
@@ -122,7 +132,7 @@ RECORDED_ENV_VARS = [
     "TURBO_LEAN_GIT", "TURBO_LEAN_ALLOWED_CSIMP", "TURBO_LEAN_ALLOWED_UNSAFE",
     "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY", "TURBO_LEAN_HOME", "TURBO_LEAN_STAGING_DIR",
     "TURBO_LEAN_NO_DAEMON", "TURBO_LEAN_NO_REMOTE_TELEMETRY", "TURBO_LEAN_TELEMETRY",
-    "TURBO_LEAN_DAEMON_IDLE_SECS",
+    "TURBO_LEAN_DAEMON_IDLE_SECS", "TURBO_LEAN_BENCH_CHECK_TIMEOUT_S",
 ]
 
 VERDICT_EXIT = {
@@ -131,6 +141,7 @@ VERDICT_EXIT = {
     "comparison_refused_workload_rev_mismatch": 4,
     "comparison_refused_toolchain_mismatch": 4,
     "blocked_workload_unexpected_failure": 4,
+    "partial_run": 0,
     "regression": 1, "measurement_failed": 1, "stale_expectation": 3,
 }
 
@@ -195,6 +206,22 @@ def empty_workload_result(w):
     }
 
 
+def selected_workloads(args):
+    """WORKLOADS filtered by --only-workloads, in table order.
+
+    The filter applies only to the measurement loop: validate_baseline and
+    compare_run keep seeing the full table so baseline files stay complete, and
+    unselected workloads keep the same "pending" entry an unreached workload
+    has today. Name validation (exit 2 on an unknown id) happens in main's
+    argparse stage; this helper assumes the names are valid.
+    """
+    raw = getattr(args, "only_workloads", None)
+    if not raw:
+        return list(WORKLOADS)
+    names = {n.strip() for n in raw.split(",") if n.strip()}
+    return [w for w in WORKLOADS if w["id"] in names]
+
+
 def empty_run_result(workloads, trials):
     return {
         "schema_version": SCHEMA_VERSION, "kind": "results", "created_utc": utc_now_iso(),
@@ -205,7 +232,8 @@ def empty_run_result(workloads, trials):
 
 
 def mode_result(runs_ms, coverage_ratios, statuses, extra=None, phase_dicts=None,
-                psi_lists=None, failed_trials=0, tool_coverage=None):
+                psi_lists=None, failed_trials=0, tool_coverage=None,
+                fission_dicts=None, rss_mbs=None, replay_mode=False):
     xs = list(runs_ms)
     out = {
         "runs_ms": [round(x, 1) for x in xs],
@@ -218,6 +246,37 @@ def mode_result(runs_ms, coverage_ratios, statuses, extra=None, phase_dicts=None
         "coverage_ratio_external_min": round(min(coverage_ratios), 4) if coverage_ratios else None,
         "statuses_observed": sorted(set(statuses)),
     }
+    # Per-trial peak RSS as the tool reported it (`peak_rss_mb` in its check
+    # JSON), in trial order, so a monotonic riser across trials stays visible.
+    # Absent values stay absent rather than 0: a missing reading is not 0 MB.
+    if rss_mbs is not None and any(v is not None for v in rss_mbs):
+        out["peak_rss_mb_trials"] = list(rss_mbs)
+    # G2a (roadmap/HORIZONS.md): a `theorem_cache_hit` call replayed the
+    # declaration's proof from the theorem CAS with no elaboration; a
+    # `theorem_verified` call ran elaboration (a CAS miss for its target).
+    # Any other status (a blocked probe's exit_*) counts as neither, so
+    # hits + misses can be below `trials`. Only the warm daemon modes are in
+    # the recorded replay sequence (replay_mode); a cold run has no CAS to
+    # hit, so it carries no cas_replay block at all.
+    if replay_mode:
+        hits = sum(1 for s in statuses if s == "theorem_cache_hit")
+        misses = sum(1 for s in statuses if s == "theorem_verified")
+        if hits or misses:
+            replay = {"hits": hits, "misses": misses,
+                      "hit_rate": round(hits / (hits + misses), 4)}
+            if fission_dicts is not None:
+                def fission_sum(key):
+                    # None when no trial reported the field: "never emitted"
+                    # stays distinguishable from a reported zero, like the
+                    # RSS handling above.
+                    vals = [d.get(key) for d in fission_dicts
+                            if d.get(key) is not None]
+                    return sum(int(v) for v in vals) if vals else None
+                replay["fission_cached_subshards"] = fission_sum(
+                    "fission_cached_subshards")
+                replay["fission_verified_subshards"] = fission_sum(
+                    "fission_verified_subshards")
+            out["cas_replay"] = replay
     if phase_dicts:
         names = sorted({k for pd in phase_dicts for k in pd})
         out["phases_ms_median"] = {
@@ -266,6 +325,87 @@ def blocked_workload_result(exit_code, error_class, median_ms):
         "error_class": error_class,
         "modes": {"cold_no_daemon": {"trials": 1, "median_ms": median_ms,
                                      "runs_ms": [median_ms], "rel_spread": 0.0}},
+    }
+
+
+# --------------------------------------------------- G2a CAS replay hit rate
+
+REPLAY_SEQUENCE_MODES = ("warm_cache_hit_daemon", "warm_edited_proof_daemon")
+
+
+def summarize_cas_replay(results):
+    """G2a (roadmap/HORIZONS.md): CAS replay hit rate on the recorded edit
+    sequences, computed from the statuses the tool reported.
+
+    The recorded sequence per active workload is the warm daemon loop this
+    script drives: `trials` unedited re-checks of the pinned declaration
+    (`warm_cache_hit_daemon`), then `trials` re-checks each after a distinct
+    proof-body edit (`warm_edited_proof_daemon`); warmup and settling runs
+    are excluded, as everywhere in this script. A check call counts as a CAS
+    replay hit when the tool reported `theorem_cache_hit` (proof replayed
+    from the theorem CAS, no elaboration) and as a miss when it reported
+    `theorem_verified` (elaboration ran). The per-condition rates carry the
+    information; the overall rate also reflects the sequence's own
+    unedited:edited mix (trials:trials), so it is only meaningful next to
+    its call counts, never alone. Blocked workloads and the cold mode are
+    outside the recorded sequence and are not counted.
+    """
+    def bucket(modes):
+        hits = misses = failed = other = 0
+        fission_cached, fission_verified = [], []
+        workloads = []
+        for wid, w in sorted((results.get("workloads") or {}).items()):
+            if w.get("expected_status") == "blocked":
+                continue
+            for mode in modes:
+                m = (w.get("modes") or {}).get(mode) or {}
+                rep = m.get("cas_replay")
+                if not rep:
+                    continue
+                h, mi = rep.get("hits", 0), rep.get("misses", 0)
+                hits += h
+                misses += mi
+                # Failed trials never reach the status lists, and healthy
+                # trials with a status outside the two counted ones are not
+                # classified; both counts ride along so the rates cannot hide
+                # them (classified_calls is NOT the number of calls made).
+                failed += int(m.get("failed_trials") or 0)
+                trials = m.get("trials")
+                if isinstance(trials, int):
+                    other += max(trials - h - mi, 0)
+                for key, acc in (("fission_cached_subshards", fission_cached),
+                                 ("fission_verified_subshards", fission_verified)):
+                    v = rep.get(key)
+                    if v is not None:
+                        acc.append(int(v))
+                if wid not in workloads:
+                    workloads.append(wid)
+        calls = hits + misses
+        return {"workloads": workloads, "classified_calls": calls,
+                "hits": hits, "misses": misses,
+                "hit_rate": round(hits / calls, 4) if calls else None,
+                "failed_trials": failed,
+                "other_status_calls": other,
+                "fission_cached_subshards": (sum(fission_cached)
+                                             if fission_cached else None),
+                "fission_verified_subshards": (sum(fission_verified)
+                                               if fission_verified else None)}
+
+    return {
+        "sequence": ("per active workload: {t} unedited warm re-checks "
+                     "(warm_cache_hit_daemon), then {t} edited re-checks "
+                     "(warm_edited_proof_daemon); warmup and settling runs "
+                     "excluded").format(t=results.get("trials")),
+        "unedited_recheck": bucket(("warm_cache_hit_daemon",)),
+        "edited_recheck": bucket(("warm_edited_proof_daemon",)),
+        "overall": bucket(REPLAY_SEQUENCE_MODES),
+        # Non-blocked workloads whose recorded status is not healthy; their
+        # surviving trials are still counted above, so the flag travels with
+        # the numbers.
+        "non_ok_workloads": sorted(
+            wid for wid, w in (results.get("workloads") or {}).items()
+            if w.get("expected_status") != "blocked"
+            and w.get("status") not in (None, "ok", "skipped_by_filter")),
     }
 
 
@@ -342,8 +482,17 @@ def validate_baseline(base):
 
 def host_matches(base, res) -> bool:
     bh, rh = base.get("host") or {}, res.get("host") or {}
-    if bh.get("hostname") != rh.get("hostname"):
+    bf, rf = bh.get("host_fingerprint"), rh.get("host_fingerprint")
+    if bf and rf:
+        if bf != rf:
+            return False
+    elif bh.get("hostname") != rh.get("hostname"):
+        # Legacy entries carry no fingerprint, so hostnames are compared as
+        # before. An old baseline (real hostname) against a new labeled run
+        # therefore mismatches; the migration path is --rebaseline.
         return False
+    # The label can only narrow the match further; it never widens it, since
+    # two machines sharing a label still differ in fingerprint above.
     lb, lr = bh.get("machine_label"), rh.get("machine_label")
     if lb and lr and lb != lr:
         return False
@@ -375,6 +524,22 @@ def toolchain_matches(base, res) -> bool:
     return (bt is not None and rt is not None
             and bool(bt["lean_toolchain"]) and bool(bt["lean_version"])
             and bt == rt)
+
+
+@dataclass
+class TrialSplit:
+    """Per-mode series over the HEALTHY trials (in trial order), plus the
+    count of failed ones. Named fields so a new series cannot silently
+    misalign the positional unpacking that a growing tuple invited."""
+    runs: list
+    covs: list
+    tool_covs: list
+    statuses: list
+    phases: list
+    psis: list
+    fissions: list
+    rss_mbs: list
+    failed: int
 
 
 def trial_failed(r) -> bool:
@@ -431,8 +596,10 @@ def compare_run(baseline, res):
             f"{verdict['unexpected_blocked_failures']}")
         return verdict
     healthy = all(
-        (w.get("status") == "ok" if w.get("expected_status") != "blocked"
-         else w.get("status") in ("blocked_as_expected", "unexpectedly_passing"))
+        (w.get("status") in ("ok", "skipped_by_filter")
+         if w.get("expected_status") != "blocked"
+         else w.get("status") in ("blocked_as_expected", "unexpectedly_passing",
+                                  "skipped_by_filter"))
         for w in res["workloads"].values()
     ) and not verdict["comparison_errors"]
     if not healthy:
@@ -448,6 +615,18 @@ def compare_run(baseline, res):
     if unexpected:
         verdict["unexpected_successes"] = unexpected
         verdict["verdict"] = "stale_expectation"
+        return verdict
+    # A --only-workloads run is deliberately partial: it can neither pass nor
+    # gate the full table, and its exit must stay distinguishable from a real
+    # failure (exit 0 under VERDICT_EXIT, where measurement_failed exits 1).
+    skipped = sorted(
+        wid for wid, w in res["workloads"].items()
+        if w.get("status") == "skipped_by_filter")
+    if skipped:
+        verdict["verdict"] = "partial_run"
+        verdict["skipped_reason"] = (
+            "run restricted with --only-workloads; unmeasured: "
+            + ", ".join(skipped))
         return verdict
     if baseline is None:
         verdict["verdict"] = "not_compared"
@@ -639,9 +818,22 @@ def host_id(machine_label):
                 break
     except OSError:
         pass
+    try:
+        machine_id = Path("/etc/machine-id").read_text().strip()
+    except OSError:
+        machine_id = ""
+    # The fingerprint is what host_matches compares: it pins the physical
+    # machine without putting its name in the JSON (a label is a condition
+    # tag two machines could share, so it cannot carry the machine identity).
+    fingerprint = hashlib.sha256(
+        (platform.node() + "\0" + machine_id).encode()).hexdigest()
     return {
-        "hostname": platform.node(),
+        # With a label the label IS the recorded hostname: the live node name
+        # stays out of the JSON entirely (the label exists so results never
+        # carry the machine's real name; see g2a-workloads/DIAG-warm-modes.md).
+        "hostname": machine_label if machine_label else platform.node(),
         "machine_label": machine_label,
+        "host_fingerprint": fingerprint,
         "kernel": f"{platform.system()} {platform.release()}",
         "cpu_model": cpu_model,
         "nproc": os.cpu_count(),
@@ -835,6 +1027,8 @@ class Runner:
         self.git_bin = os.environ["TURBO_LEAN_GIT"]
         self.trials = args.trials
         self.warmups = args.warmup
+        # --check-timeout-s; getattr keeps stub args objects in tests working.
+        self.check_timeout_s = getattr(args, "check_timeout_s", None) or CHECK_TIMEOUT_S
         self.scratch = Path(tempfile.mkdtemp(prefix="m1-bench-")).resolve()
         self.revs = {}
         self.oleans_guard_violated = False
@@ -888,14 +1082,25 @@ class Runner:
             env.pop("TURBO_LEAN_NO_DAEMON", None)
         return env
 
+    def effective_check_timeout_s(self):
+        # The --check-timeout-s flag (folded into check_timeout_s at
+        # construction) wins; a runner without one reads the module global at
+        # call time, so the TURBO_LEAN_BENCH_CHECK_TIMEOUT_S rebind is honored
+        # and the child's --timeout argv and subprocess.run's bound always
+        # carry the same value.
+        return getattr(self, "check_timeout_s", None) or CHECK_TIMEOUT_S
+
     def check_argv(self, w, cache: Path, file_path: Path):
         argv = [str(self.bin), "--cache-dir", str(cache), "--json", "--no-telemetry",
                 "check", "--project-dir", str(self.proj_dir(w)),
-                "--decl", w["decl"], "--timeout", str(CHECK_TIMEOUT_S), str(file_path)]
+                "--decl", w["decl"], "--timeout", str(self.effective_check_timeout_s()),
+                str(file_path)]
         return argv + list(w.get("extra_args", []))
 
     def run_check(self, w, cache: Path, home: Path, staging: Path, no_daemon: bool,
-                  timeout_s=CHECK_TIMEOUT_S):
+                  timeout_s=None):
+        if timeout_s is None:
+            timeout_s = self.effective_check_timeout_s()
         env = self.trial_env(cache, home, staging, no_daemon)
         argv = self.check_argv(w, cache, self.source_path(w))
         psi_before = sample_psi()
@@ -958,11 +1163,16 @@ class Runner:
         one is a failed measurement even if a time was parsed; it is excluded
         from the median and counted in `failed_trials`.
         """
-        runs, covs, tool_covs, statuses, phases, psis, failed = [], [], [], [], [], [], 0
+        runs, covs, tool_covs, statuses, phases, psis = [], [], [], [], [], []
+        fissions, rsss, failed = [], [], 0
         for r in trial_results:
             if trial_failed(r):
                 failed += 1
                 continue
+            j = r.get("json") or {}
+            fissions.append({k: j.get(k) for k in (
+                "fission_cached_subshards", "fission_verified_subshards")})
+            rsss.append(j.get("peak_rss_mb"))
             runs.append(r["external_wall_ms"])
             statuses.append(str((r.get("json") or {}).get("status") or f"exit_{r['exit_code']}"))
             pt = (r.get("json") or {}).get("phase_timings") or {}
@@ -973,7 +1183,9 @@ class Runner:
             tool_covs.append(pt.get("coverage_ratio") or 0.0)
             phases.append(pt.get("phases_ms") or {})
             psis.append([r.get("psi_before") or {}, r.get("psi_after") or {}])
-        return runs, covs, tool_covs, statuses, phases, psis, failed
+        return TrialSplit(runs=runs, covs=covs, tool_covs=tool_covs,
+                          statuses=statuses, phases=phases, psis=psis,
+                          fissions=fissions, rss_mbs=rsss, failed=failed)
 
     def run_cold_mode(self, w):
         trial_results = []
@@ -988,9 +1200,11 @@ class Runner:
             shutil.rmtree(d, ignore_errors=True)
             if i >= self.warmups:
                 trial_results.append(r)
-        runs, covs, tool_covs, statuses, phases, psis, failed = self.split_trials(trial_results)
-        return mode_result(runs, covs, statuses, phase_dicts=phases, psi_lists=psis,
-                           failed_trials=failed, tool_coverage=tool_covs)
+        ts = self.split_trials(trial_results)
+        return mode_result(ts.runs, ts.covs, ts.statuses, phase_dicts=ts.phases,
+                           psi_lists=ts.psis, failed_trials=ts.failed,
+                           tool_coverage=ts.tool_covs, fission_dicts=ts.fissions,
+                           rss_mbs=ts.rss_mbs)
 
     def run_warm_modes(self, w):
         d = self.wl_scratch(w["id"]) / "warm"
@@ -1007,13 +1221,15 @@ class Runner:
             hit_trials = []
             for _ in range(self.trials):
                 hit_trials.append(self.run_check(w, cache, home, staging, no_daemon=False))
-            runs, covs, tool_covs, hit_status, hit_phases, hit_psis, hit_failed = \
-                self.split_trials(hit_trials)
-            warm_cache = mode_result(runs, covs, hit_status, phase_dicts=hit_phases,
-                                     psi_lists=hit_psis, failed_trials=hit_failed,
-                                     tool_coverage=tool_covs)
-            if not all(s == "theorem_cache_hit" for s in hit_status):
-                warm_cache["cache_hit_assert_failed"] = hit_status
+            hs = self.split_trials(hit_trials)
+            warm_cache = mode_result(hs.runs, hs.covs, hs.statuses,
+                                     phase_dicts=hs.phases, psi_lists=hs.psis,
+                                     failed_trials=hs.failed,
+                                     tool_coverage=hs.tool_covs,
+                                     fission_dicts=hs.fissions,
+                                     rss_mbs=hs.rss_mbs, replay_mode=True)
+            if not all(s == "theorem_cache_hit" for s in hs.statuses):
+                warm_cache["cache_hit_assert_failed"] = hs.statuses
             edit_runs, edit_covs, edit_status, edit_phases, edit_psis = [], [], [], [], []
             src_path = self.source_path(w)
             original = src_path.read_bytes()
@@ -1035,13 +1251,15 @@ class Runner:
                     edit_trials.append(r)
             finally:
                 self.clear_edit(src_path, original)
-            runs, covs, tool_covs, edit_status, edit_phases, edit_psis, edit_failed = \
-                self.split_trials(edit_trials)
-            warm_edit = mode_result(runs, covs, edit_status, phase_dicts=edit_phases,
-                                    psi_lists=edit_psis, failed_trials=edit_failed,
-                                    tool_coverage=tool_covs)
-            if not all(s == "theorem_verified" for s in edit_status):
-                warm_edit["verified_assert_failed"] = edit_status
+            es = self.split_trials(edit_trials)
+            warm_edit = mode_result(es.runs, es.covs, es.statuses,
+                                    phase_dicts=es.phases, psi_lists=es.psis,
+                                    failed_trials=es.failed,
+                                    tool_coverage=es.tool_covs,
+                                    fission_dicts=es.fissions,
+                                    rss_mbs=es.rss_mbs, replay_mode=True)
+            if not all(s == "theorem_verified" for s in es.statuses):
+                warm_edit["verified_assert_failed"] = es.statuses
             return warm_cache, warm_edit
         finally:
             stop_daemons(self.bin, self.trial_env(cache, home, staging, no_daemon=False))
@@ -1169,7 +1387,31 @@ def install_signal_restore(runner: Runner):
                 pass  # not the main thread (tests)
 
 
+def _apply_check_timeout_override():
+    """Fold in TURBO_LEAN_BENCH_CHECK_TIMEOUT_S, validated.
+
+    A junk or non-positive value raises BenchEnvError so the run exits 4
+    (environment error) per the exit-code contract, instead of an uncaught
+    ValueError exiting 1 (reserved for a regression verdict).
+    """
+    global CHECK_TIMEOUT_S
+    raw = os.environ.get("TURBO_LEAN_BENCH_CHECK_TIMEOUT_S")
+    if raw is None:
+        return
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise BenchEnvError(
+            f"TURBO_LEAN_BENCH_CHECK_TIMEOUT_S must be an integer number of "
+            f"seconds, got {raw!r}") from e
+    if value <= 0:
+        raise BenchEnvError(
+            f"TURBO_LEAN_BENCH_CHECK_TIMEOUT_S must be positive, got {raw!r}")
+    CHECK_TIMEOUT_S = value
+
+
 def validate_environment(args):
+    _apply_check_timeout_override()
     for var, expected in REQUIRED_ENV.items():
         got = os.environ.get(var)
         if got != expected:
@@ -1262,6 +1504,13 @@ def main(argv=None):
     ap.add_argument("--trials", type=int, default=DEFAULT_TRIALS)
     ap.add_argument("--warmup", type=int, default=DEFAULT_WARMUP,
                     help="discarded settling runs before measured trials (default 1)")
+    ap.add_argument("--check-timeout-s", type=int, default=CHECK_TIMEOUT_S,
+                    help="per-check budget in seconds, passed to `check --timeout` and "
+                         f"used as the subprocess timeout (default {CHECK_TIMEOUT_S})")
+    ap.add_argument("--only-workloads",
+                    help="comma-separated workload ids; only these are measured, the "
+                         "rest stay pending. For targeted re-measurement; normally "
+                         "used with --no-baseline.")
     ap.add_argument("--out", help="write the full results JSON here")
     ap.add_argument("--baseline", help="baseline or prior results JSON to compare against "
                                        "(default: scripts/bench_check_loop_baseline.json "
@@ -1269,8 +1518,10 @@ def main(argv=None):
     ap.add_argument("--no-baseline", action="store_true", help="never compare")
     ap.add_argument("--rebaseline", action="store_true",
                     help="this run becomes the new baseline JSON (written to --out)")
-    ap.add_argument("--machine-label", help="label for this machine/condition; a baseline "
-                                            "from a different label is never compared")
+    ap.add_argument("--machine-label", help="label for this machine/condition; also "
+                                            "recorded as the host hostname field in place "
+                                            "of the live node name; a baseline from a "
+                                            "different label is never compared")
     ap.add_argument("--skip-rev-check", action="store_true",
                     help="do not enforce pinned Batteries/PFR revs (recorded honestly)")
     ap.add_argument("--allow-busy-node", action="store_true",
@@ -1286,6 +1537,20 @@ def main(argv=None):
         ap.error(f"--trials must be >= 1, got {args.trials}")
     if args.warmup < 0:
         ap.error(f"--warmup must be >= 0, got {args.warmup}")
+    if args.check_timeout_s <= 0:
+        ap.error(f"--check-timeout-s must be >= 1, got {args.check_timeout_s}")
+    if args.only_workloads is not None:
+        names = [n.strip() for n in args.only_workloads.split(",") if n.strip()]
+        if not names:
+            ap.error("--only-workloads needs at least one workload id")
+        valid = {w["id"] for w in WORKLOADS}
+        unknown = sorted(set(names) - valid)
+        if unknown:
+            ap.error(f"unknown workload id(s): {', '.join(unknown)}; valid ids: "
+                     + ", ".join(w["id"] for w in WORKLOADS))
+        if args.rebaseline:
+            ap.error("--rebaseline cannot be combined with --only-workloads: "
+                     "a baseline must measure every workload")
 
     if args.validate_only:
         try:
@@ -1305,7 +1570,14 @@ def main(argv=None):
                  "the environment needs TURBO_LEAN_GIT (git >= 2.46) and "
                  "TURBO_LEAN_ALLOWED_{CSIMP,UNSAFE,IMPLEMENTED_BY}='*'")
 
-    git_bin, git_human = validate_environment(args)
+    # Environment validation failures are environment errors (exit 4) like every
+    # other BenchEnvError; an uncaught raise here used to exit 1, the code reserved
+    # for a regression verdict.
+    try:
+        git_bin, git_human = validate_environment(args)
+    except BenchEnvError as e:
+        print(f"ENVIRONMENT ERROR (exit 4): {e}", file=sys.stderr)
+        return 4
     runner = Runner(args)
     install_signal_restore(runner)
     t_start = time.monotonic()
@@ -1337,11 +1609,22 @@ def main(argv=None):
                      "load1_at_end": None,
                      "busy_allowed": args.allow_busy_node},
             "args": {"trials": args.trials, "warmup": args.warmup,
-                     "skip_rev_check": args.skip_rev_check},
+                     "skip_rev_check": args.skip_rev_check,
+                     "check_timeout_s": args.check_timeout_s,
+                     "only_workloads": args.only_workloads},
         })
-        for w in WORKLOADS:
+        selected = selected_workloads(args)
+        for w in selected:
             entry = runner.run_workload(w)
             results["workloads"][w["id"]] = entry
+        selected_ids = {w["id"] for w in selected}
+        for w in WORKLOADS:
+            if w["id"] not in selected_ids:
+                # Deliberately unmeasured, not failed: the verdict side reads
+                # this status and reports partial_run instead of
+                # measurement_failed.
+                results["workloads"][w["id"]]["status"] = "skipped_by_filter"
+        results["cas_replay"] = summarize_cas_replay(results)
         verdict = compare_run(baseline, results)
         results["verdict"] = verdict
         if args.rebaseline:
@@ -1368,6 +1651,20 @@ def main(argv=None):
             print(f"  {cell}: {g['baseline_median_ms']} -> {g['new_median_ms']} ms "
                   f"({g['delta_ms']:+.1f} ms, {g['delta_pct']:+.2f}%) "
                   f"band ±{g['noise_band_ms']} ms: {g['verdict']}")
+        rep = results["cas_replay"]
+        if rep["overall"]["classified_calls"]:
+            un, ed, ov = rep["unedited_recheck"], rep["edited_recheck"], rep["overall"]
+            extra = ""
+            if ov["failed_trials"] or ov["other_status_calls"]:
+                extra += (f" | failed_trials={ov['failed_trials']} "
+                          f"other_status_calls={ov['other_status_calls']}")
+            if rep["non_ok_workloads"]:
+                extra += f" | non_ok_workloads={rep['non_ok_workloads']}"
+            print(f"G2A CAS REPLAY: overall {ov['hits']}/{ov['classified_calls']} "
+                  f"classified (hit_rate={ov['hit_rate']}) | unedited re-checks "
+                  f"{un['hits']}/{un['classified_calls']} (hit_rate={un['hit_rate']}) | "
+                  f"edited re-checks {ed['hits']}/{ed['classified_calls']} "
+                  f"(hit_rate={ed['hit_rate']})" + extra, flush=True)
         if verdict.get("summary"):
             print(f"SUMMARY: {verdict['summary']}", flush=True)
         print(f"VERDICT: {verdict['verdict']}"

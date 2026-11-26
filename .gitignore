@@ -12,3 +12,6 @@
 
 .lean-native/
 __pycache__/
+
+# H1.4 proof-mutant scratch worktrees (scripts/proof_mutant_matrix.py)
+/.h14-mutants/

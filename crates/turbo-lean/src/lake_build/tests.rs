@@ -4601,26 +4601,81 @@ public def api := by
 
     // ---- G2b: CAS expr replay on by default for warm hits (roadmap/HORIZONS.md G2b) ----
 
+    /// Panic-safe env guard (the `module_builder.rs` `ScopedEnvVar` shape): restores the
+    /// previous value on drop, so a failed assertion cannot leak the variable into later
+    /// warm-path tests through the `into_inner` lock recovery.
+    struct ScopedEnvVar {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, val: &str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, val);
+            Self { key, prev }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(ref p) = self.prev {
+                std::env::set_var(self.key, p);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
     /// G2b red→green: the pure warm-default decision. Replay runs by default only on a
-    /// warm (cache-hit) path, never when the explicit fail-closed flag already runs it,
-    /// and never when the operator opted out.
+    /// warm (cache-hit) path and never when the operator opted out. The explicit flag is
+    /// not a parameter: the selector's early return owns that case, so the decision
+    /// function has no dead argument.
     #[test]
     fn g2b_warm_default_cas_replay_decision_table() {
-        // (explicit, cache_hit, opt_out) -> warm default replay?
-        for (explicit, cache_hit, opt_out, want) in [
-            (false, true, false, true),   // the G2b default: a warm hit replays
-            (true, true, false, false),   // explicit flag owns the replay (fail-closed path)
-            (false, false, false, false), // cold build: elaboration ran anyway, no default replay
-            (false, true, true, false),   // TURBO_LEAN_NO_WARM_CAS_REPLAY=1 opts out
-            (true, false, false, false),
-            (true, true, true, false),
+        // (cache_hit, opt_out) -> warm default replay?
+        for (cache_hit, opt_out, want) in [
+            (true, false, true),   // the G2b default: a warm hit replays
+            (false, false, false), // cold build: elaboration ran anyway, no default replay
+            (true, true, false),   // TURBO_LEAN_NO_WARM_CAS_REPLAY=1 opts out
+            (false, true, false),
         ] {
             assert_eq!(
-                should_replay_cas_expr_on_warm_hit(explicit, cache_hit, opt_out),
+                should_replay_cas_expr_on_warm_hit(cache_hit, opt_out),
                 want,
-                "decision (explicit={explicit}, cache_hit={cache_hit}, opt_out={opt_out})"
+                "decision (cache_hit={cache_hit}, opt_out={opt_out})"
             );
         }
+    }
+
+    /// G2b round-1 addendum red→green (review finding 4): the leader / no-singleflight
+    /// branch is not always cold. Its cache-hit answer comes from this pure helper: warm
+    /// when the project's oleans were already up to date (no build ran), or when the
+    /// native build compiled nothing and served everything from cache or reuse.
+    #[test]
+    fn g2b_leader_branch_cache_hit_table() {
+        use crate::module_builder::NativeBuildReport;
+        let report = |compiled: usize, cached: usize, reused: usize| NativeBuildReport {
+            modules_compiled: compiled,
+            modules_cached: cached,
+            modules_up_to_date_reused: reused,
+            ..Default::default()
+        };
+        // Oleans already up to date: no build ran at all — warm whatever the report says.
+        assert!(leader_branch_cache_hit(true, &report(0, 0, 0)));
+        // Nothing compiled, everything cached or reused: warm.
+        assert!(leader_branch_cache_hit(false, &report(0, 1, 0)));
+        assert!(leader_branch_cache_hit(false, &report(0, 0, 2)));
+        // Anything compiled: cold, even when siblings came from cache.
+        assert!(!leader_branch_cache_hit(false, &report(1, 5, 5)));
+        // No evidence of warmth (an external-dep project's first visit): cold.
+        assert!(!leader_branch_cache_hit(false, &report(0, 0, 0)));
     }
 
     /// G2b red→green: `TURBO_LEAN_NO_WARM_CAS_REPLAY` is the opt-out, parsed with the
@@ -4630,8 +4685,7 @@ public def api := by
         let _guard = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("TURBO_LEAN_NO_WARM_CAS_REPLAY");
-        std::env::remove_var("TURBO_LEAN_NO_WARM_CAS_REPLAY");
+        let _env = ScopedEnvVar::unset("TURBO_LEAN_NO_WARM_CAS_REPLAY");
         assert!(!warm_cas_replay_disabled(), "unset must mean enabled");
         for (val, want) in [
             ("1", true),
@@ -4641,12 +4695,8 @@ public def api := by
             ("off", false),
             ("bogus", false),
         ] {
-            std::env::set_var("TURBO_LEAN_NO_WARM_CAS_REPLAY", val);
+            let _val = ScopedEnvVar::set("TURBO_LEAN_NO_WARM_CAS_REPLAY", val);
             assert_eq!(warm_cas_replay_disabled(), want, "value {val:?}");
-        }
-        match prev {
-            Some(v) => std::env::set_var("TURBO_LEAN_NO_WARM_CAS_REPLAY", v),
-            None => std::env::remove_var("TURBO_LEAN_NO_WARM_CAS_REPLAY"),
         }
     }
 
@@ -4752,20 +4802,86 @@ public def api := by
             )?,
             1
         );
+        // `Some(scope)` is exact: an EMPTY scope replays nothing instead of silently
+        // widening to the whole project (only `None` means "the whole project"), so a
+        // target-cone build whose cone resolved empty never scans every file by default.
+        assert_eq!(
+            replay_project_cas_expr_shards_best_effort(
+                &mut store,
+                &project,
+                "test",
+                "trusted",
+                Some(&[]),
+            )?,
+            CasExprReplayStats::default()
+        );
+        assert_eq!(
+            replay_project_cas_expr_shards(&mut store, &project, "test", "trusted", Some(&[]))?,
+            0
+        );
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// G2b round-1 addendum red→green (review finding 1): an internal error inside the
+    /// warm-default replay (here a lakefile that fails option resolution) must not fail a
+    /// warm build that already materialized its outputs. The selector contains it as mode
+    /// `"warm_default_error"` with zero counts; the explicit fail-closed flag still
+    /// propagates the same error.
+    #[test]
+    fn g2b_warm_default_replay_error_is_contained() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = ScopedEnvVar::unset("TURBO_LEAN_NO_WARM_CAS_REPLAY");
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_g2b_err_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let project = dir.join("project");
+        fs::create_dir_all(&project)?;
+        fs::write(
+            project.join("Demo.lean"),
+            "theorem g2b_err_demo : True := by trivial\n",
+        )?;
+        // An invalid Lake config makes option resolution fail inside the replay walk.
+        fs::write(project.join("lakefile.toml"), "name = [")?;
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+
+        // Warm default: the error is contained, logged, and reported as a mode — never a
+        // failed warm build.
+        let warm = run_cas_expr_replay_for_build(
+            &mut store, &project, "test", "trusted", None, false, true,
+        )?;
+        assert_eq!(
+            (warm.mode, warm.replayed, warm.missing, warm.invalid),
+            ("warm_default_error", 0, 0, 0)
+        );
+        // The explicit fail-closed flag still surfaces the same error.
+        let explicit_err = run_cas_expr_replay_for_build(
+            &mut store, &project, "test", "trusted", None, true, true,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{explicit_err:#}").contains("Failed to resolve Lean options"),
+            "explicit mode must keep propagating internal errors: {explicit_err:#}"
+        );
         fs::remove_dir_all(dir)?;
         Ok(())
     }
 
     /// G2b red→green: the one build-side selector every `run_build_command_with_cas_replay`
     /// branch calls. Explicit flag → fail-closed `"explicit"`; warm hit → best-effort
-    /// `"warm_default"` (env opt-out honored); cold build → `"off"`.
+    /// `"warm_default"` with "never seeded" (`missing`) and "corrupted or tampered"
+    /// (`invalid`) counted separately, never merged (env opt-out honored); cold build →
+    /// `"off"`.
     #[test]
     fn g2b_cas_replay_build_mode_selection() -> Result<()> {
         let _guard = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("TURBO_LEAN_NO_WARM_CAS_REPLAY");
-        std::env::remove_var("TURBO_LEAN_NO_WARM_CAS_REPLAY");
+        let _env = ScopedEnvVar::unset("TURBO_LEAN_NO_WARM_CAS_REPLAY");
         let dir = std::env::temp_dir().join(format!(
             "turbo_g2b_mode_{}_{}",
             std::process::id(),
@@ -4775,9 +4891,11 @@ public def api := by
         fs::create_dir_all(&project)?;
         let seeded_src = "theorem g2b_mode_seeded : True := by trivial\n";
         let missing_src = "theorem g2b_mode_missing : 3 = 3 := by rfl\n";
+        let invalid_src = "theorem g2b_mode_invalid : 4 = 4 := by rfl\n";
         let seeded = project.join("Seeded.lean");
         fs::write(&seeded, seeded_src)?;
         fs::write(project.join("Missing.lean"), missing_src)?;
+        fs::write(project.join("Invalid.lean"), invalid_src)?;
         let mut store = TurboStore::open(Some(&dir.join("store")))?;
         let split = split_lean_source(seeded_src, &[]);
         assert_eq!(split.shards.len(), 1);
@@ -4789,19 +4907,38 @@ public def api := by
             false,
             &[(seeded.clone(), seeded_src.to_string(), split)],
         )?;
+        // A corrupted (tamper-evidence) payload for `Invalid.lean`'s shard.
+        let bad_split = split_lean_source(invalid_src, &[]);
+        assert_eq!(bad_split.shards.len(), 1);
+        let bad_key = compute_shard_key("test", &bad_split.shards[0]);
+        store.batch_publish_theorem_shards(
+            "test",
+            "trusted",
+            &[(
+                bad_key,
+                bad_split.shards[0].name.clone(),
+                b"garbage: not a valid LNE1 / receipt / decl payload".to_vec(),
+                1,
+            )],
+        )?;
 
-        // Warm hit, no explicit flag: best-effort warm default.
-        let warm =
-            run_cas_expr_replay_for_build(&mut store, &project, "test", "trusted", None, false, true)?;
+        // Warm hit, no explicit flag: best-effort warm default; "never seeded" and
+        // "corrupted" are separate counts.
+        let warm = run_cas_expr_replay_for_build(
+            &mut store, &project, "test", "trusted", None, false, true,
+        )?;
         assert_eq!(
-            (warm.mode, warm.replayed, warm.skipped),
-            ("warm_default", 1, 1)
+            (warm.mode, warm.replayed, warm.missing, warm.invalid),
+            ("warm_default", 1, 1, 1)
         );
         // Cold build, no flag: off.
         let cold = run_cas_expr_replay_for_build(
             &mut store, &project, "test", "trusted", None, false, false,
         )?;
-        assert_eq!((cold.mode, cold.replayed, cold.skipped), ("off", 0, 0));
+        assert_eq!(
+            (cold.mode, cold.replayed, cold.missing, cold.invalid),
+            ("off", 0, 0, 0)
+        );
         // Explicit flag: fail-closed, even on a warm hit with a missing shard.
         let explicit_err = run_cas_expr_replay_for_build(
             &mut store, &project, "test", "trusted", None, true, true,
@@ -4823,22 +4960,28 @@ public def api := by
             true,
         )?;
         assert_eq!(
-            (explicit.mode, explicit.replayed, explicit.skipped),
-            ("explicit", 1, 0)
+            (
+                explicit.mode,
+                explicit.replayed,
+                explicit.missing,
+                explicit.invalid
+            ),
+            ("explicit", 1, 0, 0)
         );
-        // Opt-out: a warm hit stays off.
-        std::env::set_var("TURBO_LEAN_NO_WARM_CAS_REPLAY", "1");
+        // Opt-out: a warm hit stays off (the guard restores the variable even on a panic).
+        let _opt_out = ScopedEnvVar::set("TURBO_LEAN_NO_WARM_CAS_REPLAY", "1");
         let opted_out = run_cas_expr_replay_for_build(
             &mut store, &project, "test", "trusted", None, false, true,
         )?;
         assert_eq!(
-            (opted_out.mode, opted_out.replayed, opted_out.skipped),
-            ("off", 0, 0)
+            (
+                opted_out.mode,
+                opted_out.replayed,
+                opted_out.missing,
+                opted_out.invalid
+            ),
+            ("off", 0, 0, 0)
         );
-        match prev {
-            Some(v) => std::env::set_var("TURBO_LEAN_NO_WARM_CAS_REPLAY", v),
-            None => std::env::remove_var("TURBO_LEAN_NO_WARM_CAS_REPLAY"),
-        }
         fs::remove_dir_all(dir)?;
         Ok(())
     }

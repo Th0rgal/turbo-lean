@@ -53,6 +53,7 @@ import LeanNative.Proofs.CostAutotuneSoundness
 import LeanNative.Proofs.SliceBridgeStandaloneProofs
 import LeanNative.Proofs.TargetIRFuzzProofs
 import LeanNative.Proofs.LedgerEmbedded32Proofs
+import TurboLean.PolicyGates
 
 namespace LeanNative.Proofs
 
@@ -680,7 +681,6 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.lowerImpureStepPure_sound
   , ``LeanNative.Proofs.lowerRealLCNFCode_sound
   , ``LeanNative.Proofs.lowerRealLCNFDecl_sound
-  , ``LeanNative.Proofs.applyValidatedCompression_refines
   , ``LeanNative.Proofs.lowerRealLCNFDecl_driver_sound
   , ``LeanNative.Transform.evalSeqLoop_async_refines
   , ``LeanNative.Transform.optimizeAsyncStateMachine_refines
@@ -832,9 +832,12 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.lowerImpureStepPure_soundF
   , ``LeanNative.Proofs.lowerRealLCNFCode_soundF
   , ``LeanNative.Proofs.lowerRealLCNFDecl_soundF
+  , ``TurboLean.PolicyGates.specAuditWitnessReplay_eq_gate
+  , ``TurboLean.PolicyGates.specAuditWitnessReplay_sound_pos
+  , ``TurboLean.PolicyGates.specAuditWitnessReplay_sound_neg
   ]
 
-#guard auditedTheoremNames.length == 872
+#guard auditedTheoremNames.length == 874
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/

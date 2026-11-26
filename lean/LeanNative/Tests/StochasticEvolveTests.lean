@@ -179,25 +179,36 @@ def deepReceipt : SuperoptEvolveReceipt := executeSuperoptEvolve canonCfg (.modu
 #eval show IO Unit from do
   let payload := cachedStochasticBundle.toJson.toUTF8
   let digest := TurboLean.Blake3.blake3Bytes payload
-  let path := "/tmp/stochastic-evolve-integrity.tlpack"
+  -- A per-run UNIQUE path under $TMPDIR (never a fixed name, never a literal
+  -- /tmp): two concurrent builds of this module sharing one temp directory
+  -- overwrote or removed each other's fixed-name fixture mid-check, failing
+  -- elaboration with "pack integrity regression" or ENOENT (measured by the
+  -- H1.4 mutant matrix, scripts/proof_mutant_matrix.py). Cleanup runs in
+  -- `finally`, so a thrown regression does not strand the fixture; an empty
+  -- TMPDIR falls back to /tmp instead of the filesystem root.
+  let tmpDirEnv := (← IO.getEnv "TMPDIR").getD "/tmp"
+  let tmpDir := if tmpDirEnv.isEmpty then "/tmp" else tmpDirEnv
+  let path := tmpDir ++ s!"/stochastic-evolve-integrity-{← IO.monoNanosNow}.tlpack"
   let compressed := path ++ ".zst"
-  for tamper in [false, true] do
-    let hash := if tamper then (if digest.startsWith "0" then "1" else "0") ++ digest.drop 1
-      else digest
-    let header := ("{\"format_version\":2,\"actions\":[],\"blobs\":[{\"size_bytes\":" ++
-      toString payload.size ++ ",\"blob_hash\":\"" ++ hash ++ "\"}]}").toUTF8
-    let length := ByteArray.mk ((List.range 8).map (fun i => (header.size / 256 ^ i).toUInt8)).toArray
-    IO.FS.writeBinFile path (ByteArray.mk #[84, 76, 80, 75, 0, 0, 0, 2] ++ length ++ header ++ payload)
-    let hasZstd ← try
-      pure ((← IO.Process.output { cmd := "zstd", args := #["-q", "-f", "-o", compressed, path] }).exitCode == 0)
-    catch _ => pure false
-    for file in if hasZstd then [path, compressed] else [path] do
-      let accepted ← try
-        let _ ← loadStochasticBundleFromPath file
-        pure true
+  try
+    for tamper in [false, true] do
+      let hash := if tamper then (if digest.startsWith "0" then "1" else "0") ++ digest.drop 1
+        else digest
+      let header := ("{\"format_version\":2,\"actions\":[],\"blobs\":[{\"size_bytes\":" ++
+        toString payload.size ++ ",\"blob_hash\":\"" ++ hash ++ "\"}]}").toUTF8
+      let length := ByteArray.mk ((List.range 8).map (fun i => (header.size / 256 ^ i).toUInt8)).toArray
+      IO.FS.writeBinFile path (ByteArray.mk #[84, 76, 80, 75, 0, 0, 0, 2] ++ length ++ header ++ payload)
+      let hasZstd ← try
+        pure ((← IO.Process.output { cmd := "zstd", args := #["-q", "-f", "-o", compressed, path] }).exitCode == 0)
       catch _ => pure false
-      unless accepted != tamper do throw <| IO.userError "pack integrity regression"
-  IO.FS.removeFile path
-  try IO.FS.removeFile compressed catch _ => pure ()
+      for file in if hasZstd then [path, compressed] else [path] do
+        let accepted ← try
+          let _ ← loadStochasticBundleFromPath file
+          pure true
+        catch _ => pure false
+        unless accepted != tamper do throw <| IO.userError "pack integrity regression"
+  finally
+    try IO.FS.removeFile path catch _ => pure ()
+    try IO.FS.removeFile compressed catch _ => pure ()
 
 end LeanNative.Tests.StochasticEvolveTests

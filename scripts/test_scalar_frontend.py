@@ -30,12 +30,6 @@ def tearDownModule():
 
 SPEC_LEAN = fuzzer.ROOT / "lean" / "LeanNative" / "Spec.lean"
 
-# The primary `--arch` legs run the host CPU's TargetArch spelling; the opposite
-# CPU arch stays covered as the symmetric cross-emission leg (an arm64 host
-# cross-emits x86_64 IR, an x86_64 host cross-emits arm64 IR).
-HOST_ARCH = host_arch.host_target_arch()
-CROSS_ARCH = "x86_64" if HOST_ARCH == "arm64" else "arm64"
-
 # Arch-specific LLVM signature shapes for the stage-1B declarations: the x86_64
 # ABI lowering carries `zeroext` return/param attributes that the AArch64
 # lowering omits.
@@ -55,6 +49,28 @@ ENUM256_IR_NEEDLE = {
     "x86_64": "define dso_local zeroext i16 @big_enum_tag(i16 zeroext noundef %arg_v0)",
     "arm64": "define dso_local i16 @big_enum_tag(i16 noundef %arg_v0)",
 }
+
+
+# The primary `--arch` legs run the host CPU's TargetArch spelling; the opposite
+# CPU arch stays covered as the symmetric cross-emission leg (an arm64 host
+# cross-emits x86_64 IR, an x86_64 host cross-emits arm64 IR).
+def host_arch_or_skip(test: unittest.TestCase) -> str:
+    """The host CPU in the `--arch` spelling, computed lazily per test.
+
+    host_arch.host_target_arch() raises on unsupported machines, so an
+    import-time HOST_ARCH computation broke importing this module at all
+    (including test_fuzz_lcnf_conformance's `import test_scalar_frontend`).
+    The arch-dependent legs call this instead and skip on such hosts, and skip
+    (never KeyError) when the arch has no S1B_IR_NEEDLES entry
+    (ENUM256_IR_NEEDLE shares the same key set)."""
+    arch = host_arch.host_arch_or_skip(test)
+    if arch not in S1B_IR_NEEDLES:
+        test.skipTest(f"host arch {arch!r} has no S1B_IR_NEEDLES entry")
+    return arch
+
+
+# The opposite CPU arch for the symmetric cross-emission legs.
+cross_arch_for = host_arch.cross_arch_for
 
 
 def _requested_sanitizers() -> tuple[bool, bool]:
@@ -255,7 +271,7 @@ def streamFenceStep
         # Run the actual Lean bridge: same leaf names, mismatched types/arity
         # and local calls must stay outside the canonical intrinsic boundary.
         source = '''import LeanNative.IR.Bridge
-open LeanNative.IR
+open LeanNative.IR LeanNative.IR.RealLCNFBridge
 #guard canonicalUIntCastMask? `UInt64.toUInt8 [.i64] .i8 == some 255
 #guard canonicalUIntCastMask? `UInt8.toUInt64 [.i8] .i64 == some 255
 #guard canonicalUIntCastMask? `UInt16.toUInt32 [.i16] .i32 == some 65535
@@ -270,8 +286,7 @@ open LeanNative.IR
 #guard lookupCanonicalBinOp? `UInt32.ble == some .le
 #guard lookupCanonicalBinOp? `USize.blt == some .lt
 #guard lookupCanonicalBinOp? `USize.ble == some .le
-#eval do
-  let env ← Lean.mkEmptyEnvironment
+#eval show IO Unit from do
   let rejected : List (Lean.Name × List VarId × LNIRType × List LNIRType × Bool) :=
       [(`UInt64.toUInt8, [0], .i8, [.i64], true),
        (`User.UInt64.toUInt8, [0], .i8, [.i64], false),
@@ -288,9 +303,9 @@ open LeanNative.IR
        (`USize.sub, [0, 1], .usize, [.i64, .i64], false),
        (`User.UInt8.decEq, [0, 1], .i8, [.i8, .i8], false)]
   for (name, args, ret, tys, localCall) in rejected do
-    unless (tryLowerIntrinsicCall env name args ret tys localCall).isNone do
+    unless (lowerCanonicalIntrinsicPure? name args ret tys localCall).isNone do
       throw (IO.userError s!"unexpected intrinsic: {name}")
-  match tryLowerIntrinsicCall env `UInt64.decEq [0, 1] .i8 [.i64, .i64] with
+  match lowerCanonicalIntrinsicPure? `UInt64.decEq [0, 1] .i8 [.i64, .i64] with
   | some (.scalar (.select (.binOp .eq _ _) (.constU64 1) (.constU64 0))) => pure ()
   | _ => throw (IO.userError "UInt8 comparison lost its numeric representation")
 '''
@@ -336,6 +351,8 @@ def unsignedOuter (x : UInt64) : UInt64 := unsignedInner x + 1
         self._assert_batch_sanitizer_receipts(result)
 
     def test_stage1b_narrow_abi_usize_bool_enums_joinpoints_and_divmod_zero(self):
+        host = host_arch_or_skip(self)
+        cross = cross_arch_for(host)
         engines = fuzzer.probe_engines()
         self.assertTrue(all(engines[k] for k in ("stock_lean_c", "lnir_eval", "c_abi_llvm")), engines)
         lean_bin = engines["lean_bin"]
@@ -488,7 +505,7 @@ def s1b_enum_branch (tag : UInt8) (x : UInt64) (y : UInt64) : UInt64 :=
 
             wire_path = tmpdir / "stage1b.lnir"
             subprocess.run(
-                [full_bin, "emit-lnir", "--wire", "--arch", HOST_ARCH, str(lean_path), "-o", str(wire_path)],
+                [full_bin, "emit-lnir", "--wire", "--arch", host, str(lean_path), "-o", str(wire_path)],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -501,7 +518,7 @@ def s1b_enum_branch (tag : UInt8) (x : UInt64) (y : UInt64) : UInt64 :=
             cases_jsonl = tmpdir / "cases.jsonl"
             cases_jsonl.write_text("\n".join(json.dumps(c) for c in cases) + "\n", encoding="utf-8")
             ev_out = subprocess.check_output(
-                [core_bin, "eval-lnir", "--lnir", str(wire_path), "--arch", HOST_ARCH, "--opt", "--cases-file", str(cases_jsonl)],
+                [core_bin, "eval-lnir", "--lnir", str(wire_path), "--arch", host, "--opt", "--cases-file", str(cases_jsonl)],
                 text=True,
             )
             ev_rows = json.loads(ev_out)
@@ -510,25 +527,25 @@ def s1b_enum_branch (tag : UInt8) (x : UInt64) (y : UInt64) : UInt64 :=
                 self.assertTrue(r["ok"], r)
             lnir_vals = [int(r["value_u64"]) for r in ev_rows]
 
-            ll_host = tmpdir / f"stage1b.{HOST_ARCH}.ll"
-            ll_cross = tmpdir / f"stage1b.{CROSS_ARCH}.ll"
+            ll_host = tmpdir / f"stage1b.{host}.ll"
+            ll_cross = tmpdir / f"stage1b.{cross}.ll"
             subprocess.run(
-                [core_bin, "compile-llvm", "--lnir", str(wire_path), "--arch", HOST_ARCH, "-o", str(ll_host)],
+                [core_bin, "compile-llvm", "--lnir", str(wire_path), "--arch", host, "-o", str(ll_host)],
                 check=True,
                 capture_output=True,
                 text=True,
             )
             subprocess.run(
-                [core_bin, "compile-llvm", "--lnir", str(wire_path), "--arch", CROSS_ARCH, "-o", str(ll_cross)],
+                [core_bin, "compile-llvm", "--lnir", str(wire_path), "--arch", cross, "-o", str(ll_cross)],
                 check=True,
                 capture_output=True,
                 text=True,
             )
             ir_host = ll_host.read_text(encoding="utf-8")
             ir_cross = ll_cross.read_text(encoding="utf-8")
-            for needle in S1B_IR_NEEDLES[HOST_ARCH]:
+            for needle in S1B_IR_NEEDLES[host]:
                 self.assertIn(needle, ir_host)
-            for needle in S1B_IR_NEEDLES[CROSS_ARCH]:
+            for needle in S1B_IR_NEEDLES[cross]:
                 self.assertIn(needle, ir_cross)
 
             c_lines = [
@@ -724,6 +741,8 @@ def crcStep2 (crc : UInt32) (b : UInt8) : UInt32 :=
         self._assert_batch_sanitizer_receipts(result)
 
     def test_wasm32_usize_semantics_and_gpu_usize_rejection(self):
+        host = host_arch_or_skip(self)
+        cross = cross_arch_for(host)
         engines = fuzzer.probe_engines()
         core_bin = engines["core_bin"]
         full_bin = engines["full_bin"]
@@ -746,7 +765,7 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
                 text=True,
             )
             subprocess.run(
-                [full_bin, "emit-lnir", "--wire", "--arch", HOST_ARCH, str(src_path), "-o", str(native_wire)],
+                [full_bin, "emit-lnir", "--wire", "--arch", host, str(src_path), "-o", str(native_wire)],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -777,7 +796,7 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
                         "--lnir",
                         str(native_wire),
                         "--arch",
-                        HOST_ARCH,
+                        host,
                         "--batch-json",
                         "--args",
                         "wasm_usize_probe:4294967295,33",
@@ -793,7 +812,7 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
             # USize is 64-bit on both CPU arches, so the expectation is identical.
             cross_wire = tmpdir / "cross.lnir"
             subprocess.run(
-                [full_bin, "emit-lnir", "--wire", "--arch", CROSS_ARCH, str(src_path), "-o", str(cross_wire)],
+                [full_bin, "emit-lnir", "--wire", "--arch", cross, str(src_path), "-o", str(cross_wire)],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -806,7 +825,7 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
                         "--lnir",
                         str(cross_wire),
                         "--arch",
-                        CROSS_ARCH,
+                        cross,
                         "--batch-json",
                         "--args",
                         "wasm_usize_probe:4294967295,33",
@@ -922,7 +941,8 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
             subprocess.run([full_bin, "emit-lnir", "--wire", str(enum256_src), "-o", str(enum256_wire)], check=True, capture_output=True, text=True)
             # Text-only emission: check BOTH CPU arches on any host, so the x86 CI
             # job exercises the arm64 needle and an arm64 host the x86_64 one.
-            for e_arch in (HOST_ARCH, CROSS_ARCH):
+            host = host_arch_or_skip(self)
+            for e_arch in (host, cross_arch_for(host)):
                 e_ll = tmpdir / f"enum256.{e_arch}.ll"
                 subprocess.run([core_bin, "compile-llvm", "--lnir", str(enum256_wire), "--arch", e_arch, "-o", str(e_ll)], check=True, capture_output=True, text=True)
                 self.assertIn(ENUM256_IR_NEEDLE[e_arch], e_ll.read_text(encoding="utf-8"))
@@ -1033,38 +1053,47 @@ def callNestedPair (x : UInt64) : UInt64 :=
                 self.assertFalse(output.exists(), f"{label} published an artifact despite failure")
 
     def test_unsupported_lcnf_paths_fail_closed(self):
+        # L1 r1 (review a094d3a9 F2): ported from the deleted BridgeM wrappers to the
+        # proved pure core (lowerRealLCNFCode / lowerLitValuePure / lowerImpureLetValuePure);
+        # the pure-only cases (recursive local function, constructor payload pattern) went
+        # with the deleted pure lowering. L1 r2 (review 47512851 F3): the higher-order fvar
+        # case is NOT pure-only — LetValue .impure keeps `.fvar id args` — so it is ported
+        # to lowerImpureLetValuePure below.
         source = '''import LeanNative.IR.Bridge
-open Lean LeanNative.IR Lean.Compiler.LCNF
+open Lean LeanNative.IR LeanNative.IR.RealLCNFBridge Lean.Compiler.LCNF
 run_meta do
   let j : FVarId := ⟨`join⟩
   let x : FVarId := ⟨`value⟩
-  let r : FVarId := ⟨`res⟩
   let ty := mkConst ``UInt64
+  let ctx : RealBridgeCtx := { arch := .x86_64 }
+  let stX : RealBridgeState := { fvarMap := [(x, 0)], varTypes := [(0, .i64)], nextVarId := 1 }
   let recursive : FunDecl .impure := .mk j `join #[] ty (.jmp j #[])
-  let recLocalFn : FunDecl .pure := .mk j `recFn #[.mk x `p0 ty false] ty (.let ⟨r, `r, ty, .fvar j #[.fvar x]⟩ (.return r))
-  let p0 : Param .pure := .mk x `p0 ty false
-  let actions : List (String × BridgeM LNIRCode) :=
-    [("recursive join point", lowerImpureCode (.jp recursive (.jmp j #[]))),
-     ("unmapped join point", lowerImpureCode (.jmp j #[.fvar x])),
-     ("arity mismatch", lowerImpureCode (.jp (.mk j `join #[] ty (.return x)) (.jmp j #[.fvar x]))),
-     ("constructor tag mutation", lowerImpureCode (.setTag x 1 (.return x))),
-     ("recursive local function", lowerPureCode (.fun recLocalFn (.return x))),
-             ("higher-order fvar call", lowerPureLetValue (.fvar x #[.fvar x]) .i64 >>= fun _ => pure (.ret 0)),
-             ("constructor payload pattern", lowerPureAlts 0 false 0 [.alt `Boxed.mk #[p0] (.return x)]),
-             ("unsupported string literal", lowerLitValue (.str "abc") >>= fun _ => pure (.ret 0)),
-             ("Unsupported heap reset", lowerImpureLetValue (.reset 2 x rfl) .objPtr >>= fun _ => pure (.ret 0))]
-  for (expected, action) in actions do
-    let rejected ← try
-      let _ ← action.run' {}
-      pure false
-    catch error =>
-      let message ← error.toMessageData.toString
+  let cases : List (String × Except String Unit) :=
+    [("recursive join point",
+      (lowerRealLCNFCode 32 ctx {} (.jp recursive (.jmp j #[]))).map fun _ => ()),
+     ("unmapped join point",
+      (lowerRealLCNFCode 32 ctx stX (.jmp j #[.fvar x])).map fun _ => ()),
+     ("arity mismatch",
+      (lowerRealLCNFCode 32 ctx stX (.jp (.mk j `join #[] ty (.return x)) (.jmp j #[.fvar x]))).map fun _ => ()),
+     ("constructor tag mutation",
+      (lowerRealLCNFCode 32 ctx stX (.setTag x 1 (.return x))).map fun _ => ()),
+     ("higher-order fvar call",
+      (lowerImpureLetValuePure ctx stX (.fvar x #[.fvar x]) .i64).map fun _ => ()),
+     ("unsupported string literal",
+      (lowerLitValuePure (.str "abc") .i64 .x86_64).map fun _ => ()),
+     ("Unsupported heap reset",
+      (lowerImpureLetValuePure ctx { stX with varTypes := [(0, .objPtr)] } (.reset 2 x rfl) .objPtr).map fun _ => ())]
+  for (expected, result) in cases do
+    match result with
+    | .ok _ => throwError "accepted unsupported {expected}"
+    | .error message =>
       unless (message.splitOn expected).length > 1 do
         throwError "wrong rejection for {expected}: {message}"
-      pure true
-    unless rejected do throwError "accepted unsupported {expected}"
+  -- the proved path still lowers an ordinary non-recursive join point
   let ordinary : FunDecl .impure := .mk j `join #[] ty (.return x)
-  let _ ← (lowerImpureCode (.jp ordinary (.jmp j #[]))).run' { varTypes := ({} : Std.HashMap VarId LNIRType).insert 0 .i64, fvarToVar := ({} : Std.HashMap FVarId VarId).insert x 0, nextVarId := 1 }
+  match lowerRealLCNFCode 32 ctx stX (.jp ordinary (.jmp j #[])) with
+  | .ok _ => pure ()
+  | .error message => throwError "ordinary join point rejected: {message}"
 '''
         with tempfile.TemporaryDirectory(prefix="unsupported_lcnf_") as directory:
             path = Path(directory) / "Boundary.lean"
@@ -1100,6 +1129,7 @@ run_meta do
                 self.assertTrue((spool_mode / "events.jsonl").is_file(), f"{mode_flag} failed to emit events.jsonl")
 
     def test_validate_ingested_module_deduplicates_diamond_and_duplicate_call_edges(self):
+        host = host_arch_or_skip(self)
         engines = fuzzer.probe_engines()
         lean_src = """def k (x : UInt64) : UInt64 := (x ^^^ 0x9e3779b97f4a7c15) + 1
 
@@ -1127,7 +1157,7 @@ def f (x : UInt64) : UInt64 :=
             src.write_text(lean_src, encoding="utf-8")
             wire = tmp / "diamond.lnir"
             res = subprocess.run(
-                [engines["full_bin"], "emit-lnir", "--wire", "--arch", HOST_ARCH, str(src), "-o", str(wire)],
+                [engines["full_bin"], "emit-lnir", "--wire", "--arch", host, str(src), "-o", str(wire)],
                 capture_output=True, text=True,
             )
             self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
@@ -1140,7 +1170,7 @@ def f (x : UInt64) : UInt64 :=
                 encoding="utf-8",
             )
             ev_res = subprocess.run(
-                [engines["core_bin"], "eval-lnir", "--lnir", str(wire), "--arch", HOST_ARCH, "--opt", "--cases-file", str(cases_jsonl)],
+                [engines["core_bin"], "eval-lnir", "--lnir", str(wire), "--arch", host, "--opt", "--cases-file", str(cases_jsonl)],
                 capture_output=True, text=True,
             )
             self.assertEqual(ev_res.returncode, 0, ev_res.stdout + ev_res.stderr)

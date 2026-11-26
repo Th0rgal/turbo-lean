@@ -146,7 +146,8 @@ def expandCompilerAuxDecls (declNames : Array Lean.Name) : Lean.CoreM (Array Lea
   for name in declNames do
     let red := Lean.Name.str name "_redArg"
     if !out.contains red then
-      if (← Lean.Compiler.LCNF.getLocalImpureDecl? red).isSome || (← Lean.Compiler.LCNF.getMonoDecl? red).isSome then
+      -- L1 r1 (review a094d3a9 F8): mono-only `_redArg` forms fed the deleted mono arm.
+      if (← Lean.Compiler.LCNF.getLocalImpureDecl? red).isSome then
         out := out.push red
   return out
 
@@ -165,8 +166,24 @@ def ingestModuleDeclsWith (ingestImpure : Lean.Compiler.LCNF.Decl .impure → Ar
       let d ← ingestImpure impureDecl declNames arch
       decls := decls ++ [d]
       rawPairs := rawPairs ++ [(name, d.name)]
-    -- L1: a declaration with no impure LCNF form is `Unsupported` on the proved path
-    -- (the `lowerPureCode` mono lowering is gone); it stays with the stock backend.
+    else
+      -- L1 r1 (review a094d3a9 F4, red-first) + r2 (review 47512851 F2): an explicitly
+      -- requested declaration whose constant kind carries compiled code (a computable
+      -- def or opaque) fails closed by name instead of being dropped silently. The kind
+      -- check replaces the earlier base/mono LCNF lookups: those also see IMPORTED
+      -- entries, which mislabeled imported names as "no impure LCNF form", and they add
+      -- nothing the kind check misses (projections are `defnInfo` too). The whole module
+      -- ingest throws; there is no per-declaration fallback here.
+      let hasCode := match env.find? name with
+        | some (.defnInfo _) | some (.opaqueInfo _) => !Lean.isNoncomputable env name
+        | _ => false
+      if hasCode then
+        if (env.getModuleIdxFor? name).isSome then
+          Lean.throwError s!"[lean-native] Unsupported declaration `{name}`: imported declarations are outside the Stage 1B ingest (it lowers the current module's impure LCNF forms only)"
+        else
+          Lean.throwError s!"[lean-native] Unsupported declaration `{name}`: no impure LCNF form"
+    -- constants whose kind carries no compiled code (theorems, axioms, inductives and
+    -- constructors, noncomputable defs) are skipped silently
   if declsHaveMutualCycle callGraph then
     Lean.throwError s!"[lean-native] unsupported self-tail recursion / mutual recursion in {moduleName}: no qualified loop lowering"
   let rawMod : LNIRModule := { moduleName := moduleName, decls := decls }

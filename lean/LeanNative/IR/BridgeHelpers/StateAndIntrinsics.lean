@@ -13,30 +13,23 @@ L1 (`roadmap/HORIZONS.md` rung L1, w-l1): the `BridgeM` lowering utilities that 
 `substLNIRExprVars`, `freshenJoinPointCode`, `spliceJoinPointJmp`, `orderAlts`,
 `lowerLitValueM`, `lowerLitValue`, `internParams`, `lowerRefOp`, `inferImpureRhsType`,
 `lookupCtorIdx`) served only the deleted second lowering (`lowerPureCode`) and are deleted
-with it. What stays: `BridgeState`/`BridgeM` (the driver's ingest state), the self-call and
-mutual-cycle detectors the driver and module ingest use, `substScalarExprVars` (used by
-`Transform/EqSat`), and the trusted GF-SIMD intrinsic recognizers.
+with it. Round 1 (review a094d3a9 F5/F8) also deleted the compression producer's state:
+the `jpMap`, `jpIndexMap`, `localFunMap`, `inJoinPointBody`, `activeCtor`, `fvarCtor`,
+`hasExtern`, `mangledSymbol` and `isSimpleGround` fields were read by nothing once the
+post-pass was removed. What stays: the slimmed `BridgeState`/`BridgeM` (the driver's
+ingest state), the self-call and mutual-cycle detectors the driver and module ingest use,
+`substScalarExprVars` (used by `Transform/EqSat`), and the trusted GF-SIMD intrinsic
+recognizers.
 -/
 
 structure BridgeState where
   fvarToVar        : Std.HashMap Lean.FVarId VarId := {}
   varTypes         : Std.HashMap VarId LNIRType := {}
-  jpMap            : Std.HashMap Lean.FVarId (Array (Lean.Compiler.LCNF.Param .impure) × LNIRCode) := {}
-  jpIndexMap       : Std.HashMap Lean.FVarId Nat := {}
-  localFunMap      : Std.HashMap Lean.FVarId (List VarId × LNIRCode) := {}
   nextVarId        : VarId := 0
-  hasExtern        : Bool := false
-  mangledSymbol    : String := ""
-  isSimpleGround   : Bool := false
   selfDeclName     : Lean.Name := .anonymous
   localDeclNames   : Array Lean.Name := #[]
   arch             : TargetArch := .x86_64
   allowStage1DHeap : Bool := false
-  inJoinPointBody  : Bool := false
-  /-- C1.2: constructor known for a heap var (fresh `allocCtor` or enclosing `cases` alt). -/
-  activeCtor       : Std.HashMap VarId Lean.Name := {}
-  /-- C1.2: statically known ctor of `let x := ctor …` binders and reset/reuse join-point params (`collectFVarCtors`). -/
-  fvarCtor         : Std.HashMap Lean.FVarId Lean.Name := {}
   deriving Inhabited
 
 abbrev BridgeM := StateRefT BridgeState Lean.CoreM
