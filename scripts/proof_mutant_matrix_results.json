@@ -1,7 +1,7 @@
 {
   "schemaVersion": "proof-mutant-matrix-v2",
-  "generated_utc": "2026-11-26T07:25:08Z",
-  "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3",
+  "generated_utc": "2026-11-26T21:13:54Z",
+  "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
   "toolchain": "leanprover/lean4:v4.35.0",
   "kill_signal": "lake build LeanNative (proofs + Tests #guard closure)",
   "files": {
@@ -269,12 +269,13 @@
       "category": "const-offby1",
       "before": "idx + 1, discr?",
       "after": "idx + 2, discr?",
-      "duration_s": 50.4,
+      "duration_s": 60.6,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.StepMono",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/StepMono.lean:72:33: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-altidx-offby1-01",
@@ -284,12 +285,13 @@
       "category": "const-offby1",
       "before": "idx + 1, discr?",
       "after": "idx + 2, discr?",
-      "duration_s": 48.6,
+      "duration_s": 61.3,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.StepMono",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/StepMono.lean:123:33: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-boolconst-f2t-00",
@@ -299,12 +301,13 @@
       "category": "wrong-ctor-tag",
       "before": ".constBool false",
       "after": ".constBool true",
-      "duration_s": 47.5,
+      "duration_s": 69.9,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:502:20: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-boolconst-f2t-01",
@@ -314,12 +317,13 @@
       "category": "wrong-ctor-tag",
       "before": ".constBool false",
       "after": ".constBool true",
-      "duration_s": 46.7,
+      "duration_s": 61.8,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.UnaryCast",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/UnaryCast.lean:108:16: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-boolconst-f2t-02",
@@ -329,12 +333,13 @@
       "category": "wrong-ctor-tag",
       "before": ".constBool false",
       "after": ".constBool true",
-      "duration_s": 47.3,
+      "duration_s": 53.2,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.CtorIntrinsic",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/CtorIntrinsic.lean:23:13: Application type mismatch: The argument",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-boolconst-t2f-00",
@@ -344,12 +349,13 @@
       "category": "wrong-ctor-tag",
       "before": ".constBool true",
       "after": ".constBool false",
-      "duration_s": 46.7,
+      "duration_s": 69.1,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:510:20: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-boolconst-t2f-01",
@@ -359,12 +365,13 @@
       "category": "wrong-ctor-tag",
       "before": ".constBool true",
       "after": ".constBool false",
-      "duration_s": 47.6,
+      "duration_s": 71.9,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.UnaryCast",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/UnaryCast.lean:116:18: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-boolconst-t2f-02",
@@ -374,12 +381,13 @@
       "category": "wrong-ctor-tag",
       "before": ".constBool true",
       "after": ".constBool false",
-      "duration_s": 47.3,
+      "duration_s": 78.2,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.CtorIntrinsic",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/CtorIntrinsic.lean:28:15: Application type mismatch: The argument",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-boolconst-t2f-03",
@@ -389,12 +397,13 @@
       "category": "wrong-ctor-tag",
       "before": ".constBool true",
       "after": ".constBool false",
-      "duration_s": 47.1,
+      "duration_s": 58.5,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.LetValue",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/LetValue.lean:500:20: Application type mismatch: The argument",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-castguard-flip-00",
@@ -404,12 +413,13 @@
       "category": "branch-flip",
       "before": "if src != dst &&",
       "after": "if src == dst &&",
-      "duration_s": 47.4,
+      "duration_s": 57.0,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.UnaryCast",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/UnaryCast.lean:153:10: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-cidx0-flip-00",
@@ -419,12 +429,13 @@
       "category": "branch-flip",
       "before": "if cidx == 0 then .ite condVar no yes",
       "after": "if cidx == 1 then .ite condVar no yes",
-      "duration_s": 46.8,
+      "duration_s": 61.1,
       "outcome": "KILLED",
-      "killed_by": "LeanNative.Proofs.RealLCNFBridge.JpTag",
-      "first_error": "error: LeanNative/Proofs/RealLCNFBridge/JpTag.lean:471:14: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
+      "killed_by": "LeanNative.Tests.RealLCNFRecTests",
+      "first_error": "error: LeanNative/Tests/RealLCNFRecTests.lean:204:0: Expression",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-ctorhint-drop-00",
@@ -434,12 +445,13 @@
       "category": "dropped-stmt",
       "before": "match discr?.bind st.lookupFVar? with | some dv => st.setActiveCtor dv info.name | none => st",
       "after": "st",
-      "duration_s": 47.7,
+      "duration_s": 60.2,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Tests.HeapObjContract",
       "first_error": "error: LeanNative/Tests/HeapObjContract.lean:242:0: [lean-native] Unsupported scalar projection: constructor of the heap object is not statically known (C1.2)",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-ctorhint-drop-01",
@@ -449,12 +461,13 @@
       "category": "dropped-stmt",
       "before": "match discr?.bind st.lookupFVar? with | some dv => st.setActiveCtor dv info.name | none => st",
       "after": "st",
-      "duration_s": 47.0,
+      "duration_s": 60.8,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Tests.HeapObjContract",
       "first_error": "error: LeanNative/Tests/HeapObjContract.lean:242:0: [lean-native] Unsupported scalar projection: constructor of the heap object is not statically known (C1.2)",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-fresh-offby1-00",
@@ -464,12 +477,13 @@
       "category": "const-offby1",
       "before": "nextVarId := vid + 1",
       "after": "nextVarId := vid + 2",
-      "duration_s": 48.7,
+      "duration_s": 61.7,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.StateInv",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/StateInv.lean:369:14: Application type mismatch: The argument",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-fresh-offby1-01",
@@ -479,12 +493,13 @@
       "category": "const-offby1",
       "before": "nextVarId := vid + 1",
       "after": "nextVarId := vid + 2",
-      "duration_s": 49.4,
+      "duration_s": 62.1,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Tests.ProofRetentionTests",
       "first_error": "error: LeanNative/Tests/ProofRetentionTests.lean:736:0: ❌️ Docstring on `#guard_msgs` does not match generated message:",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-fvarfilter-flip-00",
@@ -494,12 +509,13 @@
       "category": "branch-flip",
       "before": ".filter (fun (f, _) => f != fvarId)",
       "after": ".filter (fun (f, _) => f == fvarId)",
-      "duration_s": 47.2,
+      "duration_s": 82.7,
       "outcome": "KILLED",
-      "killed_by": "LeanNative.Tests.ProofRetentionTests",
-      "first_error": "error: LeanNative/Tests/ProofRetentionTests.lean:737:0: [lean-native] unbound LCNF free variable `_uniq.1`",
+      "killed_by": "LeanNative.Tests.RealLCNFCallTests",
+      "first_error": "error: LeanNative/Tests/RealLCNFCallTests.lean:297:0: Expression",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-fvarfilter-flip-01",
@@ -509,12 +525,13 @@
       "category": "branch-flip",
       "before": ".filter (fun (f, _) => f != fvarId)",
       "after": ".filter (fun (f, _) => f == fvarId)",
-      "duration_s": 47.7,
+      "duration_s": 73.7,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.StateInv",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/StateInv.lean:632:12: Application type mismatch: The argument",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-fvarlookup-flip-00",
@@ -524,12 +541,13 @@
       "category": "branch-flip",
       "before": ".find? (fun (f, _) => f == fvarId)",
       "after": ".find? (fun (f, _) => f != fvarId)",
-      "duration_s": 47.3,
+      "duration_s": 72.7,
       "outcome": "KILLED",
-      "killed_by": "LeanNative.Proofs.LowerRefines",
-      "first_error": "error: LeanNative/Proofs/LowerRefines.lean:224:0: Expression",
+      "killed_by": "LeanNative.Tests.RealLCNFCallTests",
+      "first_error": "error: LeanNative/Tests/RealLCNFCallTests.lean:297:0: Expression",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-incdec-swap-00",
@@ -539,12 +557,13 @@
       "category": "wrong-ctor-tag",
       "before": "if isInc then .incRef vid n kCode else .decRef vid n kCode",
       "after": "if isInc then .decRef vid n kCode else .incRef vid n kCode",
-      "duration_s": 46.6,
+      "duration_s": 86.9,
       "outcome": "KILLED",
-      "killed_by": "LeanNative.Proofs.RealLCNFBridge.JpTag",
-      "first_error": "error: LeanNative/Proofs/RealLCNFBridge/JpTag.lean:302:8: 'change' tactic failed, pattern",
+      "killed_by": "LeanNative.Tests.RealLCNFRecTests",
+      "first_error": "error: LeanNative/Tests/RealLCNFRecTests.lean:296:0: Expression",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-ite-swap-00",
@@ -554,12 +573,13 @@
       "category": "branch-flip",
       "before": ".ite condVar no yes",
       "after": ".ite condVar yes no",
-      "duration_s": 46.1,
+      "duration_s": 136.5,
       "outcome": "KILLED",
-      "killed_by": "LeanNative.Proofs.RealLCNFBridge.JpTag",
-      "first_error": "error: LeanNative/Proofs/RealLCNFBridge/JpTag.lean:476:12: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
+      "killed_by": "LeanNative.Tests.RealLCNFRecTests",
+      "first_error": "error: LeanNative/Tests/RealLCNFRecTests.lean:204:0: Expression",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-ite-swap-01",
@@ -569,12 +589,13 @@
       "category": "branch-flip",
       "before": ".ite condVar yes no",
       "after": ".ite condVar no yes",
-      "duration_s": 45.9,
+      "duration_s": 135.7,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.JpTag",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/JpTag.lean:471:14: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-ite-swap-02",
@@ -584,12 +605,13 @@
       "category": "branch-flip",
       "before": ".ite cmpVar yes no",
       "after": ".ite cmpVar no yes",
-      "duration_s": 46.9,
+      "duration_s": 135.2,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Tests.HeapObjContract",
       "first_error": "error: LeanNative/Tests/HeapObjContract.lean:241:0: ❌️ Docstring on `#guard_msgs` does not match generated message:",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-ite-swap-03",
@@ -599,12 +621,13 @@
       "category": "branch-flip",
       "before": ".ite _ t e",
       "after": ".ite _ e t",
-      "duration_s": 49.6,
+      "duration_s": 100.4,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.LowerRefines",
-      "first_error": "error: LeanNative/Proofs/LowerRefines.lean:265:0: Expression",
+      "first_error": "error: LeanNative/Proofs/LowerRefines.lean:278:0: Expression",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-litbool-flip-00",
@@ -614,12 +637,13 @@
       "category": "branch-flip",
       "before": ".constBool (masked != 0)",
       "after": ".constBool (masked == 0)",
-      "duration_s": 47.0,
+      "duration_s": 70.6,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:256:17: Application type mismatch: The argument",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-mask-drop-00",
@@ -629,12 +653,13 @@
       "category": "dropped-stmt",
       "before": "if mask == 0xFFFFFFFFFFFFFFFF then raw else .binOp .bitAnd raw (.constU64 mask)",
       "after": "raw",
-      "duration_s": 46.3,
+      "duration_s": 54.3,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:395:26: Application type mismatch: The argument",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-mask-drop-01",
@@ -644,12 +669,13 @@
       "category": "dropped-stmt",
       "before": "if mask == 0xFFFFFFFFFFFFFFFF then raw else .binOp .bitAnd raw (.constU64 mask)",
       "after": "raw",
-      "duration_s": 46.8,
+      "duration_s": 56.7,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:395:26: Application type mismatch: The argument",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-mask-drop-02",
@@ -659,12 +685,13 @@
       "category": "dropped-stmt",
       "before": "if mask == 0xFFFFFFFFFFFFFFFF then raw else .binOp .bitAnd raw (.constU64 mask)",
       "after": "raw",
-      "duration_s": 47.3,
+      "duration_s": 55.7,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:435:56: Missing cases:",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-mask-drop-03",
@@ -674,12 +701,13 @@
       "category": "dropped-stmt",
       "before": "if mask == 0xFFFFFFFFFFFFFFFF then raw else .binOp .bitAnd raw (.constU64 mask)",
       "after": "raw",
-      "duration_s": 47.6,
+      "duration_s": 57.4,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.UnaryCast",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/UnaryCast.lean:378:129: Type mismatch",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-minmax-swap-00",
@@ -689,12 +717,13 @@
       "category": "swapped-args",
       "before": "some (min srcMask dstMask)",
       "after": "some (max srcMask dstMask)",
-      "duration_s": 45.7,
+      "duration_s": 76.2,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.UnaryCast",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/UnaryCast.lean:172:10: unsolved goals",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-neg-swap-00",
@@ -704,12 +733,13 @@
       "category": "operand-swap",
       "before": "ScalarExpr.binOp .sub (.constU64 0) (.var arg)",
       "after": "ScalarExpr.binOp .sub (.var arg) (.constU64 0)",
-      "duration_s": 46.4,
+      "duration_s": 76.3,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.UnaryCast",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/UnaryCast.lean:378:129: Type mismatch",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-objslots-flip-00",
@@ -719,12 +749,13 @@
       "category": "branch-flip",
       "before": "if args.size != spec.objSlots then",
       "after": "if args.size == spec.objSlots then",
-      "duration_s": 46.8,
+      "duration_s": 77.7,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Tests.HeapObjContract",
       "first_error": "error: LeanNative/Tests/HeapObjContract.lean:242:0: [lean-native] Ctor `LeanNative.Tests.HeapObjContract.ScalarLoweringProbe.mk` expected 0 object args, got 0",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-opnd-swap-00",
@@ -734,12 +765,13 @@
       "category": "operand-swap",
       "before": "lMasked rMasked",
       "after": "rMasked lMasked",
-      "duration_s": 46.8,
+      "duration_s": 87.4,
       "outcome": "KILLED",
-      "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
-      "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:396:22: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
+      "killed_by": "LeanNative.Tests.RealLCNFRecTests",
+      "first_error": "error: LeanNative/Tests/RealLCNFRecTests.lean:204:0: Expression",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-opnd-swap-01",
@@ -749,12 +781,13 @@
       "category": "operand-swap",
       "before": "lMasked rMasked",
       "after": "rMasked lMasked",
-      "duration_s": 46.6,
+      "duration_s": 68.9,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:408:68: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-opnd-swap-02",
@@ -764,12 +797,13 @@
       "category": "operand-swap",
       "before": "lMasked rMasked",
       "after": "rMasked lMasked",
-      "duration_s": 45.9,
+      "duration_s": 63.2,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:421:68: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-opnd-swap-03",
@@ -779,12 +813,13 @@
       "category": "operand-swap",
       "before": "lMasked rMasked",
       "after": "rMasked lMasked",
-      "duration_s": 46.8,
+      "duration_s": 64.0,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:396:22: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-opnd-swap-04",
@@ -794,12 +829,13 @@
       "category": "operand-swap",
       "before": "lMasked rMasked",
       "after": "rMasked lMasked",
-      "duration_s": 46.4,
+      "duration_s": 77.6,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:425:26: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-restore-drop-00",
@@ -809,12 +845,13 @@
       "category": "dropped-stmt",
       "before": "{ stOut with fvarMap := savedFVars, activeCtor := savedActive, jpDecls := savedJps }",
       "after": "stOut",
-      "duration_s": 49.1,
+      "duration_s": 56.5,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.StepMono",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/StepMono.lean:42:14: 'change' tactic failed, pattern",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-restore-drop-01",
@@ -824,12 +861,13 @@
       "category": "dropped-stmt",
       "before": "{ st1 with fvarMap := savedFVars, activeCtor := savedActive, jpDecls := savedJps }",
       "after": "st1",
-      "duration_s": 49.0,
+      "duration_s": 57.4,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.StepMono",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/StepMono.lean:72:33: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-restore-drop-02",
@@ -839,12 +877,13 @@
       "category": "dropped-stmt",
       "before": "{ st1 with fvarMap := savedFVars, activeCtor := savedActive, jpDecls := savedJps }",
       "after": "st1",
-      "duration_s": 47.2,
+      "duration_s": 56.0,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.StepMono",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/StepMono.lean:123:33: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-restore-drop-03",
@@ -854,12 +893,13 @@
       "category": "dropped-stmt",
       "before": "{ stOut with fvarMap := savedFVars, activeCtor := savedActive, jpDecls := savedJps }",
       "after": "stOut",
-      "duration_s": 50.2,
+      "duration_s": 70.2,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.LowerRefines",
-      "first_error": "error: LeanNative/Proofs/LowerRefines.lean:224:0: Expression",
+      "first_error": "error: LeanNative/Proofs/LowerRefines.lean:237:0: Expression",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-retpin-flip-00",
@@ -869,12 +909,13 @@
       "category": "branch-flip",
       "before": "if dst == rv then some ty else none",
       "after": "if dst != rv then some ty else none",
-      "duration_s": 50.5,
+      "duration_s": 64.9,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.LowerRefines",
-      "first_error": "error: LeanNative/Proofs/LowerRefines.lean:261:0: Expression",
+      "first_error": "error: LeanNative/Proofs/LowerRefines.lean:274:0: Expression",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-rettyfuel-offby1-00",
@@ -884,12 +925,13 @@
       "category": "const-offby1",
       "before": "inferReturnedTypePure (fuel + 16)",
       "after": "inferReturnedTypePure (fuel + 17)",
-      "duration_s": 50.4,
+      "duration_s": 66.7,
       "outcome": "SURVIVED",
       "killed_by": null,
       "first_error": null,
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-shiftmask-drop-00",
@@ -899,12 +941,13 @@
       "category": "dropped-stmt",
       "before": "if sMask == 63 then rMasked else .binOp .bitAnd rMasked (.constU64 sMask)",
       "after": "rMasked",
-      "duration_s": 49.7,
+      "duration_s": 57.3,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:448:89: Type mismatch",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-shiftmask-drop-01",
@@ -914,12 +957,13 @@
       "category": "dropped-stmt",
       "before": "if sMask == 63 then rMasked else .binOp .bitAnd rMasked (.constU64 sMask)",
       "after": "rMasked",
-      "duration_s": 49.8,
+      "duration_s": 55.9,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:472:89: Type mismatch",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-tag-offby1-00",
@@ -929,12 +973,13 @@
       "category": "wrong-ctor-tag",
       "before": ".constU64 cidx.toUInt64",
       "after": ".constU64 (cidx.toUInt64 + 1)",
-      "duration_s": 46.4,
+      "duration_s": 53.0,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Tests.HeapObjContract",
       "first_error": "error: LeanNative/Tests/HeapObjContract.lean:241:0: ❌️ Docstring on `#guard_msgs` does not match generated message:",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-tag-offby1-01",
@@ -944,12 +989,13 @@
       "category": "wrong-ctor-tag",
       "before": ".constU64 cidx.toUInt64",
       "after": ".constU64 (cidx.toUInt64 + 1)",
-      "duration_s": 46.3,
+      "duration_s": 55.1,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.CtorIntrinsic",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/CtorIntrinsic.lean:44:21: Application type mismatch: The argument",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-tag-offby1-02",
@@ -959,12 +1005,13 @@
       "category": "wrong-ctor-tag",
       "before": ".constU64 cidx.toUInt64",
       "after": ".constU64 (cidx.toUInt64 + 1)",
-      "duration_s": 47.2,
+      "duration_s": 54.1,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.CtorScalarCall",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/CtorScalarCall.lean:283:27: Application type mismatch: The argument",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-vidfilter-flip-00",
@@ -974,12 +1021,13 @@
       "category": "branch-flip",
       "before": ".filter (fun (v, _) => v != vid)",
       "after": ".filter (fun (v, _) => v == vid)",
-      "duration_s": 48.5,
+      "duration_s": 74.1,
       "outcome": "KILLED",
-      "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
-      "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:210:68: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
+      "killed_by": "LeanNative.Tests.RealLCNFCallTests",
+      "first_error": "error: LeanNative/Tests/RealLCNFCallTests.lean:297:0: Expression",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-vidfilter-flip-01",
@@ -989,12 +1037,13 @@
       "category": "branch-flip",
       "before": ".filter (fun (v, _) => v != vid)",
       "after": ".filter (fun (v, _) => v == vid)",
-      "duration_s": 48.6,
+      "duration_s": 67.3,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:215:75: Tactic `rewrite` failed: Did not find an occurrence of the pattern",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-vidfilter-flip-02",
@@ -1004,12 +1053,13 @@
       "category": "branch-flip",
       "before": ".filter (fun (v, _) => v != vid)",
       "after": ".filter (fun (v, _) => v == vid)",
-      "duration_s": 48.5,
+      "duration_s": 68.3,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.StateInv",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/StateInv.lean:461:6: Type mismatch",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RB-vidfilter-flip-03",
@@ -1019,12 +1069,13 @@
       "category": "branch-flip",
       "before": ".filter (fun (v, _) => v != vid)",
       "after": ".filter (fun (v, _) => v == vid)",
-      "duration_s": 48.2,
+      "duration_s": 63.2,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Tests.HeapObjContract",
       "first_error": "error: LeanNative/Tests/HeapObjContract.lean:242:0: [lean-native] Unsupported scalar projection: constructor of the heap object is not statically known (C1.2)",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RS-canonlookup-flip-00",
@@ -1034,12 +1085,13 @@
       "category": "branch-flip",
       "before": ".find? (fun (n, _, _) => n == fnName)",
       "after": ".find? (fun (n, _, _) => n != fnName)",
-      "duration_s": 42.8,
+      "duration_s": 68.4,
       "outcome": "KILLED",
-      "killed_by": "LeanNative.Tests.ProofRetentionTests",
-      "first_error": "error: LeanNative/Tests/ProofRetentionTests.lean:736:0: ❌️ Docstring on `#guard_msgs` does not match generated message:",
+      "killed_by": "LeanNative.Tests.RealLCNFCallTests",
+      "first_error": "error: LeanNative/Tests/RealLCNFCallTests.lean:168:0: Expression",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RS-jmpdetect-false-00",
@@ -1049,12 +1101,13 @@
       "category": "branch-flip",
       "before": "| .jmp fvarId _ => fvarId == targetFVar",
       "after": "| .jmp fvarId _ => false",
-      "duration_s": 50.4,
+      "duration_s": 71.1,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.LowerRefines",
-      "first_error": "error: LeanNative/Proofs/LowerRefines.lean:188:0: Expression",
+      "first_error": "error: LeanNative/Proofs/LowerRefines.lean:201:0: Expression",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RS-namelookup-flip-00",
@@ -1064,12 +1117,13 @@
       "category": "branch-flip",
       "before": ".find? (fun (n, _) => n == fnName)",
       "after": ".find? (fun (n, _) => n != fnName)",
-      "duration_s": 42.3,
+      "duration_s": 59.2,
       "outcome": "KILLED",
-      "killed_by": "LeanNative.Tests.ProofRetentionTests",
-      "first_error": "error: LeanNative/Tests/ProofRetentionTests.lean:737:0: [lean-native] Unsupported self-tail recursion / mutual recursion involving `l_LeanNative_Tests_ProofRetentionTests_realCheckedAddU64`",
+      "killed_by": "LeanNative.Tests.RealLCNFRecTests",
+      "first_error": "error: LeanNative/Tests/RealLCNFRecTests.lean:119:0: Expression",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RS-namelookup-flip-01",
@@ -1079,12 +1133,13 @@
       "category": "branch-flip",
       "before": ".find? (fun (n, _) => n == fnName)",
       "after": ".find? (fun (n, _) => n != fnName)",
-      "duration_s": 47.2,
+      "duration_s": 57.4,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.CtorIntrinsic",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/CtorIntrinsic.lean:644:54: Type mismatch",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RS-orderalts-id-00",
@@ -1094,12 +1149,13 @@
       "category": "dropped-stmt",
       "before": "alts.filter (fun | .default _ => false | _ => true) ++ alts.filter (fun | .default _ => true | _ => false)",
       "after": "alts",
-      "duration_s": 50.5,
+      "duration_s": 67.6,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.LowerRefines",
-      "first_error": "error: LeanNative/Proofs/LowerRefines.lean:242:0: Expression",
+      "first_error": "error: LeanNative/Proofs/LowerRefines.lean:255:0: Expression",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RS-tupleguard-oror-00",
@@ -1109,12 +1165,13 @@
       "category": "branch-flip",
       "before": "!fs.isEmpty && fs.all isFlatUnboxedScalar",
       "after": "!fs.isEmpty || fs.all isFlatUnboxedScalar",
-      "duration_s": 50.0,
+      "duration_s": 67.5,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.LowerRefines",
-      "first_error": "error: LeanNative/Proofs/LowerRefines.lean:253:0: Expression",
+      "first_error": "error: LeanNative/Proofs/LowerRefines.lean:266:0: Expression",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RS-typeeqfuel-1-00",
@@ -1124,12 +1181,13 @@
       "category": "const-offby1",
       "before": "lnirTypeEqFuel 32 a b",
       "after": "lnirTypeEqFuel 1 a b",
-      "duration_s": 46.8,
+      "duration_s": 62.3,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:46:30: Application type mismatch: The argument",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RS-usizemask-swap-00",
@@ -1139,12 +1197,13 @@
       "category": "swapped-args",
       "before": "if arch.isILP32 then 0xFFFFFFFF else 0xFFFFFFFFFFFFFFFF",
       "after": "if arch.isILP32 then 0xFFFFFFFFFFFFFFFF else 0xFFFFFFFF",
-      "duration_s": 46.6,
+      "duration_s": 69.3,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:77:21: Tactic `rfl` failed: The left-hand side",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     },
     {
       "id": "RS-widthmask-i8-00",
@@ -1154,12 +1213,13 @@
       "category": "const-offby1",
       "before": "| .i8 => some 0xFF",
       "after": "| .i8 => some 0x7F",
-      "duration_s": 47.2,
+      "duration_s": 63.3,
       "outcome": "KILLED",
       "killed_by": "LeanNative.Proofs.RealLCNFBridge.Scalar",
       "first_error": "error: LeanNative/Proofs/RealLCNFBridge/Scalar.lean:71:58: Tactic `rfl` failed: The left-hand side",
       "reason": null,
-      "measured_commit": "88324526633a0a354dfeb1394372921aa217bcf3"
+      "measured_commit": "da40658f9eb21d07a4587f465bfaec5decc295e1",
+      "op_table_hash": "a09d2231649a207c"
     }
   ]
 }
