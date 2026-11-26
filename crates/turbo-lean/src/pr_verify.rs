@@ -9892,13 +9892,51 @@ pub fn run_pr_verify_command(
         .map(|f| canon_dir.join(f))
         .collect();
     let mut trusted_replay_mods: Vec<String> = Vec::new();
-    if !classification.altered_interface_files.is_empty() {
+    // A proof-only edit is local only for importers that cannot see proof bodies, and what an importer
+    // sees is the importer's property, not the edited file's: a classic importer of a `module` file, and
+    // a `module` importer using `import all`, both see them and can reduce through them (`Acc.rec`
+    // subsingleton elimination under `decide +kernel`). Until a per-importer visibility-aware cutoff
+    // exists, every proof edit with importers gets the same dependent recheck as an interface change.
+    // The classification itself is untouched: `interface_drift` and `--disallow-statement-changes`
+    // still treat the edit as proof-only.
+    let mut recheck_interface_files = classification.altered_interface_files.clone();
+    let mut proof_edit_recheck_files: Vec<String> = Vec::new();
+    let mut deferred_import_graph_error: Option<anyhow::Error> = None;
+    let proof_edited_rels: std::collections::BTreeSet<&str> = classification
+        .proof_edited_theorems
+        .iter()
+        .filter_map(|q| q.split_once("::").map(|(rel, _)| rel))
+        .collect();
+    let candidate_rels: Vec<String> = proof_edited_rels
+        .into_iter()
+        .map(str::to_string)
+        .filter(|rel| !recheck_interface_files.contains(rel))
+        .collect();
+    // An unresolvable import graph fails the run, but after the gates that give a more specific
+    // reason for the same defect (a package `.olean` with no source, a failed kernel replay) have
+    // had their say, and before any receipt is emitted.
+    match crate::lake_build::proof_edited_files_needing_recheck(
+        &canon_dir,
+        &candidate_rels,
+        is_untrusted,
+    ) {
+        Ok(rels) => {
+            for rel in rels {
+                proof_edit_recheck_files.push(rel.clone());
+                recheck_interface_files.push(rel);
+            }
+        }
+        Err(e) => {
+            deferred_import_graph_error.get_or_insert(e);
+        }
+    }
+    if !recheck_interface_files.is_empty() {
         if is_untrusted {
             let (rechecked_count, built_all, overlay) =
                 crate::lake_build::untrusted_recheck_dependents(
                     store,
                     &canon_dir,
-                    &classification.altered_interface_files,
+                    &recheck_interface_files,
                     &trust_domain,
                     json,
                 )?;
@@ -9913,7 +9951,7 @@ pub fn run_pr_verify_command(
         } else {
             let mut certifiable_altered = Vec::new();
             let mut assurance_altered = Vec::new();
-            for f in &classification.altered_interface_files {
+            for f in &recheck_interface_files {
                 if is_assurance_rel(f) {
                     assurance_altered.push(f.clone());
                 } else {
@@ -11244,6 +11282,11 @@ pub fn run_pr_verify_command(
         nanoda_verified = true;
     }
 
+    if let Some(e) = deferred_import_graph_error {
+        return Err(e.context(
+            "a proof-only edit of a non-`module` file needs its importers re-checked, but the project's import graph cannot be resolved",
+        ));
+    }
     let mut ver_receipt =
         build_pr_verification_receipt(&mode, &kernel_prov, &base, &classification);
     if !base_policy.csimp.is_empty() {
@@ -11340,6 +11383,7 @@ pub fn run_pr_verify_command(
             "statement_digest_ms": statement_digest_ms,
             "statement_digest_kind": "constant-info+if-closure:v1",
             "lake_rechecked_modules": lake_rechecked_modules,
+            "proof_edit_recheck_files": proof_edit_recheck_files,
             "axiom_flags": classification.axiom_flags,
             "elapsed_ms": elapsed_ms
         });

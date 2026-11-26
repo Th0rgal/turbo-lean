@@ -106,7 +106,10 @@ impl KernelTestFixture {
             .env("TURBO_LEAN_TELEMETRY", "off")
             .env("TURBO_LEAN_NO_REMOTE_TELEMETRY", "1")
             .env_remove("TURBO_LEAN_KERNEL_ENGINE")
-            .env_remove("TURBO_LEAN_KERNEL_ENGINE_FROM_CONFIG");
+            .env_remove("TURBO_LEAN_KERNEL_ENGINE_FROM_CONFIG")
+            // A sibling test may hold `TURBO_CON_LECHE_BIN` set in this process (it mutates it under
+            // `env_test_lock`); a spawned CLI must never inherit that value by accident.
+            .env_remove(kernel::CON_LECHE_BIN_ENV);
         cmd
     }
 }
@@ -1273,4 +1276,93 @@ fn real_con_leche_binary_verifies_valid_and_rejects_adversarial_olean_if_built()
         &cli_fail,
         "CLI --kernel con-leche remains fail-closed even when binary exists",
     );
+}
+
+/// Restores `TURBO_CON_LECHE_BIN` to its previous value when dropped, even if an assertion panics.
+#[cfg(unix)]
+struct ConLecheBinEnvGuard(Option<std::ffi::OsString>);
+
+#[cfg(unix)]
+impl ConLecheBinEnvGuard {
+    fn set(value: &Path) -> Self {
+        let prev = std::env::var_os(kernel::CON_LECHE_BIN_ENV);
+        std::env::set_var(kernel::CON_LECHE_BIN_ENV, value);
+        Self(prev)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ConLecheBinEnvGuard {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(v) => std::env::set_var(kernel::CON_LECHE_BIN_ENV, v),
+            None => std::env::remove_var(kernel::CON_LECHE_BIN_ENV),
+        }
+    }
+}
+
+/// `--kernel auto` routing: the pinned toolchain in a workspace with a provisioned binary resolves to
+/// ConLeche at the pinned revision with no fallback; any other toolchain, or no workspace, falls back to
+/// the standard kernel and says why.
+///
+/// Routing half of the owner's draft PR #457 test, adapted to the no-git policy parameter. Its audit-spec
+/// half is covered by `milestone_m2_g1b_con_leche_contract_v4_and_olen_v1_model_disclosure`.
+/// Unix only, like `write_executable_script`. The fixture directory must have no `.git` ancestor: the
+/// identity gate refuses a provisioned binary under one.
+#[cfg(unix)]
+#[test]
+fn auto_kernel_routes_to_con_leche_only_for_pinned_toolchain_in_a_workspace() {
+    let _env_lock = pack::tests::env_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = KernelTestFixture::new("m2_auto_kernel_routing");
+    let proj = f.root.join("proj_v435");
+    fs::create_dir_all(&proj).unwrap();
+    let fake_bin = f.root.join("external-con-leche.sh");
+    write_executable_script(
+        &fake_bin,
+        "#!/usr/bin/env bash\nif [ \"${1:-}\" = \"--version\" ]; then echo 'con-leche 0.1.0'; exit 0; fi\nexit 0\n",
+    );
+
+    let (auto_v435, auto_v415, auto_no_ws) = {
+        let _bin_guard = ConLecheBinEnvGuard::set(&fake_bin);
+        let policy = kernel::BridgeNoGitPolicy::PlainDirIsUntracked;
+        (
+            kernel::resolve_kernel_engine_in_workspace(
+                kernel::KernelEngineSelection::Auto,
+                kernel::PINNED_CON_LECHE_TOOLCHAIN,
+                Some(&proj),
+                policy,
+            ),
+            kernel::resolve_kernel_engine_in_workspace(
+                kernel::KernelEngineSelection::Auto,
+                "leanprover/lean4:v4.15.0",
+                Some(&proj),
+                policy,
+            ),
+            kernel::resolve_kernel_engine_in_workspace(
+                kernel::KernelEngineSelection::Auto,
+                kernel::PINNED_CON_LECHE_TOOLCHAIN,
+                None,
+                policy,
+            ),
+        )
+    };
+
+    let auto_v435 = auto_v435.unwrap();
+    assert_eq!(auto_v435.requested_engine, kernel::KernelEngineSelection::Auto);
+    assert_eq!(auto_v435.kernel_engine, kernel::ResolvedKernelEngine::ConLeche);
+    assert_eq!(
+        auto_v435.con_leche_rev.as_deref(),
+        Some(kernel::PINNED_CON_LECHE_REV)
+    );
+    assert_eq!(auto_v435.fallback_reason, None);
+
+    let auto_v415 = auto_v415.unwrap();
+    assert_eq!(auto_v415.kernel_engine, kernel::ResolvedKernelEngine::Standard);
+    assert!(auto_v415.fallback_reason.is_some());
+
+    let auto_no_ws = auto_no_ws.unwrap();
+    assert_eq!(auto_no_ws.kernel_engine, kernel::ResolvedKernelEngine::Standard);
+    assert!(auto_no_ws.fallback_reason.is_some());
 }

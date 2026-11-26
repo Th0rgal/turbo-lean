@@ -193,7 +193,18 @@ pub(super) fn check_single_file(
         let mut file_sorry_decls: Vec<String> = Vec::new();
         let mut clean_batch_items: Vec<(String, String, Vec<u8>, i64)> = Vec::new();
 
-        if split.eligible_for_sharding && !split.shards.is_empty() {
+        // Shards elaborate only the source up to their own theorem, so a definition after the last
+        // shard is never elaborated by them. Such a file takes the whole-file path below, which
+        // elaborates everything (and caches nothing), instead of certifying text no check has read.
+        let last_shard_end = split.shards.iter().map(|s| s.end_line).max().unwrap_or(0);
+        let has_uncovered_trailing_content = src
+            .lines()
+            .skip(last_shard_end)
+            .any(|l| !l.trim().is_empty());
+        if split.eligible_for_sharding
+            && !split.shards.is_empty()
+            && !has_uncovered_trailing_content
+        {
             let now = db::now_unix();
             for (shard_key, shard) in &uncached_shards {
                 let shard_has_sorry = shard_text_contains_sorry_or_admit(shard);
