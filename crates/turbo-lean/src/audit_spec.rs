@@ -885,6 +885,17 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
                 break;
             }
             if next_line.starts_with([' ', '\t']) && is_gather_break_command(next_trim) {
+                // An indented declaration start (`def`, `theorem`, `instance`, ...)
+                // still ends the gather: the main loop accepts indented declarations,
+                // so absorbing one would lose it and corrupt this body. Only forms
+                // with real term-level versions stay in the body: `set_option … in`,
+                // `open … in`, and `#[` array literals.
+                let term_level = next_trim.starts_with("set_option ")
+                    || next_trim.starts_with("open ")
+                    || next_trim.starts_with("#[");
+                if !term_level {
+                    break;
+                }
                 truncation_suspect = true;
             }
             combined.push(' ');
@@ -4247,10 +4258,13 @@ pub(super) fn run_kernel_witness_probe(
 /// toolchain), so positional acceptance is impossible; soundness comes from the
 /// derived marker instead: the sentinel name embeds a hash of the audited source,
 /// so the audited LITERAL source text cannot contain it — a file cannot contain its
-/// own hash. Code that runs at elaboration time (`run_cmd`, any `#eval`/`#eval!`
-/// line whatever its monad, ...) can read the probe file and print the marker; such
-/// commands are detected by `audited_src_declares_probe_hostile_commands`, which
-/// disables the fallback for them.
+/// own hash. Code that runs at elaboration time or as compiled code can read the
+/// probe file and print the marker. `audited_src_declares_probe_hostile_commands`
+/// disables the fallback when it sees: a command start from `HOSTILE_COMMAND_KEYWORDS`
+/// (after attribute, `open`/`set_option`/`#guard_msgs`/`variable`/`omit`/`include`
+/// prefixes), an instance-making attribute group, or, as a whole token ANYWHERE on a
+/// line, `#eval`, `#guard`, `run_tac`, `native_decide`, `decide +native` or
+/// `implemented_by`. Code reached only through imported files is outside the scan.
 fn sentinel_present(diagnostics: &str, derived_marker: &str) -> bool {
     diagnostics.contains(derived_marker)
 }
@@ -4456,13 +4470,40 @@ fn audited_src_declares_probe_hostile_commands(clean_src: &str) -> bool {
         HOSTILE_COMMAND_KEYWORDS
             .iter()
             .any(|kw| starts_with_command_keyword(t, kw))
-            // Any `#eval`/`#eval!` runs code at elaboration time in some monad (a
-            // `def` of type `CommandElabM`, `MetaM`, or plain `IO` can register
-            // syntax or instances or read the probe file), and the monad is not
-            // visible on the `#eval` line itself. A false positive only disables
-            // the optional self-contained fallback.
-            || t.starts_with("#eval")
+            // Tokens that run compiled or elaboration-time code can read the probe
+            // file or register syntax, wherever they sit on the line. See
+            // `line_has_code_running_token`.
+            || line_has_code_running_token(line)
     })
+}
+
+/// Whether `line` holds, as a whole token anywhere on it, one of: `#eval` (also
+/// `#eval!`), `#guard` (not `#guard_msgs`), `run_tac`, `native_decide`, `decide +native`
+/// (also `decide  +native`), or `implemented_by`. Each runs compiled code (or code at
+/// elaboration time) that can read the probe file, and `run_tac`/`native_decide`
+/// usually sit mid-line (`:= by run_tac ...`). Over-matching is the safe side: a false
+/// positive only disables the optional self-contained fallback.
+fn line_has_code_running_token(line: &str) -> bool {
+    fn ident_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_' || c == '\'' || c == '.'
+    }
+    let has_token = |tok: &str| {
+        line.match_indices(tok).any(|(i, _)| {
+            let before_ok = !line[..i].chars().next_back().is_some_and(ident_char);
+            let after_ok = !line[i + tok.len()..].chars().next().is_some_and(ident_char);
+            before_ok && after_ok
+        })
+    };
+    // `decide +native`: the config flag may follow after any whitespace.
+    let decide_native = line.match_indices("decide").any(|(i, _)| {
+        let before_ok = !line[..i].chars().next_back().is_some_and(ident_char);
+        let rest = &line[i + "decide".len()..];
+        before_ok && rest.starts_with(char::is_whitespace) && rest.trim_start().starts_with("+native")
+    });
+    ["#eval", "#guard", "run_tac", "native_decide", "implemented_by"]
+        .iter()
+        .any(|tok| has_token(tok))
+        || decide_native
 }
 
 /// Honest provenance taxonomy over the final witness labels.
@@ -6343,6 +6384,102 @@ mod lexer_tests {
             text.contains("set_option maxRecDepth 2000 in n + 1"),
             "an indented continuation must not be cut, got: {text}"
         );
+    }
+
+    /// Review 9dfada6c F1: indented declaration starts still end a gather, so an
+    /// indented namespace body or `mutual` block extracts every def under its own name.
+    #[test]
+    fn extractor_gather_breaks_at_indented_declarations() {
+        let (defs, def_srcs, _) = extract_local_def_unfoldings_and_sources(
+            "namespace Foo\n  def a (n : Nat) : Nat := n + 1\n  def b (n : Nat) : Nat := n + 2\nend Foo\n",
+        );
+        let body = |n: &str| {
+            defs.iter()
+                .find(|d| d.0 == n)
+                .unwrap_or_else(|| panic!("{n} must be extracted: {defs:?}"))
+                .2
+                .clone()
+        };
+        assert_eq!(body("Foo.a"), "n + 1");
+        assert_eq!(body("Foo.b"), "n + 2");
+        assert!(def_srcs.iter().all(|s| !s.2), "neither def is suspect: {def_srcs:?}");
+
+        let (defs, _, skipped) = extract_local_def_unfoldings_and_sources(
+            "mutual\n  def isEven : Nat → Bool\n    | 0 => true\n    | n+1 => isOdd n\n  def isOdd (n : Nat) : Bool := !isEven n\nend\n",
+        );
+        assert!(
+            defs.iter().all(|d| d.0 != "isEven"),
+            "isEven (no `:=`) must not be extracted with isOdd's body: {defs:?}"
+        );
+        let odd = defs.iter().find(|d| d.0 == "isOdd").expect("isOdd extracted");
+        assert_eq!(odd.2, "!isEven n");
+        assert!(skipped.iter().any(|n| n == "isEven"), "isEven is skipped: {skipped:?}");
+
+        // Indented term-level `open … in`, `set_option … in` and `#[` stay in the body.
+        let (defs, _, _) = extract_local_def_unfoldings_and_sources(
+            "def c (n : Nat) : Nat :=\n  n +\n  open Nat in n\n",
+        );
+        assert!(defs.iter().find(|d| d.0 == "c").unwrap().2.contains("open Nat in n"));
+        let (defs, _, _) = extract_local_def_unfoldings_and_sources(
+            "def arr : Array Nat :=\n  #[1, 2]\n",
+        );
+        assert!(defs.iter().find(|d| d.0 == "arr").unwrap().2.contains("#[1, 2]"));
+    }
+
+    /// Review 9dfada6c F1 (flag): a body that kept an indented term-level `set_option …
+    /// in` continuation is truncation-suspect, and the flag blocks re-emission of the def
+    /// into a self-contained probe.
+    #[test]
+    fn truncation_suspect_flag_blocks_probe_reemission() {
+        let (_, def_srcs, _) = extract_local_def_unfoldings_and_sources(
+            "def g (n : Nat) : Nat :=\n  n +\n  set_option maxRecDepth 2000 in n + 1\n",
+        );
+        assert!(def_srcs.iter().find(|s| s.0 == "g").unwrap().2, "g must be suspect");
+        let cand = SpecKernelWitnessCandidate {
+            pos: None,
+            neg: Some(KernelWitnessSide {
+                lets: vec!["let n : Nat := 1".to_string()],
+                body: "g n = 2".to_string(),
+                assign_desc: "n=1".to_string(),
+                upgrade_label: true,
+            }),
+        };
+        assert!(
+            build_kernel_witness_minimal_probe_src(&def_srcs, &[], &[(0, cand)], true).is_none(),
+            "a suspect def must not be re-emitted"
+        );
+    }
+
+    /// Review 9dfada6c F2: code-running tokens anywhere on a line are probe-hostile.
+    #[test]
+    fn hostile_scan_matches_code_running_tokens_anywhere() {
+        for src in [
+            "#guard leak\n",
+            "theorem t : 1 = 1 := by run_tac pure ()\n",
+            "theorem t : 2 + 2 = 4 := by native_decide\n",
+            "theorem t : 2 + 2 = 4 := by decide +native\n",
+            "theorem t : 2 + 2 = 4 := by decide   +native\n",
+            "def x : Nat := 0 -- c\n@[simp, implemented_by leakImpl] def leak : Bool := true\n",
+            "example : True := by\n  trivial\n#eval! 1\n",
+            "theorem t : True := by simp; native_decide\n",
+        ] {
+            assert!(
+                audited_src_declares_probe_hostile_commands(src),
+                "must be probe-hostile: {src}"
+            );
+        }
+        for src in [
+            "#guard_msgs in\ntheorem t : True := trivial\n",
+            "theorem native_decide_free : True := trivial\n",
+            "theorem t : True := by decide\n",
+            "theorem my_run_tac_x : True := trivial\n",
+            "theorem t (h : decide_foo) : True := trivial\n",
+        ] {
+            assert!(
+                !audited_src_declares_probe_hostile_commands(src),
+                "must not be flagged: {src}"
+            );
+        }
     }
 
     #[test]
