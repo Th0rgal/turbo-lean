@@ -28,7 +28,7 @@ private theorem getActiveCtor_clear (st : RealBridgeState) (vid w : VarId) :
   · simp only [nat_beq_false h, Bool.false_eq_true, ↓reduceIte]
     exact getActiveCtor_filter_ne st.activeCtor vid w h
 
-private theorem bridgeInv_applyJpOne (st_m : RealBridgeState) (lenv_m : LEnv) (venv_m : VarEnv)
+theorem bridgeInv_applyJpOne (st_m : RealBridgeState) (lenv_m : LEnv) (venv_m : VarEnv)
     (fvarId : Lean.FVarId) (freshVid : VarId) (pTy : LNIRType) (v : Val)
     (hinv_m : BridgeStateInv st_m lenv_m venv_m)
     (hfreshLt : freshVid < st_m.nextVarId)
