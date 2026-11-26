@@ -10305,7 +10305,8 @@ pub(super) fn build_module_dag_inner(
                         root_canon.display(),
                         super::host_effects::non_owned_dep_refresh_remedy(
                             &spec.module_name,
-                            &root_pkg.pkg_root
+                            &root_pkg.pkg_root,
+                            &spec.pkg_root
                         )
                     );
                 }

@@ -1097,9 +1097,9 @@ use super::*;
             "{\"version\":\"1.1.0\",\"packagesDir\":\".lake/packages\",\"packages\":[{\"type\":\"path\",\"name\":\"shareddep\",\"dir\":\".lake/packages/shareddep\"}]}\n",
         )?;
         let projc = projc.canonicalize()?;
-        if crate::module_builder::resolve_project_config(&projc).is_err() {
-            return Ok(());
-        }
+        // Review cf31dd1e F7 / 29baa2ab F7: no silent skip — a fixture that stops
+        // resolving must FAIL this test (it is the only coverage for the
+        // closure-exclusion fix), never return Ok(()) with nothing asserted.
         let cfg = crate::module_builder::resolve_project_config(&projc)?;
         let dag = crate::module_builder::build_module_dag_with_trust(
             &cfg,
