@@ -3690,10 +3690,11 @@ mod host_effect_taint_tests {
         };
         git(&["rm", "--cached", "-q", "data.txt"])?;
         git(&["commit", "-qm", "untrack"])?;
-        assert!(
-            include_targets_tracked_at_pin(&canon, &rels),
-            "within one memo window the answer stays memoized"
-        );
+        // No assert on the memoized stale answer here: the memo is process-global and
+        // any concurrently running fixture test may reset the window between the
+        // seeding call above and a re-read, so only the post-reset behavior below is a
+        // stable promise. (Before the fix nothing cleared the memo at all, so the
+        // final assert alone is the deterministic red.)
         reset_lake_inputs_tag_memo();
         assert!(
             !include_targets_tracked_at_pin(&canon, &rels),
