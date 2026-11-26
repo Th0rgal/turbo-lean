@@ -88,16 +88,19 @@ TERMINAL_OUTCOMES = ("KILLED", "SURVIVED")
 UNMEASURED_OUTCOMES = ("NOT_APPLICABLE", "INFRA", "TIMEOUT", "ERROR")
 
 # Signatures that mean the build infrastructure failed, not the proof stack
-# (subset of scripts/emitter_mutants.json `infra_signatures`, plus the forms
-# Lake prints when a child `lean` is OOM-killed). Only consulted on rc != 0.
+# (subset of scripts/emitter_mutants.json `infra_signatures`, plus the form
+# Lake prints when a child `lean` is OOM-killed). Only consulted on rc != 0,
+# and only on error lines / the failing tail block (review r2 F3): a dependent
+# module's own `info:`/`#eval` output inside an otherwise-real kill log must
+# not turn the kill into INFRA. The loose substrings "sigkill" and bare
+# "code 137" are gone for the same reason; rc 137 / -9 is the primary OOM
+# evidence.
 INFRA_SIGNATURES: Tuple[str, ...] = (
     "out of memory",
     "oom-kill",
     "cannot allocate memory",
     "signal: 9",
-    "sigkill",
     "exited with code 137",
-    "code 137",
     "no space left on device",
     "network is unreachable",
     "connection timed out",
@@ -419,16 +422,26 @@ FAIL_MOD_RE = re.compile(r"[✖×] \[\d+/\d+\][^\n]*?(?:Building|Compiling|Runni
 ERROR_PATH_RE = re.compile(r"([A-Za-z0-9_./-]+\.lean):(\d+):(\d+):")
 
 
+def infra_scan_lines(output: str) -> List[str]:
+    """The lines infra signatures are matched against on a FAILED build: error
+    lines plus the closing block that names the failing job (review r2 F3 —
+    a rebuilt dependent module's own `info:`/`#eval` output elsewhere in the
+    log must not turn a real kill into INFRA)."""
+    lines = output.splitlines()
+    return [ln for ln in lines if "error" in ln.lower()] + lines[-5:]
+
+
 def is_infra(res: Optional[BuildResult]) -> bool:
-    """Infra signatures are only consulted on FAILED builds (review F4): a
-    green build whose test output echoes a signature is not infra. An exit of
-    137 / -9 (OOM-killed) is always infra."""
+    """Infra is only read off FAILED builds (review F4): a green build whose
+    test output echoes a signature is not infra. An exit of 137 / -9
+    (OOM-killed) is the primary OOM evidence; text signatures are matched on
+    error lines and the failing tail block only (review r2 F3)."""
     if res is None or res.rc == 0:
         return False
     if res.rc in (137, -9):
         return True
-    low = res.output.lower()
-    return any(sig in low for sig in INFRA_SIGNATURES)
+    scan = "\n".join(infra_scan_lines(res.output)).lower()
+    return any(sig in scan for sig in INFRA_SIGNATURES)
 
 
 def is_timeout(res: Optional[BuildResult]) -> bool:
@@ -869,6 +882,25 @@ def self_test() -> int:
         rec, _, _ = drive([ok, green_with_sig])
         check("green build echoing an infra signature stays SURVIVED",
               rec["outcome"] == "SURVIVED", str(rec))
+        # Review r2 F3: a FAILED build whose log carries a dependent module's
+        # own `info:` output echoing a signature, beside a real proof error,
+        # is a KILL — signatures are matched on error lines and the tail
+        # block, never on the whole log.
+        kill_with_dep_info = BuildResult(1, "\n".join([
+            "info: LeanNative/Tests/HeapObjContract.lean:9:0: simulated",
+            "info: heap pressure probe: out of memory path exercised",
+            "✖ [12/44] Building LeanNative.Proofs.RealLCNFBridge.Scalar",
+            "error: lean/LeanNative/Proofs/RealLCNFBridge/Scalar.lean:77:2: "
+            "error: unsolved goals",
+            "pad line 1", "pad line 2", "pad line 3", "pad line 4",
+            "pad line 5", "error: build failed",
+        ]), 2.0)
+        rec, _, _ = drive([ok, kill_with_dep_info])
+        check("failed build with a dependent module's infra-text info line "
+              "stays KILLED",
+              rec["outcome"] == "KILLED" and
+              rec["killed_by"] == "LeanNative.Proofs.RealLCNFBridge.Scalar",
+              str(rec))
         # A harness exception becomes an ERROR row, not an abort (review F6).
         err_rec = safe_run_one(RaisingScratch(), srcs, m0,
                                runner=PlantedRunner([ok, ok]))
