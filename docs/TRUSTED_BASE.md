@@ -24,9 +24,11 @@
   `discover_con_leche_binary_for_selection_with_provenance` (`crates/turbo-lean/src/kernel.rs`),
   which pins the accepted binary's bytes at selection time (`ResolvedConLecheBinary`, a blake3
   digest). Before each spawn the runner opens the pinned path without following a symlink final
-  component, re-hashes the OPENED bytes against that digest, and on Linux executes through the
-  verified handle itself, so the executed bytes are the hashed bytes; on other platforms the
-  canonical path is spawned right after the fd hash, leaving only that platform's small
+  component and, on Linux, copies the bytes into a sealed in-memory file while hashing them,
+  then executes that sealed copy, so the executed bytes are the hashed bytes by construction —
+  an in-place rewrite of the source inode after verification cannot reach the run (executing
+  the source's own fd would only pin the inode, not its bytes). On other platforms the
+  canonical path is spawned right after the fd hash, leaving that platform's small
   open-to-exec window. The discovery checks the pinned toolchain and the
   provisioned (`TURBO_CON_LECHE_BIN` / bridge) binaries, and for `auto` only it additionally
   accepts the toolchain-bundled binary at `$ELAN_HOME/toolchains/<pinned>/bin/con-leche`

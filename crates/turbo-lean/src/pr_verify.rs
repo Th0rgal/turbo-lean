@@ -8890,13 +8890,15 @@ fn kernel_statement_changes_with_trust(
     untrusted_cfg: Option<&crate::module_builder::ProjectConfig>,
     proof_only_project_rel_files: &[String],
 ) -> Result<Vec<String>> {
-    // Test-only wrapper: resolve the kernel engine the way the command path does, against the
-    // live project (test trees are plain directories, so the lenient no-`.git` policy applies).
+    // Test-only wrapper: resolve the kernel engine the way the command path does. Every tree
+    // that reaches the statement function passes `resolve_git_toplevel`, so `.git` always
+    // exists here and the PRODUCTION fail-closed policy costs nothing — using it keeps the
+    // tests on the same path `pr-verify` runs (review b6409bc4 F7).
     let head_kernel_prov = crate::kernel::resolve_kernel_engine_in_workspace(
         crate::kernel::resolve_kernel_selection_from_env(None)?,
         &detect_toolchain(project),
         Some(project),
-        crate::kernel::BridgeNoGitPolicy::PlainDirIsUntracked,
+        crate::kernel::BridgeNoGitPolicy::PlainDirFailsClosed,
     )?;
     Ok(kernel_statement_changes_and_csimp_with_trust(
         store,
