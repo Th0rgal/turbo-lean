@@ -4227,6 +4227,9 @@ pub fn run_ci_verify_command(
         crate::kernel::resolve_kernel_selection_from_env(None)?,
         &toolchain,
         Some(&canon_dir),
+        // `ci-verify` measures a git checkout; a missing `.git` fails the bridge-binary
+        // tracked-check closed (review 4f80161c U2).
+        crate::kernel::BridgeNoGitPolicy::PlainDirFailsClosed,
     )?;
 
     if is_untrusted && crate::module_builder::probe_bwrap_sandbox(&canon_dir).is_none() {
@@ -8887,6 +8890,14 @@ fn kernel_statement_changes_with_trust(
     untrusted_cfg: Option<&crate::module_builder::ProjectConfig>,
     proof_only_project_rel_files: &[String],
 ) -> Result<Vec<String>> {
+    // Test-only wrapper: resolve the kernel engine the way the command path does, against the
+    // live project (test trees are plain directories, so the lenient no-`.git` policy applies).
+    let head_kernel_prov = crate::kernel::resolve_kernel_engine_in_workspace(
+        crate::kernel::resolve_kernel_selection_from_env(None)?,
+        &detect_toolchain(project),
+        Some(project),
+        crate::kernel::BridgeNoGitPolicy::PlainDirIsUntracked,
+    )?;
     Ok(kernel_statement_changes_and_csimp_with_trust(
         store,
         project,
@@ -8894,6 +8905,7 @@ fn kernel_statement_changes_with_trust(
         scope,
         untrusted_cfg,
         proof_only_project_rel_files,
+        &head_kernel_prov,
     )?
     .0)
 }
@@ -8905,6 +8917,10 @@ fn kernel_statement_changes_and_csimp_with_trust(
     scope: Option<&Path>,
     untrusted_cfg: Option<&crate::module_builder::ProjectConfig>,
     proof_only_project_rel_files: &[String],
+    // Review 4f80161c U1: the ONE command-level kernel resolution, taken against the LIVE
+    // checkout before any build; the head-statement paths below reuse it and never run
+    // discovery inside a materialized snapshot.
+    head_kernel_prov: &crate::kernel::KernelProvenance,
 ) -> Result<(Vec<String>, Vec<(String, String, String)>)> {
     let repo = resolve_git_toplevel(project)?;
     let proj_rel_in_repo = project.strip_prefix(&repo)?.to_path_buf();
@@ -9371,15 +9387,10 @@ fn kernel_statement_changes_and_csimp_with_trust(
             .ok()?;
             let mut rebuilt_hint: std::collections::HashSet<String> =
                 dirty_mods.iter().cloned().collect();
-            // DA b08785bc F1: resolve the head-statement con-leche binary BEFORE any head
-            // source is compiled (lean elaboration can run IO), so nothing the compiles
-            // write can swap into execution.
-            let head_kernel_prov = crate::kernel::resolve_kernel_engine_in_workspace(
-                crate::kernel::resolve_kernel_selection_from_env(None).ok()?,
-                &detect_toolchain(&head_project),
-                Some(&head_project),
-            )
-            .ok()?;
+            // DA b08785bc F1 + review 4f80161c U1: the con-leche binary was resolved ONCE at
+            // command level against the live checkout, before any head source was compiled
+            // (lean elaboration can run IO), so nothing the compiles write can swap into
+            // execution and no discovery ever runs here.
             if !standalone.is_empty() {
                 let base_lib_dir = head_project.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
                 let (base_lp, _) = crate::module_builder::build_lean_search_path(cfg, true);
@@ -9622,13 +9633,10 @@ fn kernel_statement_changes_and_csimp_with_trust(
         } else {
             head_project
         };
-        // DA b08785bc F1: resolve the head-statement con-leche binary BEFORE the head build,
-        // so a file the build writes at the bridge path cannot swap into execution.
-        let head_kernel_prov = crate::kernel::resolve_kernel_engine_in_workspace(
-            crate::kernel::resolve_kernel_selection_from_env(None)?,
-            &detect_toolchain(&head_project),
-            Some(&head_project),
-        )?;
+        // DA b08785bc F1 + review 4f80161c U1: the con-leche binary was resolved ONCE at
+        // command level against the live checkout, before the head build, so a file the build
+        // writes at the bridge path cannot swap into execution and no discovery ever runs
+        // against a materialized snapshot.
         let _snap_head_exclude_root_guard = ExcludeRootEnvGuard::enter(&head_project);
         if is_untrusted {
             stock_statement_build_with_trust(&head_project, statement_scope, true)?;
@@ -9765,6 +9773,9 @@ pub fn run_pr_verify_command(
         crate::kernel::resolve_kernel_selection_from_env(None)?,
         &toolchain,
         Some(&canon_dir),
+        // `pr-verify` measures a git checkout; a missing `.git` fails the bridge-binary
+        // tracked-check closed (review 4f80161c U2).
+        crate::kernel::BridgeNoGitPolicy::PlainDirFailsClosed,
     )?;
     let is_untrusted = mode == "untrusted";
     if !is_untrusted
@@ -10166,6 +10177,7 @@ pub fn run_pr_verify_command(
             scope.as_deref(),
             untrusted_pr_cfg.as_ref(),
             &proof_only_rel_files,
+            &kernel_prov,
         )?;
     classification.statement_edited_theorems = statement_edited_theorems;
     let statement_digest_ms = statement_digest_t0.elapsed().as_millis();
@@ -18342,6 +18354,7 @@ end ParityNs
             crate::kernel::resolve_kernel_selection_from_env(None)?,
             &detect_toolchain(&tree.project),
             Some(&tree.project),
+            crate::kernel::BridgeNoGitPolicy::PlainDirIsUntracked,
         )?;
         let (_, cert_snap_opt) = certify_head_statement_modules_and_replay(
             &store,

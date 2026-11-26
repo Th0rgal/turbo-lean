@@ -220,6 +220,7 @@ pub fn probe_con_leche_support_for_selection(
     requested: KernelEngineSelection,
     lean_toolchain: &str,
     workspace_root: Option<&Path>,
+    no_git: BridgeNoGitPolicy,
 ) -> Option<String> {
     if !matches!(
         requested,
@@ -229,21 +230,28 @@ pub fn probe_con_leche_support_for_selection(
     ) {
         return probe_con_leche_support(lean_toolchain);
     }
-    discover_con_leche_binary_for_workspace_selection(requested, lean_toolchain, workspace_root)
-        .ok()
-        .flatten()
-        .map(|resolved| resolved.provenance.recorded_rev())
+    discover_con_leche_binary_for_workspace_selection(
+        requested,
+        lean_toolchain,
+        workspace_root,
+        no_git,
+    )
+    .ok()
+    .flatten()
+    .map(|resolved| resolved.provenance.recorded_rev())
 }
 
 /// The selection-time binary resolution behind [`probe_con_leche_support_for_selection`] and
 /// [`resolve_kernel_engine_in_workspace`]: the pinned-toolchain gate, then the ONE shared
 /// discovery, returning the accepted binary with its provenance. G1c r2 (review 22ae951a F1) +
-/// DA 388e906a F2: the pair this returns is stored in [`KernelProvenance`] so the executing
-/// sites run exactly this binary, with no second discovery after the build.
+/// DA 388e906a F2: the resolved binary this returns (path, provenance and selection-time
+/// digest) is stored in [`KernelProvenance`] so the executing sites run exactly this binary,
+/// with no second discovery after the build.
 fn discover_con_leche_binary_for_workspace_selection(
     requested: KernelEngineSelection,
     lean_toolchain: &str,
     workspace_root: Option<&Path>,
+    no_git: BridgeNoGitPolicy,
 ) -> Result<Option<ResolvedConLecheBinary>> {
     if !matches!(
         requested,
@@ -262,6 +270,7 @@ fn discover_con_leche_binary_for_workspace_selection(
         requested,
         lean_toolchain,
         workspace_root,
+        no_git,
     )
     .map(Some)
 }
@@ -302,13 +311,21 @@ pub fn resolve_kernel_engine(
     requested: KernelEngineSelection,
     lean_toolchain: &str,
 ) -> Result<KernelProvenance> {
-    resolve_kernel_engine_in_workspace(requested, lean_toolchain, None)
+    // No workspace root: discovery never consults a checkout, so the bridge-binary
+    // tracked-check (and with it the no-`.git` policy) is unreachable here.
+    resolve_kernel_engine_in_workspace(
+        requested,
+        lean_toolchain,
+        None,
+        BridgeNoGitPolicy::PlainDirIsUntracked,
+    )
 }
 
 pub fn resolve_kernel_engine_in_workspace(
     requested: KernelEngineSelection,
     lean_toolchain: &str,
     workspace_root: Option<&Path>,
+    no_git: BridgeNoGitPolicy,
 ) -> Result<KernelProvenance> {
     let lean_toolchain = normalize_lean_toolchain(lean_toolchain);
     // DA 388e906a F2: resolve the binary ONCE, here at selection; the result is stored in the
@@ -324,6 +341,7 @@ pub fn resolve_kernel_engine_in_workspace(
             requested,
             &lean_toolchain,
             Some(root),
+            no_git,
         ) {
             Ok(found) => (found, None),
             Err(e) => (None, Some(e)),
@@ -594,37 +612,118 @@ pub struct ResolvedConLecheBinary {
 }
 
 impl ResolvedConLecheBinary {
-    /// Pin `path` with `provenance` by reading its bytes now.
+    /// Pin `path` with `provenance` by reading its bytes now. The path is canonicalized first
+    /// (every discovery route already hands over a canonical path), so the pinned final
+    /// component is never a symlink and the digest can be taken from an `O_NOFOLLOW` fd.
     pub fn resolve(path: &Path, provenance: ConLecheBinaryProvenance) -> Result<Self> {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let (_file, blake3_hex) = open_nofollow_and_hash(&canon)?;
         Ok(Self {
-            path: path.to_path_buf(),
+            path: canon,
             provenance,
-            blake3_hex: blake3_file_hex(path)?,
+            blake3_hex,
         })
     }
 
-    /// Fail closed when the bytes at the pinned path no longer match the selection-time digest.
-    fn verify_bytes_unchanged(&self) -> Result<()> {
-        let now = blake3_file_hex(&self.path)?;
+    /// Open the pinned path (`O_NOFOLLOW`), hash the OPENED bytes, and fail closed when they no
+    /// longer match the selection-time digest. The returned handle is what the runner executes
+    /// (review 4f80161c U3): a path re-hash alone leaves a window in which a rebuild or rename
+    /// can swap the binary between the hash and the spawn.
+    fn open_execution_verified(&self) -> Result<VerifiedConLecheBinary> {
+        let (file, now) = open_nofollow_and_hash(&self.path)?;
         anyhow::ensure!(
             now == self.blake3_hex,
-            "`con-leche` binary `{}` changed between selection and execution: selected blake3 `{}`, on-disk blake3 `{}` (fail-closed; review b08785bc F3)",
+            "`con-leche` binary `{}` changed between selection and execution: selected blake3 `{}`, opened blake3 `{}` (fail-closed; review b08785bc F3)",
             self.path.display(),
             self.blake3_hex,
             now
         );
-        Ok(())
+        Ok(VerifiedConLecheBinary {
+            file,
+            path: self.path.clone(),
+        })
     }
 }
 
-fn blake3_file_hex(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path).with_context(|| {
+/// An open, digest-verified `con-leche` binary. On Linux the spawn goes through
+/// `/proc/self/fd/<N>` of this handle, so the EXECUTED bytes are the HASHED bytes whatever
+/// happens to the path meanwhile; elsewhere the canonical path is spawned after the fd hash,
+/// the pre-U3 behavior (review 4f80161c U3).
+#[derive(Debug)]
+struct VerifiedConLecheBinary {
+    file: std::fs::File,
+    /// Spawned directly on non-Linux targets; on Linux the spawn goes through the fd and the
+    /// path is carried for the `Debug` rendering of refusals alone.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    path: PathBuf,
+}
+
+impl VerifiedConLecheBinary {
+    fn command(&self) -> Command {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            let fd = self.file.as_raw_fd();
+            let mut cmd = Command::new(format!("/proc/self/fd/{fd}"));
+            // An ELF target is loaded by `execve` before close-on-exec processing, but a
+            // shebang target's INTERPRETER re-opens the `/proc/self/fd/N` argument after it
+            // (measured: `bash: /proc/self/fd/N: No such file or directory`, exit 127), so the
+            // fd must survive the exec. Clear `FD_CLOEXEC` in the child alone: the parent's
+            // handle keeps close-on-exec for every other spawn.
+            unsafe {
+                cmd.pre_exec(move || {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            cmd
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Command::new(&self.path)
+        }
+    }
+}
+
+/// Open `path` without following a symlink final component and hash the opened fd by
+/// streaming, so the digest is of the bytes behind the returned handle, never of whatever a
+/// racing rename or symlink swap puts at the path afterwards (review 4f80161c U3).
+fn open_nofollow_and_hash(path: &Path) -> Result<(std::fs::File, String)> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = opts.open(path).with_context(|| {
+        format!(
+            "Failed to open `con-leche` binary `{}` for the selection digest (symlink final components are refused)",
+            path.display()
+        )
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(&mut file).with_context(|| {
         format!(
             "Failed to read `con-leche` binary `{}` for the selection digest",
             path.display()
         )
     })?;
-    Ok(blake3::hash(&bytes).to_hex().to_string())
+    use std::io::Seek;
+    file.rewind().with_context(|| {
+        format!(
+            "Failed to rewind `con-leche` binary `{}` after hashing",
+            path.display()
+        )
+    })?;
+    Ok((file, hasher.finalize().to_hex().to_string()))
 }
 
 /// The capability probe for the bundled candidate (G1c r2):
@@ -693,16 +792,34 @@ fn con_leche_help_probe_once(binary_path: &Path) -> bool {
         .any(|token| token == "--olean")
 }
 
+/// How the bridge-binary tracked-check treats a checkout with NO `.git` entry. The policy is
+/// the CALLER's, not the check's (review 4f80161c U2): what a missing `.git` means depends on
+/// what the command is measuring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeNoGitPolicy {
+    /// `check --emit-olean` in a plain directory: a tree without `.git` cannot have DELIVERED
+    /// the file through a git tree, so the binary counts as untracked (DA b08785bc F4; failing
+    /// closed here regressed plain-directory checks, where git exits 128).
+    PlainDirIsUntracked,
+    /// The `pr-verify` / `ci-verify` discovery path: those commands measure a git CHECKOUT, so
+    /// a missing `.git` is an anomaly and the tracked-check fails closed.
+    PlainDirFailsClosed,
+}
+
 /// Whether the checkout's bridge-binary path is TRACKED in git (DA 388e906a F3, scoped):
 /// `pr-verify` materializes the head TREE, so a malicious PR can only plant a bridge binary by
 /// COMMITTING it, while a legitimate bridge binary is a build output and stays untracked.
 /// Exit 0 = tracked, exit 1 = untracked; anything else is an error the caller fails closed on.
-fn bridge_binary_is_tracked(checkout: &Path) -> Result<bool> {
-    // DA b08785bc F4: a checkout without a `.git` entry cannot have DELIVERED the file through
-    // a git tree, so it is untracked by construction. Failing closed here regressed
-    // `check --emit-olean` in plain directories (git exits 128 outside a work tree).
+fn bridge_binary_is_tracked(checkout: &Path, no_git: BridgeNoGitPolicy) -> Result<bool> {
+    // A checkout without a `.git` entry is decided by the caller's policy (review 4f80161c U2).
     if !checkout.join(".git").exists() {
-        return Ok(false);
+        return match no_git {
+            BridgeNoGitPolicy::PlainDirIsUntracked => Ok(false),
+            BridgeNoGitPolicy::PlainDirFailsClosed => Err(anyhow::anyhow!(
+                "checkout `{}` has no `.git` entry, so the bridge-binary tracked-check cannot run; this verification path measures a git checkout and fails closed",
+                checkout.display()
+            )),
+        };
     }
     // DA b08785bc F4: git is resolved through the trusted-tools resolver (`TURBO_LEAN_GIT`, the
     // vetted system paths, the MIN_GIT floor), never a bare PATH lookup.
@@ -733,6 +850,7 @@ pub fn discover_con_leche_binary_for_selection_with_provenance(
     requested: KernelEngineSelection,
     lean_toolchain: &str,
     workspace_root: Option<&Path>,
+    no_git: BridgeNoGitPolicy,
 ) -> Result<ResolvedConLecheBinary> {
     // DA 388e906a F5: `var_os`, so a set but non-UTF-8 value still counts as provisioned (it is
     // a reported misconfiguration downstream, never a silent switch to the bundled binary).
@@ -748,11 +866,11 @@ pub fn discover_con_leche_binary_for_selection_with_provenance(
         env_provisioned,
         elan_home_dir().as_deref(),
         &con_leche_help_advertises_olean,
-        &bridge_binary_is_tracked,
+        &|co: &Path| bridge_binary_is_tracked(co, no_git),
     )
 }
 
-/// The env-free core of [`discover_con_leche_binary_for_selection`], with the provisioned
+/// The env-free core of [`discover_con_leche_binary_for_selection_with_provenance`], with the provisioned
 /// discovery outcome, the elan home and the `--olean` capability probe injected for unit
 /// testing (review 22ae951a F6).
 fn discover_con_leche_binary_for_selection_impl(
@@ -985,9 +1103,9 @@ pub fn verify_olean_modules_with_con_leche(
             binary_path.display()
         );
     }
-    // DA b08785bc F3: the executed bytes must be the selected bytes; a path pin alone lets a
-    // rebuild swap the binary between selection and execution.
-    resolved_binary.verify_bytes_unchanged()?;
+    // DA b08785bc F3 + review 4f80161c U3: the executed bytes must be the selected bytes; the
+    // binary is opened (`O_NOFOLLOW`), hashed from that fd, and spawned from the same handle.
+    let verified = resolved_binary.open_execution_verified()?;
     if search_paths.is_empty() {
         anyhow::bail!("`con-leche --olean` requires at least one `--search-path` directory");
     }
@@ -1007,7 +1125,7 @@ pub fn verify_olean_modules_with_con_leche(
         .map_err(|_| anyhow::anyhow!("Non-UTF-8 `--search-path` entry passed to `con-leche`"))?;
     let tmpdir = resolve_scratch_tmpdir(scratch_tmpdir);
 
-    let mut cmd = Command::new(binary_path);
+    let mut cmd = verified.command();
     if let Some(ref td) = tmpdir {
         cmd.env("TMPDIR", td);
     }
@@ -1058,8 +1176,9 @@ pub fn verify_ndjson_with_con_leche(
             binary_path.display()
         );
     }
-    // DA b08785bc F3: the executed bytes must be the selected bytes.
-    resolved_binary.verify_bytes_unchanged()?;
+    // DA b08785bc F3 + review 4f80161c U3: the executed bytes must be the selected bytes; the
+    // binary is opened (`O_NOFOLLOW`), hashed from that fd, and spawned from the same handle.
+    let verified = resolved_binary.open_execution_verified()?;
     if !ndjson_file.is_file() {
         anyhow::bail!(
             "`con-leche` NDJSON stream file does not exist: `{}`",
@@ -1069,7 +1188,7 @@ pub fn verify_ndjson_with_con_leche(
     let jobs = bounded_con_leche_jobs(requested_jobs);
     let tmpdir = resolve_scratch_tmpdir(scratch_tmpdir);
 
-    let mut cmd = Command::new(binary_path);
+    let mut cmd = verified.command();
     if let Some(ref td) = tmpdir {
         cmd.env("TMPDIR", td);
     }
@@ -2430,6 +2549,7 @@ mod tests {
             KernelEngineSelection::Auto,
             PINNED_CON_LECHE_TOOLCHAIN,
             Some(&ws),
+            BridgeNoGitPolicy::PlainDirIsUntracked,
         )
         .unwrap();
         assert_eq!(std_prov.kernel_engine, ResolvedKernelEngine::Standard);
@@ -2457,6 +2577,7 @@ mod tests {
             KernelEngineSelection::Auto,
             PINNED_CON_LECHE_TOOLCHAIN,
             Some(&ws),
+            BridgeNoGitPolicy::PlainDirIsUntracked,
         )
         .unwrap();
         assert_eq!(incapable_prov.kernel_engine, ResolvedKernelEngine::Standard);
@@ -2469,6 +2590,7 @@ mod tests {
             KernelEngineSelection::Auto,
             PINNED_CON_LECHE_TOOLCHAIN,
             Some(&ws),
+            BridgeNoGitPolicy::PlainDirIsUntracked,
         )
         .unwrap();
         assert_eq!(
@@ -2499,6 +2621,7 @@ mod tests {
             KernelEngineSelection::Auto,
             "leanprover/lean4:v4.36.0",
             Some(&ws),
+            BridgeNoGitPolicy::PlainDirIsUntracked,
         )
         .unwrap();
         assert_eq!(off_pin.kernel_engine, ResolvedKernelEngine::Standard);
@@ -2509,6 +2632,7 @@ mod tests {
                 req,
                 PINNED_CON_LECHE_TOOLCHAIN,
                 Some(&ws),
+                BridgeNoGitPolicy::PlainDirIsUntracked,
             )
             .unwrap_err();
             assert!(
@@ -2517,6 +2641,133 @@ mod tests {
             );
         }
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Review 4f80161c U2: the no-`.git` outcome is the CALLER's policy, exercised on the real
+    // tracked-check function, not an injected closure.
+    #[test]
+    fn bridge_tracked_check_policy_decides_plain_dirs() {
+        let tmp = std::env::temp_dir().join(format!(
+            "turbo-lean-nogit-policy-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // `check --emit-olean` shape: a tree without `.git` cannot have delivered the file.
+        assert!(matches!(
+            bridge_binary_is_tracked(&tmp, BridgeNoGitPolicy::PlainDirIsUntracked),
+            Ok(false)
+        ));
+        // pr-verify / ci-verify shape: a checkout without `.git` fails the check closed.
+        let err =
+            bridge_binary_is_tracked(&tmp, BridgeNoGitPolicy::PlainDirFailsClosed).unwrap_err();
+        assert!(
+            err.to_string().contains("fails closed"),
+            "the plain-dir refusal must name the fail-closed policy: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Review 4f80161c U3: the digest is taken from the opened handle and the runner executes
+    // those bytes, so a swap between selection and execution, or a symlink planted at the
+    // pinned path, is refused.
+    #[test]
+    fn execution_open_refuses_swapped_bytes_and_symlinks() {
+        let tmp = std::env::temp_dir().join(format!("turbo-lean-swap-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let bin = tmp.join("con-leche");
+        std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let resolved =
+            ResolvedConLecheBinary::resolve(&bin, ConLecheBinaryProvenance::ProvisionedPinnedRev)
+                .unwrap();
+        // Unchanged bytes verify and open.
+        assert!(resolved.open_execution_verified().is_ok());
+        // Bytes swapped after selection are refused at execution.
+        std::fs::write(&bin, b"#!/bin/sh\nexit 1\n").unwrap();
+        let err = resolved.open_execution_verified().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("changed between selection and execution"),
+            "a swapped binary must be refused: {err:#}"
+        );
+        // A symlink final component at the pinned path is refused by `O_NOFOLLOW`.
+        #[cfg(unix)]
+        {
+            let target = tmp.join("elsewhere");
+            std::fs::write(&target, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::remove_file(&bin).unwrap();
+            std::os::unix::fs::symlink(&target, &bin).unwrap();
+            assert!(resolved.open_execution_verified().is_err());
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Review 4f80161c U5: the REAL tracked gate (a real git index, the real `git ls-files`
+    // check wired by `discover_con_leche_binary_for_selection_with_provenance`) refuses a
+    // tree-delivered bridge binary, and that discovery cause reaches the explicit-selection
+    // bail (DA b08785bc F6).
+    #[test]
+    fn real_tracked_gate_refuses_tree_delivered_bridge_binary() {
+        let tmp = std::env::temp_dir().join(format!("turbo-lean-tracked-{}", std::process::id()));
+        let co = tmp.join("checkout");
+        let bridge = co.join(BRIDGE_CON_LECHE_BIN_REL);
+        std::fs::create_dir_all(bridge.parent().unwrap()).unwrap();
+        std::fs::write(&bridge, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bridge, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // An isolated ELAN_HOME, as in the bundled-binary test above, so no toolchain-bundled
+        // binary can satisfy the selection in this environment.
+        let elan = tmp.join("elan");
+        std::fs::create_dir_all(&elan).unwrap();
+        let _elan_guard = ScopedEnvVar::set("ELAN_HOME", elan.as_os_str());
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&co)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        // `git ls-files --error-unmatch` reads the index, so staging suffices to make the
+        // bridge path tree-delivered.
+        git(&["add", "--", BRIDGE_CON_LECHE_BIN_REL]);
+        let err = discover_con_leche_binary_for_selection_with_provenance(
+            KernelEngineSelection::ConLeche,
+            PINNED_CON_LECHE_TOOLCHAIN,
+            Some(&co),
+            BridgeNoGitPolicy::PlainDirFailsClosed,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("TRACKED in checkout"),
+            "the real tracked gate must refuse a tree-delivered bridge binary: {err:#}"
+        );
+        let gate_err = resolve_kernel_engine_in_workspace(
+            KernelEngineSelection::ConLeche,
+            PINNED_CON_LECHE_TOOLCHAIN,
+            Some(&co),
+            BridgeNoGitPolicy::PlainDirFailsClosed,
+        )
+        .unwrap_err();
+        let msg = format!("{gate_err:#}");
+        assert!(
+            msg.contains("fail-closed kernel gate") && msg.contains("TRACKED in checkout"),
+            "the discovery cause must reach the explicit-selection bail: {msg}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

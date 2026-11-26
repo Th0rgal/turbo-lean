@@ -23,8 +23,11 @@
   head statements, `check --emit-olean`) share ONE discovery,
   `discover_con_leche_binary_for_selection_with_provenance` (`crates/turbo-lean/src/kernel.rs`),
   which pins the accepted binary's bytes at selection time (`ResolvedConLecheBinary`, a blake3
-  digest the runners re-verify immediately before each spawn), so the binary the
-  probe accepts is byte-for-byte the binary the runner executes: it checks the pinned toolchain and the
+  digest). Before each spawn the runner opens the pinned path without following a symlink final
+  component, re-hashes the OPENED bytes against that digest, and on Linux executes through the
+  verified handle itself, so the executed bytes are the hashed bytes; on other platforms the
+  canonical path is spawned right after the fd hash, leaving only that platform's small
+  open-to-exec window. The discovery checks the pinned toolchain and the
   provisioned (`TURBO_CON_LECHE_BIN` / bridge) binaries, and for `auto` only it additionally
   accepts the toolchain-bundled binary at `$ELAN_HOME/toolchains/<pinned>/bin/con-leche`
   (`bundled_toolchain_con_leche_binary`), canonicalized, rejected when it lies under the
