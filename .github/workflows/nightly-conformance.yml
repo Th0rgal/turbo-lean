@@ -78,3 +78,51 @@ jobs:
       - name: Run Tier C4 10,000-seed shared/exclusive-alias LCNF fuzz (ASan/UBSan)
         run: |
           python3 scripts/fuzz_lcnf_conformance.py --seeds 10000 --asan --ubsan
+
+  proof-mutant-sample:
+    name: H1.4 proved-lowering mutant kill sample (planted-control self-test + pinned KILLED subset)
+    runs-on: ${{ vars.TURBO_LEAN_LEAN_RUNNERS == 'true' && github.repository == 'Th0rgal/turbo-lean' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'lean-4vcpu-ubuntu-2604' || 'ubuntu-latest' }}
+    # Each sampled mutant rebuilds the mutated bridge module plus its proof and
+    # Tests dependents from a pristine .lake snapshot; the pinned sample is
+    # bounded (CI_SAMPLE in scripts/proof_mutant_matrix.py). The full 60-mutant
+    # matrix runs locally behind --full, not here.
+    timeout-minutes: 270
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Harness self-test (planted always-survives / always-killed / stillborn controls)
+        run: python3 scripts/proof_mutant_matrix.py --self-test
+
+      - name: Cache Lean toolchain and LeanNative build artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.elan
+            lean/.lake/build
+          key: ${{ runner.os }}-${{ runner.arch }}-nightly-conformance-lean-${{ hashFiles('lean/lean-toolchain', 'lean/lakefile.lean', 'lean/**/*.lean') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-nightly-conformance-lean-
+            ${{ runner.os }}-${{ runner.arch }}-roadmap-cargo-lean-
+
+      - name: Setup Lean 4 toolchain
+        run: |
+          TOOLCHAIN="$(tr -d '[:space:]' < lean/lean-toolchain)"
+          if [ ! -x "$HOME/.elan/bin/elan" ]; then
+            curl --retry 5 --retry-all-errors -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain "$TOOLCHAIN"
+          else
+            "$HOME/.elan/bin/elan" toolchain install "$TOOLCHAIN"
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          (cd lean && "$HOME/.elan/bin/lean" --version)
+
+      - name: Warm the baseline proofs/Tests closure the scratch worktrees seed from
+        run: |
+          (cd lean && lake build LeanNative)
+
+      - name: Run the pinned mutant sample (every member must stay KILLED)
+        run: |
+          python3 scripts/proof_mutant_matrix.py --sample ci --workers 1
