@@ -1019,13 +1019,23 @@ def ensure_c1_upstream_corpus() -> dict[str, Any]:
         if not (stamp.is_file() and stamp.read_text(encoding="utf-8").strip() == rev):
             dep_dir.mkdir(parents=True, exist_ok=True)
             if not (dep_dir / ".git").is_dir():
-                subprocess.run(["git", "init", "-q", str(dep_dir)], check=True, capture_output=True, text=True)
-            subprocess.run(["git", "-C", str(dep_dir), "fetch", "-q", "--depth", "1", repo_url, rev],
-                           check=True, capture_output=True, text=True)
+                subprocess.run(["git", "init", "-q", str(dep_dir)], check=True, capture_output=True,
+                               text=True, errors="replace")
+            # R8: blob-filtered fetch plus sparse checkout of the corpus piles
+            # only (measured at the pin: 4.9M .git + 22M tree vs the full
+            # checkout). The lazy blob fetch at checkout time needs a NAMED
+            # promisor remote, hence `origin` instead of a bare URL.
+            subprocess.run(["git", "-C", str(dep_dir), "config", "remote.origin.url", repo_url],
+                           check=True, capture_output=True, text=True, errors="replace")
+            subprocess.run(["git", "-C", str(dep_dir), "fetch", "-q", "--depth", "1",
+                            "--filter=blob:none", "origin", rev],
+                           check=True, capture_output=True, text=True, errors="replace")
+            subprocess.run(["git", "-C", str(dep_dir), "sparse-checkout", "set", *c1_corpus.CORPUS_PILES],
+                           check=True, capture_output=True, text=True, errors="replace")
             subprocess.run(["git", "-C", str(dep_dir), "checkout", "-q", "--detach", rev],
-                           check=True, capture_output=True, text=True)
+                           check=True, capture_output=True, text=True, errors="replace")
             head = subprocess.run(["git", "-C", str(dep_dir), "rev-parse", "HEAD"],
-                                  check=True, capture_output=True, text=True).stdout.strip()
+                                  check=True, capture_output=True, text=True, errors="replace").stdout.strip()
             if head != rev:
                 return {**base, "ok": False, "reason": f"checkout is at {head!r}, expected the pinned rev"}
             stamp.write_text(rev + "\n", encoding="utf-8")
