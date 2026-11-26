@@ -9,6 +9,7 @@ import LeanNative.Semantics.Refinement
 import LeanNative.Proofs.PeepholeProofs
 import LeanNative.Proofs.LoopOptProofs
 import LeanNative.Proofs.RealLCNFBridgeProofs
+import LeanNative.Proofs.LowerCalls
 import LeanNative.Proofs.BackendProofs
 import LeanNative.Proofs.KernelElabProofs
 import LeanNative.Proofs.SymbolicTV
@@ -824,12 +825,19 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.LedgerEmbedded32.execFn_modOfFnForTarget_eq
   , ``LeanNative.Proofs.LedgerEmbedded32.lowerModuleForTarget_sound
   , ``LeanNative.Proofs.LedgerEmbedded32.ledgerBip32Varint_e2e_nonvacuous
+  , ``LeanNative.Proofs.evalCodeF_nil
+  , ``LeanNative.Proofs.evalStepF_nil
+  , ``LeanNative.Proofs.evalRealLCNFDeclF_nil
+  , ``LeanNative.Proofs.evalCodeF_callFree
+  , ``LeanNative.Proofs.lowerImpureStepPure_soundF
+  , ``LeanNative.Proofs.lowerRealLCNFCode_soundF
+  , ``LeanNative.Proofs.lowerRealLCNFDecl_soundF
   , ``TurboLean.PolicyGates.specAuditWitnessReplay_eq_gate
   , ``TurboLean.PolicyGates.specAuditWitnessReplay_sound_pos
   , ``TurboLean.PolicyGates.specAuditWitnessReplay_sound_neg
   ]
 
-#guard auditedTheoremNames.length == 867
+#guard auditedTheoremNames.length == 874
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/
