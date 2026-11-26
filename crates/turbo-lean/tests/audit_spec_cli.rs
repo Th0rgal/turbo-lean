@@ -1851,10 +1851,21 @@ fn audit_spec_kernel_witness_replay_certifies_or_reports_unavailable() {
             neg.starts_with("kernel_certified_refuted_postcondition("),
             "kernel-replayed negative witness must carry the kernel_certified label, got: {neg}"
         );
+        assert!(
+            neg.contains("; eval=eval_refuted_postcondition("),
+            "the kernel checked one state; the eval count must stay its own labeled \
+             layer, got: {neg}"
+        );
         assert_eq!(
             spec0["witness_provenance"].as_str(),
             Some("kernel_certified_two_sided"),
             "{json}"
+        );
+        assert_eq!(
+            spec0["kernel_probe_shape"].as_str(),
+            Some("self_contained"),
+            "a fixture whose audited block fails to re-elaborate must be certified by \
+             the self-contained fallback and say so: {json}"
         );
         let chk_neg = json["specs"][1]["neg_witness"].as_str().unwrap_or("");
         assert!(
@@ -1872,10 +1883,92 @@ fn audit_spec_kernel_witness_replay_certifies_or_reports_unavailable() {
              generic or infrastructure unavailability: {json}"
         );
         assert!(
-            pos.starts_with("satisfied_states=")
-                && neg.starts_with("eval_refuted_postcondition("),
+            pos.starts_with("satisfied_states=") && neg.starts_with("eval_refuted_postcondition("),
             "without a Lean toolchain the labels must honestly stay at eval level: {json}"
         );
     }
 }
 
+/// A2 r2 (#367): the self-contained fallback must never overrule the audited context.
+/// The audited file elaborates on its own (the hypothesis is `False` under its local
+/// `LE Nat` instance, so `nomatch h` closes the proof), the host evaluator still finds
+/// concrete witnesses under core `Nat` semantics, and the verbatim probe then fails
+/// exactly in the appended witness theorems (`1 ≤ 1` is `False` in this context): the
+/// kernel has spoken, and a reconstructed probe without the instance must not certify
+/// the same witnesses under core semantics.
+#[test]
+fn audit_spec_kernel_witness_fallback_never_overrules_audited_semantics() {
+    let lean_available = Command::new("lean")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !lean_available {
+        return;
+    }
+    let fx = AuditSpecFixture::new("kw_local_inst");
+    let spec = fx.write(
+        "KwLocalInst.lean",
+        "local instance : LE Nat := ⟨fun _ _ => False⟩\n\
+         theorem kw_succ_pred (n : Nat) (h : 1 ≤ n) : n - 1 + 1 = n := nomatch h\n",
+    );
+    let out = fx
+        .cli("kw-local-inst")
+        .args(["--json", "audit-spec", "--kernel-witness"])
+        .arg(&spec)
+        .output()
+        .unwrap();
+    let json = assert_cli_ok(&out, "kernel_witness_local_instance");
+    let text = json.to_string();
+    assert!(
+        !text.contains("kernel_certified_"),
+        "a probe context without the audited source's local instance must never \
+         certify a witness: {json}"
+    );
+    assert_eq!(
+        json["kernel_witness"]["mode"].as_str(),
+        Some("probe_rejected"),
+        "{json}"
+    );
+}
+
+/// A2 r2 (#367): an ambient `TURBO_LEAN_ALLOWED_AXIOMS` glob must never widen what a
+/// `kernel_certified_*` label means: an audited source that rewrites `decide` into
+/// `native_decide` proves the appended theorems only through compiler-trust axioms,
+/// and the replay must refuse that whatever the environment says.
+#[test]
+fn audit_spec_kernel_witness_axiom_globs_never_widen_certification() {
+    let lean_available = Command::new("lean")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !lean_available {
+        return;
+    }
+    let fx = AuditSpecFixture::new("kw_axiom_glob");
+    let spec = fx.write(
+        "KwAxiomGlob.lean",
+        "macro_rules | `(tactic| decide) => `(tactic| native_decide)\n\
+         theorem kw_succ_pred (n : Nat) (h : 1 ≤ n) : n - 1 + 1 = n := by omega\n",
+    );
+    let out = fx
+        .cli("kw-axiom-glob")
+        .env("TURBO_LEAN_ALLOWED_AXIOMS", "Lean.*")
+        .args(["--json", "audit-spec", "--kernel-witness"])
+        .arg(&spec)
+        .output()
+        .unwrap();
+    let json = assert_cli_ok(&out, "kernel_witness_axiom_glob");
+    let text = json.to_string();
+    assert!(
+        !text.contains("kernel_certified_"),
+        "compiler-trust axioms admitted by an ambient glob must never certify a \
+         witness: {json}"
+    );
+    assert_ne!(
+        json["kernel_witness"]["mode"].as_str(),
+        Some("replayed"),
+        "{json}"
+    );
+}
