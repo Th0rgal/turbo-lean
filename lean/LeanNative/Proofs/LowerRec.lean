@@ -29,8 +29,8 @@ recursive `Prop`s (the positional clauses `DeclEnvLowersPosR` and per-entry `Ctx
 coherence): the strict-proofs policy forbids a new `inductive` under `Proofs/` (L2's
 `DeclEnvLowers` has the same shape for the same reason). `reservedRuntimeCallee` is
 defined as L2's `reservedRuntimeName`, so the two lanes share one predicate. Part II is
-NOT proved, and its headline is refuted over the landed `evalStepR` — see "Part II status"
-below.
+NOT proved and stays OPEN: amendment 3 fixed the step rule its first refutation rested
+on, and the remaining work is listed in "Part II status" below.
 
 Pipeline note: this leaf was cut against the L2 CONTRACT; L2 has since landed its F-stack,
 and Part I is proved against the landed definitions: `FuncEnv` and `evalCodeF`
@@ -113,6 +113,32 @@ findings folded before the Part II statements freeze):
 - F5, this block. The pipeline note, the `reservedRuntimeCallee` and `DeclEnvLowersR`
   contract text, the audit pin and the Part II sequencing text below describe the landed
   code.
+
+Amendment 3 (gap-l3, 2026-11-26; the lead's decision on the Part II status question, and
+review a2aa208f findings 1-2): the resolved local-call rule binds the call result at the
+caller's declared lowered type `rawTy`. Until this amendment it bound at
+`if isUnboxedScalarOrTuple rawTy then rawTy else .i64`, the unresolved `.fap` arm's
+fallback, while the lowering allocates the destination at `rawTy` itself
+(`IR/RealLCNFBridge.lean`, the `.fap` arm with `ctx.findLocalCallee? fnName = some sym`)
+and L2's `evalStepF` binds at `some rawTy`. The witness is guard family 6 of
+`Tests/RealLCNFRecTests.lean`: callee `l3_mk x = ObjBox.left (box x)` returns a fresh
+object, caller `l3_use x = let o := l3_mk x; dec o; 0`, one context with heap lowering
+on, `ObjBox.left`'s layout, and `l3_mk` local. Under the old rule the source run stored `o`
+at `.i64`, its `dec` was a no-op, and the run returned `0` with the object live, while the
+lowered caller under `Φ` and L2's run returned `0` with it freed. Under the amended rule
+the three runs agree exactly on value and heap; the family-6 guards fail at the old rule
+and pass at this one. The Part I statement `evalStepR_localCall_unfold` pinned the old
+binding, so its right-hand side changes with the rule: a frozen statement changes here
+because the semantics it described were wrong. Its continuation was
+`evalStepR Δ fuel ctx (env.bind decl.fvarId v none (some (if isUnboxedScalarOrTuple
+(lowerGroundImpureTypeWith ctx decl.type) then lowerGroundImpureTypeWith ctx decl.type
+else .i64))) st' (.inl k)` and is now
+`evalStepR Δ fuel ctx (env.bind decl.fvarId v none (some (lowerGroundImpureTypeWith ctx
+decl.type))) st' (.inl k)`. Nothing else moves: `evalStepR_nil` never reaches the arm (an
+empty `Δ` misses), `evalStepR_fuel_mono` does not inspect the binding, and every earlier
+guard's call result is `UInt64`, whose lowered type the old rule kept. Rejected: keeping
+the `.i64` binding with a warning, which would have certified a step rule that leaks
+objects on heap-typed local calls to keep a refutation of the headline standing.
 
 ### What the AST actually carries for recursion and loops (read first, stated only if it exists)
 
@@ -233,10 +259,10 @@ on: on `.let decl k` with `decl.value = .fap fn args _` and
   as `evalStepR Δ fuel sdCtx env' st (.inl c)` at the step's decremented fuel UNDER THE
   FULL `Δ` and the callee's paired `sdCtx` — the differences from L2's rule, and what
   makes a self or mutual call evaluate under the context the driver actually builds for
-  that callee; its `.ok (v, st')` binds into the caller exactly as the old `.fap` arm
-  would (`storedTy := if isUnboxedScalarOrTuple rawTy then rawTy else .i64`, no ctor;
-  `rawTy` from the CALLER'S `ctx`) and continues with `k` at the decremented fuel under
-  `Δ` and the caller's `ctx`.
+  that callee; its `.ok (v, st')` binds into the caller at `storedTy := rawTy`, no ctor
+  (`rawTy` from the CALLER'S `ctx`: the type the lowering allocates the destination at,
+  as L2's `evalStepF` binds; amendment 3), and continues with `k` at the decremented fuel
+  under `Δ` and the caller's `ctx`.
 - lookup miss: `.error (.unsupportedCall fn.toString)` — byte-for-byte the old behavior,
   so `Δ = []` is the old semantics (theorem `evalStepR_nil`).
 
@@ -379,9 +405,7 @@ theorem evalStepR_localCall_unfold (Δ : List (Lean.Compiler.LCNF.Decl .impure �
             | .error e => .error e
             | .ok (v, st') =>
               evalStepR Δ fuel ctx
-                (env.bind decl.fvarId v none
-                  (some (if isUnboxedScalarOrTuple (lowerGroundImpureTypeWith ctx decl.type)
-                         then lowerGroundImpureTypeWith ctx decl.type else .i64)))
+                (env.bind decl.fvarId v none (some (lowerGroundImpureTypeWith ctx decl.type)))
                 st' (.inl k)
 
 theorem evalStepR_localCall_miss (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx))
@@ -614,48 +638,37 @@ stratified lookup on `DeclEnvLowersR` environments, whose names are duplicate-fr
 `Δ : DeclEnv` is L2's, entries `Decl × RealBridgeCtx × Nat`, so `declEnvR` applies to it
 unchanged. Reason 2 below refutes the remark.)
 
-#### Part II status (gap-l3, 2026-11-26): refuted as stated; proofs not started
+#### Part II status (gap-l3, 2026-11-26): open; the semantic refutation is fixed
 
 L2's F-stack has merged (`Proofs/LowerCalls.lean` proves `lowerRealLCNFDecl_soundF`), so
-the sequencing reason above no longer holds. A fourth defect, the missing coherence
-hypotheses, was found by review and is fixed (amendment 2, F1): the statements above
-carry `h_map` and per-entry `CtxMapsEnvR`, and `declEnvLowersR_lookup_align` proves those
-hypotheses enough for the call case's lookup step. The statements are still not provable
-over the landed definitions, for three measured reasons (probe fixtures recorded with the
-leaf's report; each is a few lines of real LCNF):
+the sequencing reason above no longer holds, and the statements above carry the coherence
+hypotheses review 80ac7f68 found missing (amendment 2, F1; `declEnvLowersR_lookup_align`
+proves them enough for the call case's lookup step). This section's first status refuted
+the headline over the landed `evalStepR`; amendment 3 fixed the step rule that refutation
+rested on. What stands, each point pinned by a committed guard of
+`Tests/RealLCNFRecTests.lean`:
 
-1. The headline is false over the landed `evalStepR`. Its local-call rule binds the call
-   result at `if isUnboxedScalarOrTuple rawTy then rawTy else .i64`, while the lowering
-   allocates the destination at `rawTy` itself (`IR/RealLCNFBridge.lean`, the `.fap` arm
-   with `ctx.findLocalCallee? fnName = some sym`). For a heap-typed result the source run
-   records `.i64`, so a later `dec` of it is a no-op on the source side and a `.decRef` on
-   the LNIR side. Witness: callee `l3_mk x = ObjBox.left (box x)` (a fresh object), caller
-   `l3_use x = let o := l3_mk x; dec o; 0`, both under a context with `allowStage1DHeap`
-   and `ObjBox.left`'s layout and `localCallees = [(l3_mk, "mk_sym")]`, `Δ = [(l3_mk, ctx,
-   64)]`, `Φ = [the lowered callee]`. Every hypothesis of `lowerRealLCNFDecl_soundR` holds
-   at fuel 64 and argument `5`; the source R-run returns `0` with the object still live
-   (rc 1), the lowered caller under `Φ` returns `0` with the object freed. L2 met the same
-   divergence and binds at `some rawTy` (the comment in `IR/RealLCNFCallSemantics.lean`'s
-   resolved-call arm); L2's F-run of this fixture frees the object too.
-2. `evalRealLCNFDeclF_toR` is refuted by the same fixture: the F-run returns `0` with the
-   object freed, the R-run `0` with it live. Independently, L2's per-entry amendment runs an
-   F callee at its ENTRY fuel while R runs it at the caller's decremented fuel, so the
-   contract's "needs no fuel padding" remark no longer holds.
+1. The headline's counterexample no longer applies. It was a heap-typed local-call result
+   stored at `.i64` on the source side and at `rawTy` on the LNIR side, so a `dec` freed
+   the object on the LNIR side only. With the result bound at `rawTy`, the source run,
+   L2's run and the lowered run of that module agree exactly on value and heap (family 6).
+   The headline is not proved; no counterexample to it is known at these bytes.
+2. `evalRealLCNFDeclF_toR` as written is false for fuel. L2's per-entry amendment runs an
+   F callee at its ENTRY fuel, while R runs it at the caller's decremented step fuel, so
+   at a step budget the caller's own steps fit and the callee's do not, the F-run
+   succeeds and the R-run at the same budget ends on it (family 8: a three-addition callee
+   with entry fuel 64 under a caller at budget 3). The contract's "needs no fuel padding"
+   remark does not hold. The heap half of this item's first refutation is gone: family 6
+   compares the F and R runs and they agree.
 3. `evalCodeF_toR` does not elaborate (it passes a `FuncEnv`, a list of declaration/fuel
    pairs since L2's amendment, where `evalCodeR` takes `List LNIRDecl`), and with the
    projection `Φ.map Prod.fst` it is false for repeated names: with two entries named `f`,
-   the first calling `f` and the second returning `7`, the F-run of `f ()` returns `7`
-   (the nested call resolves in the strict suffix) and the R-run exhausts its budget at
-   every fuel (every nested call re-resolves to the first entry). A distinct-names
-   hypothesis, and a fuel bound covering the per-entry fuels, are missing.
+   the first calling `f` and the second returning `7`, the F-run returns `7` (the nested
+   call resolves in the strict suffix) and the R-run ends on its call budget at every
+   fuel, since every nested call re-resolves to the first entry (family 7).
 
-What would unblock it, for the fold owner (not taken here):
+The open work, for the fold owner:
 
-- Bind the resolved-call result at `some rawTy` in `evalStepR`, exactly as L2's
-  `evalStepF` does. That changes Part I's `evalStepR_localCall_unfold` right-hand side the
-  same way; `evalStepR_nil`, `evalStepR_fuel_mono` and the guards are unaffected (no
-  `Δ = []` run reaches the arm, the monotonicity proof does not inspect the binding, and
-  every guard's call result is `UInt64`).
 - Restate L2's step stack over R: the per-case mirrors in `RealLCNFBridge/CallsF.lean`
   conclude in `evalStepF`/`evalCodeF`, so their conclusions move to `evalStepR`/`evalCodeR`
   with the call-rule hypotheses instantiated by R's rule, and the U6 induction in
@@ -667,7 +680,8 @@ What would unblock it, for the fold owner (not taken here):
   returns the same declaration at any larger fuel), or a simulation stated for a lowering
   fuel at least the evaluation fuel. Which of these the induction takes, and whether the
   LNIR fuel of the conclusion stays the source fuel, is the first design decision.
-- Restate the two embeddings with distinct names and a fuel bound over the entry fuels.
+- Restate the two embeddings with a distinct-names hypothesis (family 7's environment
+  violates it) and a fuel bound covering the entry fuels (family 8's run violates it).
 
 ### Named exclusions (recorded, not silently dropped)
 
@@ -1237,9 +1251,7 @@ theorem evalStepR_localCall_unfold (Δ : List (Lean.Compiler.LCNF.Decl .impure �
             | .error e => .error e
             | .ok (v, st') =>
               evalStepR Δ fuel ctx
-                (env.bind decl.fvarId v none
-                  (some (if isUnboxedScalarOrTuple (lowerGroundImpureTypeWith ctx decl.type)
-                         then lowerGroundImpureTypeWith ctx decl.type else .i64)))
+                (env.bind decl.fvarId v none (some (lowerGroundImpureTypeWith ctx decl.type)))
                 st' (.inl k) := by
   rw [evalStepR.eq_def]
   simp only [hval, hloc, hlk, ↓reduceIte]
