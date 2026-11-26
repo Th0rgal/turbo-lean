@@ -640,15 +640,25 @@ def declEnvR (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat
     List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx) :=
   Δ.map fun e => (e.1, e.2.1)
 
-/-- Pointwise "Δ lowers to Φ" for the FULL-environment semantics, with PER-ENTRY context
-    and lowering fuel: each entry's own context maps its own declaration's name to its
-    LNIR name, the lowering hypothesis holds at the entry's own fuel, lowered names are
-    unreserved, and tail freshness over the whole list makes `lookupDeclRec?` and
-    `lookupFuncRec?` find corresponding positions WITHOUT stratification. The contract's
-    `nil`/`cons` constructors are the two matching clauses of this recursive `Prop`
-    (strict-proofs scope admits no new `inductive` under `Proofs/`, the shape L2's
-    `DeclEnvLowers` takes for the same reason); length-mismatched lists relate never. -/
-def DeclEnvLowersR :
+/-- A context's mangled-name map COHERES with an environment pairing, position by
+    position: WHEN it maps a source declaration's name, it maps it to the lowered
+    declaration's name at the same position (L2's `CtxMapsEnv`, for the R entry shape).
+    This is what ties a call site's source lookup, by Lean name, to its LNIR lookup, by
+    mangled symbol; length-mismatched lists cohere never. -/
+def CtxMapsEnvR (ctx : RealBridgeCtx) :
+    List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat) → List LNIRDecl → Prop
+  | [], [] => True
+  | (sd, _, _) :: Δ, ld :: Φ =>
+      (∀ m, ctx.findLocalCallee? sd.name = some m → m = ld.name) ∧ CtxMapsEnvR ctx Δ Φ
+  | _, _ => False
+
+/-- The positional clauses of `DeclEnvLowersR`: each entry's own context maps its own
+    declaration's name to its LNIR name, the lowering hypothesis holds at the entry's own
+    fuel, lowered names are unreserved, and no later lowered name repeats an earlier one.
+    A recursive `Prop` (strict-proofs scope admits no new `inductive` under `Proofs/`, the
+    shape L2's `DeclEnvLowers` takes for the same reason); length-mismatched lists relate
+    never. -/
+def DeclEnvLowersPosR :
     List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat) → List LNIRDecl → Prop
   | [], [] => True
   | (sd, ctx, fuel) :: Δ, ld :: Φ =>
@@ -656,8 +666,19 @@ def DeclEnvLowersR :
       lowerRealLCNFDecl fuel ctx sd ld.name = .ok ld ∧
       reservedRuntimeCallee ld.name = false ∧
       (∀ ld' ∈ Φ, ld'.name ≠ ld.name) ∧
-      DeclEnvLowersR Δ Φ
+      DeclEnvLowersPosR Δ Φ
   | _, _ => False
+
+/-- Pointwise "Δ lowers to Φ" for the FULL-environment semantics, with PER-ENTRY context
+    and lowering fuel: the positional clauses, and every entry's own context coheres with
+    the WHOLE pairing (`CtxMapsEnvR`). Name freshness alone cannot align a lookup keyed on
+    a Lean name with one keyed on a mangled symbol; coherence pins the symbol a context
+    resolves to the position the source lookup lands on, and freshness then keeps every
+    other position from matching it (`declEnvLowersR_lookup_align`). Coherence is over the
+    whole lists, not the tail, because a recursive call may reach an earlier entry. -/
+def DeclEnvLowersR (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat))
+    (Φ : List LNIRDecl) : Prop :=
+  DeclEnvLowersPosR Δ Φ ∧ ∀ e ∈ Δ, CtxMapsEnvR e.2.1 Δ Φ
 
 /-- `CodeRefines` with the recursion-capable environment (the L3 form of refinement). -/
 def CodeRefinesR (Φ : List LNIRDecl) (src tgt : LNIRCode) : Prop :=
@@ -1141,25 +1162,79 @@ theorem evalCodeR_extend_of_ok (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
     exact evalCodeRAux_sim [] Φ (n + 1) (n + 1) (Nat.le_refl _) none (some (evalCodeR Φ n))
       (hhead _) c env st _ h
 
+/-- Every lowered name the positional clauses admit is unreserved. -/
+theorem DeclEnvLowersPosR.fresh :
+    ∀ (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) (Φ : List LNIRDecl),
+      DeclEnvLowersPosR Δ Φ → ∀ ld ∈ Φ, reservedRuntimeCallee ld.name = false
+  | [], [], _, _, hm => nomatch hm
+  | [], _ :: _, h, _, _ => nomatch h
+  | _ :: _, [], h, _, _ => nomatch h
+  | (_, _, _) :: Δ, _ :: Φ, h, ld, hm => by
+    obtain ⟨_, _, hres, _, htail⟩ := h
+    cases hm with
+    | head => exact hres
+    | tail _ hm => exact DeclEnvLowersPosR.fresh Δ Φ htail ld hm
+
 theorem DeclEnvLowersR.fresh
     (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) (Φ : List LNIRDecl)
     (h : DeclEnvLowersR Δ Φ) :
-    ∀ ld ∈ Φ, reservedRuntimeCallee ld.name = false := by
-  induction Δ generalizing Φ with
-  | nil =>
-    cases Φ with
-    | nil => intro ld hm; exact nomatch hm
-    | cons _ _ => exact nomatch h
-  | cons e Δ ih =>
-    obtain ⟨sd, ctx, fuel⟩ := e
-    cases Φ with
-    | nil => exact nomatch h
-    | cons ld0 Φ =>
-      obtain ⟨_, _, hres, _, htail⟩ := h
-      intro ld hm
-      cases hm with
-      | head => exact hres
-      | tail _ hm => exact ih Φ htail ld hm
+    ∀ ld ∈ Φ, reservedRuntimeCallee ld.name = false :=
+  DeclEnvLowersPosR.fresh Δ Φ h.1
+
+/-- At a call site whose context resolves `fn` to `sym` and coheres with the pairing, the
+    source lookup by Lean name and the LNIR lookup by mangled symbol land on ONE position:
+    coherence pins `sym` to the lowered name where the source lookup stops, and the
+    pairwise freshness of lowered names keeps every earlier position from matching it. -/
+theorem lookupDeclRec?_align :
+    ∀ (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) (Φ : List LNIRDecl),
+      DeclEnvLowersPosR Δ Φ →
+      ∀ (ctx : RealBridgeCtx) (fn : Lean.Name) (sym : String)
+        (sd : Lean.Compiler.LCNF.Decl .impure) (sdCtx : RealBridgeCtx),
+      CtxMapsEnvR ctx Δ Φ → ctx.findLocalCallee? fn = some sym →
+      lookupDeclRec? (declEnvR Δ) fn = some (sd, sdCtx) →
+      ∃ fuelD ld, (sd, sdCtx, fuelD) ∈ Δ ∧ lookupFuncRec? Φ sym = some ld ∧
+        lowerRealLCNFDecl fuelD sdCtx sd ld.name = .ok ld
+  | [], [], _, _, _, _, _, _, _, _, hlk => nomatch hlk
+  | [], _ :: _, h, _, _, _, _, _, _, _, _ => nomatch h
+  | _ :: _, [], h, _, _, _, _, _, _, _, _ => nomatch h
+  | (sd0, c0, f0) :: Δ, ld0 :: Φ, hpos, ctx, fn, sym, sd, sdCtx, hmap, hsym, hlk => by
+    obtain ⟨_, hlow, _, hfresh, hpos'⟩ := hpos
+    obtain ⟨hhead, hmap'⟩ := hmap
+    simp only [declEnvR, List.map_cons] at hlk
+    dsimp only [lookupDeclRec?] at hlk
+    split at hlk
+    · next hb =>
+      injection hlk with hlk
+      cases hlk
+      have hsym0 : sym = ld0.name := hhead sym (by rw [eq_of_beq hb]; exact hsym)
+      refine ⟨f0, ld0, List.mem_cons_self .., ?_, hlow⟩
+      simp [lookupFuncRec?, hsym0]
+    · obtain ⟨fuelD, ld, hmem, hlkΦ, hlow'⟩ :=
+        lookupDeclRec?_align Δ Φ hpos' ctx fn sym sd sdCtx hmap' hsym hlk
+      refine ⟨fuelD, ld, List.mem_cons_of_mem _ hmem, ?_, hlow'⟩
+      obtain ⟨hm, hn⟩ := lookupFuncRec?_mem Φ sym ld hlkΦ
+      have hne : (ld0.name == sym) = false := by
+        cases hb : (ld0.name == sym) with
+        | false => rfl
+        | true => exact absurd (by rw [hn, eq_of_beq hb]) (hfresh ld hm)
+      simp only [lookupFuncRec?, hne, Bool.false_eq_true, ↓reduceIte]
+      exact hlkΦ
+
+/-- The alignment the recursion headline's call case consumes: under an admitted
+    environment, a coherent call site resolves to the LOWERING of the callee its source
+    lookup finds, at that entry's own context and fuel, and that callee's own context
+    coheres with the whole pairing again, so its nested call sites align too. -/
+theorem declEnvLowersR_lookup_align
+    (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) (Φ : List LNIRDecl)
+    (h : DeclEnvLowersR Δ Φ) (ctx : RealBridgeCtx) (fn : Lean.Name) (sym : String)
+    (sd : Lean.Compiler.LCNF.Decl .impure) (sdCtx : RealBridgeCtx)
+    (hmap : CtxMapsEnvR ctx Δ Φ) (hsym : ctx.findLocalCallee? fn = some sym)
+    (hlk : lookupDeclRec? (declEnvR Δ) fn = some (sd, sdCtx)) :
+    ∃ fuelD ld, lookupFuncRec? Φ sym = some ld ∧
+      lowerRealLCNFDecl fuelD sdCtx sd ld.name = .ok ld ∧ CtxMapsEnvR sdCtx Δ Φ := by
+  obtain ⟨fuelD, ld, hmem, hlkΦ, hlow⟩ :=
+    lookupDeclRec?_align Δ Φ h.1 ctx fn sym sd sdCtx hmap hsym hlk
+  exact ⟨fuelD, ld, hlkΦ, hlow, h.2 _ hmem⟩
 
 theorem lowerRealLCNFDecl_soundR_base (fuel : Nat) (ctx : RealBridgeCtx)
     (Φ : List LNIRDecl)
