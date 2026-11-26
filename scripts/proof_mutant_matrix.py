@@ -9,23 +9,38 @@ cache. The kill signal is a failed `lake build LeanNative` of the proofs/Tests
 closure (theorem elaboration failure or a failed `#guard` executable guard),
 never a hand-judged verdict.
 
-Honesty rules this harness enforces:
+Honesty rules this harness enforces (round 1 of the harness review folded in):
   * The committed originals are never touched: mutations happen only in a
     scratch worktree under `.h14-mutants/` inside the repository root, created
-    with `git worktree add --detach` and removed with `git worktree remove`.
+    with `git worktree add --detach` and removed with `git worktree remove`
+    (with `git worktree prune` around both, so a killed run cannot strand a
+    registration).
+  * The measured object is one COMMIT: pristine sources and pins are read with
+    `git show <commit>:<path>` at the commit the scratch worktrees are built
+    at, the run fails closed when the working tree's copies differ from that
+    commit, and the results JSON records that same commit and its toolchain.
   * Site enumeration is deterministic and tied to pinned file sha256s; a pin
     mismatch fails closed (the matrix owner re-enumerates and re-pins).
   * A mutant whose own module fails to elaborate is NOT_APPLICABLE (stillborn),
     never counted as KILLED: it measures Lean's type checker, not the proofs.
-  * Infrastructure failures (OOM, disk, download) are INFRA, never a kill.
+  * A build timeout is TIMEOUT and an infrastructure failure (OOM 137, disk,
+    download) is INFRA — both are unmeasured, never kills, and both make the
+    run exit non-zero. Infra signatures are only consulted on failed builds, so
+    a green build whose test output echoes one is still a SURVIVED. Builds run
+    in their own process group and the whole group is SIGKILLed on timeout, so
+    orphaned `lean` children cannot write into `.lake/build` across the
+    pristine-snapshot restore boundary (cross-mutant contamination).
   * `lean/.lake/build` is restored from a pristine snapshot before every mutant
-    (the `scripts/emitter_mutants.py` shape), so one mutant's partial build
-    cannot contaminate the next verdict.
+    (the `scripts/emitter_mutants.py` shape).
+  * Every finished mutant is appended to a progress JSONL as it completes; a
+    crashed or interrupted run resumes from it (`--resume`), and a per-mutant
+    exception becomes an ERROR row instead of aborting the run.
 
-CI runs `--self-test` (planted always-survives / always-killed / stillborn
-controls through the real classifier) plus the bounded pinned sample
-(`--sample ci`, members in CI_SAMPLE below, every one measured KILLED by the
-full matrix). The full matrix (`--full`) takes hours and runs on demand.
+CI runs `--self-test` (planted always-survives / always-killed / stillborn /
+timeout / infra controls driven through the real `run_one` with a fake scratch)
+plus the bounded pinned sample (`--sample ci`, members in CI_SAMPLE below,
+every one recorded KILLED in the committed results JSON, which the self-test
+checks). The full matrix (`--full`) takes hours and runs on demand.
 """
 
 from __future__ import annotations
@@ -37,16 +52,19 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
-SCHEMA = "proof-mutant-matrix-v1"
+SCHEMA = "proof-mutant-matrix-v2"
 SCRATCH_DIRNAME = ".h14-mutants"
+RESULTS_PATH = ROOT / "scripts" / "proof_mutant_matrix_results.json"
 
 FILES: Dict[str, str] = {
     "RB": "lean/LeanNative/IR/RealLCNFBridge.lean",
@@ -64,14 +82,22 @@ PINNED_SHA256: Dict[str, str] = {
 }
 CLOSURE_TARGETS: List[str] = ["LeanNative"]
 
+# Outcomes that are a measurement (stay in the denominator and need no re-run).
+TERMINAL_OUTCOMES = ("KILLED", "SURVIVED")
+# Outcomes excluded from the denominator.
+UNMEASURED_OUTCOMES = ("NOT_APPLICABLE", "INFRA", "TIMEOUT", "ERROR")
+
 # Signatures that mean the build infrastructure failed, not the proof stack
-# (subset of scripts/emitter_mutants.json `infra_signatures`).
+# (subset of scripts/emitter_mutants.json `infra_signatures`, plus the forms
+# Lake prints when a child `lean` is OOM-killed). Only consulted on rc != 0.
 INFRA_SIGNATURES: Tuple[str, ...] = (
     "out of memory",
     "oom-kill",
     "cannot allocate memory",
     "signal: 9",
     "sigkill",
+    "exited with code 137",
+    "code 137",
     "no space left on device",
     "network is unreachable",
     "connection timed out",
@@ -210,9 +236,10 @@ OPERATORS: List[Operator] = [
 ]
 
 # Pinned CI sample: a bounded, representative subset the nightly workflow runs.
-# Every member was measured KILLED by the full matrix at the pinned shas; the
-# CI job fails if any stops being killed (a proof/guard was weakened) or if a
-# pin drifts (re-run --full and re-pin).
+# Every member is recorded KILLED in the committed results JSON
+# (scripts/proof_mutant_matrix_results.json), which --self-test checks; the CI
+# job fails if any stops being killed (a proof/guard was weakened) or if a pin
+# drifts (re-run --full and re-pin).
 CI_SAMPLE: List[Tuple[str, str]] = [
     ("RB-opnd-swap-00", "KILLED"),
     ("RB-mask-drop-00", "KILLED"),
@@ -247,8 +274,39 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def read_sources(root: Path) -> Dict[str, str]:
-    return {tag: (root / rel).read_text(encoding="utf-8") for tag, rel in FILES.items()}
+def git(root: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(root)] + list(args),
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+def git_show(root: Path, commit: str, rel: str) -> str:
+    """Byte-exact file content at a commit (no strip: the sha pins need the
+    trailing newline)."""
+    proc = subprocess.run(["git", "-C", str(root), "show", f"{commit}:{rel}"],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"git show {commit}:{rel} failed: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def read_sources_at(root: Path, commit: str) -> Dict[str, str]:
+    """Pristine sources at the MEASURED commit — what scratch worktrees hold
+    and what mutants apply to (review F1: never the working tree)."""
+    return {tag: git_show(root, commit, rel) for tag, rel in FILES.items()}
+
+
+def assert_sources_clean(root: Path, commit: str) -> List[str]:
+    """Fail closed when the working tree's copies of the enumerated files
+    differ from the measured commit (review F1)."""
+    errs = []
+    for tag, rel in FILES.items():
+        proc = subprocess.run(
+            ["git", "-C", str(root), "diff", "--quiet", commit, "--", rel],
+            capture_output=True, text=True)
+        if proc.returncode != 0:
+            errs.append(f"{rel}: working tree differs from {commit[:12]} "
+                        f"(commit or revert it; the matrix measures one commit)")
+    return errs
 
 
 def check_pins(srcs: Dict[str, str]) -> List[str]:
@@ -301,44 +359,80 @@ def apply_mutant(text: str, mutant: Mutant) -> str:
     return text[:m.start()] + m.expand(op.replacement) + text[m.end():]
 
 
-def lake_env() -> Dict[str, str]:
+def lake_env(tmpdir: Optional[Path] = None) -> Dict[str, str]:
     env = dict(os.environ)
     env["PATH"] = str(Path.home() / ".elan" / "bin") + os.pathsep + env.get("PATH", "")
     env.setdefault("LEAN_NUM_THREADS", "4")
     env["TURBO_LEAN_REMOTE_CACHE"] = ""
     env["TURBO_LEAN_REMOTE_TOKEN"] = ""
+    if tmpdir is not None:
+        # Per-scratch TMPDIR and TURBO_LEAN_HOME: elaboration-time IO tests
+        # write fixed-name files under $TMPDIR (Tests/EvalLCNFCLITests.lean's
+        # json-noise fixture) and pack/cache state under TURBO_LEAN_HOME
+        # (Tests/StochasticEvolveTests.lean; the nightly workflow isolates the
+        # same variable per workspace), so concurrent workers sharing either
+        # can fail each other's builds and record a false KILL for an
+        # unrelated mutant.
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        env["TMPDIR"] = str(tmpdir)
+        cache = tmpdir / "turbo-cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        env["TURBO_LEAN_HOME"] = str(cache)
     return env
 
 
 class LakeRunner:
-    """Real build runner. --self-test swaps this for planted fakes."""
+    """Real build runner. The self-test swaps this for planted fakes.
+
+    Review F3: the build runs in its own process group and the WHOLE group is
+    SIGKILLed on timeout, so orphaned `lean` children cannot keep writing into
+    `.lake/build` across the next mutant's snapshot restore."""
 
     def __init__(self, lean_dir: Path, timeout_s: int):
         self.lean_dir = lean_dir
         self.timeout_s = timeout_s
+        # Inside the scratch worktree, so `git worktree remove --force` and the
+        # scratch cleanup take it with them.
+        self.tmpdir = lean_dir.parent / ".h14-tmp"
 
     def build(self, targets: List[str]) -> BuildResult:
         t0 = time.monotonic()
+        proc = subprocess.Popen(
+            ["lake", "build"] + targets, cwd=str(self.lean_dir),
+            env=lake_env(self.tmpdir), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, start_new_session=True)
         try:
-            proc = subprocess.run(
-                ["lake", "build"] + targets, cwd=str(self.lean_dir),
-                env=lake_env(), capture_output=True, text=True,
-                timeout=self.timeout_s)
-            out = proc.stdout + "\n" + proc.stderr
-            return BuildResult(proc.returncode, out, time.monotonic() - t0)
-        except subprocess.TimeoutExpired as e:
-            out = (e.stdout or "") if isinstance(e.stdout, str) else ""
-            return BuildResult(124, out + "\n[proof-mutant-matrix] build timeout",
-                               time.monotonic() - t0)
+            out, _ = proc.communicate(timeout=self.timeout_s)
+            return BuildResult(proc.returncode, out or "", time.monotonic() - t0)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            out, _ = proc.communicate()
+            return BuildResult(
+                124, (out or "") + "\n[proof-mutant-matrix] build timeout "
+                "(process group SIGKILLed)", time.monotonic() - t0)
 
 
 FAIL_MOD_RE = re.compile(r"[✖×] \[\d+/\d+\][^\n]*?(?:Building|Compiling|Running) ([A-Za-z0-9_.']+)")
 ERROR_PATH_RE = re.compile(r"([A-Za-z0-9_./-]+\.lean):(\d+):(\d+):")
 
 
-def is_infra(output: str) -> bool:
-    low = output.lower()
+def is_infra(res: Optional[BuildResult]) -> bool:
+    """Infra signatures are only consulted on FAILED builds (review F4): a
+    green build whose test output echoes a signature is not infra. An exit of
+    137 / -9 (OOM-killed) is always infra."""
+    if res is None or res.rc == 0:
+        return False
+    if res.rc in (137, -9):
+        return True
+    low = res.output.lower()
     return any(sig in low for sig in INFRA_SIGNATURES)
+
+
+def is_timeout(res: Optional[BuildResult]) -> bool:
+    return res is not None and res.rc == 124
 
 
 def first_error_line(output: str) -> Optional[str]:
@@ -363,10 +457,17 @@ def killed_by_module(output: str) -> Optional[str]:
 
 
 def classify(module_res: BuildResult, closure_res: Optional[BuildResult]) -> Dict[str, object]:
-    if is_infra(module_res.output) or (closure_res and is_infra(closure_res.output)):
+    # Order matters (review F3/F4): timeout and infra are UNMEASURED and take
+    # precedence over any kill/stillborn reading of the same rc.
+    if is_timeout(module_res) or is_timeout(closure_res):
+        return {"outcome": "TIMEOUT", "killed_by": None,
+                "first_error": None,
+                "reason": "build timeout (unmeasured, never a kill)"}
+    if is_infra(module_res) or is_infra(closure_res):
         return {"outcome": "INFRA", "killed_by": None,
                 "first_error": first_error_line((closure_res or module_res).output),
-                "reason": "infrastructure signature in build output (unmeasured)"}
+                "reason": "infrastructure signature or OOM exit on a failed "
+                          "build (unmeasured, never a kill)"}
     if module_res.rc != 0:
         return {"outcome": "NOT_APPLICABLE", "killed_by": None,
                 "first_error": first_error_line(module_res.output),
@@ -377,11 +478,6 @@ def classify(module_res: BuildResult, closure_res: Optional[BuildResult]) -> Dic
                 "first_error": first_error_line(closure_res.output), "reason": None}
     return {"outcome": "SURVIVED", "killed_by": None, "first_error": None,
             "reason": None}
-
-
-def git(root: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(root)] + list(args),
-                          capture_output=True, text=True, check=True).stdout.strip()
 
 
 class Scratch:
@@ -399,10 +495,17 @@ class Scratch:
     def create(self) -> None:
         if self.path.exists():
             self.remove()
+        # Review F5: a killed previous run can leave a registration whose
+        # directory is gone; prune before add, and surface git's own stderr.
+        subprocess.run(["git", "-C", str(self.root), "worktree", "prune"],
+                       capture_output=True, text=True)
         self.base.mkdir(exist_ok=True)
-        subprocess.run(["git", "-C", str(self.root), "worktree", "add",
-                        "--detach", str(self.path), self.commit],
-                       capture_output=True, text=True, check=True)
+        proc = subprocess.run(["git", "-C", str(self.root), "worktree", "add",
+                               "--detach", str(self.path), self.commit],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"git worktree add {self.path} failed "
+                               f"(rc={proc.returncode}): {proc.stderr.strip()}")
         shutil.copytree(self.root / "lean" / ".lake", self.path / "lean" / ".lake",
                         symlinks=True)
 
@@ -430,18 +533,28 @@ class Scratch:
     def remove(self) -> None:
         # The brief's deletion rule: scratch worktrees are removed with
         # `git -C <worktree> worktree remove <literal path we created>`.
-        subprocess.run(["git", "-C", str(self.root), "worktree", "remove",
-                        "--force", str(self.path)], capture_output=True, text=True)
-        if self.path.exists():
+        proc = subprocess.run(["git", "-C", str(self.root), "worktree", "remove",
+                               "--force", str(self.path)],
+                              capture_output=True, text=True)
+        if proc.returncode != 0 and self.path.exists():
+            print(f"[scratch] git worktree remove {self.path} failed "
+                  f"(rc={proc.returncode}): {proc.stderr.strip()}; "
+                  f"falling back to rmtree + prune", file=sys.stderr)
             shutil.rmtree(self.path)
+        # Review F5: drop the registration the rmtree fallback leaves behind.
+        subprocess.run(["git", "-C", str(self.root), "worktree", "prune"],
+                       capture_output=True, text=True)
 
     def drop_snapshot(self) -> None:
         if self.snap.exists():
             shutil.rmtree(self.snap)
 
 
-def run_one(scratch: Scratch, pristine: Dict[str, str], mutant: Mutant,
+def run_one(scratch, pristine: Dict[str, str], mutant: Mutant,
             runner: Optional[object] = None) -> Dict[str, object]:
+    """Two-stage protocol: build the mutated module (stillborn check), then the
+    proofs/Tests closure (kill check). The self-test drives THIS function with
+    a fake scratch and planted runners (review F8)."""
     r = runner or scratch.runner
     scratch.restore(pristine)
     scratch.write_mutant(pristine, mutant)
@@ -456,19 +569,65 @@ def run_one(scratch: Scratch, pristine: Dict[str, str], mutant: Mutant,
         "duration_s": round(time.monotonic() - t0, 1),
     }
     rec.update(verdict)
-    scratch.restore(pristine)
     return rec
 
 
-def run_matrix(mutants: List[Mutant], pristine: Dict[str, str], workers: int,
-               timeout_s: int, keep_scratch: bool) -> List[Dict[str, object]]:
-    commit = git(ROOT, "rev-parse", "HEAD")
+def safe_run_one(scratch, pristine: Dict[str, str], mutant: Mutant,
+                 runner: Optional[object] = None) -> Dict[str, object]:
+    """Review F6: a per-mutant exception becomes an ERROR row, never an abort."""
+    try:
+        return run_one(scratch, pristine, mutant, runner)
+    except Exception as e:  # noqa: BLE001 - every failure becomes a row
+        return {
+            "id": mutant.mid, "file": FILES[mutant.file_tag], "line": mutant.line,
+            "operator": mutant.op, "category": mutant.category,
+            "before": mutant.before, "after": mutant.after,
+            "duration_s": 0.0, "outcome": "ERROR", "killed_by": None,
+            "first_error": None,
+            "reason": f"harness exception: {type(e).__name__}: {e}",
+        }
+
+
+def load_progress(jsonl_path: Path, commit: str) -> Dict[str, Dict[str, object]]:
+    """Resume rows from a prior interrupted run at the SAME commit. Only
+    measured outcomes (KILLED/SURVIVED) and stillborns are reused; TIMEOUT,
+    INFRA and ERROR re-run."""
+    done: Dict[str, Dict[str, object]] = {}
+    if not jsonl_path.exists():
+        return done
+    for ln in jsonl_path.read_text(encoding="utf-8").splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        rec = json.loads(ln)
+        if rec.get("measured_commit") != commit:
+            raise RuntimeError(
+                f"{jsonl_path}: progress rows are for commit "
+                f"{str(rec.get('measured_commit'))[:12]}, this run measures "
+                f"{commit[:12]}; move the file aside")
+        if rec.get("outcome") in TERMINAL_OUTCOMES + ("NOT_APPLICABLE",):
+            done[str(rec["id"])] = rec
+    return done
+
+
+def run_matrix(mutants: List[Mutant], pristine: Dict[str, str], commit: str,
+               workers: int, timeout_s: int, keep_scratch: bool,
+               jsonl_path: Path, resume: bool) -> List[Dict[str, object]]:
     base = ROOT / SCRATCH_DIRNAME
+    done = load_progress(jsonl_path, commit) if resume else {}
+    todo = [m for m in mutants if m.mid not in done]
+    if done:
+        print(f"[resume] {len(done)} mutant(s) carried from {jsonl_path}, "
+              f"{len(todo)} to run")
+    if not resume and jsonl_path.exists():
+        jsonl_path.unlink()
+    workers = max(1, min(workers, max(1, len(todo))))  # review F7
     scratches = [Scratch(ROOT, base, i, commit, timeout_s) for i in range(workers)]
     chunks: List[List[Mutant]] = [[] for _ in range(workers)]
-    for i, m in enumerate(mutants):
+    for i, m in enumerate(todo):
         chunks[i % workers].append(m)
-    results: List[Dict[str, object]] = []
+    results: List[Dict[str, object]] = list(done.values())
+    jsonl_lock = threading.Lock()
     try:
         for s in scratches:
             print(f"[setup] creating scratch worktree {s.path} at {commit[:12]}",
@@ -488,11 +647,18 @@ def run_matrix(mutants: List[Mutant], pristine: Dict[str, str], workers: int,
         def worker(idx: int) -> List[Dict[str, object]]:
             out = []
             for m in chunks[idx]:
-                rec = run_one(scratches[idx], pristine, m)
+                rec = safe_run_one(scratches[idx], pristine, m)
+                rec["measured_commit"] = commit
+                with jsonl_lock:
+                    with jsonl_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 print(f"[{rec['outcome']:>14}] {rec['id']:28s} line {rec['line']:<4} "
                       f"{rec.get('killed_by') or ''} ({rec['duration_s']}s)",
                       flush=True)
                 out.append(rec)
+            # Review F7: one final restore per scratch (run_one no longer
+            # restores after each mutant; the next mutant restores first).
+            scratches[idx].restore(pristine)
             return out
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
@@ -512,19 +678,20 @@ def run_matrix(mutants: List[Mutant], pristine: Dict[str, str], workers: int,
 def summarize(results: List[Dict[str, object]]) -> Dict[str, object]:
     total = len(results)
     counts = {k: sum(1 for r in results if r["outcome"] == k)
-              for k in ("KILLED", "SURVIVED", "NOT_APPLICABLE", "INFRA")}
-    denom = total - counts["NOT_APPLICABLE"] - counts["INFRA"]
+              for k in TERMINAL_OUTCOMES + UNMEASURED_OUTCOMES}
+    denom = counts["KILLED"] + counts["SURVIVED"]
     by_cat: Dict[str, Dict[str, int]] = {}
     for r in results:
-        c = by_cat.setdefault(str(r["category"]), {"KILLED": 0, "SURVIVED": 0,
-                                                   "NOT_APPLICABLE": 0, "INFRA": 0})
-        c[str(r["outcome"])] += 1
+        c = by_cat.setdefault(str(r["category"]), {})
+        c[str(r["outcome"])] = c.get(str(r["outcome"]), 0) + 1
     return {
         "total_mutants": total,
         "killed": counts["KILLED"],
         "survived": counts["SURVIVED"],
         "not_applicable_stillborn": counts["NOT_APPLICABLE"],
         "infra_unmeasured": counts["INFRA"],
+        "timeout_unmeasured": counts["TIMEOUT"],
+        "error_unmeasured": counts["ERROR"],
         "denominator_valid_mutants": denom,
         "coverage": f"{counts['KILLED']}/{denom}",
         "coverage_pct": round(100.0 * counts["KILLED"] / denom, 1) if denom else None,
@@ -533,7 +700,8 @@ def summarize(results: List[Dict[str, object]]) -> Dict[str, object]:
 
 
 # ---------------------------------------------------------------------------
-# Self-test: planted controls through the REAL classifier, no Lean build.
+# Self-test: planted controls driven through the REAL run_one (review F8),
+# no Lean build.
 # ---------------------------------------------------------------------------
 
 class PlantedRunner:
@@ -543,11 +711,33 @@ class PlantedRunner:
     def __init__(self, outcomes: List[BuildResult]):
         self.outcomes = list(outcomes)
         self.calls = 0
+        self.targets: List[List[str]] = []
 
     def build(self, targets: List[str]) -> BuildResult:
         res = self.outcomes[min(self.calls, len(self.outcomes) - 1)]
         self.calls += 1
+        self.targets.append(list(targets))
         return res
+
+
+class FakeScratch:
+    """No-op scratch so the self-test can drive run_one without a worktree."""
+
+    def __init__(self):
+        self.restores = 0
+        self.mutants_written: List[str] = []
+        self.runner = None
+
+    def restore(self, pristine: Dict[str, str]) -> None:
+        self.restores += 1
+
+    def write_mutant(self, pristine: Dict[str, str], mutant: Mutant) -> None:
+        self.mutants_written.append(mutant.mid)
+
+
+class RaisingScratch(FakeScratch):
+    def write_mutant(self, pristine: Dict[str, str], mutant: Mutant) -> None:
+        raise OSError("planted scratch failure")
 
 
 def self_test() -> int:
@@ -561,9 +751,14 @@ def self_test() -> int:
         if not cond:
             failures.append(name)
 
-    srcs = read_sources(ROOT)
+    commit = git(ROOT, "rev-parse", "HEAD")
+    clean_errs = assert_sources_clean(ROOT, commit)
+    check("enumerated sources in the working tree match HEAD (fail-closed)",
+          not clean_errs, "; ".join(clean_errs))
+    srcs = read_sources_at(ROOT, commit)
     pin_errs = check_pins(srcs)
-    check("pinned source sha256s match the tree", not pin_errs, "; ".join(pin_errs))
+    check("pinned source sha256s match the measured commit", not pin_errs,
+          "; ".join(pin_errs))
 
     mutants, errs = enumerate_mutants(srcs)
     check("deterministic enumeration has pinned per-operator counts", not errs,
@@ -615,34 +810,88 @@ def self_test() -> int:
     killed = BuildResult(1, kill_out, 2.0)
     stillborn = BuildResult(1, "error: lean/LeanNative/IR/RealLCNFBridge.lean:10:1: "
                                "error: type mismatch", 1.0)
-    infra = BuildResult(1, "ld: No space left on device", 1.0)
+    infra_fail = BuildResult(1, "ld: No space left on device", 1.0)
+    oom_rc = BuildResult(137, "make: *** [all] Killed", 1.0)
+    oom_text = BuildResult(1, "error: Lean exited with code 137", 1.0)
+    timeout = BuildResult(124, "[proof-mutant-matrix] build timeout "
+                               "(process group SIGKILLed)", 3600.0)
+    green_with_sig = BuildResult(0, "info: simulated heap test: out of memory "
+                                    "path exercised\nBuild completed "
+                                    "successfully (44 jobs)", 2.0)
+    m0 = mutants[0] if mutants else None
 
-    # Planted always-survives control: both stages green must classify SURVIVED.
-    v = classify(ok, ok)
-    check("planted always-survives control classifies SURVIVED",
-          v["outcome"] == "SURVIVED", str(v))
-    # Planted always-killed control: closure stage red must classify KILLED
-    # with the failing module parsed out.
-    v = classify(ok, killed)
-    check("planted always-killed control classifies KILLED",
-          v["outcome"] == "KILLED", str(v))
-    check("planted always-killed control names the killing module",
-          v["killed_by"] == "LeanNative.Proofs.RealLCNFBridgeProofs", str(v))
-    check("planted always-killed control captures the first error line",
-          bool(v["first_error"]) and "unsolved goals" in str(v["first_error"]), str(v))
-    v = classify(stillborn, None)
-    check("planted stillborn control classifies NOT_APPLICABLE",
-          v["outcome"] == "NOT_APPLICABLE", str(v))
-    v = classify(ok, infra)
-    check("planted infra control classifies INFRA (never a kill)",
-          v["outcome"] == "INFRA", str(v))
+    def drive(outcomes: List[BuildResult]):
+        fs = FakeScratch()
+        pr = PlantedRunner(outcomes)
+        rec = run_one(fs, srcs, m0, runner=pr)
+        return rec, fs, pr
 
-    # The planted runner drives the same two-stage protocol run_one uses.
-    pr = PlantedRunner([ok, killed])
-    mres = pr.build(["+X"])
-    cres = pr.build(CLOSURE_TARGETS) if mres.rc == 0 else None
-    check("two-stage protocol with planted runner reaches the closure stage",
-          pr.calls == 2 and classify(mres, cres)["outcome"] == "KILLED")
+    if m0 is not None:
+        # Planted always-survives control: both stages green through run_one.
+        rec, fs, pr = drive([ok, ok])
+        check("planted always-survives control classifies SURVIVED via run_one",
+              rec["outcome"] == "SURVIVED" and pr.calls == 2, str(rec))
+        check("run_one restores once and writes the mutant once",
+              fs.restores == 1 and fs.mutants_written == [m0.mid],
+              f"restores={fs.restores} wrote={fs.mutants_written}")
+        check("run_one's module stage targets the mutated module",
+              pr.targets[0] == [f"+{MODULES[m0.file_tag]}"] and
+              pr.targets[1] == CLOSURE_TARGETS, str(pr.targets))
+        # Planted always-killed control: closure stage red through run_one.
+        rec, _, pr = drive([ok, killed])
+        check("planted always-killed control classifies KILLED via run_one",
+              rec["outcome"] == "KILLED" and pr.calls == 2, str(rec))
+        check("planted always-killed control names the killing module",
+              rec["killed_by"] == "LeanNative.Proofs.RealLCNFBridgeProofs", str(rec))
+        check("planted always-killed control captures the first error line",
+              bool(rec["first_error"]) and "unsolved goals" in str(rec["first_error"]),
+              str(rec))
+        # Planted stillborn control: module stage red, closure never runs.
+        rec, _, pr = drive([stillborn])
+        check("planted stillborn control classifies NOT_APPLICABLE and skips "
+              "the closure stage", rec["outcome"] == "NOT_APPLICABLE" and
+              pr.calls == 1, f"{rec} calls={pr.calls}")
+        # Timeout and OOM are unmeasured, never kills (review F3/F4).
+        rec, _, _ = drive([ok, timeout])
+        check("planted timeout control classifies TIMEOUT (never a kill)",
+              rec["outcome"] == "TIMEOUT", str(rec))
+        rec, _, _ = drive([ok, oom_rc])
+        check("planted OOM rc-137 control classifies INFRA (never a kill)",
+              rec["outcome"] == "INFRA", str(rec))
+        rec, _, _ = drive([ok, oom_text])
+        check("planted 'exited with code 137' control classifies INFRA",
+              rec["outcome"] == "INFRA", str(rec))
+        rec, _, _ = drive([ok, infra_fail])
+        check("planted infra control classifies INFRA (never a kill)",
+              rec["outcome"] == "INFRA", str(rec))
+        # A GREEN build whose output echoes a signature is a real SURVIVED
+        # (review F4: signatures are only consulted on failed builds).
+        rec, _, _ = drive([ok, green_with_sig])
+        check("green build echoing an infra signature stays SURVIVED",
+              rec["outcome"] == "SURVIVED", str(rec))
+        # A harness exception becomes an ERROR row, not an abort (review F6).
+        err_rec = safe_run_one(RaisingScratch(), srcs, m0,
+                               runner=PlantedRunner([ok, ok]))
+        check("a harness exception becomes an ERROR row",
+              err_rec["outcome"] == "ERROR" and
+              "planted scratch failure" in str(err_rec["reason"]), str(err_rec))
+
+    # The committed results artifact backs the CI sample's KILLED claims
+    # (review F9): every pinned id must be recorded KILLED at the pinned shas.
+    if RESULTS_PATH.exists():
+        doc = json.loads(RESULTS_PATH.read_text(encoding="utf-8"))
+        by_id = {r["id"]: r for r in doc.get("mutants", [])}
+        missing = [mid for mid, exp in CI_SAMPLE
+                   if by_id.get(mid, {}).get("outcome") != exp]
+        check("every CI sample id is recorded KILLED in the committed results "
+              "JSON", not missing, str(missing))
+        stale = [rel for rel, sha in doc.get("files", {}).items()
+                 if sha not in PINNED_SHA256.values()]
+        check("committed results JSON was measured at the pinned source shas",
+              not stale, str(stale))
+    else:
+        check("committed results JSON exists (scripts/"
+              "proof_mutant_matrix_results.json)", False, "file missing")
 
     print(f"[self-test] {'OK' if not failures else 'FAILED'} "
           f"({len(failures)} failure(s))")
@@ -650,12 +899,14 @@ def self_test() -> int:
 
 
 def write_results(path: Path, results: List[Dict[str, object]],
-                  srcs: Dict[str, str]) -> None:
-    toolchain = (ROOT / "lean" / "lean-toolchain").read_text().strip()
+                  srcs: Dict[str, str], commit: str) -> None:
+    # Review F2: the recorded commit and toolchain are the MEASURED ones
+    # (captured when the scratch worktrees were created), not re-read state.
+    toolchain = git_show(ROOT, commit, "lean/lean-toolchain").strip()
     doc = {
         "schemaVersion": SCHEMA,
         "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "measured_commit": git(ROOT, "rev-parse", "HEAD"),
+        "measured_commit": commit,
         "toolchain": toolchain,
         "kill_signal": "lake build " + " ".join(CLOSURE_TARGETS) +
                        " (proofs + Tests #guard closure)",
@@ -687,17 +938,24 @@ def main() -> int:
                     help="per-build timeout in seconds")
     ap.add_argument("--json-out", default="",
                     help="write the results JSON to this path")
+    ap.add_argument("--jsonl", default="",
+                    help="per-mutant progress JSONL (default: "
+                         "h14-matrix-progress.jsonl in the repo root)")
+    ap.add_argument("--resume", action="store_true",
+                    help="reuse measured rows from the progress JSONL")
     ap.add_argument("--keep-scratch", action="store_true")
     args = ap.parse_args()
 
     if args.self_test:
         return self_test()
 
-    srcs = read_sources(ROOT)
+    commit = git(ROOT, "rev-parse", "HEAD")
+    clean_errs = assert_sources_clean(ROOT, commit)
+    srcs = read_sources_at(ROOT, commit)
     pin_errs = check_pins(srcs)
     mutants, errs = enumerate_mutants(srcs)
-    if pin_errs or errs:
-        for e in pin_errs + errs:
+    if clean_errs or pin_errs or errs:
+        for e in clean_errs + pin_errs + errs:
             print(f"[proof-mutant-matrix] FAIL-CLOSED: {e}", file=sys.stderr)
         return 1
 
@@ -732,20 +990,25 @@ def main() -> int:
         ap.print_help()
         return 64
 
-    print(f"[proof-mutant-matrix] running {len(selected)} mutant(s), "
-          f"{args.workers} worker(s)")
-    results = run_matrix(selected, srcs, max(1, args.workers), args.timeout,
-                         args.keep_scratch)
+    jsonl_path = Path(args.jsonl) if args.jsonl else ROOT / "h14-matrix-progress.jsonl"
+    print(f"[proof-mutant-matrix] running {len(selected)} mutant(s) at "
+          f"{commit[:12]}, {min(max(1, args.workers), len(selected))} worker(s), "
+          f"progress -> {jsonl_path}")
+    results = run_matrix(selected, srcs, commit, max(1, args.workers),
+                         args.timeout, args.keep_scratch, jsonl_path,
+                         args.resume)
     summary = summarize(results)
     print(json.dumps(summary, indent=2))
 
     if args.json_out:
-        write_results(Path(args.json_out), results, srcs)
+        write_results(Path(args.json_out), results, srcs, commit)
 
     rc = 0
-    if summary["infra_unmeasured"]:
-        print("[proof-mutant-matrix] INFRA outcomes present: unmeasured, rerun",
-              file=sys.stderr)
+    unmeasured = (summary["infra_unmeasured"] + summary["timeout_unmeasured"]
+                  + summary["error_unmeasured"])
+    if unmeasured:
+        print(f"[proof-mutant-matrix] {unmeasured} unmeasured outcome(s) "
+              f"(INFRA/TIMEOUT/ERROR): rerun with --resume", file=sys.stderr)
         rc = 1
     if expected:
         for r in results:
