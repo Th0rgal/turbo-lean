@@ -1399,18 +1399,43 @@ fn lake_refresh_targets_inner(
     input_lib_targets
 }
 
-/// The Lake-inputs sweep's module closure over `dag`: every module whose own build
-/// reads a Lake file input (an input-bearing library or executable can build it, or
-/// its source uses `include_str`), plus every transitive dependent, each of which
-/// has to be re-checked once an input changes.
+/// The Lake-inputs sweep's module closure over `dag`: every OWNED module whose own
+/// build reads a Lake file input (an input-bearing library or executable can build
+/// it, or its source uses `include_str`), plus every transitive OWNED dependent,
+/// each of which has to be re-checked once an input changes.
+///
+/// Non-owned modules never enter the closure, as seed or as dependent (DA 47e88386
+/// F4): the explicit input-target seeds are already ownership-gated, and a non-owned
+/// seed here would pull its owned dependents in, whose emitted targets make
+/// `lake build <dependent>` rebuild the stale non-owned module inside the shared
+/// checkout's `.lake/build`, the #434 write the emission filter cannot catch. The
+/// dependency's own workspace refreshes it; the stale-import refresh then covers the
+/// owned importers.
 pub(crate) fn input_closure_sweep_mods(
     cfg: &crate::module_builder::ProjectConfig,
     dag: &crate::module_builder::ModuleDag,
 ) -> std::collections::BTreeSet<String> {
+    let owned_dep_pkgs: std::collections::HashSet<&str> = cfg
+        .dep_pkgs
+        .iter()
+        .filter(|dp| crate::module_builder::dep_pkg_lake_targets_owned_by_project(cfg, dp))
+        .flat_map(|dp| {
+            [
+                dp.name.as_str(),
+                crate::module_builder::pkg_target_base_name(dp),
+            ]
+        })
+        .collect();
+    let node_owned = |n: &crate::module_builder::ModuleNode| {
+        n.is_root_pkg || owned_dep_pkgs.contains(n.pkg_name.as_str())
+    };
     let mut closure: std::collections::BTreeSet<String> = dag
         .nodes
         .iter()
         .filter_map(|(m, n)| {
+            if !node_owned(n) {
+                return None;
+            }
             let spec_has_include_str = crate::module_builder::resolve_module_in_package(
                 &cfg.root_pkg,
                 true,
@@ -1451,7 +1476,8 @@ pub(crate) fn input_closure_sweep_mods(
     while changed {
         changed = false;
         for (m, n) in &dag.nodes {
-            if !closure.contains(m)
+            if node_owned(n)
+                && !closure.contains(m)
                 && n.direct_dag_deps.iter().any(|d| closure.contains(d))
             {
                 closure.insert(m.clone());

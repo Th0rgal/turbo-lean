@@ -1005,6 +1005,148 @@ use super::*;
         Ok(())
     }
 
+    /// DA 47e88386 F4: the input-closure sweep must not let a NON-OWNED input-bearing
+    /// module pull its owned dependents into the closure. Emitting those dependents
+    /// makes `lake build <dependent>` rebuild the stale non-owned module inside the
+    /// shared checkout's `.lake/build`, the very write #434 forbids; the emission
+    /// filter cannot catch it because the dependents' own targets are owned shapes.
+    /// Owned seeds keep their dependents: the stale-input re-check this sweep exists
+    /// for still covers everything the project may rebuild.
+    #[test]
+    fn test_input_closure_sweep_excludes_non_owned_modules_and_their_dependents() -> Result<()> {
+        struct RmDirs(Vec<PathBuf>);
+        impl Drop for RmDirs {
+            fn drop(&mut self) {
+                for p in &self.0 {
+                    let _ = fs::remove_dir_all(p);
+                }
+            }
+        }
+        let mut cleanup = RmDirs(Vec::new());
+        // A shared out-of-tree checkout with Lake file inputs: a real clone, which the
+        // ownership evidence rules class as the #434 shape when nothing claims it.
+        let shared = std::env::temp_dir().join(format!(
+            "turbo_lake_closure_shared_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&shared);
+        cleanup.0.push(shared.clone());
+        fs::create_dir_all(shared.join("SharedDep"))?;
+        fs::create_dir_all(shared.join("Data"))?;
+        fs::write(
+            shared.join("lean-toolchain"),
+            include_str!("../../../../lean/lean-toolchain"),
+        )?;
+        fs::write(
+            shared.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage shareddep\ninput_dir depSources where\n  path := \"Data\"\n  filter := .extension \"sol\"\n@[default_target]\nlean_lib «SharedDep» where\n  globs := #[.submodules `SharedDep]\n  needs := #[depSources]\n",
+        )?;
+        fs::write(
+            shared.join("SharedDep/D.lean"),
+            "def gen := include_str \"../Data/a.sol\"\n",
+        )?;
+        fs::write(shared.join("Data/a.sol"), "contract A {}")?;
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "."],
+            vec!["-c", "user.name=t", "-c", "user.email=t@e", "-c", "commit.gpgsign=false", "commit", "-qm", "init"],
+        ] {
+            let mut git = match crate::trusted_tools::git(&shared) {
+                Ok(git) => git,
+                Err(err) => {
+                    if std::env::var_os("CI").is_some() {
+                        return Err(err);
+                    }
+                    eprintln!(
+                        "skipping the closure-sweep ownership test: trusted git unavailable ({err:#})"
+                    );
+                    return Ok(());
+                }
+            };
+            assert!(git.arg("-C").arg(&shared).args(&args).status()?.success());
+        }
+        // The project: an owned input-bearing lib (P2In) with its own dependent
+        // (P2.B), plus an owned module (P2.A) whose ONLY path into the closure is
+        // the non-owned module it imports.
+        let projc = std::env::temp_dir().join(format!(
+            "turbo_lake_closure_proj_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&projc);
+        cleanup.0.push(projc.clone());
+        fs::create_dir_all(projc.join(".lake/packages"))?;
+        fs::create_dir_all(projc.join("Data"))?;
+        fs::create_dir_all(projc.join("P2"))?;
+        fs::write(
+            projc.join("lean-toolchain"),
+            include_str!("../../../../lean/lean-toolchain"),
+        )?;
+        fs::write(
+            projc.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage p2\nrequire shareddep from \".lake/packages/shareddep\"\ninput_dir p2Sources where\n  path := \"Data\"\n  filter := .extension \"sol\"\n@[default_target]\nlean_lib P2In where\n  globs := #[.one `P2In]\n  needs := #[p2Sources]\nlean_lib «P2» where\n  globs := #[.one `P2.A, .one `P2.B]\n",
+        )?;
+        fs::write(projc.join("P2In.lean"), "def pin : Nat := 1\n")?;
+        fs::write(projc.join("P2/A.lean"), "import SharedDep.D\ndef a2 : Nat := 1\n")?;
+        fs::write(projc.join("P2/B.lean"), "import P2In\ndef b2 : Nat := 1\n")?;
+        fs::write(projc.join("Data/a.sol"), "contract A {}")?;
+        std::os::unix::fs::symlink(&shared, projc.join(".lake/packages/shareddep"))?;
+        fs::write(
+            projc.join("lake-manifest.json"),
+            "{\"version\":\"1.1.0\",\"packagesDir\":\".lake/packages\",\"packages\":[{\"type\":\"path\",\"name\":\"shareddep\",\"dir\":\".lake/packages/shareddep\"}]}\n",
+        )?;
+        let projc = projc.canonicalize()?;
+        if crate::module_builder::resolve_project_config(&projc).is_err() {
+            return Ok(());
+        }
+        let cfg = crate::module_builder::resolve_project_config(&projc)?;
+        let dag = crate::module_builder::build_module_dag_with_trust(
+            &cfg,
+            &["P2In".to_string(), "P2".to_string()],
+            false,
+        )?;
+        assert!(
+            dag.nodes.contains_key("SharedDep.D"),
+            "fixture: the dag reaches the non-owned module through P2.A's import, \
+             or the negative assertions below prove nothing"
+        );
+        let closure = input_closure_sweep_mods(&cfg, &dag);
+        assert!(
+            closure.contains("P2In"),
+            "an owned input-bearing module seeds the closure: {closure:?}"
+        );
+        assert!(
+            closure.contains("P2.B"),
+            "a dependent of an OWNED seed joins the closure, so stale-input \
+             re-checks of owned modules keep working: {closure:?}"
+        );
+        assert!(
+            !closure.contains("SharedDep.D"),
+            "a non-owned input-bearing module never enters the closure: its own \
+             workspace refreshes it (#434): {closure:?}"
+        );
+        assert!(
+            !closure.contains("P2.A"),
+            "an owned module whose only path into the closure is a non-owned module \
+             stays out: emitting it would make lake rebuild the stale non-owned \
+             module inside the shared checkout (DA 47e88386 F4): {closure:?}"
+        );
+        let emitted = lake_refresh_targets_for_input_closure(
+            &cfg,
+            &closure.iter().cloned().collect::<Vec<_>>(),
+        );
+        assert!(
+            emitted.contains(&"P2In".to_string()),
+            "the owned input-bearing library is emitted: {emitted:?}"
+        );
+        assert!(
+            !emitted.iter().any(|t| t.contains("SharedDep")),
+            "no SharedDep-shaped target is emitted for the fixed closure: {emitted:?}"
+        );
+        Ok(())
+    }
+
     /// A manifest entry has to name the input bytes it was recorded against, and a *missing* entry
     /// has to read as stale once the package declares inputs.
     ///
