@@ -2081,6 +2081,50 @@ fn audit_spec_kernel_witness_hash_exit_never_reconstructs() {
 /// conservatism is what keeps the fallback out: deleting the scan turns this red,
 /// where the r2 local-instance case has the error-position gate as a second defence.
 #[test]
+fn audit_spec_kernel_witness_sibling_hostile_disables_fallback() {
+    let lean_available = Command::new("lean")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !lean_available {
+        eprintln!("skipping: no `lean` on PATH, nothing to replay");
+        return;
+    }
+    let fx = AuditSpecFixture::new("kw_sib_hostile");
+    // The sibling's defs are pulled into the self-contained probe via the external
+    // local-def sweep, so a probe-hostile command in a SIBLING is as disqualifying as
+    // one in the audited file itself. The audited file carries the same deliberate
+    // column-0 breakage shape as the sole-defence test (every error in-block), so only
+    // the hostile scan can refuse the fallback.
+    let _sib = fx.write("KwSibDefs.lean", "notation \"⟪\" x \"⟫\" => Nat.succ x\n");
+    let spec = fx.write(
+        "KwSibHostile.lean",
+        "theorem kw_chk (p q : Bool) (h : p ≤ q) : (p && !q) = false := by\n\
+         revert h; cases p <;> cases q <;> decide\n",
+    );
+    let out = fx
+        .cli("kw-sib-hostile")
+        .args(["--json", "audit-spec", "--kernel-witness"])
+        .arg(&spec)
+        .output()
+        .unwrap();
+    let json = assert_cli_ok(&out, "kernel_witness_sibling_hostile");
+    let text = json.to_string();
+    assert!(
+        !text.contains("kernel_certified_"),
+        "a sibling declaring notation must disable the reconstructed fallback exactly \
+         as the audited file would: {json}"
+    );
+    assert_eq!(
+        json["kernel_witness"]["mode"].as_str(),
+        Some("probe_rejected"),
+        "{json}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn audit_spec_kernel_witness_hostile_scan_is_sole_defence() {
     let lean_available = Command::new("lean")
         .arg("--version")
