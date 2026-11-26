@@ -1409,6 +1409,12 @@ pub(crate) fn warned_stale_non_owned()
     WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
 }
 
+/// Test builds count the stale non-owned warnings the sweep actually prints, so a test
+/// can tell "warned once" from "warned on every sweep".
+#[cfg(test)]
+pub(crate) static STALE_NON_OWNED_WARNINGS_EMITTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Records `key` in the dedupe set and returns whether the stale-module warning should
 /// be printed now: true the first time a key is seen (or when the lock is poisoned, so
 /// the user is warned rather than silenced), false for a repeat.
@@ -1532,6 +1538,9 @@ pub(crate) fn input_closure_sweep_mods(
                     return None;
                 }
                 if record_stale_non_owned_warning(warned, key) {
+                    #[cfg(test)]
+                    STALE_NON_OWNED_WARNINGS_EMITTED
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     eprintln!(
                         "[turbo-lean] input-bearing module `{}` lives in a non-owned checkout and its artifacts are stale on disk; the freshness sweep does not cover it — {}",
                         m,
