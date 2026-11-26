@@ -33,9 +33,12 @@ Methodology & Honesty Rules:
   corpus denominator — the measurement neither lowers nor expands them — and the number excluded is
   published per corpus and subcorpus as `compiler_aux_decls_excluded`, so the scope of
   `total_declarations` is auditable rather than claimed.
-- External `Batteries` modules outside the in-toolchain `Init.Data.*` / `Std.Data.*` and the
-  `verification/c2-lake-packages/*` `.olean` artifacts are explicitly reported as `unknown` rather
-  than extrapolated; measuring them is a later leaf.
+- The external `Batteries` corpus (`external_batteries`, leaf H1.0b) is measured only over an
+  already-built `lake build` tree of the pinned `leanprover-community/batteries` revision
+  (`PINNED_BATTERIES_REV`, whose `lean-toolchain` is the pinned `leanprover/lean4:v4.35.0`),
+  discovered via `TURBO_BATTERIES_OLEANS` or at the conventional untracked checkout
+  `scratch/batteries`. Nothing is fetched or built by this script; without such a tree (or on a
+  partial one) the corpus is reported `not_measured` with a reason, never extrapolated.
 """
 from __future__ import annotations
 
@@ -84,8 +87,27 @@ CON_LECHE_EXCLUSION_REASON = (
 CON_LECHE_PINNED_MODULE_COUNTS: dict[str, int] = {
     "501589f5680d9599dee1bcef30a420bc8924c490": 102,
 }
+# H1.0b external Batteries corpus. Nothing is fetched or built by this script:
+# the measurement runs only over an already-built default-target `lake build`
+# tree of the pinned `leanprover-community/batteries` revision (whose
+# `lean-toolchain` file reads the pinned `leanprover/lean4:v4.35.0`), found via
+# `TURBO_BATTERIES_OLEANS` or at the conventional untracked checkout
+# `scratch/batteries`.
+PINNED_BATTERIES_REV = "66e469188fe07963e5cf666c7d4433f45b8131c5"
+BATTERIES_OLEANS_ENV = "TURBO_BATTERIES_OLEANS"
+BATTERIES_REPO_URL = "https://github.com/leanprover-community/batteries.git"
+# Pinned Batteries revision -> expected `Batteries`/`Batteries.*` module count of
+# a full default-target `lake build` (the `Batteries` lib plus the `runLinter`
+# exe; `runLinter` is not a corpus module). Obtained at commit
+# 66e469188fe07963e5cf666c7d4433f45b8131c5 by counting `Batteries.lean` plus
+# `Batteries/**/*.lean` in `git ls-tree -r` (195 sources) and matching the 195
+# `Batteries*`-named `.olean` outputs of the completed 222-job build.
+BATTERIES_PINNED_MODULE_COUNTS: dict[str, int] = {
+    "66e469188fe07963e5cf666c7d4433f45b8131c5": 195,
+}
 _LIVE_AUDIT_CACHE: dict[str, dict[str, Any]] = {}
 _CON_LECHE_CACHE: dict[str, dict[str, Any]] = {}
+_BATTERIES_CACHE: dict[str, dict[str, Any]] = {}
 
 # The committed results pin the sha256 of every tracked bridge/semantics/proof
 # source they were measured from (`bridge_file_sha256` in
@@ -1212,12 +1234,377 @@ def measure_con_leche(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     return result
 
 
-def _batteries_unknown_reason() -> str:
-    return (
-        "External `leanprover-community/batteries` modules beyond `Init.Data.*` and "
-        "`Std.Data.*` are not measured by this invocation (`C2x` adds the nightly "
-        "Batteries checkout); reported as unknown rather than estimated."
-    )
+def _batteries_olean_root(root_dir: Path = ROOT_DIR) -> Path | None:
+    """Where a prebuilt pinned Batteries `.olean` tree is, if there is one.
+
+    `TURBO_BATTERIES_OLEANS` wins. Otherwise the tree a full `lake build` of an
+    untracked `scratch/batteries` checkout leaves behind is used when present.
+    """
+    raw = os.environ.get(BATTERIES_OLEANS_ENV, "").strip()
+    if raw:
+        p = Path(raw)
+        return p if p.is_dir() else None
+    default = root_dir / "scratch" / "batteries" / ".lake" / "build" / "lib" / "lean"
+    return default if default.is_dir() else None
+
+
+def _batteries_modules(olean_root: Path) -> list[str]:
+    mods: list[str] = []
+    for olean in olean_root.rglob("*.olean"):
+        rel = olean.relative_to(olean_root).with_suffix("")
+        name = ".".join(rel.parts)
+        if name == "Batteries" or name.startswith("Batteries."):
+            mods.append(name)
+    return sorted(mods)
+
+
+def _is_full_batteries_build(olean_root: Path) -> bool:
+    """True when `olean_root` sits inside a completed default-target `lake build`.
+
+    The pinned revision's default targets are the `Batteries` lib and the
+    `runLinter` exe, so a finished build leaves `../../bin/runLinter` beside the
+    `.olean` tree; a lib-only partial build does not.
+    """
+    return (olean_root.parent.parent / "bin" / "runLinter").is_file()
+
+
+def _merge_batteries_shard_facts(
+    decl_rows: list[tuple[str, bool, list[str], str]], aux_total: int
+) -> tuple[tuple[int, int, int, int, int, int], list[str]]:
+    """Whole-corpus classification over per-declaration shard facts.
+
+    `decl_rows` holds one row per non-aux corpus declaration, in corpus order:
+    (decl name, has_local_call, same-corpus callees minus self, ingest verdict
+    "ok" or "err:<head>"). The classification is auditMods' exactly: a
+    declaration on a directed call-graph cycle (reachable from its own callees;
+    self-edges are already removed at emission) is rejected_not_lowered without
+    consulting its ingest verdict; otherwise an ok ingest splits proved vs
+    lowered_unproved on has_local_call, and an ingest error is rejected.
+    Returns the auditMods tuple (total, proved, lowered_unproved, rejected,
+    rejected_not_lowered, aux_total) plus the rejection reason heads
+    ("mutual_cycle" or the error head), which are diagnostic only and are never
+    written to the committed results.
+    """
+    edges: dict[str, list[str]] = {}
+    for name, _, callees, _ in decl_rows:
+        edges[name] = callees  # a duplicate name overwrites, as HashMap.insert does
+
+    def _on_cycle(target: str) -> bool:
+        # declInMutualCycle's relation: DFS from the target's own callees over
+        # the corpus call graph; true iff the target itself is reached (a node
+        # absent from the graph contributes no edges).
+        seen: set[str] = set()
+        frontier = list(edges.get(target, ()))
+        while frontier:
+            cur = frontier.pop()
+            if cur == target:
+                return True
+            if cur in seen:
+                continue
+            seen.add(cur)
+            frontier.extend(edges.get(cur, ()))
+        return False
+
+    tot = prv = unp = rej = cyc = 0
+    reasons: list[str] = []
+    for name, has_call, _, verdict in decl_rows:
+        tot += 1
+        if _on_cycle(name):
+            rej += 1
+            cyc += 1
+            reasons.append(REJECTED_NOT_LOWERED_REASON)
+        elif verdict == "ok":
+            if has_call:
+                unp += 1
+            else:
+                prv += 1
+        else:
+            rej += 1
+            reasons.append(verdict[4:] if verdict.startswith("err:") else verdict)
+    return (tot, prv, unp, rej, cyc, aux_total), reasons
+
+
+def _lean_shard_facts_driver(all_modules: list[str], shard_modules: list[str]) -> str:
+    """A facts-emitting audit driver for one module shard of a larger corpus.
+
+    Semantics parity with `auditMods` is by construction: the driver imports
+    and converts (`toImpureDecls`) the WHOLE corpus so that `corpusNames`, the
+    local-callee set, the per-declaration callee lists, and every
+    `ingestLCNFImpureDecl` call see exactly the global name set the monolithic
+    driver sees; only the per-declaration work (ingest, has-local-call, callee
+    emission) is restricted to this shard's modules. The whole-corpus cycle
+    pass runs once in `_merge_batteries_shard_facts` over the merged facts.
+    Cycle members' ingest verdicts are computed here but ignored by the merger,
+    which is sound because each ingest runs in a fresh `runCoreOnEnv` state and
+    has no cross-declaration effect.
+    """
+    all_names = ",\n    ".join(f"`{m}" for m in all_modules)
+    shard_names = ",\n    ".join(f"`{m}" for m in shard_modules)
+    return _LEAN_AUDIT_DRIVER_HEAD + f"""
+unsafe def main (args : List String) : IO Unit := do
+  enableInitializersExecution
+  initSearchPath (← findSysroot) (args.map System.FilePath.mk)
+  let allMods : Array Name := #[
+    {all_names}
+  ]
+  let shardMods : Array Name := #[
+    {shard_names}
+  ]
+  let env ← importModules (allMods.map (fun m => {{ module := m }})) {{}} (loadExts := true)
+  let shardSet : Std.HashSet Name := shardMods.foldl (fun s m => s.insert m) {{}}
+  let mut corpusDecls : Array (Name × Decl .impure) := #[]
+  for modName in allMods do
+    let some modIdx := env.getModuleIdx? modName
+      | throw (IO.userError s!"audit module `{{modName}}` not found in the imported environment")
+    let mdecls := monoExt.getModuleEntries env modIdx
+    let impDecls ← toImpureDecls env mdecls
+    let impNonAux := impDecls.filter (fun d => !isCompilerGeneratedAuxDecl env d.name)
+    if shardSet.contains modName then
+      IO.println s!"SHARD_AUX:{{modName}}|{{impDecls.size - impNonAux.size}}"
+    for d in impNonAux do
+      corpusDecls := corpusDecls.push (modName, d)
+    IO.println s!"PROGRESS toimpure {{modName}}"
+  let corpusNames := corpusDecls.map (·.2.name)
+  let mut localSet : Std.HashSet Name := {{}}
+  for n in corpusNames do localSet := localSet.insert n
+  for modName in shardMods do
+    for (m, d) in corpusDecls do
+      if m == modName then
+        let callees := match d.value with
+          | .code c => (collectCodeLocalCallees corpusNames c).filter (· != d.name)
+          | _ => []
+        let hasCall := match d.value with
+          | .code c => codeHasLocalCall localSet c
+          | .extern _ => false
+        let r ← runCoreOnEnv env (ingestLCNFImpureDecl d corpusNames .x86_64 true)
+        let verdict := match r with
+          | .ok _ => "ok"
+          | .error e => "err:" ++ (((e.replace "\\n" " ").replace "|" "/").take 200)
+        let calleeStr := String.intercalate "," (callees.map (fun n => n.toString))
+        let hc := if hasCall then "1" else "0"
+        IO.println s!"SHARD_DECL:{{d.name}}|{{hc}}|{{calleeStr}}|{{verdict}}"
+    IO.println s!"PROGRESS ingest {{modName}}"
+  IO.println "SHARD_DONE"
+"""
+
+
+def _run_sharded_batteries_audit(
+    root_dir: Path,
+    olean_root: Path,
+    modules: list[str],
+    workers: int | None = None,
+    shard_count: int | None = None,
+    log_dir: Path | None = None,
+) -> tuple[tuple[int, int, int, int, int, int], list[str]]:
+    """Measure a module corpus with the real lowerer, sharded across processes.
+
+    Each shard is one `lake env lean --run` of `_lean_shard_facts_driver`; the
+    merged per-declaration facts are classified by
+    `_merge_batteries_shard_facts` (the whole-corpus cycle pass included), so
+    the result tuple is `auditMods`-equivalent by construction. Fail-closed: a
+    shard that exits non-zero, omits `SHARD_DONE`, drops or duplicates a
+    module's `SHARD_AUX` line, or emits an unparsable facts line raises; a
+    failed run is never converted into counts. `TURBO_BATTERIES_AUDIT_WORKERS`
+    overrides the worker count; `TURBO_BATTERIES_AUDIT_LOG_DIR` (or `log_dir`)
+    streams each shard's stdout to `<dir>/batteries-shard-<i>.log` for
+    progress, instead of a run-private temporary directory.
+    """
+    if not modules:
+        raise RuntimeError("sharded audit called with no modules")
+    env_workers = os.environ.get("TURBO_BATTERIES_AUDIT_WORKERS", "").strip()
+    if workers is None:
+        workers = int(env_workers) if env_workers.isdigit() and int(env_workers) > 0 else 24
+    workers = max(1, min(workers, len(modules)))
+    if shard_count is None:
+        shard_count = workers
+    shard_count = max(1, min(shard_count, len(modules)))
+    shards = [modules[i::shard_count] for i in range(shard_count)]
+    env_log_dir = os.environ.get("TURBO_BATTERIES_AUDIT_LOG_DIR", "").strip()
+    if log_dir is None and env_log_dir:
+        log_dir = Path(env_log_dir)
+    lean_dir = root_dir / "lean"
+    env = _lean_env()
+
+    def _run_shard(idx_and_shard: tuple[int, list[str]], out_dir: Path) -> list[str]:
+        idx, shard = idx_and_shard
+        driver_path = out_dir / f"ShardDriver{idx}.lean"
+        driver_path.write_text(_lean_shard_facts_driver(modules, shard), encoding="utf-8")
+        shard_log = out_dir / f"batteries-shard-{idx}.log"
+        with open(shard_log, "w", encoding="utf-8") as lf:
+            proc = subprocess.run(
+                ["lake", "env", "lean", "--run", str(driver_path), str(olean_root)],
+                cwd=str(lean_dir),
+                env=env,
+                stdout=lf,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        out = shard_log.read_text(encoding="utf-8")
+        if proc.returncode != 0 or "SHARD_DONE" not in out:
+            raise RuntimeError(
+                f"Batteries shard {idx} failed (rc={proc.returncode}):\n"
+                f"STDOUT tail:\n{out[-4000:]}\nSTDERR tail:\n{proc.stderr[-4000:]}"
+            )
+        return out.splitlines()
+
+    with tempfile.TemporaryDirectory(prefix="lcnf-batteries-shards-") as tmp:
+        out_dir = Path(tmp)
+        if log_dir is not None:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            out_dir = log_dir
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            shard_lines = list(
+                pool.map(lambda pair: _run_shard(pair, out_dir), enumerate(shards))
+            )
+
+    aux_by_module: dict[str, int] = {}
+    decl_rows: list[tuple[str, bool, list[str], str]] = []
+    for lines in shard_lines:
+        for ln in lines:
+            if ln.startswith("SHARD_AUX:"):
+                mod, aux = ln[len("SHARD_AUX:"):].split("|", 1)
+                if mod in aux_by_module:
+                    raise RuntimeError(f"module `{mod}` reported by more than one shard")
+                aux_by_module[mod] = int(aux)
+            elif ln.startswith("SHARD_DECL:"):
+                parts = ln[len("SHARD_DECL:"):].split("|", 3)
+                if len(parts) != 4 or parts[1] not in ("0", "1"):
+                    raise RuntimeError(f"unparsable shard facts line: {ln!r}")
+                name, hc, callees_s, verdict = parts
+                callees = [c for c in callees_s.split(",") if c]
+                decl_rows.append((name, hc == "1", callees, verdict))
+    missing = sorted(set(modules) - set(aux_by_module))
+    if missing:
+        raise RuntimeError(
+            "sharded audit silently dropped module(s): " + ", ".join(missing)
+        )
+    aux_total = sum(aux_by_module.values())
+    return _merge_batteries_shard_facts(decl_rows, aux_total)
+
+
+def measure_external_batteries(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
+    """Measure the pinned external Batteries corpus with the real lowerer, or say why not.
+
+    Same honesty contract as `measure_con_leche`: nothing is fetched or built.
+    The caller points `TURBO_BATTERIES_OLEANS` at (or leaves at `scratch/batteries`)
+    an already-built `lake build` tree of `PINNED_BATTERIES_REV`. Without one, or
+    on a partial build, the corpus is `not_measured` with a reason and no counts.
+    An unmapped pinned revision, or a full built tree whose module count differs
+    from `BATTERIES_PINNED_MODULE_COUNTS[rev]`, returns
+    `measurement_source = "error"` with a named `error_code`.
+    """
+    expected_count = BATTERIES_PINNED_MODULE_COUNTS.get(PINNED_BATTERIES_REV)
+    if expected_count is None:
+        return {
+            "measurement_source": "error",
+            "error_code": "unmapped_pinned_batteries_revision",
+            "pinned_revision": PINNED_BATTERIES_REV,
+            "reason": (
+                f"unmapped_pinned_batteries_revision: PINNED_BATTERIES_REV={PINNED_BATTERIES_REV!r} "
+                f"has no expected module count in BATTERIES_PINNED_MODULE_COUNTS"
+            ),
+        }
+    olean_root = _batteries_olean_root(root_dir)
+    cache_key = f"{root_dir.resolve()}|{PINNED_BATTERIES_REV}|{expected_count}|{olean_root}"
+    if cache_key in _BATTERIES_CACHE:
+        return _BATTERIES_CACHE[cache_key]
+    if olean_root is None:
+        result = {
+            "measurement_source": "not_measured",
+            "reason": (
+                f"no prebuilt pinned Batteries `.olean` tree: set {BATTERIES_OLEANS_ENV} to a "
+                f"`lake build` output directory of {BATTERIES_REPO_URL} commit "
+                f"{PINNED_BATTERIES_REV} (or check that commit out at `scratch/batteries` and "
+                "`lake build` it); this script does not fetch or build that repository."
+            ),
+            "expected_module_count": expected_count,
+        }
+        _BATTERIES_CACHE[cache_key] = result
+        return result
+    # The checkout is the nearest ancestor that is a git work tree.
+    rev = "unknown"
+    probe = olean_root
+    for _ in range(6):
+        if (probe / ".git").exists():
+            rev = _git_head(probe)
+            break
+        probe = probe.parent
+    if rev != PINNED_BATTERIES_REV:
+        result = {
+            "measurement_source": "not_measured",
+            "reason": (
+                f"prebuilt Batteries tree at `{olean_root}` is revision `{rev}`, not the pinned "
+                f"`{PINNED_BATTERIES_REV}`"
+            ),
+            "expected_module_count": expected_count,
+        }
+        _BATTERIES_CACHE[cache_key] = result
+        return result
+    modules = _batteries_modules(olean_root)
+    if not modules:
+        result = {
+            "measurement_source": "not_measured",
+            "reason": f"no `Batteries`/`Batteries.*` `.olean` modules under `{olean_root}`",
+            "module_count": 0,
+            "expected_module_count": expected_count,
+        }
+        _BATTERIES_CACHE[cache_key] = result
+        return result
+    if len(modules) != expected_count:
+        if _is_full_batteries_build(olean_root):
+            result = {
+                "measurement_source": "error",
+                "error_code": "batteries_module_count_mismatch",
+                "commit_sha": PINNED_BATTERIES_REV,
+                "olean_root": str(olean_root),
+                "module_count": len(modules),
+                "expected_module_count": expected_count,
+                "reason": (
+                    f"batteries_module_count_mismatch: full Batteries build at `{olean_root}` "
+                    f"(revision {PINNED_BATTERIES_REV}) has {len(modules)} `Batteries*` modules, "
+                    f"expected {expected_count}"
+                ),
+            }
+        else:
+            result = {
+                "measurement_source": "not_measured",
+                "reason": (
+                    f"partial Batteries tree under `{olean_root}` has {len(modules)} `Batteries*` "
+                    f"modules, whereas pinned revision {PINNED_BATTERIES_REV} has "
+                    f"{expected_count}; refusing to measure a partial tree"
+                ),
+                "module_count": len(modules),
+                "expected_module_count": expected_count,
+            }
+        _BATTERIES_CACHE[cache_key] = result
+        return result
+    (
+        total,
+        proved,
+        unproved,
+        rejected,
+        rejected_not_lowered,
+        aux_excluded,
+    ), _reasons = _run_sharded_batteries_audit(root_dir, olean_root, modules)
+    result = {
+        "measurement_source": "live_invocation",
+        "measured_at_utc": _utc_now(),
+        "repository": BATTERIES_REPO_URL,
+        "commit_sha": PINNED_BATTERIES_REV,
+        "toolchain": PINNED_TOOLCHAIN,
+        "olean_root": str(olean_root),
+        "module_count": len(modules),
+        "expected_module_count": expected_count,
+        "total_declarations": total,
+        "proved": proved,
+        "lowered_unproved": unproved,
+        "rejected": rejected,
+        "rejected_not_lowered": rejected_not_lowered,
+        "rejected_not_lowered_reason": REJECTED_NOT_LOWERED_REASON,
+        "compiler_aux_decls_excluded": aux_excluded,
+    }
+    _BATTERIES_CACHE[cache_key] = result
+    return result
 
 
 def build_live_corpora(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
@@ -1266,10 +1653,7 @@ def build_live_corpora(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
             "rejected_not_lowered_reason": c1["rejected_not_lowered_reason"],
             "compiler_aux_decls_excluded": c1["compiler_aux_decls_excluded"],
         }
-    corpora["external_batteries"] = {
-        "status": "unknown",
-        "reason": _batteries_unknown_reason(),
-    }
+    corpora["external_batteries"] = measure_external_batteries(root_dir)
     corpora["con_leche_h3_benchmark"] = measure_con_leche(root_dir)
     return corpora
 
@@ -1734,7 +2118,7 @@ def check_coverage_report(
                     status_failed.add(cname)
                     continue
             if corp.get("status") == "unknown":
-                # External Batteries stays unknown and is not compared.
+                # An `unknown` corpus carries no counts and is not compared.
                 continue
             if corp.get("measurement_source") in ("not_measured", "error"):
                 # A live corpus that is absent from the baseline can be an honest
@@ -1892,7 +2276,8 @@ class TestLcnfCoverage(unittest.TestCase):
         )
         bat = rep["corpora"]["std_init_and_c2"]
         self.assertEqual(bat["measurement_source"], "live_invocation")
-        self.assertEqual(rep["corpora"]["external_batteries"]["status"], "unknown")
+        ext = rep["corpora"]["external_batteries"]
+        self.assertIn(ext.get("measurement_source"), ("live_invocation", "not_measured"), ext)
         self.assertGreater(bat["total_declarations"], 0)
         self.assertEqual(
             bat["total_declarations"],
@@ -1902,11 +2287,20 @@ class TestLcnfCoverage(unittest.TestCase):
     def test_json_corpus_numbers_come_from_live_measurement(self) -> None:
         # (a): `--json` must emit the same live measurement `--check` performs, never
         # stored constants. Every measured corpus carries measurement_source=live_invocation.
+        # The spawned CLI is a cold process: without this env override it would
+        # re-measure the full external Batteries corpus (hours of CPU) just to
+        # exercise the --json path. Pointing it at a nonexistent tree makes the
+        # subprocess report external_batteries as an honest not_measured stub
+        # (--json performs no baseline comparison, so that is exit 0), while
+        # std/c1 are still measured live end to end.
+        sub_env = dict(os.environ)
+        sub_env[BATTERIES_OLEANS_ENV] = str(ROOT_DIR / "scripts" / "no-such-batteries-olean-tree")
         proc = subprocess.run(
             [sys.executable, str(Path(__file__).resolve()), "--json"],
             capture_output=True,
             text=True,
             timeout=3600,
+            env=sub_env,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         data = json.loads(proc.stdout)
@@ -1917,6 +2311,10 @@ class TestLcnfCoverage(unittest.TestCase):
                 "live_invocation",
                 f"corpus `{cname}` was not measured live in this invocation",
             )
+        ext = data["corpora"]["external_batteries"]
+        self.assertEqual(ext.get("measurement_source"), "not_measured")
+        for field in RESULT_FIELDS:
+            self.assertNotIn(field, ext)
         prov = data.get("measurement_provenance", {})
         self.assertIn("command", prov)
         self.assertIn("date_utc", prov)
@@ -2159,8 +2557,7 @@ class TestLcnfCoverage(unittest.TestCase):
         # Point 2: `--check` must compare the live measurement against the committed
         # `scripts/lcnf_coverage_results.json` written by `--write-results`, failing
         # with the corpus name and both sets of counts when they differ, and reporting
-        # unmeasured corpora (con-leche in CI) as skipped while ignoring unknown
-        # external Batteries.
+        # unmeasured corpora (con-leche in CI) as skipped.
         results_path = ROOT_DIR / "scripts" / "lcnf_coverage_results.json"
         self.assertTrue(results_path.is_file(), f"missing committed baseline {results_path}")
         baseline = json.loads(results_path.read_text(encoding="utf-8"))
@@ -2207,7 +2604,6 @@ class TestLcnfCoverage(unittest.TestCase):
             if "subcorpora" in entry:
                 corp["subcorpora"] = json.loads(json.dumps(entry["subcorpora"]))
             corpora[cname] = corp
-        corpora["external_batteries"] = {"status": "unknown", "reason": "test unknown corpus"}
         corpora["con_leche_h3_benchmark"] = {
             "measurement_source": "not_measured",
             "reason": "no prebuilt pinned con-leche tree (test fixture)",
@@ -2919,10 +3315,12 @@ unsafe def main (args : List String) : IO Unit := do
         # claim the measurement does not perform is dishonest output.
         self.assertNotIn("expandCompilerAuxDecls", CORPUS_SCOPES["c1_corpus"])
 
-    def test_std_init_and_c2_renamed_and_external_batteries_separate_unknown(self) -> None:
-        # Point 3: the corpus holding Init/Std + C2 is named `std_init_and_c2` (not
-        # a misleading Batteries name), and external Batteries is its own top-level
-        # corpus entry with status `unknown`.
+    def test_std_init_and_c2_renamed_and_external_batteries_separate_corpus(self) -> None:
+        # Point 3 + H1.0b: the corpus holding Init/Std + C2 is named `std_init_and_c2`
+        # (not a misleading Batteries name), and external Batteries is its own
+        # top-level corpus entry: measured live from the pinned prebuilt tree when
+        # one is present, else an honest `not_measured` stub with a reason and no
+        # counts, never an extrapolated number.
         self.assertIn("std_init_and_c2", CORPUS_SCOPES)
         self.assertEqual(set(CORPUS_SCOPES.keys()), {"std_init_and_c2", "c1_corpus"})
         rep = build_coverage_report(ROOT_DIR)
@@ -2930,10 +3328,157 @@ unsafe def main (args : List String) : IO Unit := do
         self.assertIn("std_init_and_c2", corpora)
         self.assertIn("external_batteries", corpora)
         ext = corpora["external_batteries"]
-        self.assertEqual(ext.get("status"), "unknown")
-        self.assertTrue(ext.get("reason"))
-        for field in RESULT_FIELDS:
-            self.assertNotIn(field, ext)
+        self.assertIn(ext.get("measurement_source"), ("live_invocation", "not_measured"), ext)
+        if ext["measurement_source"] == "live_invocation":
+            self.assertEqual(ext["commit_sha"], PINNED_BATTERIES_REV)
+            self.assertEqual(ext["module_count"], ext["expected_module_count"])
+            self.assertEqual(
+                ext["total_declarations"],
+                ext["proved"] + ext["lowered_unproved"] + ext["rejected"],
+            )
+        else:
+            self.assertTrue(ext.get("reason"))
+            for field in RESULT_FIELDS:
+                self.assertNotIn(field, ext)
+
+    def test_batteries_numbers_come_from_the_named_olean_tree(self) -> None:
+        # H1.0b: when a prebuilt pinned Batteries tree is named, its totals must come
+        # from running the lowerer over it in this invocation, not a stored table,
+        # and the measured module set is exactly the `Batteries*` modules (never the
+        # `runLinter` exe module that a default-target build leaves beside them).
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        saved_cache = dict(_BATTERIES_CACHE)
+        with tempfile.TemporaryDirectory(prefix="bat-tree-") as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            lib = root / ".lake" / "build" / "lib" / "lean"
+            (lib / "Batteries" / "Data").mkdir(parents=True)
+            (lib / "Batteries.olean").write_bytes(b"")
+            (lib / "Batteries" / "Data" / "List.olean").write_bytes(b"")
+            (lib / "runLinter.olean").write_bytes(b"")
+            saved = os.environ.get(BATTERIES_OLEANS_ENV)
+            os.environ[BATTERIES_OLEANS_ENV] = str(lib)
+            try:
+                _BATTERIES_CACHE.clear()
+                with mock.patch.object(
+                    m,
+                    "_run_sharded_batteries_audit",
+                    return_value=((100, 7, 11, 82, 4, 9), ["mutual_cycle"]),
+                ) as run, mock.patch.object(
+                    m, "_git_head", return_value=PINNED_BATTERIES_REV
+                ), mock.patch.dict(
+                    m.BATTERIES_PINNED_MODULE_COUNTS, {PINNED_BATTERIES_REV: 2}
+                ):
+                    corp = measure_external_batteries(ROOT_DIR)
+            finally:
+                _BATTERIES_CACHE.clear()
+                _BATTERIES_CACHE.update(saved_cache)
+                if saved is None:
+                    os.environ.pop(BATTERIES_OLEANS_ENV, None)
+                else:
+                    os.environ[BATTERIES_OLEANS_ENV] = saved
+        self.assertEqual(corp["measurement_source"], "live_invocation")
+        self.assertEqual(
+            (corp["total_declarations"], corp["proved"], corp["lowered_unproved"], corp["rejected"]),
+            (100, 7, 11, 82),
+        )
+        self.assertEqual(
+            (corp["rejected_not_lowered"], corp["compiler_aux_decls_excluded"]), (4, 9)
+        )
+        self.assertEqual(corp["commit_sha"], PINNED_BATTERIES_REV)
+        self.assertEqual(corp["module_count"], 2)
+        self.assertEqual(corp["expected_module_count"], 2)
+        run.assert_called_once()
+        self.assertEqual(
+            run.call_args.args, (ROOT_DIR, lib, ["Batteries", "Batteries.Data.List"])
+        )
+
+    def test_batteries_absent_partial_mismatch_and_unmapped_shapes(self) -> None:
+        # H1.0b fail-closed shapes, mirroring the con-leche corpus: an absent or
+        # partial tree stays `not_measured` with a reason and no counts (an honest
+        # skip absent a counted baseline); a FULL default-target build with a wrong
+        # module count, and an unmapped pinned revision, are named errors `--check`
+        # refuses.
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        self.assertIn(PINNED_BATTERIES_REV, BATTERIES_PINNED_MODULE_COUNTS)
+        saved_cache = dict(_BATTERIES_CACHE)
+        with tempfile.TemporaryDirectory(prefix="bat-shapes-") as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            build_dir = root / ".lake" / "build"
+            lib = build_dir / "lib" / "lean"
+            (lib / "Batteries").mkdir(parents=True)
+            (lib / "Batteries.olean").write_bytes(b"")
+            (lib / "Batteries" / "Basic.olean").write_bytes(b"")
+            saved = os.environ.get(BATTERIES_OLEANS_ENV)
+            try:
+                os.environ[BATTERIES_OLEANS_ENV] = str(lib)
+                _BATTERIES_CACHE.clear()
+                with mock.patch.object(m, "_git_head", return_value=PINNED_BATTERIES_REV):
+                    partial = measure_external_batteries(ROOT_DIR)
+                    (build_dir / "bin").mkdir(parents=True)
+                    (build_dir / "bin" / "runLinter").write_bytes(b"")
+                    _BATTERIES_CACHE.clear()
+                    full_mismatch = measure_external_batteries(ROOT_DIR)
+                os.environ[BATTERIES_OLEANS_ENV] = str(root / "nonexistent")
+                _BATTERIES_CACHE.clear()
+                absent = measure_external_batteries(ROOT_DIR)
+                with mock.patch.object(m, "PINNED_BATTERIES_REV", "deadbeef" * 5):
+                    _BATTERIES_CACHE.clear()
+                    unmapped = measure_external_batteries(ROOT_DIR)
+            finally:
+                _BATTERIES_CACHE.clear()
+                _BATTERIES_CACHE.update(saved_cache)
+                if saved is None:
+                    os.environ.pop(BATTERIES_OLEANS_ENV, None)
+                else:
+                    os.environ[BATTERIES_OLEANS_ENV] = saved
+        base_rep = build_coverage_report(ROOT_DIR)
+        for res in (partial, absent):
+            self.assertEqual(res.get("measurement_source"), "not_measured", res)
+            self.assertTrue(res.get("reason"))
+            for field in RESULT_FIELDS:
+                self.assertNotIn(field, res)
+            chk = check_coverage_report(
+                ROOT_DIR, {**base_rep, "corpora": {"external_batteries": res}}
+            )
+            self.assertTrue(chk["ok"], chk["errors"])
+        self.assertEqual(full_mismatch.get("measurement_source"), "error")
+        self.assertEqual(full_mismatch.get("error_code"), "batteries_module_count_mismatch")
+        self.assertEqual(unmapped.get("measurement_source"), "error")
+        self.assertEqual(unmapped.get("error_code"), "unmapped_pinned_batteries_revision")
+        for res, code in (
+            (full_mismatch, "batteries_module_count_mismatch"),
+            (unmapped, "unmapped_pinned_batteries_revision"),
+        ):
+            chk_bad = check_coverage_report(
+                ROOT_DIR, {**base_rep, "corpora": {"external_batteries": res}}
+            )
+            self.assertFalse(chk_bad["ok"])
+            self.assertTrue(any(code in e for e in chk_bad["errors"]), chk_bad["errors"])
+
+    def test_batteries_shard_merge_matches_auditmods_classification(self) -> None:
+        # H1.0b sharded path: the Python merger classifies per-declaration shard
+        # facts exactly as auditMods does. A cycle member is rejected_not_lowered
+        # without consulting its ingest verdict (even an "ok" or an error), a
+        # non-cycle ok declaration splits proved vs lowered_unproved on
+        # has_local_call, an ingest error is rejected with its reason head, and
+        # a callee absent from the corpus graph contributes no edges.
+        rows = [
+            ("A", True, ["B"], "ok"),  # on the 2-cycle with B -> rejected_not_lowered
+            ("B", True, ["A"], "err:boom"),  # same cycle; its ingest verdict is ignored
+            ("C", True, ["A"], "ok"),  # calls into the cycle, not on it -> lowered_unproved
+            ("D", False, [], "ok"),  # fully lowered, no local call -> proved
+            ("E", False, [], "err:unsupported thing"),  # rejected with its reason head
+            ("F", True, ["Z"], "ok"),  # callee outside the graph -> lowered_unproved
+        ]
+        counts, reasons = _merge_batteries_shard_facts(rows, aux_total=7)
+        self.assertEqual(counts, (6, 1, 2, 3, 2, 7))
+        self.assertEqual(sorted(reasons), ["mutual_cycle", "mutual_cycle", "unsupported thing"])
 
     def test_con_leche_reports_natoppins_exclusion_and_rejects_partial_tree(self) -> None:
         # Point 4: con-leche output must state the NatOpPins exclusion and its reason
@@ -3149,16 +3694,52 @@ unsafe def main (args : List String) : IO Unit := do
             self.assertLessEqual(corp["rejected_not_lowered"], corp["rejected"])
         self.assertGreaterEqual(rep["corpora"]["c1_corpus"]["rejected_not_lowered"], 2)
 
-        chk_proc = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve()), "--check"],
-            capture_output=True,
-            text=True,
-            timeout=3600,
-        )
-        self.assertEqual(chk_proc.returncode, 0, chk_proc.stderr)
-        self.assertIn("rejected_not_lowered", chk_proc.stdout)
-        self.assertIn("mutual_cycle", chk_proc.stdout)
+        # The --check CLI's one-line human summary is asserted through its
+        # extracted builder (`_human_check_summary`, the exact function main()
+        # prints) over the in-process cached report, instead of spawning a cold
+        # --check subprocess that would re-measure the full external Batteries
+        # corpus; the end-to-end CLI path stays covered by the --json spawn
+        # above and by the repository's real --check gate runs.
+        summary_line = _human_check_summary(rep, True)
+        self.assertIn("rejected_not_lowered", summary_line)
+        self.assertIn("mutual_cycle", summary_line)
+        self.assertIn("std_init_and_c2=", summary_line)
+        self.assertIn("batteries=", summary_line)
 
+
+
+def _human_check_summary(report: dict[str, Any], ok: bool) -> str:
+    """The one-line human summary `--check` prints (extracted so tests can
+    assert its exact content without spawning a cold CLI process that would
+    re-measure every corpus)."""
+    ms = report["lcnf_constructor_matrix"]["summary"]
+    corpora = report["corpora"]
+    parts = [
+        f"[lcnf-coverage] ok={ok} "
+        f"matrix={ms['proved']}/{ms['total']} proved "
+        f"({ms['lowered_unproved']} lowered_unproved, {ms['rejected']} rejected)"
+    ]
+    for label, cname in (
+        ("std_init_and_c2", "std_init_and_c2"),
+        ("c1", "c1_corpus"),
+        ("batteries", "external_batteries"),
+        ("con_leche", "con_leche_h3_benchmark"),
+    ):
+        corp = corpora.get(cname, {})
+        if corp.get("measurement_source") == "live_invocation":
+            parts.append(
+                f"{label}={corp['proved']}/{corp['total_declarations']} proved "
+                f"(+{corp['lowered_unproved']} vacuous_local_call, "
+                f"{corp['rejected']} rejected incl. "
+                f"rejected_not_lowered={corp['rejected_not_lowered']} "
+                f"[{corp['rejected_not_lowered_reason']}], "
+                f"aux_excluded={corp['compiler_aux_decls_excluded']})"
+            )
+        elif corp.get("measurement_source") == "error":
+            parts.append(f"{label}=error ({corp.get('error_code', 'error')})")
+        else:
+            parts.append(f"{label}=skipped (not measured)")
+    return " ".join(parts)
 
 
 def main() -> int:
@@ -3209,33 +3790,7 @@ def main() -> int:
         out["errors"] = chk["errors"]
         print(json.dumps(out, indent=2, sort_keys=True))
     else:
-        ms = chk["report"]["lcnf_constructor_matrix"]["summary"]
-        corpora = chk["report"]["corpora"]
-        parts = [
-            f"[lcnf-coverage] ok={chk['ok']} "
-            f"matrix={ms['proved']}/{ms['total']} proved "
-            f"({ms['lowered_unproved']} lowered_unproved, {ms['rejected']} rejected)"
-        ]
-        for label, cname in (
-            ("std_init_and_c2", "std_init_and_c2"),
-            ("c1", "c1_corpus"),
-            ("con_leche", "con_leche_h3_benchmark"),
-        ):
-            corp = corpora.get(cname, {})
-            if corp.get("measurement_source") == "live_invocation":
-                parts.append(
-                    f"{label}={corp['proved']}/{corp['total_declarations']} proved "
-                    f"(+{corp['lowered_unproved']} vacuous_local_call, "
-                    f"{corp['rejected']} rejected incl. "
-                    f"rejected_not_lowered={corp['rejected_not_lowered']} "
-                    f"[{corp['rejected_not_lowered_reason']}], "
-                    f"aux_excluded={corp['compiler_aux_decls_excluded']})"
-                )
-            elif corp.get("measurement_source") == "error":
-                parts.append(f"{label}=error ({corp.get('error_code', 'error')})")
-            else:
-                parts.append(f"{label}=skipped (not measured)")
-        print(" ".join(parts))
+        print(_human_check_summary(chk["report"], chk["ok"]))
     if not chk["ok"]:
         for err in chk["errors"]:
             print(f"  [ERROR] {err}", file=sys.stderr)

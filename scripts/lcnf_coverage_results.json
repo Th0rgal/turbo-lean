@@ -8,8 +8,8 @@
     "lean/LeanNative/IR/BridgeHelpers/ScalarDagAndJoinPoints.lean": "42bdac7e56063d12506f9af947f0f7eaf4260374cf74a54a3b2f80665a9af031",
     "lean/LeanNative/IR/BridgeHelpers/StateAndIntrinsics.lean": "f0a9d71675a70a6e2637b00d264bfa7ed2aafad7b8f7ddf137a781c4aa095b10",
     "lean/LeanNative/IR/BridgeHelpers/TypesAndSigs.lean": "1e6d6f4c07d6684435c11a64a672f89dc7a0c781271e5a04b45c8250828a2223",
-    "lean/LeanNative/IR/RealLCNFBridge.lean": "b6da4f47f73d7ff231908ee9d8531f9231280108a78f6337ce8ec570516724ae",
-    "lean/LeanNative/IR/RealLCNFSemantics.lean": "3e5729f3aee6d1d993317577549dcb9475ac4b5832f94e54a04fa7d6a0aba0b6",
+    "lean/LeanNative/IR/RealLCNFBridge.lean": "7b60916a77f117d7a69243801c78c68f42e3be59deedba8e980230382d25ac9f",
+    "lean/LeanNative/IR/RealLCNFSemantics.lean": "82bc8345586d1ecd333a778d7a25091b8938c69dacdffef53a9ff47c61e32c3e",
     "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean": "2b652b961f78656b494c8f45a58293b0fb01f1f44c8d81c409f4201d546a5b16"
   },
   "corpora": {
@@ -21,6 +21,15 @@
       "rejected_not_lowered": 2,
       "rejected_not_lowered_reason": "mutual_cycle",
       "total_declarations": 902
+    },
+    "external_batteries": {
+      "compiler_aux_decls_excluded": 3472,
+      "lowered_unproved": 1060,
+      "proved": 59,
+      "rejected": 9539,
+      "rejected_not_lowered": 211,
+      "rejected_not_lowered_reason": "mutual_cycle",
+      "total_declarations": 10658
     },
     "std_init_and_c2": {
       "compiler_aux_decls_excluded": 817,
@@ -52,7 +61,7 @@
       "total_declarations": 1805
     }
   },
-  "measured_source_commit": "2d18487bfecacada542884c868953424bfc75161",
+  "measured_source_commit": "1b2b7d060feaa5315be37e9052207feb27768e2a",
   "measured_source_commit_note": "`measured_source_commit` is the commit of the tree the measurement was taken from (recorded when `--write-results` ran, i.e. the parent of the commit that updates this file).",
   "schemaVersion": "turbo-lean-lcnf-coverage-results-v3",
   "toolchain": "leanprover/lean4:v4.35.0"
