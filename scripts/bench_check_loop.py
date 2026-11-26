@@ -499,20 +499,37 @@ def validate_baseline(base):
 def host_matches(base, res) -> bool:
     bh, rh = base.get("host") or {}, res.get("host") or {}
     bf, rf = bh.get("host_fingerprint"), rh.get("host_fingerprint")
+    lb, lr = bh.get("machine_label"), rh.get("machine_label")
+    if (lb or lr) and not (bf and rf):
+        # A labeled host records the label AS its hostname, and without a
+        # machine-id it records no fingerprint, so two machine-id-less
+        # machines sharing a label would pass the hostname fallback below.
+        # A label on either side therefore requires both fingerprints; a
+        # missing one is a host mismatch.
+        return False
     if bf and rf:
         if bf != rf:
             return False
-    elif bh.get("hostname") != rh.get("hostname"):
-        # Legacy entries carry no fingerprint, so hostnames are compared as
-        # before. An old baseline (real hostname) against a new labeled run
-        # therefore mismatches; the migration path is --rebaseline.
+    elif bf or rf:
+        # A fingerprint on exactly one side is always a mismatch: the
+        # fingerprinted side proves machine-id identity is available, and a
+        # bare hostname on the other side cannot verify the same machine.
+        # The unfingerprinted side may be either shape — a legacy schema-1
+        # entry with no host_fingerprint key at all, or a current entry
+        # recording None because the machine exposes no machine-id — and
+        # both read the same here. The migration path is --rebaseline.
         return False
-    # The label narrows the match: it never admits two machines (the
-    # fingerprint check above already refused them), and a label present on
-    # only one side is a condition mismatch too — the help promises a
-    # baseline from a different label is never compared, and "no label" is
-    # a different condition.
-    lb, lr = bh.get("machine_label"), rh.get("machine_label")
+    elif bh.get("hostname") != rh.get("hostname"):
+        # Neither side has a fingerprint (the key is absent on a legacy
+        # schema-1 entry; a current entry without a machine-id records
+        # None), so hostnames are compared as before. Unlabeled entries'
+        # hostname is the real node name.
+        return False
+    # The label narrows the match further: both-fingerprints is already
+    # required above whenever a label is present, so a shared label never
+    # admits two machines, and a label present on only one side is a
+    # condition mismatch — the help promises a baseline from a different
+    # label is never compared, and "no label" is a different condition.
     if bool(lb) != bool(lr):
         return False
     if lb and lr and lb != lr:
@@ -1544,9 +1561,13 @@ def main(argv=None):
     ap.add_argument("--trials", type=int, default=DEFAULT_TRIALS)
     ap.add_argument("--warmup", type=int, default=DEFAULT_WARMUP,
                     help="discarded settling runs before measured trials (default 1)")
-    ap.add_argument("--check-timeout-s", type=int, default=CHECK_TIMEOUT_S,
+    ap.add_argument("--check-timeout-s", type=int, default=None,
                     help="per-check budget in seconds, passed to `check --timeout` and "
-                         f"used as the subprocess timeout (default {CHECK_TIMEOUT_S})")
+                         "used as the subprocess timeout (default: "
+                         "TURBO_LEAN_BENCH_CHECK_TIMEOUT_S if set, else 900). The "
+                         "default is resolved AFTER environment validation, so the env "
+                         "override reaches real runs; a default captured at parser "
+                         "build would freeze the import-time 900 in.")
     ap.add_argument("--only-workloads",
                     help="comma-separated workload ids; only these are measured, the "
                          "rest are recorded as skipped_by_filter and the run verdict "
@@ -1579,7 +1600,7 @@ def main(argv=None):
         ap.error(f"--trials must be >= 1, got {args.trials}")
     if args.warmup < 0:
         ap.error(f"--warmup must be >= 0, got {args.warmup}")
-    if args.check_timeout_s <= 0:
+    if args.check_timeout_s is not None and args.check_timeout_s <= 0:
         ap.error(f"--check-timeout-s must be >= 1, got {args.check_timeout_s}")
     if args.only_workloads is not None:
         names = [n.strip() for n in args.only_workloads.split(",") if n.strip()]
@@ -1620,6 +1641,12 @@ def main(argv=None):
     except BenchEnvError as e:
         print(f"ENVIRONMENT ERROR (exit 4): {e}", file=sys.stderr)
         return 4
+    if args.check_timeout_s is None:
+        # Resolved only now: validate_environment has folded the (validated)
+        # TURBO_LEAN_BENCH_CHECK_TIMEOUT_S override into the global, so the
+        # recorded args carry the value every trial actually used. An explicit
+        # --check-timeout-s flag wins over the env override.
+        args.check_timeout_s = CHECK_TIMEOUT_S
     runner = Runner(args)
     install_signal_restore(runner)
     t_start = time.monotonic()

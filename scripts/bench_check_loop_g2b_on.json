@@ -1,0 +1,1869 @@
+{
+  "schema_version": 1,
+  "kind": "results",
+  "created_utc": "2026-11-26T08:10:12Z",
+  "turbo_lean_commit": "a3ad5f4dfed54db85bf3c7eef6314e7fb443983c",
+  "toolchain": {
+    "lean_toolchain": "leanprover/lean4:v4.35.0",
+    "lean_version": "Lean (version 4.35.0, x86_64-unknown-linux-gnu, commit eb6cafb7290e8bd5f2937522d8d804f58f02bafc, Release)",
+    "by_repo": {
+      "batteries": "leanprover/lean4:v4.35.0",
+      "pfr": "leanprover/lean4:v4.35.0"
+    }
+  },
+  "host": {
+    "hostname": "g2a-ro-192c",
+    "machine_label": "g2a-ro-192c",
+    "host_fingerprint": "a311449512ac7ba9aefe01016d434d61785301b6dc4f7fb66642a50bfc6d59c2",
+    "kernel": "Linux 6.12.115-140.210.amzn2023.x86_64",
+    "cpu_model": "AMD EPYC 9R14",
+    "nproc": 192,
+    "mem_gb": 1552.1
+  },
+  "trials": 5,
+  "settings": {
+    "TURBO_LEAN_GIT": "/usr/bin/git",
+    "TURBO_LEAN_ALLOWED_CSIMP": "*",
+    "TURBO_LEAN_ALLOWED_UNSAFE": "*",
+    "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY": "*",
+    "TURBO_LEAN_HOME": null,
+    "TURBO_LEAN_STAGING_DIR": null,
+    "TURBO_LEAN_NO_DAEMON": null,
+    "TURBO_LEAN_NO_REMOTE_TELEMETRY": null,
+    "TURBO_LEAN_TELEMETRY": null,
+    "TURBO_LEAN_DAEMON_IDLE_SECS": null,
+    "git_version": "git version 2.50.1",
+    "scratch_root": "/tmp/m1-bench-ha9a89v1"
+  },
+  "workloads": {
+    "batteries_list_lemmas_top": {
+      "id": "batteries_list_lemmas_top",
+      "status": "ok",
+      "repo": "batteries",
+      "file": "Batteries/Data/List/Lemmas.lean",
+      "decl": "List.dropLast_eq_eraseIdx",
+      "expected_status": "active",
+      "modes": {
+        "cold_no_daemon": {
+          "runs_ms": [
+            6989.8,
+            6533.1,
+            6427.6,
+            6428.7,
+            6393.9
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 6428.7,
+          "spread_ms": 595.9,
+          "rel_spread": 0.0927,
+          "coverage_ratio_min": 1.0,
+          "coverage_ratio_external_min": 0.9984,
+          "statuses_observed": [
+            "theorem_verified"
+          ],
+          "peak_rss_mb_trials": [
+            481,
+            481,
+            481,
+            481,
+            481
+          ],
+          "phases_ms_median": {
+            "cas_lookup": 0.6,
+            "cli_startup": 0.9,
+            "dependent_recheck": 9.6,
+            "elaboration": 730.0,
+            "identity_probe": 2283.6,
+            "import_refresh": 3345.8,
+            "setup": 13.7,
+            "split_and_hygiene": 36.5
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.6,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 72.99
+            },
+            {
+              "cpu.some": 0.36,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 81.0
+            },
+            {
+              "cpu.some": 0.36,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 81.0
+            },
+            {
+              "cpu.some": 0.2,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.54,
+              "io.full": 0.36,
+              "load1": 80.76
+            },
+            {
+              "cpu.some": 0.2,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.54,
+              "io.full": 0.36,
+              "load1": 80.76
+            },
+            {
+              "cpu.some": 0.11,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.78,
+              "io.full": 0.56,
+              "load1": 79.58
+            },
+            {
+              "cpu.some": 0.11,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.78,
+              "io.full": 0.56,
+              "load1": 79.58
+            },
+            {
+              "cpu.some": 0.06,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.42,
+              "io.full": 0.3,
+              "load1": 75.99
+            },
+            {
+              "cpu.some": 0.06,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.42,
+              "io.full": 0.3,
+              "load1": 75.99
+            },
+            {
+              "cpu.some": 0.02,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.19,
+              "io.full": 0.13,
+              "load1": 74.55
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.6,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.78,
+            "io.full": 0.56,
+            "load1": 81.0
+          },
+          "psi_contended": false
+        },
+        "warm_cache_hit_daemon": {
+          "runs_ms": [
+            2488.0,
+            2413.5,
+            2472.1,
+            2461.7,
+            2360.3
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 2461.7,
+          "spread_ms": 127.6,
+          "rel_spread": 0.0519,
+          "coverage_ratio_min": 0.9999,
+          "coverage_ratio_external_min": 0.9965,
+          "statuses_observed": [
+            "theorem_cache_hit"
+          ],
+          "cas_replay": {
+            "hits": 5,
+            "misses": 0,
+            "hit_rate": 1.0,
+            "fission_cached_subshards": null,
+            "fission_verified_subshards": null
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.7,
+            "cli_startup": 0.8,
+            "dependent_recheck": 9.2,
+            "identity_probe": 2326.9,
+            "import_refresh": 74.1,
+            "setup": 12.7,
+            "split_and_hygiene": 25.1
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.19,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.1,
+              "io.full": 0.07,
+              "load1": 72.75
+            },
+            {
+              "cpu.some": 0.16,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.08,
+              "io.full": 0.06,
+              "load1": 71.81
+            },
+            {
+              "cpu.some": 0.16,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.08,
+              "io.full": 0.06,
+              "load1": 71.81
+            },
+            {
+              "cpu.some": 0.13,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.25,
+              "io.full": 0.23,
+              "load1": 71.81
+            },
+            {
+              "cpu.some": 0.13,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.25,
+              "io.full": 0.23,
+              "load1": 71.81
+            },
+            {
+              "cpu.some": 0.1,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.75,
+              "io.full": 0.73,
+              "load1": 70.22
+            },
+            {
+              "cpu.some": 0.1,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.75,
+              "io.full": 0.73,
+              "load1": 70.22
+            },
+            {
+              "cpu.some": 0.07,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.5,
+              "io.full": 0.49,
+              "load1": 70.22
+            },
+            {
+              "cpu.some": 0.07,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.5,
+              "io.full": 0.49,
+              "load1": 70.22
+            },
+            {
+              "cpu.some": 0.05,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.41,
+              "io.full": 0.4,
+              "load1": 69.4
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.19,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.75,
+            "io.full": 0.73,
+            "load1": 72.75
+          },
+          "psi_contended": false
+        },
+        "warm_edited_proof_daemon": {
+          "runs_ms": [
+            2798.4,
+            2781.7,
+            2773.3,
+            2689.3,
+            2696.5
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 2773.3,
+          "spread_ms": 109.2,
+          "rel_spread": 0.0394,
+          "coverage_ratio_min": 1.0,
+          "coverage_ratio_external_min": 0.997,
+          "statuses_observed": [
+            "theorem_verified"
+          ],
+          "peak_rss_mb_trials": [
+            185,
+            187,
+            187,
+            186,
+            186
+          ],
+          "cas_replay": {
+            "hits": 0,
+            "misses": 5,
+            "hit_rate": 0.0,
+            "fission_cached_subshards": 0,
+            "fission_verified_subshards": 0
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.6,
+            "cli_startup": 0.8,
+            "dependent_recheck": 30.6,
+            "elaboration": 268.5,
+            "identity_probe": 2343.7,
+            "import_refresh": 74.1,
+            "setup": 12.7,
+            "split_and_hygiene": 35.3
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.04,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.33,
+              "io.full": 0.32,
+              "load1": 69.4
+            },
+            {
+              "cpu.some": 0.03,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.22,
+              "io.full": 0.22,
+              "load1": 68.25
+            },
+            {
+              "cpu.some": 0.03,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.22,
+              "io.full": 0.22,
+              "load1": 68.25
+            },
+            {
+              "cpu.some": 0.02,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.18,
+              "io.full": 0.18,
+              "load1": 68.25
+            },
+            {
+              "cpu.some": 0.02,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.18,
+              "io.full": 0.18,
+              "load1": 68.25
+            },
+            {
+              "cpu.some": 0.01,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.12,
+              "io.full": 0.12,
+              "load1": 68.07
+            },
+            {
+              "cpu.some": 0.01,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.12,
+              "io.full": 0.12,
+              "load1": 68.07
+            },
+            {
+              "cpu.some": 0.01,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.1,
+              "io.full": 0.09,
+              "load1": 68.07
+            },
+            {
+              "cpu.some": 0.01,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.1,
+              "io.full": 0.09,
+              "load1": 68.07
+            },
+            {
+              "cpu.some": 0.01,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.08,
+              "io.full": 0.08,
+              "load1": 66.54
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.04,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.33,
+            "io.full": 0.32,
+            "load1": 69.4
+          },
+          "psi_contended": false
+        }
+      }
+    },
+    "batteries_string_lemmas_top": {
+      "id": "batteries_string_lemmas_top",
+      "status": "ok",
+      "repo": "batteries",
+      "file": "Batteries/Data/String/Lemmas.lean",
+      "decl": "String.lt_antisymm",
+      "expected_status": "active",
+      "modes": {
+        "cold_no_daemon": {
+          "runs_ms": [
+            16474.2,
+            16574.1,
+            16657.4,
+            16689.9,
+            16189.3
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 16574.1,
+          "spread_ms": 500.6,
+          "rel_spread": 0.0302,
+          "coverage_ratio_min": 1.0,
+          "coverage_ratio_external_min": 0.9992,
+          "statuses_observed": [
+            "theorem_verified"
+          ],
+          "peak_rss_mb_trials": [
+            487,
+            489,
+            487,
+            489,
+            489
+          ],
+          "phases_ms_median": {
+            "cas_lookup": 0.6,
+            "cli_startup": 0.9,
+            "dependent_recheck": 9.3,
+            "elaboration": 722.3,
+            "identity_probe": 2277.6,
+            "import_refresh": 13355.2,
+            "setup": 15.8,
+            "split_and_hygiene": 61.3
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 61.66
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 59.78
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 59.78
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 67.58
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 67.58
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 64.26
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 64.26
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 62.1
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 62.1
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 61.27
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.0,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.0,
+            "io.full": 0.0,
+            "load1": 67.58
+          },
+          "psi_contended": false
+        },
+        "warm_cache_hit_daemon": {
+          "runs_ms": [
+            2532.3,
+            2475.7,
+            2696.7,
+            2530.5,
+            2584.3
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 2532.3,
+          "spread_ms": 221.0,
+          "rel_spread": 0.0873,
+          "coverage_ratio_min": 0.9999,
+          "coverage_ratio_external_min": 0.9966,
+          "statuses_observed": [
+            "theorem_cache_hit"
+          ],
+          "cas_replay": {
+            "hits": 5,
+            "misses": 0,
+            "hit_rate": 1.0,
+            "fission_cached_subshards": null,
+            "fission_verified_subshards": null
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.7,
+            "cli_startup": 0.8,
+            "dependent_recheck": 9.1,
+            "identity_probe": 2322.6,
+            "import_refresh": 131.2,
+            "setup": 15.3,
+            "split_and_hygiene": 46.2
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.18,
+              "io.full": 0.18,
+              "load1": 64.59
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.14,
+              "io.full": 0.14,
+              "load1": 64.59
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.14,
+              "io.full": 0.14,
+              "load1": 64.59
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.12,
+              "io.full": 0.12,
+              "load1": 63.66
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.12,
+              "io.full": 0.12,
+              "load1": 63.66
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.09,
+              "io.full": 0.09,
+              "load1": 63.66
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.09,
+              "io.full": 0.09,
+              "load1": 63.66
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.06,
+              "io.full": 0.06,
+              "load1": 62.49
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.06,
+              "io.full": 0.06,
+              "load1": 62.49
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.05,
+              "io.full": 0.05,
+              "load1": 62.49
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.0,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.18,
+            "io.full": 0.18,
+            "load1": 64.59
+          },
+          "psi_contended": false
+        },
+        "warm_edited_proof_daemon": {
+          "runs_ms": [
+            2933.4,
+            2818.9,
+            2833.8,
+            2837.0,
+            2846.4
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 2837.0,
+          "spread_ms": 114.5,
+          "rel_spread": 0.0404,
+          "coverage_ratio_min": 1.0,
+          "coverage_ratio_external_min": 0.9962,
+          "statuses_observed": [
+            "theorem_verified"
+          ],
+          "peak_rss_mb_trials": [
+            155,
+            155,
+            155,
+            155,
+            155
+          ],
+          "cas_replay": {
+            "hits": 0,
+            "misses": 5,
+            "hit_rate": 0.0,
+            "fission_cached_subshards": 0,
+            "fission_verified_subshards": 0
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.6,
+            "cli_startup": 0.7,
+            "dependent_recheck": 36.4,
+            "elaboration": 231.3,
+            "identity_probe": 2352.1,
+            "import_refresh": 131.4,
+            "setup": 15.3,
+            "split_and_hygiene": 59.6
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.99,
+              "io.full": 0.99,
+              "load1": 62.05
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.81,
+              "io.full": 0.81,
+              "load1": 62.05
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.81,
+              "io.full": 0.81,
+              "load1": 62.05
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 1.2,
+              "io.full": 1.2,
+              "load1": 61.16
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 1.2,
+              "io.full": 1.2,
+              "load1": 61.16
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 1.25,
+              "io.full": 1.25,
+              "load1": 60.03
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 1.25,
+              "io.full": 1.25,
+              "load1": 60.03
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 1.02,
+              "io.full": 1.02,
+              "load1": 60.03
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 1.02,
+              "io.full": 1.02,
+              "load1": 60.03
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.68,
+              "io.full": 0.68,
+              "load1": 59.79
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.0,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 1.25,
+            "io.full": 1.25,
+            "load1": 62.05
+          },
+          "psi_contended": false
+        }
+      }
+    },
+    "batteries_rbtree_lemmas_top": {
+      "repo": "batteries",
+      "file": "Batteries/Recycling/RBTree/Lemmas.lean",
+      "decl": "RBTree.RBNode.min?_reverse",
+      "expected_status": "active",
+      "status": "skipped_by_filter",
+      "modes": {}
+    },
+    "batteries_rbtree_lemmas_mid": {
+      "id": "batteries_rbtree_lemmas_mid",
+      "status": "ok",
+      "repo": "batteries",
+      "file": "Batteries/Recycling/RBTree/Lemmas.lean",
+      "decl": "RBTree.RBNode.Path.ordered_iff",
+      "expected_status": "active",
+      "modes": {
+        "cold_no_daemon": {
+          "runs_ms": [
+            14745.4,
+            14731.8,
+            14747.8,
+            15001.5,
+            14738.9
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 14745.4,
+          "spread_ms": 269.7,
+          "rel_spread": 0.0183,
+          "coverage_ratio_min": 1.0,
+          "coverage_ratio_external_min": 0.999,
+          "statuses_observed": [
+            "theorem_verified"
+          ],
+          "peak_rss_mb_trials": [
+            529,
+            527,
+            527,
+            527,
+            528
+          ],
+          "phases_ms_median": {
+            "cas_lookup": 0.6,
+            "cli_startup": 0.9,
+            "dependent_recheck": 9.0,
+            "elaboration": 2563.0,
+            "identity_probe": 2799.7,
+            "import_refresh": 9281.4,
+            "setup": 12.3,
+            "split_and_hygiene": 73.0
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.11,
+              "io.full": 0.11,
+              "load1": 57.17
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.66,
+              "io.full": 0.48,
+              "load1": 56.68
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.66,
+              "io.full": 0.48,
+              "load1": 56.68
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 1.91,
+              "io.full": 1.7,
+              "load1": 57.17
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 1.91,
+              "io.full": 1.7,
+              "load1": 57.17
+            },
+            {
+              "cpu.some": 0.59,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.47,
+              "io.full": 0.42,
+              "load1": 56.5
+            },
+            {
+              "cpu.some": 0.59,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.47,
+              "io.full": 0.42,
+              "load1": 56.5
+            },
+            {
+              "cpu.some": 0.11,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.09,
+              "io.full": 0.08,
+              "load1": 58.84
+            },
+            {
+              "cpu.some": 0.11,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.09,
+              "io.full": 0.08,
+              "load1": 58.84
+            },
+            {
+              "cpu.some": 0.02,
+              "cpu.full": 0.0,
+              "memory.some": 0.1,
+              "memory.full": 0.05,
+              "io.some": 0.13,
+              "io.full": 0.07,
+              "load1": 59.17
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.59,
+            "cpu.full": 0.0,
+            "memory.some": 0.1,
+            "memory.full": 0.05,
+            "io.some": 1.91,
+            "io.full": 1.7,
+            "load1": 59.17
+          },
+          "psi_contended": false
+        },
+        "warm_cache_hit_daemon": {
+          "runs_ms": [
+            3097.6,
+            3054.8,
+            3139.1,
+            3088.7,
+            3084.3
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 3088.7,
+          "spread_ms": 84.3,
+          "rel_spread": 0.0273,
+          "coverage_ratio_min": 0.9999,
+          "coverage_ratio_external_min": 0.9964,
+          "statuses_observed": [
+            "theorem_cache_hit"
+          ],
+          "cas_replay": {
+            "hits": 5,
+            "misses": 0,
+            "hit_rate": 1.0,
+            "fission_cached_subshards": null,
+            "fission_verified_subshards": null
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.7,
+            "cli_startup": 0.8,
+            "dependent_recheck": 8.7,
+            "identity_probe": 2791.5,
+            "import_refresh": 198.7,
+            "setup": 11.9,
+            "split_and_hygiene": 62.0
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.02,
+              "memory.full": 0.0,
+              "io.some": 0.02,
+              "io.full": 0.01,
+              "load1": 60.43
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.01,
+              "memory.full": 0.0,
+              "io.some": 0.02,
+              "io.full": 0.01,
+              "load1": 60.4
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.01,
+              "memory.full": 0.0,
+              "io.some": 0.02,
+              "io.full": 0.01,
+              "load1": 60.4
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.01,
+              "memory.full": 0.0,
+              "io.some": 0.01,
+              "io.full": 0.0,
+              "load1": 61.49
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.01,
+              "memory.full": 0.0,
+              "io.some": 0.01,
+              "io.full": 0.0,
+              "load1": 61.49
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.01,
+              "io.full": 0.0,
+              "load1": 61.49
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.01,
+              "io.full": 0.0,
+              "load1": 61.49
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.36,
+              "io.full": 0.36,
+              "load1": 63.37
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.36,
+              "io.full": 0.36,
+              "load1": 63.37
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.48,
+              "io.full": 0.48,
+              "load1": 63.37
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.0,
+            "cpu.full": 0.0,
+            "memory.some": 0.02,
+            "memory.full": 0.0,
+            "io.some": 0.48,
+            "io.full": 0.48,
+            "load1": 63.37
+          },
+          "psi_contended": false
+        },
+        "warm_edited_proof_daemon": {
+          "runs_ms": [
+            3747.9,
+            3706.3,
+            3700.4,
+            3722.8,
+            3705.0
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 3706.3,
+          "spread_ms": 47.5,
+          "rel_spread": 0.0128,
+          "coverage_ratio_min": 1.0,
+          "coverage_ratio_external_min": 0.9973,
+          "statuses_observed": [
+            "theorem_verified"
+          ],
+          "peak_rss_mb_trials": [
+            270,
+            272,
+            272,
+            270,
+            271
+          ],
+          "cas_replay": {
+            "hits": 0,
+            "misses": 5,
+            "hit_rate": 0.0,
+            "fission_cached_subshards": 0,
+            "fission_verified_subshards": 0
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.6,
+            "cli_startup": 0.8,
+            "dependent_recheck": 28.3,
+            "elaboration": 603.4,
+            "identity_probe": 2797.0,
+            "import_refresh": 196.1,
+            "setup": 12.0,
+            "split_and_hygiene": 71.2
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.26,
+              "io.full": 0.26,
+              "load1": 62.9
+            },
+            {
+              "cpu.some": 0.14,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.17,
+              "io.full": 0.17,
+              "load1": 62.9
+            },
+            {
+              "cpu.some": 0.14,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.17,
+              "io.full": 0.17,
+              "load1": 62.9
+            },
+            {
+              "cpu.some": 0.09,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.11,
+              "io.full": 0.11,
+              "load1": 62.51
+            },
+            {
+              "cpu.some": 0.09,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.11,
+              "io.full": 0.11,
+              "load1": 62.51
+            },
+            {
+              "cpu.some": 0.06,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.07,
+              "io.full": 0.07,
+              "load1": 62.14
+            },
+            {
+              "cpu.some": 0.06,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.07,
+              "io.full": 0.07,
+              "load1": 62.14
+            },
+            {
+              "cpu.some": 0.05,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.06,
+              "io.full": 0.06,
+              "load1": 62.14
+            },
+            {
+              "cpu.some": 0.05,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.06,
+              "io.full": 0.06,
+              "load1": 62.14
+            },
+            {
+              "cpu.some": 0.03,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.04,
+              "io.full": 0.04,
+              "load1": 61.97
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.14,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.26,
+            "io.full": 0.26,
+            "load1": 62.9
+          },
+          "psi_contended": false
+        }
+      }
+    },
+    "batteries_unionfind_top": {
+      "id": "batteries_unionfind_top",
+      "status": "ok",
+      "repo": "batteries",
+      "file": "Batteries/Data/UnionFind/Basic.lean",
+      "decl": "Batteries.UnionFind.parentD_eq",
+      "expected_status": "active",
+      "modes": {
+        "cold_no_daemon": {
+          "runs_ms": [
+            6536.3,
+            6608.3,
+            6471.7,
+            6695.1,
+            6425.8
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 6536.3,
+          "spread_ms": 269.3,
+          "rel_spread": 0.0412,
+          "coverage_ratio_min": 1.0,
+          "coverage_ratio_external_min": 0.9988,
+          "statuses_observed": [
+            "theorem_verified"
+          ],
+          "peak_rss_mb_trials": [
+            428,
+            428,
+            430,
+            428,
+            428
+          ],
+          "phases_ms_median": {
+            "cas_lookup": 0.5,
+            "cli_startup": 0.9,
+            "dependent_recheck": 9.2,
+            "elaboration": 631.5,
+            "identity_probe": 2190.0,
+            "import_refresh": 3666.6,
+            "setup": 6.1,
+            "split_and_hygiene": 20.2
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.01,
+              "io.full": 0.01,
+              "load1": 62.22
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 61.47
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 61.47
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 61.03
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 61.03
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 61.27
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 61.27
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 60.19
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 60.19
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 59.7
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.0,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.01,
+            "io.full": 0.01,
+            "load1": 62.22
+          },
+          "psi_contended": false
+        },
+        "warm_cache_hit_daemon": {
+          "runs_ms": [
+            2257.6,
+            2205.6,
+            2251.8,
+            2210.1,
+            2241.9
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 2241.9,
+          "spread_ms": 52.1,
+          "rel_spread": 0.0232,
+          "coverage_ratio_min": 0.9999,
+          "coverage_ratio_external_min": 0.9969,
+          "statuses_observed": [
+            "theorem_cache_hit"
+          ],
+          "cas_replay": {
+            "hits": 5,
+            "misses": 0,
+            "hit_rate": 1.0,
+            "fission_cached_subshards": null,
+            "fission_verified_subshards": null
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.7,
+            "cli_startup": 0.8,
+            "dependent_recheck": 8.5,
+            "identity_probe": 2146.9,
+            "import_refresh": 60.8,
+            "setup": 5.4,
+            "split_and_hygiene": 15.5
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 58.92
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 59.01
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 59.01
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.54,
+              "io.full": 0.54,
+              "load1": 59.01
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.54,
+              "io.full": 0.54,
+              "load1": 59.01
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.44,
+              "io.full": 0.44,
+              "load1": 57.64
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.44,
+              "io.full": 0.44,
+              "load1": 57.64
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.36,
+              "io.full": 0.36,
+              "load1": 57.64
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.36,
+              "io.full": 0.36,
+              "load1": 57.64
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.29,
+              "io.full": 0.29,
+              "load1": 56.47
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.0,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.54,
+            "io.full": 0.54,
+            "load1": 59.01
+          },
+          "psi_contended": false
+        },
+        "warm_edited_proof_daemon": {
+          "runs_ms": [
+            2426.1,
+            2470.6,
+            2429.0,
+            2407.6,
+            2500.5
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 2429.0,
+          "spread_ms": 92.9,
+          "rel_spread": 0.0382,
+          "coverage_ratio_min": 1.0,
+          "coverage_ratio_external_min": 0.9973,
+          "statuses_observed": [
+            "theorem_verified"
+          ],
+          "peak_rss_mb_trials": [
+            144,
+            144,
+            144,
+            144,
+            144
+          ],
+          "cas_replay": {
+            "hits": 0,
+            "misses": 5,
+            "hit_rate": 0.0,
+            "fission_cached_subshards": 0,
+            "fission_verified_subshards": 0
+          },
+          "phases_ms_median": {
+            "cas_lookup": 0.6,
+            "cli_startup": 0.8,
+            "dependent_recheck": 17.3,
+            "elaboration": 199.6,
+            "identity_probe": 2123.8,
+            "import_refresh": 58.9,
+            "setup": 5.5,
+            "split_and_hygiene": 19.5
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.24,
+              "io.full": 0.24,
+              "load1": 56.47
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.52,
+              "io.full": 0.52,
+              "load1": 55.95
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.52,
+              "io.full": 0.52,
+              "load1": 55.95
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.97,
+              "io.full": 0.97,
+              "load1": 55.95
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.97,
+              "io.full": 0.97,
+              "load1": 55.95
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.79,
+              "io.full": 0.79,
+              "load1": 54.76
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.79,
+              "io.full": 0.79,
+              "load1": 54.76
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.65,
+              "io.full": 0.65,
+              "load1": 54.76
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.65,
+              "io.full": 0.65,
+              "load1": 54.76
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.43,
+              "io.full": 0.43,
+              "load1": 54.53
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.0,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.97,
+            "io.full": 0.97,
+            "load1": 56.47
+          },
+          "psi_contended": false
+        }
+      }
+    },
+    "pfr_more_ruzsa_dist": {
+      "repo": "pfr",
+      "file": "PFR/MoreRuzsaDist.lean",
+      "decl": "rdist_of_neg_le",
+      "expected_status": "blocked",
+      "status": "skipped_by_filter",
+      "modes": {}
+    }
+  },
+  "turbo_lean_dirty": false,
+  "turbo_lean_repo": "/mnt/agent2-ram/wt/turbo-lean-cbe41387/agent-a69bd15494eec4221",
+  "turbo_lean_binary": {
+    "path": "/mnt/agent2-ram/wt/turbo-lean-cbe41387/agent-a69bd15494eec4221/target-g2a/release/turbo-lean",
+    "sha256": "e4fccb2515a3ac08ffb1b7cb3d01f4c63c338d66761e3fb8835598d8af37ad2e"
+  },
+  "workload_revs": {
+    "batteries": "66e469188fe07963e5cf666c7d4433f45b8131c5",
+    "pfr": "ebe2d96230b1abb190f74592aace441a0f10fe09"
+  },
+  "revs_pinned": true,
+  "node": {
+    "load1_at_start": 62.98,
+    "load1_at_end": 54.53,
+    "busy_allowed": true
+  },
+  "args": {
+    "trials": 5,
+    "warmup": 1,
+    "skip_rev_check": false,
+    "check_timeout_s": 2400,
+    "only_workloads": "batteries_list_lemmas_top,batteries_string_lemmas_top,batteries_rbtree_lemmas_mid,batteries_unionfind_top"
+  },
+  "cas_replay": {
+    "sequence": "per active workload: 5 unedited warm re-checks (warm_cache_hit_daemon), then 5 edited re-checks (warm_edited_proof_daemon); warmup and settling runs excluded",
+    "unedited_recheck": {
+      "workloads": [
+        "batteries_list_lemmas_top",
+        "batteries_rbtree_lemmas_mid",
+        "batteries_string_lemmas_top",
+        "batteries_unionfind_top"
+      ],
+      "classified_calls": 20,
+      "hits": 20,
+      "misses": 0,
+      "hit_rate": 1.0,
+      "failed_trials": 0,
+      "other_status_calls": 0,
+      "fission_cached_subshards": null,
+      "fission_verified_subshards": null
+    },
+    "edited_recheck": {
+      "workloads": [
+        "batteries_list_lemmas_top",
+        "batteries_rbtree_lemmas_mid",
+        "batteries_string_lemmas_top",
+        "batteries_unionfind_top"
+      ],
+      "classified_calls": 20,
+      "hits": 0,
+      "misses": 20,
+      "hit_rate": 0.0,
+      "failed_trials": 0,
+      "other_status_calls": 0,
+      "fission_cached_subshards": 0,
+      "fission_verified_subshards": 0
+    },
+    "overall": {
+      "workloads": [
+        "batteries_list_lemmas_top",
+        "batteries_rbtree_lemmas_mid",
+        "batteries_string_lemmas_top",
+        "batteries_unionfind_top"
+      ],
+      "classified_calls": 40,
+      "hits": 20,
+      "misses": 20,
+      "hit_rate": 0.5,
+      "failed_trials": 0,
+      "other_status_calls": 0,
+      "fission_cached_subshards": 0,
+      "fission_verified_subshards": 0
+    },
+    "non_ok_workloads": []
+  },
+  "verdict": {
+    "verdict": "partial_run",
+    "regressions": [],
+    "improvements": [],
+    "measured_nothing": [],
+    "comparison_errors": [],
+    "unexpected_successes": [],
+    "unexpected_blocked_failures": [],
+    "pfr_status": "skipped_by_filter",
+    "skipped_reason": "run restricted with --only-workloads; unmeasured: batteries_rbtree_lemmas_top, pfr_more_ruzsa_dist",
+    "same_binary": null,
+    "baseline_commit": null,
+    "run_commit": "a3ad5f4dfed54db85bf3c7eef6314e7fb443983c",
+    "baseline_binary_sha256": null,
+    "run_binary_sha256": "e4fccb2515a3ac08ffb1b7cb3d01f4c63c338d66761e3fb8835598d8af37ad2e",
+    "gates": {}
+  },
+  "run_duration_s": 503.5
+}

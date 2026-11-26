@@ -134,6 +134,10 @@ def sample_baseline(mod, **overrides):
     return mod.make_baseline(
         turbo_lean_commit="8a1d67dba051f59440c91df828584657efd12605",
         host={"hostname": "bench-host", "machine_label": "lab-node-1",
+              # A labeled host must carry a fingerprint (a label on either
+              # side requires both); fixtures compared against copies of this
+              # host say "same machine, same condition".
+              "host_fingerprint": "c" * 64,
               "kernel": "Linux 6.8", "cpu_model": "test-cpu", "nproc": 8, "mem_gb": 62},
         trials=5,
         settings={"TURBO_LEAN_GIT": "/fake/git", "TURBO_LEAN_ALLOWED_CSIMP": "*",
@@ -397,7 +401,13 @@ class Comparison(unittest.TestCase):
         self.assertEqual(verdict2["verdict"], "regression")
 
     def test_host_mismatch_is_skipped_never_pass(self):
-        verdict = self.mod.compare_run(self._baseline(), self._results(host="other-runner"))
+        # A different machine differs in FINGERPRINT: a changed hostname with
+        # the same fingerprint and label is the same machine relabeled, which
+        # compares (fingerprint-first identity). So the mismatch fixture
+        # changes the fingerprint too, modeling a real other machine.
+        res = self._results(host="other-runner")
+        res["host"]["host_fingerprint"] = "d" * 64
+        verdict = self.mod.compare_run(self._baseline(), res)
         self.assertEqual(verdict["verdict"], "comparison_skipped_host_mismatch")
         self.assertNotEqual(verdict["verdict"], "pass")
 
@@ -1610,13 +1620,47 @@ class HostFingerprint(unittest.TestCase):
         self.assertFalse(mod.host_matches(self._host("uruk", None, None),
                                           self._host("gilgamesh", None, None)))
 
-    def test_one_sided_fingerprint_falls_back_to_hostname_compare(self):
+    def test_unfingerprinted_baseline_never_matches_a_labeled_run(self):
         # An old baseline (real hostname, no fingerprint) against a new labeled
-        # run compares hostnames and mismatches; the migration is --rebaseline.
+        # run mismatches twice over: the label requires both fingerprints, and
+        # a one-sided fingerprint is always a mismatch. Migration: --rebaseline.
         mod = load_script()
         self.assertFalse(mod.host_matches(self._host("uruk", None, None),
                                           self._host("g2a-ro-192c", "g2a-ro-192c",
                                                      "a" * 64)))
+
+    def test_fingerprint_on_one_side_only_is_always_a_mismatch(self):
+        # A key PRESENT but None (a new-schema entry from a machine-id-less
+        # host) against a real fingerprint must mismatch even with equal
+        # hostnames and no labels: the None side's hostname proves nothing
+        # about the machine. A key ABSENT on both sides is the schema-1
+        # legacy case, where the hostname fallback still applies.
+        mod = load_script()
+        with_fp = {"host": {"hostname": "box", "machine_label": None,
+                            "host_fingerprint": "a" * 64}}
+        none_fp = {"host": {"hostname": "box", "machine_label": None,
+                            "host_fingerprint": None}}
+        legacy = {"host": {"hostname": "box", "machine_label": None}}
+        self.assertFalse(mod.host_matches(with_fp, none_fp))
+        self.assertFalse(mod.host_matches(none_fp, with_fp))
+        self.assertFalse(mod.host_matches(legacy, with_fp))
+        # Legacy-vs-legacy and legacy-vs-present-None keep the fallback.
+        self.assertTrue(mod.host_matches(legacy, dict(legacy)))
+        self.assertTrue(mod.host_matches(legacy, none_fp))
+
+    def test_label_requires_fingerprints_on_both_sides(self):
+        # host_id writes the label into hostname and records no fingerprint
+        # without a machine-id, so two machine-id-less containers sharing a
+        # label would pass the legacy hostname fallback. A label on either
+        # side therefore requires both fingerprints; a missing one is a host
+        # mismatch.
+        mod = load_script()
+        self.assertFalse(mod.host_matches(self._host("quiet", "quiet", None),
+                                          self._host("quiet", "quiet", None)))
+        labeled_fp = self._host("quiet", "quiet", "a" * 64)
+        labeled_no_fp = self._host("quiet", "quiet", None)
+        self.assertFalse(mod.host_matches(labeled_no_fp, labeled_fp))
+        self.assertFalse(mod.host_matches(labeled_fp, labeled_no_fp))
 
     def test_label_on_one_side_only_does_not_match(self):
         # The help promises a labeled baseline is never compared with a run
@@ -1662,6 +1706,11 @@ class HostFingerprint(unittest.TestCase):
 
     def test_host_id_records_hex_fingerprint_never_node_name(self):
         mod = load_script()
+        # Stubbed like its sibling test_no_machine_id_means_no_fingerprint:
+        # without this the test demands a 64-hex fingerprint from the real
+        # /etc/machine-id and fails on any host that lacks one, a case the
+        # script's own docstring calls common in containers.
+        mod.read_machine_id = lambda: "fixture-machine-id"
         h = mod.host_id("g2a-ro-192c")
         fp = h.get("host_fingerprint")
         self.assertTrue(isinstance(fp, str) and re.fullmatch(r"[0-9a-f]{64}", fp), fp)
@@ -1766,6 +1815,35 @@ class ReplayFailureVisibility(unittest.TestCase):
             self.assertIn("G2A CAS REPLAY:", r.stdout)
             self.assertIn("failed_trials=4", r.stdout)
             self.assertIn("non_ok_workloads=['batteries_list_lemmas_top']", r.stdout)
+
+
+class CheckTimeoutMainPath(unittest.TestCase):
+    def test_env_override_reaches_a_real_run(self):
+        # Through main(), the path a real run takes: no --check-timeout-s
+        # flag, env override set. The recorded args must carry the value
+        # actually used (argparse's import-time default froze 900 in and the
+        # validated global was never read back).
+        with tempfile.TemporaryDirectory(prefix="m1-timeout-main-") as td:
+            r = run_bench(Path(td), ["--no-baseline", "--only-workloads",
+                                     "batteries_list_lemmas_top",
+                                     "--out", str(Path(td) / "o.json")],
+                          env_extra={"TURBO_LEAN_BENCH_CHECK_TIMEOUT_S": "123"})
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            data = json.loads((Path(td) / "o.json").read_text())
+            self.assertEqual(data["args"]["check_timeout_s"], 123)
+            self.assertEqual(
+                data["settings"]["TURBO_LEAN_BENCH_CHECK_TIMEOUT_S"], "123")
+
+    def test_explicit_flag_beats_env_override(self):
+        with tempfile.TemporaryDirectory(prefix="m1-timeout-flag-") as td:
+            r = run_bench(Path(td), ["--no-baseline", "--only-workloads",
+                                     "batteries_list_lemmas_top",
+                                     "--check-timeout-s", "77",
+                                     "--out", str(Path(td) / "o.json")],
+                          env_extra={"TURBO_LEAN_BENCH_CHECK_TIMEOUT_S": "123"})
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            data = json.loads((Path(td) / "o.json").read_text())
+            self.assertEqual(data["args"]["check_timeout_s"], 77)
 
 
 class ProvenanceEnvVars(unittest.TestCase):
