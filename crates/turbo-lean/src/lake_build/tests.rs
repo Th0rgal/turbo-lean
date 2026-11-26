@@ -5361,11 +5361,17 @@ mod freshness_ownership_tests {
         };
         let warned = warned_stale_non_owned();
         warned.lock().unwrap().remove(&key);
+        // Emissions are counted process-wide (these tests run single-threaded), so the
+        // assertions read the change since the test started.
+        let emitted_counter = &crate::lake_build::freshness::STALE_NON_OWNED_WARNINGS_EMITTED;
+        let emitted_base = emitted_counter.load(std::sync::atomic::Ordering::SeqCst);
+        let emitted = || emitted_counter.load(std::sync::atomic::Ordering::SeqCst) - emitted_base;
         // Olean older than the source: stale -> warned, and never in the closure.
         set_olean_age(-3600)?;
         let c1 = input_closure_sweep_mods(&cfg, &dag);
         assert!(!c1.contains("D.D"), "a non-owned module never enters the closure: {c1:?}");
         assert!(warned.lock().unwrap().contains(&key), "a stale non-owned input-bearing module is recorded");
+        assert_eq!(emitted(), 1, "the first stale sweep prints the warning once");
         // The first sweep already consumed the first-time decision for this key, so the
         // decision step reports "not first time" now, and again after a second sweep.
         assert!(
@@ -5377,6 +5383,7 @@ mod freshness_ownership_tests {
             !record_stale_non_owned_warning(warned, key.clone()),
             "a second sweep must not make the key first-time again (no repeat warning)"
         );
+        assert_eq!(emitted(), 1, "a repeat sweep over the same stale module prints nothing");
         // Control: the decision step does report true for a key it has not seen.
         let fresh_key = (key.0.join("__control__"), key.1.clone());
         assert!(record_stale_non_owned_warning(warned, fresh_key.clone()), "an unseen key is first-time");
@@ -5390,6 +5397,7 @@ mod freshness_ownership_tests {
         set_olean_age(-3600)?;
         let _ = input_closure_sweep_mods(&cfg, &dag);
         assert!(warned.lock().unwrap().contains(&key), "going stale again warns again");
+        assert_eq!(emitted(), 2, "going stale again prints the warning a second time");
         warned.lock().unwrap().remove(&key);
         Ok(())
     }
