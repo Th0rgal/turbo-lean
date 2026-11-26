@@ -1148,35 +1148,20 @@ theorem evalExpr_call_ok_reserved (env : VarEnv) (st : HeapState) (fn : String)
     (args : List VarId) (retTy : LNIRType) (isExt : Bool) (r : Val × HeapState)
     (h : evalExpr env st (.call fn args retTy isExt) = .ok r) :
     reservedRuntimeCallee fn = true := by
-  cases hres : reservedRuntimeCallee fn with
-  | true => rfl
-  | false =>
-    exfalso
-    have hne : ∀ L : String, reservedRuntimeCallee L = true → (fn == L) = false := by
-      intro L hL
-      cases hb : (fn == L) with
-      | false => rfl
-      | true => rw [eq_of_beq hb] at hres; rw [hres] at hL; exact nomatch hL
+  cases isExt
+  · -- L2's non-capture lemma, applied to a one-entry environment named `fn`: such an
+    -- environment captures the call unless `fn` is reserved, and an environment of
+    -- unreserved names captures no call `evalExpr` succeeds on.
+    cases hres : reservedRuntimeCallee fn with
+    | true => rfl
+    | false =>
+      have hnone := FuncEnv.callTarget?_of_evalExpr_ok
+        (Φ := [({ name := fn, params := [], retTy := retTy, body := .unreachable }, 0)])
+        (fun p hp => by rw [List.mem_singleton] at hp; subst hp; exact hres) h
+      simp [LeanNative.Semantics.FuncEnv.callTarget?, LeanNative.Semantics.FuncEnv.lookup?] at hnone
+  · -- `evalExpr` refuses every extern call.
     dsimp only [evalExpr] at h
-    cases hvl : evalVarList env args with
-    | error _ => rw [hvl] at h; exact nomatch h
-    | ok vals =>
-      rw [hvl] at h
-      cases isExt
-      · simp only [Bool.false_eq_true, ↓reduceIte, Bool.or_false,
-          hne "lean_native_box_u64" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_native_unbox_u64" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_native_ensure_exclusive" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_native_sarray_len" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_mark_mt" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_native_ctor_set" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_native_ctor_set_scalar" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_native_ctor_set_tag" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_native_del_obj" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_native_ctor_tag" (by simp [reservedRuntimeCallee, reservedRuntimeName])] at h
-        all_goals exact nomatch h
-      · simp only [↓reduceIte] at h
-        all_goals exact nomatch h
+    cases hvl : evalVarList env args <;> rw [hvl] at h <;> simp at h
 
 /-- Under an environment of unreserved names every successful `evalExpr` is the let head,
     whatever the callee slot holds: a call `evalExpr` succeeds on names a reserved
