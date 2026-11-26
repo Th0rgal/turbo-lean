@@ -186,4 +186,370 @@ theorem evalCodeF_fuel_mono_step (Φ : FuncEnv) (f : Nat) :
   | .unreachable, venv, hst, v, hst', h => by
     unfold evalCodeF at h ⊢; exact h
 
+/-- Mirror of `evalCode_ite_asBool` (JpTag) at a fixed `Φ`. -/
+private theorem evalCodeF_ite_asBool (Φ : FuncEnv) (fuel : Nat) (venv : VarEnv) (hst : HeapState)
+    (condVar : VarId) (cond : Val) (b : Bool) (thenB elseB : LNIRCode)
+    (hcond : venv condVar = some cond) (hb : asBool cond = .ok b) :
+    evalCodeF Φ fuel venv hst (.ite condVar thenB elseB) =
+      if b then evalCodeF Φ fuel venv hst thenB else evalCodeF Φ fuel venv hst elseB := by
+  rw [evalCodeF.eq_def]
+  simp only []
+  rw [hcond]
+  cases cond with
+  | bool b0 =>
+    injection hb with heq; subst b0
+    cases b <;> rfl
+  | u64 n => injection hb with heq; subst b; rfl
+  | u256 w => injection hb with heq; subst b; rfl
+  | _ => exact nomatch hb
+
+/-- Mirror of `tag_branch_sound` (JpTag) with both environments threaded: the branch
+    continuations now evaluate under `evalStepF Δ` on the source side and the lowered
+    branch code under `evalCodeF Φ`; the lowering side is unchanged. -/
+theorem tag_branch_soundF (Δ : DeclEnv) (Φ : FuncEnv)
+    (fuel : Nat) (ctx : RealBridgeCtx) (lenv envIn : LEnv)
+    (venv : VarEnv) (hst hst' : HeapState) (v cond : Val)
+    (condVar : VarId) (condTy : LNIRType) (cidx : Nat) (isBool : Bool) (idx : Nat)
+    (discr? : Option Lean.FVarId) (rest : List (Lean.Compiler.LCNF.Alt .impure))
+    (altCode : Lean.Compiler.LCNF.Code .impure)
+    (yesCode noCode code : LNIRCode) (st2 st' : RealBridgeState)
+    (hi1 : lnirTypeEq condTy .i1 = true → isBool = true)
+    (hcondV : venv condVar = some cond)
+    (hyes : ∀ venvY, (∀ u, u < st2.nextVarId → venvY u = venv u) →
+      evalStepF Δ fuel ctx envIn hst (.inl altCode) = .ok (v, hst') →
+      evalCodeF Φ (fuel + 1) venvY hst yesCode = .ok (v, hst'))
+    (hno : ∀ venvN, (∀ u, u < st2.nextVarId → venvN u = venv u) →
+      evalStepF Δ fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, rest)) = .ok (v, hst') →
+      evalCodeF Φ (fuel + 1) venvN hst noCode = .ok (v, hst'))
+    (hbr : (if isBool || lnirTypeEq condTy .i1 then
+        (Except.ok ((lowerTagBranchPure condVar condTy cidx isBool 0 yesCode noCode).1, st2) :
+          Except String (LNIRCode × RealBridgeState))
+      else
+        Except.ok ((lowerTagBranchPure condVar condTy cidx isBool (st2.freshVar .i1).1 yesCode noCode).1,
+          (st2.freshVar .i1).2)) = Except.ok (code, st'))
+     (hev : (if isBool then
+         match asBool cond with
+         | .ok b =>
+           if cidx == 0 then
+             if b then evalStepF Δ fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, rest))
+             else evalStepF Δ fuel ctx envIn hst (.inl altCode)
+           else if cidx == 1 then
+             if b then evalStepF Δ fuel ctx envIn hst (.inl altCode)
+             else evalStepF Δ fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, rest))
+           else evalStepF Δ fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, rest))
+         | .error e => .error e
+       else
+         match cond with
+         | .u64 n =>
+           if n == cidx.toUInt64 then evalStepF Δ fuel ctx envIn hst (.inl altCode)
+           else evalStepF Δ fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, rest))
+         | _ => .error (.typeError "evalBinOp: invalid operand types")) = .ok (v, hst')) :
+     evalCodeF Φ (fuel + 1) venv hst code = .ok (v, hst') := by
+  cases isBool
+  · have hnotI1 : lnirTypeEq condTy .i1 = false := by
+      cases h : lnirTypeEq condTy .i1
+      · rfl
+      · exact nomatch hi1 h
+    rw [hnotI1] at hbr
+    simp only [Bool.or_false, Bool.false_eq_true, ↓reduceIte, lowerTagBranchPure, hnotI1] at hbr hev
+    injection hbr with hp; rcases Prod.mk.inj hp with ⟨rfl, rfl⟩
+    cases cond with
+    | u64 n =>
+      rw [evalCodeF_letBind_evalExpr rfl]
+      rw [(freshVar_spec st2 .i1).1]
+      dsimp only [evalExpr, evalScalarExpr]; rw [hcondV]; dsimp only [evalBinOp, ↓reduceIte]
+      let cmpVar := st2.nextVarId
+      cases hn : (n == cidx.toUInt64) <;> simp only [hn, Bool.false_eq_true, ↓reduceIte] at hev ⊢
+      · rw [evalCodeF.eq_def]; simp only []
+        rw [VarEnv.bind_self]
+        exact hno (venv.bind cmpVar (.bool false))
+          (fun u hu => venv_bind_fresh venv cmpVar u hu (.bool false)) hev
+      · rw [evalCodeF.eq_def]; simp only []
+        rw [VarEnv.bind_self]
+        exact hyes (venv.bind cmpVar (.bool true))
+          (fun u hu => venv_bind_fresh venv cmpVar u hu (.bool true)) hev
+    | _ => exact nomatch hev
+  · simp only [Bool.true_or, ↓reduceIte, lowerTagBranchPure] at hbr hev
+    injection hbr with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
+    cases hab : asBool cond with
+    | error _ => rw [hab] at hev; exact nomatch hev
+    | ok b =>
+      rw [hab] at hev
+      cases hc0 : (cidx == 0)
+      · simp only [hc0, Bool.false_eq_true, ↓reduceIte] at hev ⊢
+        cases hc1 : (cidx == 1)
+        · simp only [hc1, Bool.false_eq_true, ↓reduceIte] at hev ⊢
+          exact hno venv (fun _ _ => rfl) hev
+        · simp only [hc1, ↓reduceIte] at hev ⊢
+          rw [evalCodeF_ite_asBool Φ (fuel + 1) venv hst condVar cond b yesCode noCode hcondV hab]
+          cases b <;> simp only [↓reduceIte, Bool.false_eq_true] at hev ⊢
+          · exact hno venv (fun _ _ => rfl) hev
+          · exact hyes venv (fun _ _ => rfl) hev
+      · simp only [hc0, ↓reduceIte] at hev ⊢
+        rw [evalCodeF_ite_asBool Φ (fuel + 1) venv hst condVar cond b noCode yesCode hcondV hab]
+        cases b <;> simp only [↓reduceIte, Bool.false_eq_true] at hev ⊢
+        · exact hyes venv (fun _ _ => rfl) hev
+        · exact hno venv (fun _ _ => rfl) hev
+
+/-- Mirror of `lowerStepInr_sound` (StepCases) with both environments threaded; the
+    induction hypothesis is a parameter exactly as in L1, so the call rule never appears
+    here — a sibling instantiates it with its own `ih`. -/
+theorem lowerStepInr_soundF (Δ : DeclEnv) (Φ : FuncEnv) (fuel : Nat) (ctx : RealBridgeCtx)
+    (ih : ∀ (st st' : RealBridgeState) (lenv : LEnv) (venv : VarEnv) (hst hst' : HeapState) (v : Val)
+      (target : Lean.Compiler.LCNF.Code .impure ⊕
+        (VarId × Bool × Nat × Option Lean.FVarId × List (Lean.Compiler.LCNF.Alt .impure)))
+      (code : LNIRCode),
+      BridgeStateInv st lenv venv →
+      lowerImpureStepPure fuel ctx st target = .ok (code, st') →
+      (match target with
+       | .inl c => evalStepF Δ fuel ctx lenv hst (.inl c) = .ok (v, hst')
+       | .inr (condVar, isBool, idx, discr?, alts) =>
+         condVar < st.nextVarId ∧
+         (∀ dx, discr? = some dx → (st.lookupFVar? dx).isSome = true) ∧
+         (lnirTypeEq (st.getVarType condVar) .i1 = true → isBool = true) ∧
+         ∃ cond, venv condVar = some cond ∧
+           evalStepF Δ fuel ctx lenv hst (.inr (cond, isBool, idx, discr?, alts)) = .ok (v, hst')) →
+      evalCodeF Φ fuel venv hst code = .ok (v, hst'))
+    (st st' : RealBridgeState) (lenv : LEnv) (venv : VarEnv) (hst hst' : HeapState) (v : Val)
+    (condVar : VarId) (isBool : Bool) (idx : Nat) (discr? : Option Lean.FVarId)
+    (alts : List (Lean.Compiler.LCNF.Alt .impure)) (code : LNIRCode) (cond : Val)
+    (hinv : BridgeStateInv st lenv venv)
+    (h_lower : lowerImpureStepPure (fuel + 1) ctx st (.inr (condVar, isBool, idx, discr?, alts)) = .ok (code, st'))
+    (hcondLt : condVar < st.nextVarId)
+    (hdiscr : ∀ dx, discr? = some dx → (st.lookupFVar? dx).isSome = true)
+    (hi1 : lnirTypeEq (st.getVarType condVar) .i1 = true → isBool = true)
+    (hcondV : venv condVar = some cond)
+    (h_eval : evalStepF Δ (fuel + 1) ctx lenv hst (.inr (cond, isBool, idx, discr?, alts)) = .ok (v, hst')) :
+    evalCodeF Φ (fuel + 1) venv hst code = .ok (v, hst') := by
+  dsimp only [lowerImpureStepPure] at h_lower
+  rw [evalStepF.eq_def] at h_eval
+  simp only at h_eval
+  cases alts with
+  | nil => exact nomatch h_eval
+  | cons alt rest =>
+    cases rest with
+    | nil =>
+      cases alt with
+      | alt cn ps c _ =>
+        dsimp only at h_lower h_eval
+        cases hemp : (!ps.isEmpty) <;> simp only [hemp, ↓reduceIte, Bool.false_eq_true] at h_lower
+        · exact evalCodeF_fuel_mono_step Φ fuel code venv hst v hst'
+            (ih st st' lenv venv hst hst' v (.inl c) code hinv h_lower h_eval)
+        · exact nomatch h_lower
+      | ctorAlt info c _ =>
+        dsimp only at h_lower h_eval
+        rcases discr_env_inv st lenv venv discr? info.name hinv hdiscr with ⟨hinvIn, _⟩
+        change (match lowerImpureStepPure fuel ctx
+            (match discr?.bind st.lookupFVar? with
+             | some dv => st.setActiveCtor dv info.name | none => st)
+            (.inl c) with
+          | Except.ok (c0, stOut) =>
+            Except.ok (c0, ({ stOut with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls } : RealBridgeState))
+          | Except.error e => Except.error e) = Except.ok (code, st') at h_lower
+        cases hc : lowerImpureStepPure fuel ctx
+            (match discr?.bind st.lookupFVar? with
+             | some dv => st.setActiveCtor dv info.name | none => st)
+            (.inl c) with
+        | error _ => rw [hc] at h_lower; exact nomatch h_lower
+        | ok pr =>
+          rw [hc] at h_lower; injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
+          exact evalCodeF_fuel_mono_step Φ fuel pr.1 venv hst v hst'
+            (ih _ pr.2 _ venv hst hst' v (.inl c) pr.1 hinvIn hc h_eval)
+      | default c =>
+        exact evalCodeF_fuel_mono_step Φ fuel code venv hst v hst'
+          (ih st st' lenv venv hst hst' v (.inl c) code hinv h_lower h_eval)
+    | cons alt2 rest2 =>
+      cases alt with
+      | default c =>
+        exact evalCodeF_fuel_mono_step Φ fuel code venv hst v hst'
+          (ih st st' lenv venv hst hst' v (.inl c) code hinv h_lower h_eval)
+      | ctorAlt info c _ =>
+        dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure] at h_lower
+        dsimp only at h_eval
+        rcases discr_env_inv st lenv venv discr? info.name hinv hdiscr with ⟨hinvIn, hnextIn, htyIn⟩
+        cases hD : discr?.bind st.lookupFVar? with
+        | none =>
+          rw [hD] at h_lower hinvIn hnextIn htyIn; dsimp only at h_lower hinvIn hnextIn htyIn
+          cases h1 : lowerImpureStepPure fuel ctx st (.inl c) with
+          | error _ => rw [h1] at h_lower; exact nomatch h_lower
+          | ok p1 =>
+            rw [h1] at h_lower; rcases p1 with ⟨yesCode, st1⟩; dsimp only at h_lower
+            rcases lowerImpureStepPure_mono fuel ctx st st1 (.inl c) yesCode h1 with ⟨hn1, ht1⟩
+            have hinv1R : BridgeStateInv
+                { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                lenv venv :=
+              bridgeInv_ext st _ lenv venv hinv hn1 (fun u hu => ht1 u hu) rfl (fun _ _ => rfl) rfl
+            cases h2 : lowerImpureStepPure fuel ctx
+                { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) with
+            | error _ => rw [h2] at h_lower; exact nomatch h_lower
+            | ok p2 =>
+              rw [h2] at h_lower; rcases p2 with ⟨noCode, st2⟩; dsimp only at h_lower
+              rcases lowerImpureStepPure_mono fuel ctx
+                  { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                  st2 (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) noCode h2 with ⟨hn2, _⟩
+              have hgeBase : st.nextVarId ≤ st2.nextVarId := Nat.le_trans hn1 hn2
+              have hyes : ∀ venvY, (∀ u, u < st2.nextVarId → venvY u = venv u) →
+                  evalStepF Δ fuel ctx
+                    (match discr? with
+                     | some dx => if (lenv.vals dx).isSome then lenv.withCtor dx info.name else lenv
+                     | none => lenv)
+                    hst (.inl c) = .ok (v, hst') →
+                  evalCodeF Φ (fuel + 1) venvY hst yesCode = .ok (v, hst') := by
+                intro venvY hge hev
+                exact evalCodeF_fuel_mono_step Φ fuel yesCode venvY hst v hst'
+                  (ih st st1 _ venvY hst hst' v (.inl c) yesCode
+                    (bridgeInv_venv_agree st _ venv venvY hinvIn
+                      (fun u hu => hge u (Nat.lt_of_lt_of_le hu hgeBase))) h1 hev)
+              have hno : ∀ venvN, (∀ u, u < st2.nextVarId → venvN u = venv u) →
+                  evalStepF Δ fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, alt2 :: rest2)) =
+                    .ok (v, hst') →
+                  evalCodeF Φ (fuel + 1) venvN hst noCode = .ok (v, hst') := by
+                intro venvN hge hev
+                exact evalCodeF_fuel_mono_step Φ fuel noCode venvN hst v hst'
+                  (ih { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                    st2 lenv venvN hst hst' v
+                    (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) noCode
+                    (bridgeInv_venv_agree _ lenv venv venvN hinv1R
+                      (fun u hu => hge u (Nat.lt_of_lt_of_le hu hn2))) h2
+                    ⟨Nat.lt_of_lt_of_le hcondLt hn1, fun dx hdx => by
+                      have := hdiscr dx hdx
+                      change (st.lookupFVar? dx).isSome = true at this
+                      simp only [RealBridgeState.lookupFVar?]; exact this,
+                     fun h => hi1 (by
+                       have hty1R : st1.getVarType condVar = st.getVarType condVar := ht1 condVar hcondLt
+                       change lnirTypeEq (st1.getVarType condVar) .i1 = true at h
+                       rw [hty1R] at h; exact h),
+                     cond, by rw [hge condVar (Nat.lt_of_lt_of_le hcondLt hgeBase)]; exact hcondV, hev⟩)
+              exact tag_branch_soundF Δ Φ fuel ctx lenv
+                (match discr? with
+                 | some dx => if (lenv.vals dx).isSome then lenv.withCtor dx info.name else lenv
+                 | none => lenv)
+                venv hst hst' v cond condVar
+                (st.getVarType condVar) info.cidx isBool idx discr? (alt2 :: rest2) c
+                yesCode noCode code st2 st' hi1 hcondV hyes hno h_lower h_eval
+        | some dv =>
+          rw [hD] at h_lower hinvIn hnextIn htyIn; dsimp only at h_lower hinvIn hnextIn htyIn
+          let stIn := st.setActiveCtor dv info.name
+          cases h1 : lowerImpureStepPure fuel ctx stIn (.inl c) with
+          | error _ => rw [h1] at h_lower; exact nomatch h_lower
+          | ok p1 =>
+            rw [h1] at h_lower; rcases p1 with ⟨yesCode, st1⟩; dsimp only at h_lower
+            rcases lowerImpureStepPure_mono fuel ctx stIn st1 (.inl c) yesCode h1 with ⟨hn1, ht1⟩
+            have hbase1 : st.nextVarId ≤ st1.nextVarId := hn1
+            have hinv1R : BridgeStateInv
+                { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                lenv venv :=
+              bridgeInv_ext st _ lenv venv hinv hbase1
+                (fun u hu => ht1 u hu) rfl (fun _ _ => rfl) rfl
+            cases h2 : lowerImpureStepPure fuel ctx
+                { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) with
+            | error _ => rw [h2] at h_lower; exact nomatch h_lower
+            | ok p2 =>
+              rw [h2] at h_lower; rcases p2 with ⟨noCode, st2⟩; dsimp only at h_lower
+              rcases lowerImpureStepPure_mono fuel ctx
+                  { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                  st2 (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) noCode h2 with ⟨hn2, _⟩
+              have hgeBase : st.nextVarId ≤ st2.nextVarId := Nat.le_trans hbase1 hn2
+              have hyes : ∀ venvY, (∀ u, u < st2.nextVarId → venvY u = venv u) →
+                  evalStepF Δ fuel ctx
+                    (match discr? with
+                     | some dx => if (lenv.vals dx).isSome then lenv.withCtor dx info.name else lenv
+                     | none => lenv)
+                    hst (.inl c) = .ok (v, hst') →
+                  evalCodeF Φ (fuel + 1) venvY hst yesCode = .ok (v, hst') := by
+                intro venvY hge hev
+                exact evalCodeF_fuel_mono_step Φ fuel yesCode venvY hst v hst'
+                  (ih stIn st1 _ venvY hst hst' v (.inl c) yesCode
+                    (bridgeInv_venv_agree stIn _ venv venvY hinvIn
+                      (fun u hu => hge u (Nat.lt_of_lt_of_le hu hgeBase))) h1 hev)
+              have hno : ∀ venvN, (∀ u, u < st2.nextVarId → venvN u = venv u) →
+                  evalStepF Δ fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, alt2 :: rest2)) =
+                    .ok (v, hst') →
+                  evalCodeF Φ (fuel + 1) venvN hst noCode = .ok (v, hst') := by
+                intro venvN hge hev
+                exact evalCodeF_fuel_mono_step Φ fuel noCode venvN hst v hst'
+                  (ih { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                    st2 lenv venvN hst hst' v
+                    (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) noCode
+                    (bridgeInv_venv_agree _ lenv venv venvN hinv1R
+                      (fun u hu => hge u (Nat.lt_of_lt_of_le hu hn2))) h2
+                    ⟨Nat.lt_of_lt_of_le hcondLt hbase1, fun dx hdx => by
+                      have := hdiscr dx hdx
+                      change (st.lookupFVar? dx).isSome = true at this
+                      simp only [RealBridgeState.lookupFVar?]; exact this,
+                     fun h => hi1 (by
+                       have hty1R : st1.getVarType condVar = st.getVarType condVar := ht1 condVar hcondLt
+                       change lnirTypeEq (st1.getVarType condVar) .i1 = true at h
+                       rw [hty1R] at h; exact h),
+                     cond, by rw [hge condVar (Nat.lt_of_lt_of_le hcondLt hgeBase)]; exact hcondV, hev⟩)
+              exact tag_branch_soundF Δ Φ fuel ctx lenv
+                (match discr? with
+                 | some dx => if (lenv.vals dx).isSome then lenv.withCtor dx info.name else lenv
+                 | none => lenv)
+                venv hst hst' v cond condVar
+                (st.getVarType condVar) info.cidx isBool idx discr? (alt2 :: rest2) c
+                yesCode noCode code st2 st' hi1 hcondV hyes hno h_lower h_eval
+      | alt ctorName params c _ =>
+        dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure, MonadExcept.throw,
+          MonadExceptOf.throw, throwThe] at h_lower
+        dsimp only at h_eval
+        cases hemp : (!params.isEmpty) <;> simp only [hemp, ↓reduceIte, Bool.false_eq_true] at h_lower
+        · cases h1 : lowerImpureStepPure fuel ctx st (.inl c) with
+          | error _ => rw [h1] at h_lower; exact nomatch h_lower
+          | ok p1 =>
+            rw [h1] at h_lower; rcases p1 with ⟨yesCode, st1⟩; dsimp only at h_lower
+            rcases lowerImpureStepPure_mono fuel ctx st st1 (.inl c) yesCode h1 with ⟨hn1, ht1⟩
+            have hinv1R : BridgeStateInv
+                { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                lenv venv :=
+              bridgeInv_ext st _ lenv venv hinv hn1
+                (fun u hu => by change st1.getVarType u = st.getVarType u; exact ht1 u hu) rfl
+                (fun _ _ => rfl) rfl
+            cases h2 : lowerImpureStepPure fuel ctx
+                { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) with
+            | error _ => rw [h2] at h_lower; exact nomatch h_lower
+            | ok p2 =>
+              rw [h2] at h_lower; rcases p2 with ⟨noCode, st2⟩; dsimp only at h_lower
+              rcases lowerImpureStepPure_mono fuel ctx
+                  { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                  st2 (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) noCode h2 with ⟨hn2, ht2⟩
+              have hcondLt2 : condVar < st2.nextVarId := Nat.lt_of_lt_of_le hcondLt (Nat.le_trans hn1 hn2)
+              have hgeBase : st.nextVarId ≤ st2.nextVarId := Nat.le_trans hn1 hn2
+              have hyes : ∀ venvY, (∀ u, u < st2.nextVarId → venvY u = venv u) →
+                  evalStepF Δ fuel ctx lenv hst (.inl c) = .ok (v, hst') →
+                  evalCodeF Φ (fuel + 1) venvY hst yesCode = .ok (v, hst') := by
+                intro venvY hge hev
+                exact evalCodeF_fuel_mono_step Φ fuel yesCode venvY hst v hst'
+                  (ih st st1 lenv venvY hst hst' v (.inl c) yesCode
+                    (bridgeInv_venv_agree st lenv venv venvY hinv
+                      (fun u hu => hge u (Nat.lt_of_lt_of_le hu hgeBase))) h1 hev)
+              have hno : ∀ venvN, (∀ u, u < st2.nextVarId → venvN u = venv u) →
+                  evalStepF Δ fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, alt2 :: rest2)) =
+                    .ok (v, hst') →
+                  evalCodeF Φ (fuel + 1) venvN hst noCode = .ok (v, hst') := by
+                intro venvN hge hev
+                exact evalCodeF_fuel_mono_step Φ fuel noCode venvN hst v hst'
+                  (ih { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                    st2 lenv venvN hst hst' v
+                    (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) noCode
+                    (bridgeInv_venv_agree _ lenv venv venvN hinv1R
+                      (fun u hu => hge u (Nat.lt_of_lt_of_le hu hn2))) h2
+                    ⟨Nat.lt_of_lt_of_le hcondLt hn1, fun dx hdx => by
+                      have := hdiscr dx hdx
+                      change (st.lookupFVar? dx).isSome = true at this
+                      simp only [RealBridgeState.lookupFVar?]; exact this,
+                     fun h => hi1 (by
+                       have hty1R : st1.getVarType condVar = st.getVarType condVar := ht1 condVar hcondLt
+                       change lnirTypeEq (st1.getVarType condVar) .i1 = true at h
+                       rw [hty1R] at h; exact h),
+                     cond, by rw [hge condVar (Nat.lt_of_lt_of_le hcondLt hgeBase)]; exact hcondV, hev⟩)
+              exact tag_branch_soundF Δ Φ fuel ctx lenv lenv venv hst hst' v cond condVar
+                (st.getVarType condVar) ((ctx.findNullaryCtor? ctorName).getD idx) isBool idx discr?
+                (alt2 :: rest2) c yesCode noCode code st2 st' hi1 hcondV hyes hno
+                h_lower h_eval
+        · exact nomatch h_lower
+
 end LeanNative.Proofs
