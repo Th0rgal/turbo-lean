@@ -20,6 +20,16 @@ leaf. Part II freezes the recursion-headline signatures H1.4 builds against; its
 are sequenced after the L2 lane's F-proofs merge (the reason is named there — it is a
 pipeline-sequencing fact at the bytes, not an unprovability).
 
+Status (gap-l3, 2026-11-26): Part I is PROVED at the end of this file — the 14 theorems
+with the statements below, registered in `AxiomAudit.lean` (874 → 888; L2's raise landed
+first), each depending only on `propext`, `Classical.choice` and `Quot.sound`; the
+executable guards are in `Tests/RealLCNFRecTests.lean`. Two shape notes. `DeclEnvLowersR`
+is a recursive `Prop` whose two matching clauses are the contract's `nil`/`cons`: the
+strict-proofs policy forbids a new `inductive` under `Proofs/` (L2's `DeclEnvLowers` has
+the same shape for the same reason). `reservedRuntimeCallee` is defined as L2's
+`reservedRuntimeName`, so the two lanes share one predicate. Part II is NOT proved, and
+its headline is refuted over the landed `evalStepR` — see "Part II status" below.
+
 Pipeline note: this leaf is cut against the L2 CONTRACT (`Proofs/LowerCalls.lean`,
 415256b1); L2's definitions (`FuncEnv`, `evalCodeF`, `DeclEnv`, `evalStepF`,
 `evalRealLCNFDeclF`, `DeclEnvLowers`, `CodeRefinesF`, `reservedRuntimeName`) are not in
@@ -228,7 +238,7 @@ def CodeRefinesR (Φ : List LNIRDecl) (src tgt : LNIRCode) : Prop :=
     evalCodeR Φ fuel env st tgt = .ok (v, st')
 ```
 
-### Part I — theorems proved by this leaf (14; appended to `AxiomAudit.lean`, 865 → 879)
+### Part I — theorems proved by this leaf (14; appended to `AxiomAudit.lean`, 874 → 888 at the proving tip)
 
 Conservativity — the old semantics is the empty-environment instance:
 
@@ -385,6 +395,16 @@ Expected helper lemmas landing with the proofs (shapes not frozen by this contra
 (`evalStepR_fuel_mono` with the `hasJmpToPure` false-antitonicity sublemma L2's contract
 also names) — the last is Part II's helper and may land there instead.
 
+Landed with the proofs: `lookupFuncRec?_mem` / `lookupDeclRec?_mem` (with the semantics),
+`evalSeqLoop_mono_of_step_mono`, `evalParFor_fuel_mono`, `evalCodeRAux_nil`,
+`evalLetValue_fap_local`, and one LNIR simulation lemma in place of two per-arm
+inductions: `letHeadR` is the value a `.letBind` binds at one level of `evalCodeR`
+(`evalCodeRAux_letBind` rewrites every `.letBind` arm onto it), and `evalCodeRAux_sim`
+says a level simulates any level whose let heads reproduce its successful ones at a budget
+at least as large; `evalCodeR_fuel_mono` instantiates it through `letHeadR_mono`, and
+`evalCodeR_extend_of_ok` through `letHeadR_of_evalExpr_ok`. The `evalStepR`
+fuel-monotonicity pair did not land; it is Part II's.
+
 Executable guards land in `lean/LeanNative/Tests/RealLCNFRecTests.lean` (NEW file; L2's
 planned `Tests/RealLCNFCallTests.lean` is untouched): a self-recursive declaration
 (countdown-accumulate) whose `evalRealLCNFDeclR` result is wrong unless the callee body
@@ -489,6 +509,46 @@ identically and R's lookup is a superset of F's stratified lookup on `DeclEnvLow
 environments, whose names are duplicate-free. Its `Δ : DeclEnv` is L2's, under the same
 per-entry correction — entries `Decl × RealBridgeCtx × Nat` — so `declEnvR` applies to it
 unchanged; elaborable once L2's definitions exist.)
+
+#### Part II status (gap-l3, 2026-11-26): refuted as frozen; proofs not started
+
+L2's F-stack has merged (`Proofs/LowerCalls.lean` proves `lowerRealLCNFDecl_soundF`), so
+the sequencing reason above no longer holds. The frozen statements are not provable over
+the landed definitions, for three measured reasons (probe fixtures recorded with the leaf's
+report; each is a few lines of real LCNF):
+
+1. The headline is false over the landed `evalStepR`. Its local-call rule binds the call
+   result at `if isUnboxedScalarOrTuple rawTy then rawTy else .i64`, while the lowering
+   allocates the destination at `rawTy` itself (`IR/RealLCNFBridge.lean`, the `.fap` arm
+   with `ctx.findLocalCallee? fnName = some sym`). For a heap-typed result the source run
+   records `.i64`, so a later `dec` of it is a no-op on the source side and a `.decRef` on
+   the LNIR side. Witness: callee `l3_mk x = ObjBox.left (box x)` (a fresh object), caller
+   `l3_use x = let o := l3_mk x; dec o; 0`, both under a context with `allowStage1DHeap`
+   and `ObjBox.left`'s layout and `localCallees = [(l3_mk, "mk_sym")]`, `Δ = [(l3_mk, ctx,
+   64)]`, `Φ = [the lowered callee]`. Every hypothesis of `lowerRealLCNFDecl_soundR` holds
+   at fuel 64 and argument `5`; the source R-run returns `0` with the object still live
+   (rc 1), the lowered caller under `Φ` returns `0` with the object freed. L2 met the same
+   divergence and binds at `some rawTy` (the comment in `IR/RealLCNFCallSemantics.lean`'s
+   resolved-call arm); L2's F-run of this fixture frees the object too.
+2. `evalRealLCNFDeclF_toR` is refuted by the same fixture: the F-run returns `0` with the
+   object freed, the R-run `0` with it live. Independently, L2's per-entry amendment runs an
+   F callee at its ENTRY fuel while R runs it at the caller's decremented fuel, so the
+   contract's "needs no fuel padding" remark no longer holds.
+3. `evalCodeF_toR` does not elaborate (it passes a `FuncEnv`, a list of declaration/fuel
+   pairs since L2's amendment, where `evalCodeR` takes `List LNIRDecl`), and with the
+   projection `Φ.map Prod.fst` it is false for repeated names: with two entries named `f`,
+   the first calling `f` and the second returning `7`, the F-run of `f ()` returns `7`
+   (the nested call resolves in the strict suffix) and the R-run exhausts its budget at
+   every fuel (every nested call re-resolves to the first entry). A distinct-names
+   hypothesis, and a fuel bound covering the per-entry fuels, are missing.
+
+What would unblock it, for the fold owner (not taken here): bind the resolved-call result
+at `some rawTy` in `evalStepR` exactly as L2's `evalStepF` does, which changes Part I's
+`evalStepR_localCall_unfold` right-hand side the same way (`evalStepR_nil` and the guards
+are unaffected: no `Δ = []` run reaches the arm, and every guard's call result is `UInt64`);
+then R-twin L2's step stack (`RealLCNFBridge/CallsF.lean` and the U6 induction in
+`LowerCalls.lean`, about 2,600 lines that conclude in `evalStepF`/`evalCodeF`), and restate
+the two embeddings with distinct names and a fuel bound over the entry fuels.
 
 ### Named exclusions (recorded, not silently dropped)
 
