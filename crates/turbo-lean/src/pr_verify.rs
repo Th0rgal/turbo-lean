@@ -3919,6 +3919,7 @@ fn resolve_untrusted_pr_project_config(
         config_digest: String::new(),
         pre_recipe_config_digest: String::new(),
         unsupported: None,
+        lake_rejected_lean_options: None,
         native_unsupported: None,
         link_unsupported: None,
     };

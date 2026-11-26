@@ -295,6 +295,12 @@ fn resolve_identity_probe_context(
     {
         let pkg = crate::module_builder::resolve_package_config(project_dir, is_untrusted)
             .context("Failed to resolve Lean options for declaration identity")?;
+        // Trusted mode parses with the dependency downgrade active (`is_root_pkg = false`),
+        // which drops Lake-rejected `leanOptions` entries; refuse like
+        // `optional_package_config` instead of handing out args with entries silently gone
+        // (DA 3ff1014b finding 3).
+        crate::module_builder::refuse_lake_rejected_lean_options(&pkg)
+            .context("Failed to resolve Lean options for declaration identity")?;
         crate::module_builder::resolve_file_lean_args_in_package(&pkg, file)
     } else {
         Vec::new()
@@ -1224,6 +1230,34 @@ mod memo_tests {
         );
         fs::remove_file(old_key)?;
         scratch.remove()?;
+        Ok(())
+    }
+
+    /// DA 3ff1014b finding 3: the trusted identity path resolves the package config with
+    /// the dependency downgrade active (`is_root_pkg = false`), so a Lake-rejected
+    /// `leanOptions` entry used to reach `resolve_file_lean_args_in_package` silently
+    /// dropped. It must refuse like `optional_package_config` instead.
+    #[test]
+    fn trusted_identity_args_refuse_lake_rejected_lean_options() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_identity_rejected_opts_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[LeanOption.mk `autoImplicit false]\n",
+        )?;
+        fs::write(dir.join("Demo.lean"), "")?;
+        let err = resolve_identity_probe_context(&dir, Path::new("Demo.lean"), false, &[])
+            .expect_err("trusted-mode args from a config with dropped `leanOptions` must refuse");
+        assert!(
+            format!("{err:#}").contains("entry form Lake rejects"),
+            "the refusal names the dropped entry class, never another failure: {err:#}"
+        );
+        let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 }
