@@ -167,12 +167,15 @@
  "committed_pair": {
   "off": {
    "path": "scripts/bench_check_loop_g2b_off.json",
-   "sha256": "e0af122856bb0918d620476b2478cbd93fe500ac11d92d781e81f2216e71c28b"
+   "raw_sha256": "e0af122856bb0918d620476b2478cbd93fe500ac11d92d781e81f2216e71c28b",
+   "sha256": "90e8ded3ebe33b40efe815b3be95395f71d87f72faeeb3876190884c13295ed2"
   },
   "on": {
    "path": "scripts/bench_check_loop_g2b_on.json",
-   "sha256": "e6910f6553af85acfe73eea6355269cfa5124ce6ed3f24d8b2d8fd40ea349462"
+   "raw_sha256": "e6910f6553af85acfe73eea6355269cfa5124ce6ed3f24d8b2d8fd40ea349462",
+   "sha256": "7304f836b57069de9d9cdabb313810f72883debbbdb2f082309bf66f72b4f773"
   },
+  "sha_note": "sha256 is the file now in the tree, with its host paths removed (its path_scrub block); raw_sha256 is the file this analysis read, the same in every measured value",
   "why_aa": "one binary (e4fccb25...) at a3ad5f4d on this host; the toggled warm CAS replay is unreachable from the check path the bench drives (HORIZONS G2b)"
  },
  "created_utc": "2026-11-26T19:09:33Z",
