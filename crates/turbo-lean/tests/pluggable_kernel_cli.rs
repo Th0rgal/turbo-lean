@@ -635,6 +635,15 @@ fn compile_real_olean_module(dir: &Path, module: &str) -> Option<PathBuf> {
     {
         Ok(v) if v.status.success() => {}
         _ => {
+            // Review bb7c0f2f F6: a silent skip would let CI report this G1b evidence
+            // test as passing on a host (or network outage) where Lean never ran; under
+            // CI, or when explicitly required, fail hard instead.
+            assert!(
+                std::env::var_os("CI").is_none()
+                    && std::env::var_os("TURBO_LEAN_REQUIRE_LEAN").is_none(),
+                "no runnable Lean toolchain (`elan`/`lean`) on PATH; refusing to skip the \
+                 real-`.olean` compile under CI / TURBO_LEAN_REQUIRE_LEAN"
+            );
             eprintln!(
                 "no runnable Lean toolchain (`elan`/`lean`) on PATH; cannot compile a real `{module}.olean`"
             );

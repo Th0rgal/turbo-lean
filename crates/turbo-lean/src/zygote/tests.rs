@@ -2254,13 +2254,27 @@ use super::*;
             2
         );
         // #435 review (finding 2): `RLIMIT_DATA` meters writable private VIRTUAL mappings
-        // (heap, malloc arenas, pthread stacks), not RSS, so the hard cap binds only when
-        // the per-worker share is at least the worker RSS estimate, and then with x2
-        // headroom over the share; a tighter share stays advisory (no rlimit).
+        // (heap, malloc arenas, pthread stacks), not RSS, so the cap is the share FLOORED
+        // at the worker RSS estimate, with x2 headroom. Review bb7c0f2f F2: the cap is
+        // MONOTONE in the budget (no step from "no cap" to a 4096 MiB cap at a 2048 MiB
+        // share), so raising --max-memory-mb can never newly fail a worker; a
+        // sub-estimate share gets the generous 4096 MiB floor cap instead of none.
         assert_eq!(capped.per_worker_share_mb(2), Some(2048));
         assert_eq!(capped.per_worker_rlimit_mb(2), Some(4096)); // 2048 MiB share x2 headroom
         assert_eq!(capped.per_worker_share_mb(64), Some(512)); // floored share
-        assert_eq!(capped.per_worker_rlimit_mb(64), None); // sub-estimate share: advisory only
+        assert_eq!(capped.per_worker_rlimit_mb(64), Some(4096)); // floor cap, not advisory
+        // Monotone: a bigger budget never shrinks the cap past a smaller budget's.
+        let bigger = WorkerBudget {
+            jobs: None,
+            max_memory_mb: Some(8192),
+        };
+        assert_eq!(bigger.per_worker_share_mb(4), Some(2048));
+        assert_eq!(bigger.per_worker_rlimit_mb(4), Some(4096));
+        let biggest = WorkerBudget {
+            jobs: None,
+            max_memory_mb: Some(12_288),
+        };
+        assert_eq!(biggest.per_worker_rlimit_mb(4), Some(6144)); // 3072 share x2
         assert_eq!(capped.replay_batch_cap(32, 2), 8); // 2 GiB per worker: shrink batches
         assert_eq!(capped.replay_batch_cap(32, 4), 1); // 1 GiB per worker: single-module slices
 
@@ -2363,13 +2377,20 @@ use super::*;
         // #437: the replay budget defaults to the audit budget ...
         assert_eq!(replay_timeout_ms(false), audit_timeout_ms(false));
         assert_eq!(replay_timeout_ms(true), audit_timeout_ms(true));
-        // #443 review (finding 3): `0` or an empty TURBO_LEAN_AUDIT_TIMEOUT_SECS is
-        // explicitly unbounded (matching `eval --timeout-ms 0`); an unparsable value is
-        // no configuration at all, so the defaults apply.
+        // #443 review (finding 3) + review bb7c0f2f F1: a literal `0` is explicitly
+        // unbounded on the TRUSTED side only; untrusted audits clamp to [15, 600] s like
+        // untrusted replay and compile budgets (a PR-supplied `[audit] timeout_secs = 0`
+        // must not hold a CI runner), and an EMPTY value (an empty CI export such as
+        // `VAR=${UNSET}`) is no configuration at all, like an unparsable one.
         std::env::set_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "0");
         assert_eq!(audit_timeout_ms(false), UNBOUNDED_TIMEOUT_MS);
+        assert_eq!(audit_timeout_ms(true), 600_000);
+        // Review bb7c0f2f F7: the untrusted replay default over an explicitly unbounded
+        // audit budget clamps the same way.
+        assert_eq!(replay_timeout_ms(true), 600_000);
         std::env::set_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "");
-        assert_eq!(audit_timeout_ms(true), UNBOUNDED_TIMEOUT_MS);
+        assert_eq!(audit_timeout_ms(false), 300_000);
+        assert_eq!(audit_timeout_ms(true), 120_000);
         std::env::set_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "soon");
         assert_eq!(audit_timeout_ms(false), 300_000);
         std::env::remove_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS");

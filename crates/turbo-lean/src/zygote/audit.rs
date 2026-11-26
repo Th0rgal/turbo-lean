@@ -1748,15 +1748,38 @@ pub(super) fn audit_compiled_module_batch_exec_pinned(
         cmd.arg(m);
     }
 
+    let applied_rlimit_mb = if is_untrusted {
+        None
+    } else {
+        per_worker_rlimit_mb
+    };
     let out = crate::module_builder::run_command_with_timeout_pinned_fd(
         &mut cmd,
         timeout,
         is_untrusted,
         pinned_dir_raw_fd,
     );
-    match out.and_then(|o| parse_audit_modules_reply(&o, mod_names)) {
+    // Review bb7c0f2f F4: an allocation failure under the worker cap names the knob (so
+    // `error_names_memory_cap` can classify it), and a memory-capped failure is never
+    // bisected — the recursive halving below would redo full-closure loads under the
+    // same cap and end in the same unhelpful error.
+    let attempt = out.and_then(|o| {
+        parse_audit_modules_reply(&o, mod_names).map_err(|e| {
+            let note = WorkerBudget::memory_kill_note(
+                &o.status,
+                &String::from_utf8_lossy(&o.stderr),
+                applied_rlimit_mb,
+            );
+            if note.is_empty() {
+                e
+            } else {
+                e.context(note.trim_start().to_string())
+            }
+        })
+    });
+    match attempt {
         Ok(_) => Ok(()),
-        Err(_) if mod_names.len() > 1 => {
+        Err(e) if mod_names.len() > 1 && !WorkerBudget::error_names_memory_cap(&e) => {
             let mid = mod_names.len() / 2;
             audit_compiled_module_batch_exec_pinned(
                 store_root,

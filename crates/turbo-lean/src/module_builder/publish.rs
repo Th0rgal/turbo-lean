@@ -5116,6 +5116,9 @@ pub(crate) fn build_project_modules_native_with_options(
                     &batch_mods,
                     lp_ref,
                     is_untrusted,
+                    // Review bb7c0f2f F5: the worker caps its audit subprocesses at the
+                    // POOL's share of the budget, not a single-worker share.
+                    audit_pool_size,
                 );
                 let _ = tx.send(SchedulerEvent::AuditBatchFinished { batch_mods, res });
             });
