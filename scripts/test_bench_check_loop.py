@@ -1651,6 +1651,20 @@ class OnlyWorkloadsPartialRun(unittest.TestCase):
             self.assertEqual(data["verdict"]["verdict"], "partial_run")
             self.assertIn("VERDICT: partial_run", r.stdout)
 
+    def test_partial_run_fails_under_strict_comparison(self):
+        # --strict-comparison promises "a comparison really happened"; a
+        # filtered run never compares, so with a baseline given it must
+        # exit 1, not slip through as exit 0.
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-filter-strict-") as td:
+            bp = Path(td) / "b.json"
+            bp.write_text(json.dumps(full_valid_baseline(mod)))
+            r = run_bench(Path(td), ["--baseline", str(bp), "--strict-comparison",
+                                     "--only-workloads", "batteries_list_lemmas_top",
+                                     "--out", str(Path(td) / "o.json")])
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("partial_run", r.stdout)
+
     def test_rebaseline_with_only_workloads_is_usage_error(self):
         mod = load_script()
         with self.assertRaises(SystemExit) as cm:

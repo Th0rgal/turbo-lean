@@ -33,10 +33,11 @@ the two runs were actually compared.
 
 Exit codes:
     0  measurements healthy; comparison passed, or was explicitly skipped and
-       flagged (`comparison_skipped_*`), or was not requested (`not_compared`).
+       flagged (`comparison_skipped_*`), or was not requested (`not_compared`),
+       or the run was deliberately partial (`partial_run`, --only-workloads).
        The script never reports a pass for a comparison it skipped.
     1  regression, unhealthy measurement, or (with --strict-comparison) a
-       skipped or absent comparison.
+       skipped, absent, or partial-run comparison.
     2  usage error.
     3  stale expectation: a workload expected `blocked` (PFR) passed.
     4  environment/setup failure (missing env, wrong revs, wrong git, missing
@@ -1645,6 +1646,7 @@ def main(argv=None):
         code = VERDICT_EXIT[verdict["verdict"]]
         if (code == 0 and args.strict_comparison
                 and verdict["verdict"] in ("not_compared",
+                                           "partial_run",
                                            "comparison_skipped_host_mismatch",
                                            "comparison_skipped_settings_mismatch")):
             code = 1
