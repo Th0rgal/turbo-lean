@@ -1043,6 +1043,35 @@ def ensure_c1_upstream_corpus() -> dict[str, Any]:
 
 C1_UPSTREAM_PROGRAM_TIMEOUT_S = 240
 
+# R1: deliberate frontend refusal diagnostics, measured live at the pin over
+# all 250 manifest programs (2026-11-26). Every fail-closed refusal the
+# frontend emits carries one of these stderr shapes (sources:
+# lean/LeanNative/Driver/CoreCLI.lean, lean/LeanNative/IR/RealLCNFBridge.lean).
+# An elaboration failure prints "Elaboration failed for <file>" instead
+# (lean/LeanNative/Driver/BuildExe.lean), and an internal bridge invariant
+# trip prints "[lean-native] internal bridge error: ..."; neither is a
+# deliberate refusal, so neither counts as rejected_fail_closed.
+C1_UPSTREAM_REJECTION_MARKERS: tuple[str, ...] = (
+    "[lean-native] Unsupported ",
+    "[lean-native] unsupported ",
+    "[lean-native] Failed to extract any LCNF declarations",
+    "[lean-native] Module contains no Stage 1B scalar functions",
+)
+# R1: authored scalar-subset canary, manifest-external; the opt-in leg is ok
+# only when the frontend lowers it end to end.
+C1_UPSTREAM_CANARY = ROOT / "scripts" / "fixtures" / "c1_upstream_canary.lean"
+
+
+def classify_c1_upstream_rejection(returncode: int, stderr: str) -> str:
+    """R1: a nonzero `emit-lnir` exit counts as rejected_fail_closed only when
+    stderr carries a deliberate refusal diagnostic; every other nonzero shape
+    (negative returncode = signal death, usage errors, elaboration errors,
+    internal bridge errors) is frontend_error, and any frontend_error makes
+    the leg not ok."""
+    if returncode > 0 and any(marker in stderr for marker in C1_UPSTREAM_REJECTION_MARKERS):
+        return "rejected_fail_closed"
+    return "frontend_error"
+
 
 def run_c1_upstream_corpus(enabled: bool) -> dict[str, Any]:
     """Manifest-driven upstream Tier C1 leg (roadmap leaf C1x). Opt-in like the
@@ -1051,12 +1080,15 @@ def run_c1_upstream_corpus(enabled: bool) -> dict[str, Any]:
     sha256 at the pin, matrix-construct coverage) before any execution.
 
     Each program runs through the real frontend (`emit-lnir --wire`). A
-    fail-closed nonzero exit is the EXPECTED shape for rejected-category
-    programs and is recorded with a `skippedReason` naming the program's
-    syntactic matrix constructs — never silently dropped. A program the
-    frontend lowers is additionally compiled (`compile-llvm`); none of the
-    pinned 250 currently lower with exported scalar entrypoints, so 3-way
-    case-vector execution of upstream programs remains open."""
+    nonzero exit counts as rejected_fail_closed ONLY when stderr carries a
+    deliberate `[lean-native]` refusal diagnostic
+    (C1_UPSTREAM_REJECTION_MARKERS); any other nonzero outcome is recorded as
+    frontend_error and makes the leg not ok (R1). The authored scalar canary
+    (C1_UPSTREAM_CANARY, manifest-external) runs with every opt-in leg and
+    must reach lowered_llvm_emitted. A program the frontend lowers is
+    additionally compiled (`compile-llvm`); none of the pinned 250 currently
+    lower with exported scalar entrypoints, so 3-way case-vector execution of
+    upstream programs remains open."""
     if not enabled:
         return {
             "executed": False,
@@ -1089,19 +1121,38 @@ def run_c1_upstream_corpus(enabled: bool) -> dict[str, Any]:
     manifest = json.loads(c1_corpus.MANIFEST_PATH.read_text(encoding="utf-8"))
     env = fuzz.pinned_toolchain_env()
 
-    def run_one(prog: dict[str, Any], tmp_dir: str) -> dict[str, Any]:
-        src = corpus_root / prog["path"]
-        wire = Path(tmp_dir) / (prog["path"].replace("/", "__") + ".lnir")
+    def run_one(prog: dict[str, Any], tmp_dir: str, src: Path | None = None) -> dict[str, Any]:
+        src = corpus_root / prog["path"] if src is None else src
+        # R3: each program subprocess runs in its own directory under the
+        # leg's tmp dir (the C2 leg's explicit per-package cwd shape), so a
+        # cwd-relative write can land neither in the suite's cwd nor in a
+        # sibling program's scratch.
+        prog_dir = tempfile.mkdtemp(prefix="prog_", dir=tmp_dir)
+        wire = Path(prog_dir) / (prog["path"].replace("/", "__") + ".lnir")
         constructs = ", ".join(prog["matrixConstructs"])
         try:
             res = subprocess.run(
                 [engines["full_bin"], "emit-lnir", "--wire", str(src), "-o", str(wire)],
-                capture_output=True, text=True, env=env, timeout=C1_UPSTREAM_PROGRAM_TIMEOUT_S,
+                capture_output=True, text=True, errors="replace", env=env,
+                timeout=C1_UPSTREAM_PROGRAM_TIMEOUT_S, cwd=prog_dir,
             )
         except subprocess.TimeoutExpired:
             return {"path": prog["path"], "outcome": "infrastructure_timeout",
                     "skippedReason": f"emit-lnir exceeded {C1_UPSTREAM_PROGRAM_TIMEOUT_S}s"}
         if res.returncode != 0:
+            if classify_c1_upstream_rejection(res.returncode, res.stderr or "") != "rejected_fail_closed":
+                return {
+                    "path": prog["path"],
+                    "outcome": "frontend_error",
+                    "returncode": res.returncode,
+                    "matrixConstructs": prog["matrixConstructs"],
+                    "skippedReason": (
+                        f"emit-lnir exit {res.returncode} without a deliberate refusal "
+                        f"diagnostic (negative rc = signal death; elaboration, usage and "
+                        f"internal errors land here); syntactic matrix constructs: {constructs}"
+                    ),
+                    "stderrTail": (res.stderr or "")[-240:],
+                }
             return {
                 "path": prog["path"],
                 "outcome": "rejected_fail_closed",
@@ -1117,7 +1168,8 @@ def run_c1_upstream_corpus(enabled: bool) -> dict[str, Any]:
         try:
             comp = subprocess.run(
                 [engines["core_bin"], "compile-llvm", "--lnir", str(wire), "-o", str(ll)],
-                capture_output=True, text=True, env=env, timeout=C1_UPSTREAM_PROGRAM_TIMEOUT_S,
+                capture_output=True, text=True, errors="replace", env=env,
+                timeout=C1_UPSTREAM_PROGRAM_TIMEOUT_S, cwd=prog_dir,
             )
         except subprocess.TimeoutExpired:
             return {"path": prog["path"], "outcome": "infrastructure_timeout",
@@ -1135,18 +1187,35 @@ def run_c1_upstream_corpus(enabled: bool) -> dict[str, Any]:
         workers = max(1, min(8, (os.cpu_count() or 2) // 4))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             rows = list(pool.map(lambda p: run_one(p, tmp), manifest["programs"]))
+        # R1: the authored scalar canary runs with the leg but stays
+        # manifest-external: it proves the frontend still LOWERS (so a
+        # regression that rejects everything cannot read as 250 expected
+        # rejections) and never counts toward outcomeCounts or the
+        # upstream_lean4_run_250_three_way missing-coverage token.
+        if C1_UPSTREAM_CANARY.is_file():
+            canary = run_one(
+                {"path": "scripts/fixtures/c1_upstream_canary.lean", "matrixConstructs": []},
+                tmp,
+                src=C1_UPSTREAM_CANARY,
+            )
+        else:
+            canary = {"path": str(C1_UPSTREAM_CANARY), "outcome": "canary_missing",
+                      "skippedReason": "authored canary fixture absent"}
+        canary["manifestExternal"] = True
     rows.sort(key=lambda r: r["path"])
     counts = {"rejected_fail_closed": 0, "lowered_llvm_emitted": 0,
-              "lowered_llvm_failed": 0, "infrastructure_timeout": 0}
+              "lowered_llvm_failed": 0, "infrastructure_timeout": 0, "frontend_error": 0}
     failing: list[str] = []
     for r in rows:
         counts[r["outcome"]] += 1
-        if r["outcome"] in ("lowered_llvm_failed", "infrastructure_timeout"):
+        if r["outcome"] in ("lowered_llvm_failed", "infrastructure_timeout", "frontend_error"):
             failing.append(r["path"])
     ok = (
         not failing
+        and counts["frontend_error"] == 0
         and len(rows) == manifest["programCount"]
         and counts["rejected_fail_closed"] + counts["lowered_llvm_emitted"] == manifest["programCount"]
+        and canary.get("outcome") == "lowered_llvm_emitted"
     )
     return {
         "executed": True,
@@ -1159,8 +1228,28 @@ def run_c1_upstream_corpus(enabled: bool) -> dict[str, Any]:
         "programCount": manifest["programCount"],
         "outcomeCounts": counts,
         "failingPrograms": failing,
+        # No manifest program executes 3-way case vectors yet; the
+        # upstream_lean4_run_250_three_way missing-coverage token keys on
+        # this staying 0 (the canary is deliberately outside it).
+        "caseVectorExecutions": 0,
+        "canary": canary,
         "programs": rows,
     }
+
+
+def c1_upstream_subresult(enabled: bool) -> dict[str, Any]:
+    """R4: the upstream corpus leg never raises past the C1 tier; an exception
+    becomes a failed upstream sub-result recorded on the tier."""
+    try:
+        return run_c1_upstream_corpus(enabled=enabled)
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as err:
+        return {
+            "executed": False,
+            "optedIn": enabled,
+            "ok": False,
+            "status": "failed_upstream_leg_exception",
+            "error": f"{type(err).__name__}: {err}",
+        }
 
 
 def run_c1_corpus(asan: bool, ubsan: bool) -> dict[str, Any]:
@@ -1240,6 +1329,16 @@ def assert_toolchain_pins_consistent() -> None:
             f"pins {PINNED_CON_LECHE_TOOLCHAIN!r} for C2/C3 (con-leche). Update "
             "PINNED_CON_LECHE_TOOLCHAIN, PINNED_CON_LECHE_REV and the C2 package "
             "fixtures together."
+        )
+    # R2: the C1 upstream manifest module must pin the same toolchain the
+    # repo pins, or corpus programs elaborate under a toolchain the suite's
+    # engines were not built with.
+    if c1_corpus.C1_UPSTREAM_TOOLCHAIN != repo_pin:
+        raise SystemExit(
+            f"Toolchain pin mismatch: scripts/build_c1_corpus_manifest.py pins "
+            f"C1_UPSTREAM_TOOLCHAIN {c1_corpus.C1_UPSTREAM_TOOLCHAIN!r} but lean/lean-toolchain "
+            f"pins {repo_pin!r}. Update the C1 upstream corpus pin (repoUrl/rev/tag/toolchain) "
+            "and regenerate scripts/c1_corpus_manifest.json together."
         )
 
 
@@ -1326,10 +1425,13 @@ def main() -> int:
         for tier in tiers:
             if tier == "C1":
                 c1 = run_c1_corpus(asan=args.asan, ubsan=args.ubsan)
-                c1["upstream"] = run_c1_upstream_corpus(enabled=args.c1_upstream)
+                # R4: record the tier result before the upstream leg runs, and
+                # take the upstream leg through its exception wrapper, so an
+                # upstream failure can never lose the authored-corpus result.
+                tier_results["C1"] = c1
+                c1["upstream"] = c1_upstream_subresult(enabled=args.c1_upstream)
                 if args.c1_upstream and c1["upstream"].get("ok") is not True:
                     c1["ok"] = False
-                tier_results["C1"] = c1
                 if c1.get("ok") is not True:
                     failures.append({"stage": "tier_C1_scalar_corpus", "detail": c1})
             elif tier == "C2":
