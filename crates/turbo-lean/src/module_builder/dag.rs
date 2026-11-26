@@ -9349,6 +9349,14 @@ pub(super) fn materialize_lake_recipes(cfg: &ProjectConfig, is_untrusted: bool) 
             let mut queried = Vec::with_capacity(names.len());
             for name in &names {
                 let target = format!("@{}/{}", pkg.base_name, name);
+                // #407: a `lake query` materializes (builds) its target, so it counts
+                // toward the "zero Lake invocations on a warm hit" log.
+                crate::module_builder::log_lake_build_invocation(
+                    &cfg.root_pkg.pkg_root,
+                    "query --json",
+                    std::slice::from_ref(&target),
+                    false,
+                );
                 let mut query_cmd = Command::new(&tools.lake);
                 scrub_untrusted_env(&mut query_cmd);
                 let output = query_cmd
