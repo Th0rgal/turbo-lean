@@ -802,7 +802,10 @@ class ImprovementSide(unittest.TestCase):
             self.assertEqual(r0.returncode, 0, r0.stdout + r0.stderr)
             o0 = json.loads((Path(td) / "o0.json").read_text())
             base = full_valid_baseline(self.mod)
-            base["host"]["hostname"] = o0["host"]["hostname"]
+            # Same host AND same condition: sync the whole host block (label
+            # and fingerprint included) — a labeled baseline no longer matches
+            # an unlabeled run on the same machine.
+            base["host"] = dict(o0["host"])
             base["settings"] = dict(o0["settings"])
             base["workload_revs"] = dict(o0.get("workload_revs") or base["workload_revs"])
             base["toolchain"] = dict(o0.get("toolchain") or base["toolchain"])
@@ -1359,7 +1362,10 @@ class ComparabilityAndProvenance(unittest.TestCase):
             self.assertEqual(r0.returncode, 0, r0.stdout + r0.stderr)
             o0 = json.loads((Path(td) / "o0.json").read_text())
             base = full_valid_baseline(mod)
-            base["host"]["hostname"] = o0["host"]["hostname"]
+            # Same host AND same condition: sync the whole host block (label
+            # and fingerprint included) — a labeled baseline no longer matches
+            # an unlabeled run on the same machine.
+            base["host"] = dict(o0["host"])
             base["settings"] = dict(o0["settings"])
             base["toolchain"] = dict(o0.get("toolchain") or full_valid_baseline(mod)["toolchain"])
             base["workload_revs"] = dict(o0["workload_revs"], batteries="deadbeef" * 5)
@@ -1379,7 +1385,10 @@ class ComparabilityAndProvenance(unittest.TestCase):
             self.assertEqual(r0.returncode, 0, r0.stdout + r0.stderr)
             o0 = json.loads((Path(td) / "o0.json").read_text())
             base = full_valid_baseline(mod)
-            base["host"]["hostname"] = o0["host"]["hostname"]
+            # Same host AND same condition: sync the whole host block (label
+            # and fingerprint included) — a labeled baseline no longer matches
+            # an unlabeled run on the same machine.
+            base["host"] = dict(o0["host"])
             base["settings"] = dict(o0["settings"])
             base["workload_revs"] = dict(o0["workload_revs"])
             base["toolchain"] = {"lean_toolchain": "leanprover/lean4:v4.34.0",
@@ -1406,7 +1415,10 @@ class ComparabilityAndProvenance(unittest.TestCase):
                 for m in wl["modes"].values():
                     m["median_ms"] = 1_000_000.0
                     m["runs_ms"] = [1_000_000.0] * m["trials"]
-            base["host"]["hostname"] = o0["host"]["hostname"]
+            # Same host AND same condition: sync the whole host block (label
+            # and fingerprint included) — a labeled baseline no longer matches
+            # an unlabeled run on the same machine.
+            base["host"] = dict(o0["host"])
             base["settings"] = dict(o0["settings"])
             base["workload_revs"] = dict(o0["workload_revs"])
             base["toolchain"] = dict(o0.get("toolchain") or full_valid_baseline(mod)["toolchain"])
@@ -1445,7 +1457,10 @@ class ComparabilityAndProvenance(unittest.TestCase):
                 for m in wl["modes"].values():
                     m["median_ms"] = 1_000_000.0
                     m["runs_ms"] = [1_000_000.0] * m["trials"]
-            base["host"]["hostname"] = o0["host"]["hostname"]
+            # Same host AND same condition: sync the whole host block (label
+            # and fingerprint included) — a labeled baseline no longer matches
+            # an unlabeled run on the same machine.
+            base["host"] = dict(o0["host"])
             base["settings"] = dict(o0["settings"])
             base["workload_revs"] = dict(o0["workload_revs"])
             base["toolchain"] = dict(o0.get("toolchain") or full_valid_baseline(mod)["toolchain"])
