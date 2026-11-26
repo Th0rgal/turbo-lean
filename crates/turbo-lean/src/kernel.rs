@@ -216,14 +216,28 @@ pub fn probe_con_leche_support_for_selection(
 ) -> Option<String> {
     if !matches!(
         requested,
-        KernelEngineSelection::ConLeche | KernelEngineSelection::Both
+        KernelEngineSelection::Auto
+            | KernelEngineSelection::ConLeche
+            | KernelEngineSelection::Both
     ) {
         return probe_con_leche_support(lean_toolchain);
     }
     if normalize_lean_toolchain(lean_toolchain) != PINNED_CON_LECHE_TOOLCHAIN {
         return None;
     }
-    let bin = discover_con_leche_binary(workspace_root).ok()?;
+    let bin = match discover_con_leche_binary(workspace_root) {
+        Ok(b) => b,
+        // G1c: `auto` also accepts the toolchain-bundled binary; the explicit selections keep
+        // failing closed on the provisioned (`TURBO_CON_LECHE_BIN` / bridge) binaries only. The
+        // bundled binary lives outside any checkout, so the bridge-identity check below does
+        // not apply to it.
+        Err(_) if requested == KernelEngineSelection::Auto => {
+            return bundled_toolchain_con_leche_binary(lean_toolchain)
+                .filter(|b| is_executable_file(b))
+                .map(|_| PINNED_CON_LECHE_REV.to_string());
+        }
+        Err(_) => return None,
+    };
     if let Some(proj) = workspace_root {
         let canon_proj = proj.canonicalize().ok()?;
         let checkout = canon_proj
@@ -430,6 +444,28 @@ pub fn discover_con_leche_binary(workspace_root: Option<&Path>) -> Result<PathBu
 
     anyhow::bail!(
         "Verified `con-leche` binary not found (expected `{CON_LECHE_BIN_ENV}` or `{BRIDGE_CON_LECHE_BIN_REL}` built at rev `{PINNED_CON_LECHE_REV}`)"
+    )
+}
+
+/// The toolchain-bundled `con-leche` binary (`$ELAN_HOME/toolchains/<toolchain>/bin/con-leche`,
+/// with elan's directory mangling of `/` to `--` and `:` to `---`), for the `auto` selection's
+/// support probe (G1c). Returns the path only for the pinned toolchain; callers check that it is
+/// an executable file. Explicit `con-leche`/`both` selections never consult it.
+fn bundled_toolchain_con_leche_binary(lean_toolchain: &str) -> Option<PathBuf> {
+    let toolchain = normalize_lean_toolchain(lean_toolchain);
+    if toolchain != PINNED_CON_LECHE_TOOLCHAIN {
+        return None;
+    }
+    let elan_home = std::env::var_os("ELAN_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".elan")))?;
+    let dir_name = toolchain.replace('/', "--").replace(':', "---");
+    Some(
+        elan_home
+            .join("toolchains")
+            .join(dir_name)
+            .join("bin")
+            .join("con-leche"),
     )
 }
 
@@ -1583,6 +1619,103 @@ mod tests {
                 "unexpected error: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn test_kernel_auto_selects_bundled_con_leche_on_pinned_toolchain() {
+        // G1c: `--kernel auto` performs the real support probe. On the pinned toolchain it also
+        // accepts the toolchain-bundled binary (`$ELAN_HOME/toolchains/<pinned>/bin/con-leche`);
+        // off the pin, or without the binary, it resolves to the standard kernel with a fallback
+        // reason. Explicit `con-leche`/`both` keep failing closed on the provisioned
+        // (env / bridge) binaries only: the bundled binary never satisfies them.
+        static ELAN_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _env = ELAN_TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_elan = std::env::var_os("ELAN_HOME");
+        let prev_bin = std::env::var_os(CON_LECHE_BIN_ENV);
+        std::env::remove_var(CON_LECHE_BIN_ENV);
+
+        let tmp = std::env::temp_dir().join(format!(
+            "turbo_lean_g1c_elan_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ws = tmp.join("ws");
+        let elan = tmp.join("elan");
+        let bin_dir = elan.join("toolchains/leanprover--lean4---v4.35.0/bin");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        // No bundled binary yet: auto on the pinned toolchain stays standard, with a reason.
+        std::env::set_var("ELAN_HOME", &elan);
+        let std_prov = resolve_kernel_engine_in_workspace(
+            KernelEngineSelection::Auto,
+            PINNED_CON_LECHE_TOOLCHAIN,
+            Some(&ws),
+        )
+        .unwrap();
+        assert_eq!(std_prov.kernel_engine, ResolvedKernelEngine::Standard);
+        assert!(std_prov.fallback_reason.is_some());
+
+        // Bundled executable present: auto selects con-leche with the pinned rev, no fallback.
+        let bundled = bin_dir.join("con-leche");
+        std::fs::write(&bundled, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bundled, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let auto_prov = resolve_kernel_engine_in_workspace(
+            KernelEngineSelection::Auto,
+            PINNED_CON_LECHE_TOOLCHAIN,
+            Some(&ws),
+        )
+        .unwrap();
+        assert_eq!(
+            auto_prov.kernel_engine,
+            ResolvedKernelEngine::ConLeche,
+            "auto on the pinned toolchain must select the bundled con-leche"
+        );
+        assert_eq!(
+            auto_prov.con_leche_rev.as_deref(),
+            Some(PINNED_CON_LECHE_REV)
+        );
+        assert_eq!(auto_prov.fallback_reason, None);
+
+        // Off the pinned toolchain the bundled binary is never consulted.
+        let off_pin = resolve_kernel_engine_in_workspace(
+            KernelEngineSelection::Auto,
+            "leanprover/lean4:v4.36.0",
+            Some(&ws),
+        )
+        .unwrap();
+        assert_eq!(off_pin.kernel_engine, ResolvedKernelEngine::Standard);
+
+        // Explicit selections keep failing closed: the bundled binary does not provision them.
+        for req in [KernelEngineSelection::ConLeche, KernelEngineSelection::Both] {
+            let err = resolve_kernel_engine_in_workspace(
+                req,
+                PINNED_CON_LECHE_TOOLCHAIN,
+                Some(&ws),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("fail-closed kernel gate"),
+                "explicit {req} must stay fail-closed with only the bundled binary present: {err:#}"
+            );
+        }
+
+        match prev_elan {
+            Some(v) => std::env::set_var("ELAN_HOME", v),
+            None => std::env::remove_var("ELAN_HOME"),
+        }
+        match prev_bin {
+            Some(v) => std::env::set_var(CON_LECHE_BIN_ENV, v),
+            None => std::env::remove_var(CON_LECHE_BIN_ENV),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

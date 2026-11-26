@@ -16,12 +16,14 @@
 - `turbo-lean` wraps kernel *selection*, not the kernel itself: `crates/turbo-lean/src/kernel.rs`
   (`parse_selection`, `resolve_kernel_engine_in_workspace` at `kernel.rs:281`), with the routing rule
   defined and proved in Lean: `routeKernelEngine`, `lean/TurboLean/PolicyGates.lean:113-118`.
-- Production routing today: `auto` is routed by PolicyGates to con-leche when `conLecheSupported` is
-  true (`routeKernelEngine`, `lean/TurboLean/PolicyGates.lean:113-118`), but the current Rust resolver
-  does not probe support for `auto` — `probe_con_leche_support_for_selection` probes only for explicit
-  `con-leche`/`both` selections and returns an unconditional `None` stub otherwise
-  (`crates/turbo-lean/src/kernel.rs:207-221`) — so production `auto` currently resolves to the
-  standard Lean kernel.
+- Production routing: `auto` is routed by PolicyGates to con-leche when `conLecheSupported` is
+  true (`routeKernelEngine`, `lean/TurboLean/PolicyGates.lean:113-118`), and since G1c the Rust
+  resolver probes support for `auto` too: `probe_con_leche_support_for_selection` checks the pinned
+  toolchain and the provisioned binaries, and `auto` additionally accepts the toolchain-bundled
+  binary at `$ELAN_HOME/toolchains/<pinned>/bin/con-leche` (`bundled_toolchain_con_leche_binary`,
+  `crates/turbo-lean/src/kernel.rs`). Explicit `con-leche`/`both` selections keep failing closed on
+  the provisioned (`TURBO_CON_LECHE_BIN` / bridge) binaries only. Pinned both ways by
+  `test_kernel_auto_selects_bundled_con_leche_on_pinned_toolchain` (`kernel.rs`).
 - **Not yet inventoried**: end-to-end confirmation of the engine that executes for each CLI entrypoint
   on a built binary (needs a build; none were run for this docs pass).
 
