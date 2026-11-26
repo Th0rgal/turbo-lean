@@ -859,10 +859,15 @@ impl TurboStore {
                 if uver < 9 {
                     // G1a: `kernel_audited_oleans_auth` gained the MAC-attested
                     // `csimp_posture_digest` column; audited rows are re-derivable, so the table
-                    // is rebuilt rather than migrated in place.
-                    let _ = conn.execute("DROP TABLE IF EXISTS kernel_audited_oleans_auth", []);
+                    // is rebuilt rather than migrated in place. The DROP, CREATE and version
+                    // bump run in ONE transaction with the error propagated (review 22ae951a
+                    // F5): a DROP that failed (e.g. busy past the timeout) with a succeeding
+                    // CREATE IF NOT EXISTS used to leave the old 8-column table at
+                    // user_version 9, after which every audited-authority write failed hard on
+                    // the missing column, permanently. A failed migration now leaves the store
+                    // at the old version and retries on the next open.
                     conn.execute_batch(&format!(
-                        "{}\nPRAGMA user_version = 9;",
+                        "BEGIN IMMEDIATE;\nDROP TABLE IF EXISTS kernel_audited_oleans_auth;\n{}\nPRAGMA user_version = 9;\nCOMMIT;",
                         KERNEL_AUDITED_OLEANS_AUTH_DDL
                     ))?;
                 }
