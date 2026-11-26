@@ -1439,7 +1439,59 @@ pub(crate) fn input_closure_sweep_mods(
         .nodes
         .iter()
         .filter_map(|(m, n)| {
-            let owned = node_owned(n);
+            // Review a64324fd F6 (reshaping cf31dd1e F6): ownership is decided FIRST.
+            // A non-owned node runs only the config-walking gates (an input-bearing
+            // library or executable can build it) before it is dismissed — never the
+            // module resolvers or per-module source reads, which on a Mathlib import
+            // meant thousands of file reads on every sweep just to decide whether to
+            // print a warning.
+            if !node_owned(n) {
+                if crate::module_builder::input_bearing_libs_for_module(cfg, m).is_empty()
+                    && crate::module_builder::input_bearing_exes_for_module(cfg, m).is_empty()
+                {
+                    return None;
+                }
+                // cf31dd1e F6: an EXCLUDED non-owned input-bearing seed used to fail
+                // the freshness check loudly; now that the sweep skips it, a stale one
+                // must not go silent while the purge path fails closed on the same
+                // state. Said once per module per process (a64324fd F6: the sweep runs
+                // on every freshness probe, and an un-deduped eprintln repeated each
+                // time).
+                let spec =
+                    crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, m)
+                        .or_else(|| {
+                            match crate::module_builder::resolve_import_site(cfg, m) {
+                                crate::module_builder::ImportSite::Module(s) => Some(*s),
+                                _ => None,
+                            }
+                        });
+                if spec
+                    .as_ref()
+                    .is_some_and(crate::module_builder::spec_own_artifact_stale_on_disk)
+                {
+                    static WARNED_STALE_NON_OWNED: std::sync::OnceLock<
+                        std::sync::Mutex<std::collections::BTreeSet<String>>,
+                    > = std::sync::OnceLock::new();
+                    let first_time = WARNED_STALE_NON_OWNED
+                        .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
+                        .lock()
+                        .map(|mut warned| warned.insert(m.clone()))
+                        .unwrap_or(true);
+                    if first_time {
+                        eprintln!(
+                            "[turbo-lean] input-bearing module `{}` lives in a non-owned checkout and its artifacts are stale on disk; the freshness sweep does not cover it — {}",
+                            m,
+                            crate::module_builder::non_owned_dep_refresh_remedy(
+                                m,
+                                &cfg.root_pkg.pkg_root,
+                                &n.pkg_root,
+                                crate::module_builder::OwnerMarkerSite::PkgRootOrParent,
+                            )
+                        );
+                    }
+                }
+                return None;
+            }
             let spec = crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, m)
                 .or_else(
                     || match crate::module_builder::resolve_import_site(cfg, m) {
@@ -1467,27 +1519,6 @@ pub(crate) fn input_closure_sweep_mods(
                     .map(|s| crate::module_builder::source_uses_include_str(&s))
                     .unwrap_or(false);
             if !input_bearing {
-                return None;
-            }
-            if !owned {
-                // Review cf31dd1e F6: an EXCLUDED non-owned input-bearing seed used to
-                // fail the freshness check loudly; now that the sweep skips it, a stale
-                // one must not go silent while the purge path fails closed on the same
-                // state. Say so once, naming the remedy.
-                if spec
-                    .as_ref()
-                    .is_some_and(crate::module_builder::spec_own_artifact_stale_on_disk)
-                {
-                    eprintln!(
-                        "[turbo-lean] input-bearing module `{}` lives in a non-owned checkout and its artifacts are stale on disk; the freshness sweep does not cover it — {}",
-                        m,
-                        crate::module_builder::non_owned_dep_refresh_remedy(
-                            m,
-                            &cfg.root_pkg.pkg_root,
-                            &n.pkg_root,
-                        )
-                    );
-                }
                 return None;
             }
             Some(m.clone())

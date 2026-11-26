@@ -86,7 +86,12 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
                  artifacts first ({}) and retry.",
                 spec.module_name,
                 spec.pkg_root.display(),
-                non_owned_dep_refresh_remedy(&spec.module_name, &cfg.root_pkg.pkg_root, &spec.pkg_root)
+                non_owned_dep_refresh_remedy(
+                    &spec.module_name,
+                    &cfg.root_pkg.pkg_root,
+                    &spec.pkg_root,
+                    OwnerMarkerSite::PkgRootOrParent,
+                )
             )
         };
         let Ok(src_raw) = fs::read_to_string(&spec.src_path) else {
@@ -928,12 +933,16 @@ pub(crate) fn dep_pkg_lake_targets_owned_by_project(
 ///   wrong: an editable sibling clone lost ownership (review finding 6's silent
 ///   skips returned), while a `.git`-less tarball or rsync copy behind a symlinked
 ///   `.lake/packages` entry stayed owned, exactly the #434 shared-checkout write;
-/// * a `path` manifest entry whose directory sits in no git repository, with the
-///   project in none either, stays editable scratch (finding 6): with no repository
-///   signal on either side there is no shared-checkout evidence. An out-of-tree GIT
-///   clone behind a `path` entry with no marker (`require mathlib from
-///   "/abs/mathlib4"`, one clone shared across projects) is refreshed by its own
-///   workspace, exactly the #434 class (DA 71add786 finding 4).
+/// * a `path` manifest entry whose directory sits in no git repository stays editable
+///   scratch (finding 6) — whether or not the PROJECT is in git — when its DECLARED
+///   directory is relative, reaches the package without a symlink hop, and lies
+///   outside the project's own packagesDir slot (review a64324fd F4). An ABSOLUTE
+///   declared dir (`require mathlib from "/opt/mathlib"`: a tarball, container image
+///   or store path shared across projects) and a symlinked entry carry no
+///   editable-scratch evidence and need the owner marker. An out-of-tree GIT clone
+///   behind a `path` entry with no marker (`require mathlib from "/abs/mathlib4"`,
+///   one clone shared across projects) is refreshed by its own workspace, exactly
+///   the #434 class (DA 71add786 finding 4).
 fn pkg_root_owned_by_project(
     cfg: &ProjectConfig,
     pkg_name: &str,
@@ -974,14 +983,25 @@ fn pkg_root_owned_by_project(
     // `require … from "../libs/x"` shape only. A package reached THROUGH A SYMLINK (the
     // #434 shape) must not inherit ownership from an enclosing repository, and an
     // unrelated enclosing checkout (a dotfiles repository at `$HOME`) would otherwise
-    // make every git-less neighbor under it count as owned. The raw path therefore has
-    // to reach the package without a symlink hop: its lexical normalization equals its
-    // canonicalization. A symlink above BOTH roots loses this grant conservatively; the
-    // owner marker is the way back.
-    let raw_symlink_free = pkg_canon
-        .as_deref()
-        .ok()
-        .is_some_and(|canon| lexical_normalize(pkg_root) == *canon);
+    // make every git-less neighbor under it count as owned. Review a64324fd F3: the
+    // symlink-hop test runs on the manifest's DECLARED directory, never on `pkg_root`
+    // alone — the resolver may hand back the symlink's canonical target, on which
+    // `lexical_normalize(pkg_root) == canon` is vacuously true and sees nothing. With
+    // no matching `path` entry (a git-pinned clone under `.lake/packages`), the raw
+    // `pkg_root`'s own components are walked instead, which catches a symlinked
+    // packages slot the lexical test also caught. A symlink anywhere on the declared
+    // route loses this grant conservatively; the owner marker is the way back.
+    let raw_symlink_free = pkg_canon.as_deref().ok().is_some_and(|canon| {
+        let declared = declared_path_dep_dirs(cfg, pkg_name, pkg_base_name, pkg_root);
+        if declared.is_empty() {
+            lexical_normalize(pkg_root) == *canon && components_symlink_free(pkg_root)
+        } else {
+            declared.iter().any(|dir| {
+                components_symlink_free(dir)
+                    && fs::canonicalize(dir).is_ok_and(|c| c == *canon)
+            })
+        }
+    });
     let pkg_repo = pkg_canon
         .ok()
         .as_deref()
@@ -992,11 +1012,13 @@ fn pkg_root_owned_by_project(
         // "../foo"`, no `.git` anywhere above it) is editable scratch — finding 6's
         // shape — whether or not the PROJECT is a git checkout; the previous
         // `(None, Some(_)) => false` arm silently dropped it from the closure sweep
-        // and made the purge refuse as soon as the project was in git. An entry under
-        // the project's own packagesDir SLOT (a symlinked or copied
-        // `.lake/packages/<dep>`) is NOT that shape: a git-less copy there is the
-        // #434 tarball case and stays non-owned.
-        (None, _) => manifest_path_dep_declared_outside_packages_slot(
+        // and made the purge refuse as soon as the project was in git. Review
+        // a64324fd F4 bounds the grant: only a RELATIVE, symlink-free declared dir
+        // outside the project's own packagesDir SLOT counts. An absolute entry
+        // (`/opt/mathlib`, a store path) is a shared install, a symlinked `../foo`
+        // reaches a shared directory, and a git-less copy under the slot is the #434
+        // tarball case: all three stay non-owned without the marker.
+        (None, _) => manifest_path_dep_grants_scratch_ownership(
             cfg,
             pkg_name,
             pkg_base_name,
@@ -1006,44 +1028,89 @@ fn pkg_root_owned_by_project(
     }
 }
 
-/// Whether the manifest names this package as a `path` dependency whose DECLARED
-/// directory lies outside the project's own packagesDir slot (review cf31dd1e F2): a `path` entry
-/// declared under `.lake/packages/<dep>` is where a symlinked or copied tarball lives —
-/// the #434 shape — whatever form the resolved package root takes (the resolver may
-/// hand back the symlink's canonical target, which no raw-path test on the root can
-/// see). The declared location is compared lexically, never canonicalized, precisely so
-/// the symlink target cannot launder the entry out of the slot.
-fn manifest_path_dep_declared_outside_packages_slot(
+/// The manifest's `path`-dependency directories matching this package: the
+/// user-visible route to the package, which the resolved `pkg_root` cannot stand in
+/// for once the resolver hands back a symlink's canonical target (review a64324fd
+/// F3/F4). The manifest parser stores each `dir` joined onto the project root WITHOUT
+/// normalizing (`project_dir.join(d)`), so a relative declaration keeps the project
+/// root as its prefix — `..` components and symlink names as spelled — while an
+/// absolute declaration replaces the root and keeps none of it. Matching mirrors the
+/// ownership walk's identity signals: the manifest name, the target base name, or a
+/// directory that is or canonicalizes to the package root.
+fn declared_path_dep_dirs(
+    cfg: &ProjectConfig,
+    pkg_name: &str,
+    pkg_base_name: &str,
+    pkg_root: &Path,
+) -> Vec<PathBuf> {
+    let pkg_canon = pkg_root.canonicalize().ok();
+    cfg.manifest_packages
+        .iter()
+        .filter(|mp| {
+            mp.pkg_type == "path"
+                && (mp.name == pkg_name
+                    || (!pkg_base_name.is_empty() && mp.name == pkg_base_name)
+                    || mp.dir == pkg_root
+                    || mp
+                        .dir
+                        .canonicalize()
+                        .ok()
+                        .zip(pkg_canon.as_ref())
+                        .is_some_and(|(a, b)| a == *b))
+        })
+        .map(|mp| mp.dir.clone())
+        .collect()
+}
+
+/// Whether a manifest `path` entry grants this git-less package editable-scratch
+/// ownership (review cf31dd1e F2, bounded by a64324fd F4). The entry must have been
+/// DECLARED RELATIVE (an absolute entry — `/opt/mathlib`, a store path — is a shared
+/// install carrying no scratch evidence), must reach the package without a symlink
+/// hop (a symlinked `../foo` reaches a shared directory; the walk runs on the
+/// declared route, so the resolver's canonical target cannot launder it), and must
+/// lie outside the project's own packagesDir slot (a `path` entry declared under
+/// `.lake/packages/<dep>` is where a symlinked or copied tarball lives — the #434
+/// shape). The slot comparison is lexical, never canonicalized, precisely so the
+/// symlink target cannot launder the entry out of the slot. The owner marker is the
+/// way back for every refused shape.
+///
+/// Declared-relative is read back from the stored form: the parser joins a relative
+/// `dir` onto the project root unnormalized, so the stored path keeps that prefix,
+/// while an absolute `dir` replaces the root (`PathBuf::join` semantics). An absolute
+/// declaration that happens to sit under the project root reads as relative here,
+/// which is harmless: it is in-tree, the shape the canonical `starts_with` ownership
+/// arm already grants.
+fn manifest_path_dep_grants_scratch_ownership(
     cfg: &ProjectConfig,
     pkg_name: &str,
     pkg_base_name: &str,
     pkg_root: &Path,
 ) -> bool {
     let slot = lexical_normalize(&cfg.root_pkg.pkg_root.join(&cfg.root_pkg.packages_dir));
-    let pkg_canon = pkg_root.canonicalize().ok();
-    cfg.manifest_packages.iter().any(|mp| {
-        if mp.pkg_type != "path" {
+    declared_path_dep_dirs(cfg, pkg_name, pkg_base_name, pkg_root)
+        .iter()
+        .any(|dir| {
+            dir.starts_with(&cfg.root_pkg.pkg_root)
+                && components_symlink_free(dir)
+                && !lexical_normalize(dir).starts_with(&slot)
+        })
+}
+
+/// Every on-disk component of `path`, the leaf included, is reached without a symlink:
+/// `fs::symlink_metadata` on each cumulative prefix reports a non-symlink. A prefix
+/// that does not exist counts as symlink-free (there is nothing to traverse), and the
+/// walk runs on the path AS SPELLED, with no `..` folding: a symlink component later
+/// cancelled by `..` still refuses, conservatively, because the kernel resolves the
+/// symlink before applying `..` while a lexical fold does not (review a64324fd F3).
+fn components_symlink_free(path: &Path) -> bool {
+    let mut cur = PathBuf::new();
+    for comp in path.components() {
+        cur.push(comp.as_os_str());
+        if fs::symlink_metadata(&cur).is_ok_and(|md| md.file_type().is_symlink()) {
             return false;
         }
-        let matches = mp.name == pkg_name
-            || (!pkg_base_name.is_empty() && mp.name == pkg_base_name)
-            || mp.dir == pkg_root
-            || mp
-                .dir
-                .canonicalize()
-                .ok()
-                .zip(pkg_canon.as_ref())
-                .is_some_and(|(a, b)| a == *b);
-        if !matches {
-            return false;
-        }
-        let declared = if mp.dir.is_absolute() {
-            mp.dir.clone()
-        } else {
-            cfg.root_pkg.pkg_root.join(&mp.dir)
-        };
-        !lexical_normalize(&declared).starts_with(&slot)
-    })
+    }
+    true
 }
 
 /// Fold `.` and `..` components textually, touching no filesystem state: the comparison
@@ -1086,6 +1153,17 @@ fn owner_marker_names_project(pkg_root: &Path, root_canon: &Path) -> bool {
     marker_names_root(pkg_root) || pkg_root.parent().is_some_and(marker_names_root)
 }
 
+/// Where the caller honors a `.turbo-lean-packages-owner` marker, so the remedy's
+/// marker hint names a location that would actually clear the refusal (review
+/// a64324fd F2). The ownership walk (`pkg_root_owned_by_project`) and the freshness
+/// sweep read the marker from the package root or the directory that holds it; the
+/// #436 build-scope gate (`dag.rs`) honors only a marker in the project's canonical
+/// packages dir, so a marker placed in the package root cannot clear that gate.
+pub(crate) enum OwnerMarkerSite {
+    PkgRootOrParent,
+    PackagesDir(PathBuf),
+}
+
 /// The remedy the non-owned-checkout refusal names. Review cf31dd1e F3: it depends on
 /// where the package lives. An entry under the project's own tree is refreshed through
 /// the PROJECT's workspace (running `lake` inside `.lake/packages/<dep>` resolves the
@@ -1094,24 +1172,50 @@ fn owner_marker_names_project(pkg_root: &Path, root_canon: &Path) -> bool {
 /// from this project would write into a checkout other projects may share — the very
 /// #434 write these refusals exist to stop — so the fix there is the checkout's own
 /// workspace, or the owner marker when the checkout really is this project's.
+///
+/// Review a64324fd F2: the branch is decided on CANONICAL paths, and the message
+/// prints them. The raw root of a symlinked `.lake/packages/<dep>` entry is lexically
+/// under the project, so a raw `starts_with` would send the user to `lake build +X`
+/// from the project root — a write through the symlink into the shared checkout, the
+/// very write the refusal exists to stop. The canonical project root is also what
+/// `owner_marker_names_project` and the #436 gate compare marker CONTENT against, so
+/// the marker hint prints that form too.
 pub(crate) fn non_owned_dep_refresh_remedy(
     module: &str,
     project_root: &Path,
     pkg_root: &Path,
+    marker_site: OwnerMarkerSite,
 ) -> String {
-    if pkg_root.starts_with(project_root) {
-        format!(
+    let root_canon =
+        fs::canonicalize(project_root).unwrap_or_else(|_| lexical_normalize(project_root));
+    let pkg_canon = fs::canonicalize(pkg_root).unwrap_or_else(|_| lexical_normalize(pkg_root));
+    if pkg_canon.starts_with(&root_canon) {
+        return format!(
             "run `lake build +{}` from the project root {}",
             module,
-            project_root.display()
-        )
-    } else {
-        format!(
-            "refresh it from that checkout's own workspace (`lake build` in {}), or, if this project truly owns it, mark it with a `.turbo-lean-packages-owner` file naming {}",
-            pkg_root.display(),
-            project_root.display()
-        )
+            root_canon.display()
+        );
     }
+    let marker_hint = match marker_site {
+        OwnerMarkerSite::PkgRootOrParent => format!(
+            "mark it with a `.turbo-lean-packages-owner` file (in {} or the directory \
+             that holds it) naming {}",
+            pkg_canon.display(),
+            root_canon.display()
+        ),
+        OwnerMarkerSite::PackagesDir(dir) => format!(
+            "put a `.turbo-lean-packages-owner` file naming {} in the packages dir {} \
+             (the build-scope gate honors the marker only there)",
+            root_canon.display(),
+            dir.display()
+        ),
+    };
+    format!(
+        "refresh it from that checkout's own workspace (`lake build` in {}), or, if \
+         this project truly owns it, {}",
+        pkg_canon.display(),
+        marker_hint
+    )
 }
 
 /// A package root inside a *different* package's `.lake/packages` is a nested checkout
@@ -2783,7 +2887,10 @@ pub(super) fn run_audit_chunk_subprocess(
     record_scheduler_test_event("audit_subprocess_end", mod_names);
     // Review bb7c0f2f F4: an allocation failure under the worker cap names the knob (so
     // `error_names_memory_cap` can classify it), and a memory-capped failure is never
-    // bisected — the halving would redo full-closure loads under the same cap.
+    // bisected — the halving would redo full-closure loads under the same cap. Review
+    // a64324fd F5: only the DEFINITE allocation signature skips bisection; the "may
+    // have been" signal note covers any SIGSEGV/SIGABRT (a Lean stack overflow, an
+    // unrelated crash), which still deserves the bisection that isolates the module.
     let attempt = out.and_then(|o| {
         parse_worker_audit_reply(&o, mod_names).map_err(|e| {
             let note = crate::zygote::WorkerBudget::memory_kill_note(
@@ -2802,7 +2909,7 @@ pub(super) fn run_audit_chunk_subprocess(
         Ok(()) => Ok(()),
         Err(e)
             if mod_names.len() > 1
-                && !crate::zygote::WorkerBudget::error_names_memory_cap(&e) =>
+                && !crate::zygote::WorkerBudget::error_names_definite_memory_cap(&e) =>
         {
             let mid = mod_names.len() / 2;
             run_audit_chunk_subprocess(
@@ -3035,6 +3142,19 @@ pub(super) fn run_audit_or_replay_batch_worker_bound(
             Err(chunk_err) => {
                 if chunk.len() == 1 {
                     per_mod.insert(chunk[0].clone(), (Err(chunk_err), None));
+                } else if crate::zygote::WorkerBudget::error_names_definite_memory_cap(&chunk_err)
+                {
+                    // Review a64324fd F5: a chunk that provably hit the per-worker
+                    // memory cap is recorded for the WHOLE chunk, mirroring the
+                    // union-replay arm's early return above — the per-module retry
+                    // below would redo up to a chunk's worth of full-closure loads
+                    // under the same cap, the cost the no-bisect rule (review
+                    // bb7c0f2f F4) exists to avoid, and the error text already names
+                    // the knob to raise.
+                    let text = format!("{chunk_err:#}");
+                    for m in chunk {
+                        per_mod.insert(m.clone(), (Err(anyhow::anyhow!("{text}")), None));
+                    }
                 } else {
                     for m in chunk {
                         let single_skip_replay = (is_untrusted && pre_replayed)
@@ -3835,6 +3955,220 @@ mod host_effect_taint_tests {
             !dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
             "a `.git`-less out-of-tree copy behind a symlinked packages entry is not \
              lake-built from this project (#434)"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// Review cf31dd1e F1, pinned by a64324fd F9: the owner marker is honored on the
+    /// CANONICAL package root. When the project's whole packagesDir is a symlink to a
+    /// relocated, marker-owned directory, a nested symlinked entry under it pointing
+    /// at a SHARED checkout must not inherit the marker through its raw parent (the
+    /// relocated dir) — canonically its parent is wherever the shared checkout lives,
+    /// which carries no marker.
+    #[cfg(unix)]
+    #[test]
+    fn host_effects_nested_symlink_under_marker_owned_relocated_slot_is_not_owned() -> Result<()> {
+        let dir = temp_dir("relocated_marker_slot");
+        let proj = dir.join("proj");
+        let relocated = dir.join("relocated_packages");
+        let shared = dir.join("shared").join("lintlib");
+        fs::create_dir_all(proj.join(".lake"))?;
+        fs::create_dir_all(&relocated)?;
+        fs::create_dir_all(&shared)?;
+        let tc = include_str!("../../../../lean/lean-toolchain");
+        fs::write(shared.join("lean-toolchain"), tc)?;
+        fs::write(
+            shared.join("lakefile.toml"),
+            "name = \"lintlib\"\ndefaultTargets = [\"LintLib\"]\n[[lean_lib]]\nname = \"LintLib\"\n",
+        )?;
+        fs::write(shared.join("LintLib.lean"), LINTER_SHAPE)?;
+        fs::write(proj.join("lean-toolchain"), tc)?;
+        fs::write(
+            proj.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage proj where\nrequire lintlib from \".lake/packages/lintlib\"\n@[default_target]\nlean_lib Proj where\n",
+        )?;
+        fs::write(proj.join("Proj.lean"), "import LintLib\ndef p : Nat := 1\n")?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [{
+                    "type": "path",
+                    "name": "lintlib",
+                    "dir": ".lake/packages/lintlib",
+                    "manifestFile": "lake-manifest.json",
+                    "inherited": false,
+                    "configFile": "lakefile.toml"
+                }]
+            }))?,
+        )?;
+        // The packagesDir itself is a symlink to the relocated dir; the relocated dir
+        // carries the marker; the nested entry is a symlink to the shared checkout.
+        std::os::unix::fs::symlink(&relocated, proj.join(".lake/packages"))?;
+        std::os::unix::fs::symlink(&shared, relocated.join("lintlib"))?;
+        git_init_commit(&proj)?;
+        let canon = fs::canonicalize(&proj)?;
+        fs::write(
+            relocated.join(".turbo-lean-packages-owner"),
+            format!("{}\n", canon.display()),
+        )?;
+        reset_lake_inputs_tag_memo();
+        let cfg = resolve_project_config(&canon)?;
+        let dep_pkg = cfg
+            .dep_pkgs
+            .iter()
+            .find(|dp| dp.name == "lintlib")
+            .expect("nested-symlink lintlib dependency resolves");
+        let spec = resolve_module_in_package(dep_pkg, false, "LintLib")
+            .expect("LintLib module resolves through the relocated slot");
+        assert!(
+            !spec_artifacts_purgeable_from_project_root(&cfg, &spec),
+            "a nested symlinked entry under a marker-owned relocated slot points at a \
+             shared checkout: the marker must not be inherited through the raw parent \
+             (review cf31dd1e F1)"
+        );
+        assert!(
+            !dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
+            "a shared checkout behind a marker-owned relocated slot is never \
+             lake-built from this project (review cf31dd1e F1)"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// Review cf31dd1e F5, pinned by a64324fd F3/F9: a package reached THROUGH A
+    /// SYMLINK must not inherit same-repository ownership from an enclosing checkout
+    /// (a dotfiles repository above both would otherwise own every symlinked
+    /// neighbor). The symlink-hop test runs on the manifest's DECLARED directory, so
+    /// it holds even when the resolver hands back the symlink's canonical target, on
+    /// which the old `lexical_normalize == canon` test was vacuously true.
+    #[cfg(unix)]
+    #[test]
+    fn host_effects_symlinked_package_inside_enclosing_git_repo_is_not_owned() -> Result<()> {
+        let dir = temp_dir("enclosing_repo_symlink");
+        let proj = dir.join("proj");
+        let shared = dir.join("shared").join("lintlib");
+        fs::create_dir_all(&proj)?;
+        fs::create_dir_all(&shared)?;
+        let tc = include_str!("../../../../lean/lean-toolchain");
+        fs::write(shared.join("lean-toolchain"), tc)?;
+        fs::write(
+            shared.join("lakefile.toml"),
+            "name = \"lintlib\"\ndefaultTargets = [\"LintLib\"]\n[[lean_lib]]\nname = \"LintLib\"\n",
+        )?;
+        fs::write(shared.join("LintLib.lean"), LINTER_SHAPE)?;
+        fs::write(proj.join("lean-toolchain"), tc)?;
+        fs::write(
+            proj.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage proj where\nrequire lintlib from \"../lintlib_link\"\n@[default_target]\nlean_lib Proj where\n",
+        )?;
+        fs::write(proj.join("Proj.lean"), "import LintLib\ndef p : Nat := 1\n")?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [{
+                    "type": "path",
+                    "name": "lintlib",
+                    "dir": "../lintlib_link",
+                    "manifestFile": "lake-manifest.json",
+                    "inherited": false,
+                    "configFile": "lakefile.toml"
+                }]
+            }))?,
+        )?;
+        std::os::unix::fs::symlink(&shared, dir.join("lintlib_link"))?;
+        // ONE git repository encloses the project, the symlink and the shared
+        // checkout, so the same-repo arm is the one under test.
+        git_init_commit(&dir)?;
+        let canon = fs::canonicalize(&proj)?;
+        reset_lake_inputs_tag_memo();
+        let cfg = resolve_project_config(&canon)?;
+        let dep_pkg = cfg
+            .dep_pkgs
+            .iter()
+            .find(|dp| dp.name == "lintlib")
+            .expect("symlinked lintlib dependency resolves");
+        assert!(
+            !dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
+            "a package reached through a symlink must not inherit ownership from the \
+             enclosing repository (review cf31dd1e F5)"
+        );
+        // The resolver may hand back the symlink's canonical target as the package
+        // root; the declared-dir walk must refuse that form too (review a64324fd F3:
+        // on it, `lexical_normalize(pkg_root) == canon` is vacuously true).
+        let shared_canon = fs::canonicalize(&shared)?;
+        assert!(
+            !pkg_root_owned_by_project(&cfg, "lintlib", "", &shared_canon),
+            "the canonical symlink target must not read as same-repo owned \
+             (review a64324fd F3)"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// Review a64324fd F2/F9: the refusal remedy is decided on CANONICAL paths and
+    /// names them, and its marker hint names the site the CALLER honors.
+    #[cfg(unix)]
+    #[test]
+    fn non_owned_remedy_decides_on_canonical_paths_and_names_the_marker_site() -> Result<()> {
+        let dir = temp_dir("remedy_canon");
+        let proj = dir.join("proj");
+        let shared = dir.join("shared_lintlib");
+        fs::create_dir_all(proj.join(".lake/packages"))?;
+        fs::create_dir_all(&shared)?;
+        std::os::unix::fs::symlink(&shared, proj.join(".lake/packages/lintlib"))?;
+        let raw_pkg = proj.join(".lake/packages/lintlib");
+        let shared_canon = fs::canonicalize(&shared)?;
+        // The raw entry is lexically under the project, but it resolves to a shared
+        // checkout: the remedy must send the user to that checkout's own workspace,
+        // never to `lake build +X` from the project root, which would write through
+        // the symlink (#434).
+        let msg = non_owned_dep_refresh_remedy(
+            "LintLib",
+            &proj,
+            &raw_pkg,
+            OwnerMarkerSite::PkgRootOrParent,
+        );
+        assert!(
+            msg.contains("own workspace"),
+            "symlinked entry gets the out-of-tree remedy: {msg}"
+        );
+        assert!(
+            msg.contains(&shared_canon.display().to_string()),
+            "the remedy names the canonical checkout, not the symlinked slot: {msg}"
+        );
+        assert!(
+            !msg.contains("from the project root"),
+            "the in-project `lake build` advice would write through the symlink: {msg}"
+        );
+        // A real in-tree subdirectory keeps the project-workspace remedy.
+        let real = proj.join(".lake/packages/real");
+        fs::create_dir_all(&real)?;
+        let msg2 = non_owned_dep_refresh_remedy(
+            "Real",
+            &proj,
+            &real,
+            OwnerMarkerSite::PkgRootOrParent,
+        );
+        assert!(
+            msg2.contains("run `lake build +Real` from the project root"),
+            "in-tree entry keeps the project-workspace remedy: {msg2}"
+        );
+        // The #436 build-scope gate honors the marker only in the packages dir, so
+        // its remedy must say so instead of pointing at the package root.
+        let msg3 = non_owned_dep_refresh_remedy(
+            "LintLib",
+            &proj,
+            &raw_pkg,
+            OwnerMarkerSite::PackagesDir(proj.join(".lake/packages")),
+        );
+        assert!(
+            msg3.contains("in the packages dir"),
+            "the dag-gate remedy names the packages dir marker site: {msg3}"
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())
