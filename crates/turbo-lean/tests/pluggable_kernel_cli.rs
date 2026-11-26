@@ -360,6 +360,9 @@ fn pr_and_ci_verify_base_policy_isolation_and_receipt_verification() {
         kernel::KernelEngineSelection::Auto,
         toolchain,
         Some(&repo),
+        // Mirrors `ci-verify`'s policy (review 4f80161c U2), so this host-honest probe keeps
+        // computing the same answer as the resolver inside the CLI child.
+        kernel::BridgeNoGitPolicy::PlainDirFailsClosed,
     ) {
         Some(expected_rev) => {
             assert_eq!(ci_json["kernel_engine"], "con-leche");

@@ -436,6 +436,9 @@ pub(crate) fn run_check_command_inner(
         crate::kernel::resolve_kernel_selection_from_env(None)?,
         &toolchain,
         emit_olean.then_some(canon_dir.as_path()),
+        // `check --emit-olean` runs in plain directories too; a tree without `.git` cannot
+        // have delivered the bridge binary (review 4f80161c U2).
+        crate::kernel::BridgeNoGitPolicy::PlainDirIsUntracked,
     )?;
 
     if resolved_file.is_dir() && decl.is_none() {
