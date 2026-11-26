@@ -122,8 +122,11 @@ TARGET_CONSTRUCT_SPEC: tuple[tuple[str, str, str], ...] = (
     # R5: the width suffix is required; bare `Int` (arbitrary precision) is not
     # a signed fixed-width scalar and must not satisfy this detector.
     ("Type.signed_scalars", "rejected", r"\b(?:Int(?:8|16|32|64)|ISize)\b"),
-    ("LetValue.proj", "lowered_unproved", r"\.(?:fst|snd|[12])\b"),
-    ("LetValue.const", "lowered_unproved", r"\b[A-Z][A-Za-z0-9]*\.[a-z][A-Za-z0-9_!?']*"),
+    # L1 (81986e6a) deleted the pure-phase lowering these two rows named; the
+    # matrix re-bins them as rejected (no impure LCNF form fails closed). Status
+    # only: the detectors and their order, which drive selection, are unchanged.
+    ("LetValue.proj", "rejected", r"\.(?:fst|snd|[12])\b"),
+    ("LetValue.const", "rejected", r"\b[A-Z][A-Za-z0-9]*\.[a-z][A-Za-z0-9_!?']*"),
     ("LetValue.fap.local_call", "lowered_unproved", _MULTI_DEF),
 )
 EXCLUDED_TARGETS: dict[str, str] = {
