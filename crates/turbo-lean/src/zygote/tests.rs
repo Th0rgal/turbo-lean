@@ -3321,10 +3321,13 @@ use super::*;
         // owns nor touches, so with an empty `[csimp] allow` the audit of `App.Main` passes
         // and the early pass must pass too: its refusals must be a subset of the audit's.
         // Auditing `Dep.Lib` itself (the owner as target) must refuse in both modes.
-        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+        // Lock order: env_test_lock first, then BWRAP_TEST_ENV_LOCK, matching every other
+        // dual-lock test in this binary (the pr_verify fixtures take the same order); the
+        // opposite order is an ABBA deadlock on parallel test threads.
+        let _env_guard = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _env_guard = crate::pack::tests::env_test_lock()
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let prev_csimp = std::env::var_os("TURBO_LEAN_ALLOWED_CSIMP");
