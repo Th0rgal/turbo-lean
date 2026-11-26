@@ -621,3 +621,154 @@ def evalCode (fuel : Nat) : VarEnv → HeapState → LNIRCode → Except UBError
     .error (.typeError "reached unreachable code")
 
 end LeanNative.Semantics
+
+/-! ## L2 (roadmap H1 rung L2 "Calls"): function environment for `LNIRCode` evaluation
+
+Contract: `lean/LeanNative/Proofs/LowerCalls.lean`. Append-only section: nothing above
+this line changed, and `evalCode`'s signature and equations are untouched —
+`evalCodeF [] = evalCode` is a theorem (`LowerCalls.lean`), not a redefinition. -/
+
+namespace LeanNative.Semantics
+
+open LeanNative.IR
+
+/-- Function environment: the lowered declarations a `.call` may resolve against, in
+    dependency order (callees strictly later than callers). -/
+abbrev FuncEnv := List LNIRDecl
+
+namespace FuncEnv
+
+/-- First declaration named `fn`, paired with the STRICT SUFFIX of the environment after
+    it. The callee body evaluates under that suffix, so the environment is stratified and
+    only non-recursive (forward) call chains resolve; a self or backward call misses. -/
+def lookup? : FuncEnv → String → Option (LNIRDecl × FuncEnv)
+  | [], _ => none
+  | d :: Φ, fn => if d.name == fn then some (d, Φ) else lookup? Φ fn
+
+theorem lookup?_length : ∀ (Φ : FuncEnv) (fn : String) (d : LNIRDecl) (Φ' : FuncEnv),
+    lookup? Φ fn = some (d, Φ') → Φ'.length < Φ.length := by
+  intro Φ
+  induction Φ with
+  | nil => intro fn d Φ' h; exact nomatch h
+  | cons d0 Φ ih =>
+    intro fn d Φ' h
+    unfold lookup? at h
+    split at h
+    · injection h with h
+      cases h
+      exact Nat.lt_succ_self _
+    · exact Nat.lt_succ_of_lt (ih fn d Φ' h)
+
+/-- The user-call view of a let-bound expression: callee, strict suffix, and argument
+    variables, when the expression is a non-extern `.call` whose symbol is bound in `Φ`.
+    `none` for every other expression — including extern calls and lookup misses, which
+    keep `evalCode`'s `evalExpr` behavior. -/
+def callTarget? (Φ : FuncEnv) : LNIRExpr → Option (LNIRDecl × FuncEnv × List VarId)
+  | .call fn args _ false => (lookup? Φ fn).map fun (ld, Φ') => (ld, Φ', args)
+  | _ => none
+
+theorem callTarget?_length {Φ : FuncEnv} {e : LNIRExpr} {ld : LNIRDecl} {Φ' : FuncEnv}
+    {args : List VarId} (h : callTarget? Φ e = some (ld, Φ', args)) :
+    Φ'.length < Φ.length := by
+  unfold callTarget? at h
+  split at h
+  · match hl : lookup? Φ ‹String› with
+    | none => rw [hl] at h; exact nomatch h
+    | some (ld0, Φ0) =>
+      rw [hl] at h
+      simp only [Option.map_some] at h
+      injection h with h
+      cases h
+      exact lookup?_length Φ _ _ _ hl
+  · exact nomatch h
+
+end FuncEnv
+
+set_option linter.unusedVariables false in
+/-- L2 environment-aware `LNIRCode` evaluation. Mirrors `evalCode` clause for clause
+    (same instruction semantics, same `evalExpr`, same loop helpers, recursive
+    occurrences at the same `Φ`) with ONE new rule: a let-bound non-extern `.call` whose
+    symbol is bound in `Φ` runs the callee body under the strict suffix after it, with
+    the declaration-entry binding convention of `lowerRealLCNFDecl_sound`'s conclusion
+    and the ambient `fuel` unchanged (fuel-indexed calls are L3). An extern call or a
+    lookup miss delegates to `evalExpr` exactly as `evalCode` does. -/
+def evalCodeF : FuncEnv → Nat → VarEnv → HeapState → LNIRCode → Except UBError (Val × HeapState)
+  | Φ, fuel, env, st, .letBind dst _ty val k =>
+    match hc : FuncEnv.callTarget? Φ val with
+    | some (ld, Φ', args) =>
+      match evalVarList env args with
+      | .ok vals =>
+        match evalCodeF Φ' fuel
+            ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
+            st ld.body with
+        | .ok (v, st') => evalCodeF Φ fuel (env.bind dst v) st' k
+        | .error err => .error err
+      | .error err => .error err
+    | none =>
+      match evalExpr env st val with
+      | .ok (v, st') => evalCodeF Φ fuel (env.bind dst v) st' k
+      | .error err => .error err
+  | Φ, fuel, env, st, .rawStore ptrVar idxVar valVar elemTy k =>
+    match env ptrVar, env idxVar, env valVar with
+    | some (.rawPtrId bufId), some (.u64 idx), some (.u64 val) =>
+      match st.writeElemExclusive bufId idx.toNat (maskElemVal elemTy val) with
+      | .ok st' => evalCodeF Φ fuel env st' k
+      | .error err => .error err
+    | some (.sarrayId bufId), some (.u64 idx), some (.u64 val) =>
+      match st.writeElemExclusive bufId idx.toNat (maskElemVal elemTy val) with
+      | .ok st' => evalCodeF Φ fuel env st' k
+      | .error err => .error err
+    | none, _, _ => .error (.unboundVar ptrVar)
+    | _, none, _ => .error (.unboundVar idxVar)
+    | _, _, none => .error (.unboundVar valVar)
+    | _, _, _ => .error (.typeError "rawStore requires rawPtrId/sarrayId and u64 index/value")
+  | Φ, fuel, env, st, .incRef objVar count k =>
+    match st.evalIncRef env objVar count with
+    | .ok st' => evalCodeF Φ fuel env st' k
+    | .error err => .error err
+  | Φ, fuel, env, st, .decRef objVar count k =>
+    match st.evalDecRef env objVar count with
+    | .ok st' => evalCodeF Φ fuel env st' k
+    | .error err => .error err
+  | Φ, fuel, env, st, .ite condVar thenBranch elseBranch =>
+    match env condVar with
+    | some (.bool true) => evalCodeF Φ fuel env st thenBranch
+    | some (.bool false) => evalCodeF Φ fuel env st elseBranch
+    | some (.u64 n) =>
+      if n != 0 then evalCodeF Φ fuel env st thenBranch
+      else evalCodeF Φ fuel env st elseBranch
+    | some (.u256 w) =>
+      if w != UInt256.zero then evalCodeF Φ fuel env st thenBranch
+      else evalCodeF Φ fuel env st elseBranch
+    | some _ => .error (.typeError "ite condition must be bool, u64, or u64")
+    | none => .error (.unboundVar condVar)
+  | Φ, fuel, env, st, .seqFor idxVar loVar hiVar accVar accInit _accTy stepBody k =>
+    match env loVar, env hiVar, env accInit with
+    | some (.u64 lo), some (.u64 hi), some initVal =>
+      let count := hi.toNat - lo.toNat
+      match evalSeqLoop count lo.toNat idxVar accVar initVal env st
+          (fun stepEnv stepSt => evalCodeF Φ fuel stepEnv stepSt stepBody) with
+      | .ok (finalAcc, st') => evalCodeF Φ fuel (env.bind accVar finalAcc) st' k
+      | .error err => .error err
+    | none, _, _ => .error (.unboundVar loVar)
+    | _, none, _ => .error (.unboundVar hiVar)
+    | _, _, none => .error (.unboundVar accInit)
+    | _, _, _ => .error (.typeError "seqFor bounds must be u64")
+  | Φ, fuel, env, st, .parFor outVar lenVar inputs elemTy kernel k =>
+    match evalParFor fuel env st lenVar inputs kernel elemTy with
+    | .ok (outVal, st') => evalCodeF Φ fuel (env.bind outVar outVal) st' k
+    | .error err => .error err
+  | _, _, env, st, .ret v =>
+    match env v with
+    | some val => .ok (val, st)
+    | none => .error (.unboundVar v)
+  | _, _, _, _, .unreachable =>
+    .error (.typeError "reached unreachable code")
+termination_by Φ _ _ _ c => (Φ.length, sizeOf c)
+decreasing_by
+  all_goals simp_wf
+  all_goals first
+    | exact Prod.Lex.left _ _ (FuncEnv.callTarget?_length hc)
+    | (apply Prod.Lex.right; simp +arith)
+
+end LeanNative.Semantics
