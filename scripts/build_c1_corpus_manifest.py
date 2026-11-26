@@ -114,7 +114,9 @@ TARGET_CONSTRUCT_SPEC: tuple[tuple[str, str, str], ...] = (
         r"\.(?:map|foldl|foldr|filter|any|all|mapM|forM)\b|\.find\?|\(·",
     ),
     ("LetValue.reset_reuse", "rejected", r"\.(?:set!|set|modify|push|pop)\b"),
-    ("Type.signed_scalars", "rejected", r"\b(?:Int(?:8|16|32|64)?|ISize)\b"),
+    # R5: the width suffix is required; bare `Int` (arbitrary precision) is not
+    # a signed fixed-width scalar and must not satisfy this detector.
+    ("Type.signed_scalars", "rejected", r"\b(?:Int(?:8|16|32|64)|ISize)\b"),
     ("LetValue.proj", "lowered_unproved", r"\.(?:fst|snd|[12])\b"),
     ("LetValue.const", "lowered_unproved", r"\b[A-Z][A-Za-z0-9]*\.[a-z][A-Za-z0-9_!?']*"),
     ("LetValue.fap.local_call", "lowered_unproved", _MULTI_DEF),
@@ -136,7 +138,7 @@ EMPHASIS_SPEC: tuple[tuple[str, str, int], ...] = (
     ("pap_partial_application", r"\.(?:map|foldl|foldr|filter)\b|\(·", 30),
     ("letrec", r"\blet\s+rec\b", 30),
     ("array_bytearray_sharing", r"\b(?:Array|ByteArray)\b", 30),
-    ("signed_int_scalars", r"\b(?:Int(?:8|16|32|64)?|ISize)\b", 30),
+    ("signed_int_scalars", r"\b(?:Int(?:8|16|32|64)|ISize)\b", 30),
 )
 
 _IMPORT_RE = re.compile(r"^\s*(?:public\s+)?import\s", re.M)
@@ -237,8 +239,10 @@ def select_programs(
                 add(c)
                 break
 
+    # R6: never pad the corpus with a candidate carrying no matrix constructs;
+    # every selected program must exercise at least one targeted matrix row.
     fill = sorted(
-        (c for c in ordered if c["path"] not in chosen),
+        (c for c in ordered if c["path"] not in chosen and c["matrixConstructs"]),
         key=lambda c: (not c["importFree"], -len(c["matrixConstructs"]), c["bytes"], c["path"]),
     )
     for c in fill:
@@ -294,10 +298,15 @@ def verify_manifest(
     manifest_path: Path = MANIFEST_PATH,
     corpus_root: Path | None = None,
     expect_program_count: int = PROGRAM_COUNT,
+    quotas: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """The C1x manifest gate. Manifest-only checks always run; with
-    `corpus_root` every program is re-read from the pinned checkout (sha256
-    and recomputed markers must match). Returns `{"ok": bool, "reasons": [...]}`."""
+    `corpus_root` every program is re-read from the pinned checkout (sha256,
+    recomputed matrix constructs AND emphasis markers must match), and each
+    emphasis `required` floor is checked against min(quota, measured
+    available-at-the-pin) rather than the manifest's own recorded value (R6).
+    Returns `{"ok": bool, "reasons": [...]}`."""
+    quotas = quotas if quotas is not None else {name: q for name, _p, q in EMPHASIS_SPEC}
     reasons: list[str] = []
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -348,11 +357,31 @@ def verify_manifest(
     if missing:
         reasons.append(f"matrix constructs with no covering program: {missing}")
 
+    available: dict[str, int] | None = None
+    if corpus_root is not None and not reasons:
+        try:
+            cands = enumerate_candidates(corpus_root)
+            available = {
+                name: sum(1 for c in cands if name in c["emphasis"]) for name, _p, _q in EMPHASIS_SPEC
+            }
+        except (FileNotFoundError, OSError) as err:
+            reasons.append(f"cannot measure emphasis availability at the pin: {err}")
+
     for name, _pat, _q in EMPHASIS_SPEC:
         rec = manifest.get("emphasis", {}).get(name, {})
         actual = sum(1 for p in programs if name in p.get("emphasis", []))
         if rec.get("count") != actual:
             reasons.append(f"emphasis {name!r}: recorded count {rec.get('count')} != rows {actual}")
+        elif available is not None:
+            # R6: the floor is measured, never trusted from the manifest.
+            floor = min(quotas[name], available[name], expect_program_count)
+            if rec.get("required") != floor:
+                reasons.append(
+                    f"emphasis {name!r}: recorded required {rec.get('required')} != "
+                    f"min(quota {quotas[name]}, measured available {available[name]}) = {floor}"
+                )
+            elif actual < floor:
+                reasons.append(f"emphasis {name!r}: rows {actual} below measured floor {floor}")
         elif actual < int(rec.get("required", 0)):
             reasons.append(f"emphasis {name!r}: rows {actual} below required {rec.get('required')}")
 
@@ -372,6 +401,11 @@ def verify_manifest(
             if matrix_constructs(text) != p["matrixConstructs"]:
                 reasons.append(f"{p['path']!r} matrixConstructs drifted from the detectors")
                 break
+            # R6: emphasis markers are recomputed from source too, so a stale
+            # or hand-edited emphasis list cannot ride a matching sha.
+            if emphasis_markers(text) != p.get("emphasis", []):
+                reasons.append(f"{p['path']!r} emphasis markers drifted from the detectors")
+                break
             verified_files += 1
 
     return {
@@ -382,6 +416,33 @@ def verify_manifest(
         "shaVerifiedFiles": verified_files,
         "corpusRoot": str(corpus_root) if corpus_root is not None else None,
     }
+
+
+def write_manifest_gated(
+    corpus_root: Path,
+    manifest_path: Path,
+    program_count: int = PROGRAM_COUNT,
+    quotas: dict[str, int] | None = None,
+) -> int:
+    """R6: build the manifest, write it to a sibling temp file, run
+    verify_manifest on it against the pinned checkout, and only then replace
+    the committed manifest. A failed gate refuses the write (exit 2) and
+    leaves the committed manifest untouched."""
+    manifest = build_manifest(corpus_root, program_count=program_count, quotas=quotas)
+    tmp_path = manifest_path.with_name(manifest_path.name + ".tmp")
+    tmp_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    gate = verify_manifest(
+        tmp_path, corpus_root=corpus_root, expect_program_count=program_count, quotas=quotas
+    )
+    if gate.get("ok") is not True:
+        print("[c1-corpus] --write refused: the freshly built manifest fails its own gate", file=sys.stderr)
+        for reason in gate.get("reasons", []):
+            print(f"  [reason] {reason}", file=sys.stderr)
+        tmp_path.unlink()
+        return 2
+    os.replace(tmp_path, manifest_path)
+    print(f"[c1-corpus] wrote {manifest_path} ({manifest['programCount']} programs; gate PASSED pre-write)")
+    return 0
 
 
 # --------------------------- self-test ---------------------------
@@ -417,6 +478,12 @@ class C1CorpusManifestSelfTest(unittest.TestCase):
             union.update(matrix_constructs(text))
         self.assertEqual(union, set(TARGET_STATUS), "synthetic corpus must cover every target")
         self.assertNotIn("Type.signed_scalars", matrix_constructs("def f (x : UInt64) : UInt64 := x\n"))
+        # R5: the signed-scalar detector requires the width suffix; bare `Int`
+        # is arbitrary precision, not a signed fixed-width scalar.
+        self.assertNotIn("Type.signed_scalars", matrix_constructs("def f (x : Int) := x\n"))
+        self.assertNotIn("signed_int_scalars", emphasis_markers("def f (x : Int) := x\n"))
+        self.assertIn("Type.signed_scalars", matrix_constructs("def g (y : Int32) := y\n"))
+        self.assertIn("signed_int_scalars", emphasis_markers("def g (y : Int32) := y\n"))
         self.assertNotIn("DeclValue.extern", matrix_constructs("def f := 1\n"))
         self.assertIn("LetValue.fap.local_call", matrix_constructs("def a := 1\ndef b := a\n"))
         self.assertNotIn("LetValue.fap.local_call", matrix_constructs("def a := 1\n"))
@@ -477,6 +544,88 @@ class C1CorpusManifestSelfTest(unittest.TestCase):
             self.assertFalse(red2["ok"])
             self.assertTrue(any("no covering program" in r for r in red2["reasons"]), red2["reasons"])
 
+    def test_fill_step_skips_constructless_candidates(self):
+        # R6: the fill step never pads the corpus with a candidate carrying no
+        # matrix constructs; a program_count reachable only by padding raises.
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="c1x_fill_") as tmp:
+            root = self._synth_corpus(Path(tmp))
+            (root / "tests/elab/synth_constructless.lean").write_text(
+                "-- no matrix constructs and no emphasis markers in this file\n",
+                encoding="utf-8",
+            )
+            quotas = {name: 1 for name, _p, _q in EMPHASIS_SPEC}
+            with self.assertRaises(RuntimeError):
+                build_manifest(root, program_count=len(_SYNTH_FILES) + 1, quotas=quotas)
+
+    def test_gate_checks_required_against_measured_floor(self):
+        # R6: with a corpus root the gate recomputes each emphasis floor as
+        # min(quota, measured available) instead of trusting the manifest's
+        # own recorded `required` value.
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="c1x_floor_") as tmp:
+            root = Path(tmp)
+            manifest = self._small_manifest(root)
+            mp = root / "manifest.json"
+            lowered = json.loads(json.dumps(manifest))
+            lowered["emphasis"]["closures"]["required"] = 0
+            mp.write_text(json.dumps(lowered), encoding="utf-8")
+            red = verify_manifest(mp, corpus_root=root, expect_program_count=len(_SYNTH_FILES))
+            self.assertFalse(red["ok"])
+            self.assertTrue(
+                any("closures" in r and "required" in r for r in red["reasons"]), red["reasons"]
+            )
+
+    def test_gate_recomputes_emphasis_markers_from_source(self):
+        # R6: the per-file corpus pass recomputes emphasis markers from
+        # program source, not only matrixConstructs.
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="c1x_emph_") as tmp:
+            root = Path(tmp)
+            manifest = self._small_manifest(root)
+            mp = root / "manifest.json"
+            quotas = {name: 1 for name, _p, _q in EMPHASIS_SPEC}
+            quotas["pap_partial_application"] = 0
+            tampered = json.loads(json.dumps(manifest))
+            for row in tampered["programs"]:
+                row["emphasis"] = [e for e in row["emphasis"] if e != "pap_partial_application"]
+            tampered["emphasis"]["pap_partial_application"]["count"] = 0
+            tampered["emphasis"]["pap_partial_application"]["required"] = 0
+            mp.write_text(json.dumps(tampered), encoding="utf-8")
+            red = verify_manifest(
+                mp, corpus_root=root, expect_program_count=len(_SYNTH_FILES), quotas=quotas
+            )
+            self.assertFalse(red["ok"])
+            self.assertTrue(any("emphasis" in r and "drifted" in r for r in red["reasons"]), red["reasons"])
+
+    def test_write_refuses_on_failed_gate(self):
+        # R6: --write verifies the freshly built manifest before replacing the
+        # committed one and refuses (exit 2, no write) on a failed gate.
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory(prefix="c1x_write_") as tmp:
+            root = self._synth_corpus(Path(tmp))
+            out = Path(tmp) / "out" / "manifest.json"
+            out.parent.mkdir()
+            quotas = {name: 1 for name, _p, _q in EMPHASIS_SPEC}
+            rc = write_manifest_gated(root, out, program_count=len(_SYNTH_FILES), quotas=quotas)
+            self.assertEqual(rc, 0)
+            self.assertTrue(out.is_file())
+            before = out.read_bytes()
+            with mock.patch.object(
+                sys.modules[__name__],
+                "verify_manifest",
+                return_value={"ok": False, "reasons": ["planted gate failure"], "programCount": 0},
+            ):
+                rc = write_manifest_gated(root, out, program_count=len(_SYNTH_FILES), quotas=quotas)
+            self.assertEqual(rc, 2)
+            self.assertEqual(out.read_bytes(), before, "a refused --write must not touch the manifest")
+            self.assertFalse(list(out.parent.glob("*.tmp")), "a refused --write must clean its temp file")
+
     def test_selection_is_deterministic(self):
         import tempfile
 
@@ -519,12 +668,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
-        manifest = build_manifest(corpus_root)
-        Path(args.manifest).write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        print(f"[c1-corpus] wrote {args.manifest} ({manifest['programCount']} programs)")
-        return 0
+        return write_manifest_gated(corpus_root, Path(args.manifest))
 
     if args.verify:
         report = verify_manifest(Path(args.manifest), corpus_root=corpus_root)
