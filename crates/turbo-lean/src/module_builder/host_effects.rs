@@ -393,13 +393,23 @@ fn strip_attrs_and_modifiers(line: &str) -> &str {
     }
 }
 
+/// Calls that only STORE their argument for later invocation: a host read inside the
+/// stored definition stays definition-only IO. Everything else counts as a run —
+/// `registerEnvExtension` (Lean runs the initial-value thunk whenever an importer
+/// creates its environment), `registerBuiltinAttribute` (the handler runs in every
+/// importer that applies the attribute), and any user helper named `addX` or
+/// `registerX` that executes its argument.
+const STORE_ONLY_REGISTRATION_HEADS: &[&str] = &["addLinter"];
+
 /// True when `uq_block` references `name` in a position its body would *run*, rather
-/// than only passing it to a registration call. `initialize addLinter fooLinter` (and
-/// the `register*` family) stores the definition for later invocations instead of
-/// executing it at import time, so a host read inside `fooLinter` stays
-/// definition-only IO; `initialize cfg ← loadCfg` runs `loadCfg`. The discriminator is
-/// the word right before the reference: a registration-shaped head (`register...`, or
-/// `add` followed by a capital) makes that occurrence a registration argument.
+/// than only passing it to a store-only registration call. `initialize addLinter
+/// fooLinter` stores the definition for later invocations instead of executing it at
+/// import time; `initialize cfg ← loadCfg` runs `loadCfg`. The discriminator is the
+/// word right before the reference, and only the explicit allowlist
+/// [`STORE_ONLY_REGISTRATION_HEADS`] makes that occurrence a registration argument: a
+/// name-shape rule (`register...`, `add` + capital) also swallowed
+/// `registerEnvExtension` and `registerBuiltinAttribute`, whose arguments do run
+/// inside importers.
 fn name_run_referenced(uq_block: &str, name: &str) -> bool {
     let is_ident = |c: char| crate::splitter::is_lean_id_rest(c) || c == '.';
     let mut from = 0usize;
@@ -421,10 +431,7 @@ fn name_run_referenced(uq_block: &str, name: &str) -> bool {
             .map(|(p, _)| &before[p..])
             .unwrap_or("");
         let head_seg = head.rsplit('.').next().unwrap_or(head);
-        let registration = head_seg.starts_with("register")
-            || (head_seg.starts_with("add")
-                && head_seg[3..].chars().next().is_some_and(|c| c.is_ascii_uppercase()));
-        if !registration {
+        if !STORE_ONLY_REGISTRATION_HEADS.contains(&head_seg) {
             return true;
         }
     }
@@ -458,7 +465,13 @@ fn defined_def_names(uq_block: &str) -> Vec<String> {
         if end == 0 {
             continue;
         }
-        let name = &rest[..end];
+        // `def helper.{u}`: the ident scan accepts `.`, so a universe-binder suffix
+        // leaves a trailing dot that no reference would ever match. A Lean name never
+        // ends in a dot; strip it.
+        let name = rest[..end].trim_end_matches('.');
+        if name.is_empty() {
+            continue;
+        }
         if let Some(seg) = name.rsplit('.').next() {
             if seg != name && !seg.is_empty() {
                 names.push(seg.to_string());
@@ -2899,6 +2912,12 @@ mod host_effect_taint_tests {
     /// A bare `#eval` runs arbitrary code during this module's own build only, so a
     /// pinned dependency module holding one classifies `SelfOnly`.
     const EVAL_SHAPE: &str = "def forty : Nat := 40\n#eval forty\n";
+    /// An environment extension: Lean runs the registered initial-value thunk whenever
+    /// an importer creates its environment, so a host read inside it spreads.
+    const REG_ENV_EXT_SHAPE: &str = "import Lean\ndef loadInitial : IO (Array String) := do\n  let _ ← IO.getEnv \"TURBO_TAINT_TEST\"\n  pure #[]\ninitialize ext : Lean.EnvExtension (Array String) ← Lean.registerEnvExtension loadInitial\n";
+    /// A builtin attribute registration: the handler runs in every importer that
+    /// applies the attribute, so a host read inside it spreads.
+    const REG_BUILTIN_ATTR_SHAPE: &str = "import Lean\ndef fooAttrImpl : IO Unit := do\n  let _ ← IO.FS.readFile \"style.txt\"\n  pure ()\ninitialize registerBuiltinAttribute fooAttrImpl\n";
     /// Lean and Mathlib write the attribute on its own line above the definition it
     /// applies to; the two lines are one declaration.
     const SPLIT_ATTR_TACTIC_SHAPE: &str = "import Lean\n@[tactic fooTac]\ndef evalFoo : IO Nat := do\n  let _rows ← IO.FS.lines \"x\"\n  return 3\n";
@@ -3236,6 +3255,18 @@ mod host_effect_taint_tests {
             HostEffectTaint::None,
             "`initialize addLinter fooLinter` registers, it does not run: #433's \
              definition-only IO must stay untainted"
+        );
+        assert_eq!(
+            taint(REG_ENV_EXT_SHAPE),
+            HostEffectTaint::SpreadsToImporters,
+            "registerEnvExtension runs its initial-value thunk whenever an importer \
+             creates its environment: not a store-only registration"
+        );
+        assert_eq!(
+            taint(REG_BUILTIN_ATTR_SHAPE),
+            HostEffectTaint::SpreadsToImporters,
+            "a registerBuiltinAttribute handler runs in every importer that applies \
+             the attribute: not a store-only registration"
         );
         assert_eq!(
             taint(PRIVATE_DEF_INIT_HELPER_SHAPE),
@@ -3577,5 +3608,22 @@ mod host_effect_taint_tests {
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())
+    }
+
+    /// A universe-polymorphic head (`def helper.{u}`) defines `helper`: the trailing
+    /// dot of the scanned name belongs to the `.{u}` suffix, not the name, and a name
+    /// ending in a dot never matches any reference.
+    #[test]
+    fn defined_def_names_strip_universe_suffix_dots() {
+        let names = defined_def_names("def helper.{u} : Sort u := default\n");
+        assert!(
+            names.iter().any(|n| n == "helper"),
+            "def helper.{{u}} must define `helper`; got {names:?}"
+        );
+        let dotted = defined_def_names("def Foo.helper.{u} : Sort u := default\n");
+        assert!(
+            dotted.iter().any(|n| n == "helper") && dotted.iter().any(|n| n == "Foo.helper"),
+            "def Foo.helper.{{u}} must define `Foo.helper` and its last segment; got {dotted:?}"
+        );
     }
 }
