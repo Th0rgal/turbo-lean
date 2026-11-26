@@ -222,19 +222,27 @@ class Stats(unittest.TestCase):
 
 class CheckTimeoutOverride(unittest.TestCase):
     def test_env_override_reaches_subprocess_timeout(self):
-        # TURBO_LEAN_BENCH_CHECK_TIMEOUT_S is read at import into
-        # CHECK_TIMEOUT_S. The child's `--timeout` argv reads the global at
-        # call time; subprocess.run's own bound must carry the same value,
-        # so run_check may not freeze the module global into its parameter
-        # default at definition time.
+        # TURBO_LEAN_BENCH_CHECK_TIMEOUT_S is folded into CHECK_TIMEOUT_S by
+        # validate_environment through _apply_check_timeout_override(),
+        # validated (junk is a BenchEnvError, exit 4, never a bare crash).
+        # The child's `--timeout` argv reads the global at call time;
+        # subprocess.run's own bound must carry the same value, so run_check
+        # may not freeze the module global into its parameter default at
+        # definition time.
         key = "TURBO_LEAN_BENCH_CHECK_TIMEOUT_S"
         prev = os.environ.get(key)
         os.environ[key] = "123"
         try:
-            # The hook is real script behavior: a fresh load under the
-            # override must carry it, with no hand rebind here.
+            # Real script behavior, no hand rebind: import keeps the 900
+            # default; the override call applies the env value; junk raises.
             mod = load_script()
+            self.assertEqual(mod.CHECK_TIMEOUT_S, 900)
+            mod._apply_check_timeout_override()
             self.assertEqual(mod.CHECK_TIMEOUT_S, 123)
+            os.environ[key] = "junk"
+            with self.assertRaises(mod.BenchEnvError):
+                mod._apply_check_timeout_override()
+            os.environ[key] = "123"
 
             recorded = {}
 

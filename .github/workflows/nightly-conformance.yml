@@ -130,5 +130,22 @@ jobs:
           (cd lean && lake build LeanNative)
 
       - name: Run the pinned mutant sample (every member must stay KILLED)
+        # --timeout sized from the recorded duration_s values in the committed
+        # results JSON (max 115 s per build on a 192-core host; the 4-vCPU
+        # runner gets ~13x headroom), so one hung build costs 25 minutes
+        # instead of the default hour.
         run: |
-          python3 scripts/proof_mutant_matrix.py --sample ci --workers 1
+          python3 scripts/proof_mutant_matrix.py --sample ci --workers 1 --timeout 1500 --jsonl h14-ci-sample-progress.jsonl
+
+      - name: Surface per-mutant progress for diagnosis
+        if: always()
+        run: |
+          if [ -f h14-ci-sample-progress.jsonl ]; then cat h14-ci-sample-progress.jsonl; else echo "no progress file written"; fi
+
+      - name: Upload per-mutant progress JSONL
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proof-mutant-sample-progress
+          path: h14-ci-sample-progress.jsonl
+          if-no-files-found: ignore
