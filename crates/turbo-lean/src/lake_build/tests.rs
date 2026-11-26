@@ -827,6 +827,92 @@ use super::*;
             vec!["+Dep.D".to_string()],
             "a dependency module without input-bearing libs must be qualified with `+` so Lake builds it"
         );
+
+        // DA 449989b1 F3: a dependency reached through a SYMLINKED `.lake/packages`
+        // entry canonicalizes outside the project root (a shared checkout, the #434
+        // class) and must emit NO lake target from here, whatever it carries: not
+        // its input-bearing library, not a `+` module qualification. Its own
+        // workspace refreshes it; the purge sweep already skips it the same way.
+        let shared = std::env::temp_dir().join(format!(
+            "turbo_lake_shared_dep_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&shared);
+        fs::create_dir_all(shared.join("SharedDep"))?;
+        fs::create_dir_all(shared.join("Data"))?;
+        fs::write(
+            shared.join("lean-toolchain"),
+            include_str!("../../../../lean/lean-toolchain"),
+        )?;
+        fs::write(
+            shared.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage shareddep\ninput_dir depSources where\n  path := \"Data\"\n  filter := .extension \"sol\"\n@[default_target]\nlean_lib «SharedDep» where\n  globs := #[.submodules `SharedDep]\n  needs := #[depSources]\n",
+        )?;
+        fs::write(
+            shared.join("SharedDep/D.lean"),
+            "def gen := include_str \"../Data/a.sol\"\n",
+        )?;
+        fs::write(shared.join("Data/a.sol"), "contract A {}")?;
+        // A real clone: with a `.git` present, a `path` entry outside the root is a
+        // shared checkout, never editable scratch.
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "."],
+            vec!["-c", "user.name=t", "-c", "user.email=t@e", "-c", "commit.gpgsign=false", "commit", "-qm", "init"],
+        ] {
+            assert!(crate::trusted_tools::git(&shared)?
+                .arg("-C")
+                .arg(&shared)
+                .args(&args)
+                .status()?
+                .success());
+        }
+        let proj2 = std::env::temp_dir().join(format!(
+            "turbo_lake_sharedproj_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&proj2);
+        fs::create_dir_all(proj2.join(".lake/packages"))?;
+        fs::write(
+            proj2.join("lean-toolchain"),
+            include_str!("../../../../lean/lean-toolchain"),
+        )?;
+        fs::write(
+            proj2.join("lakefile.toml"),
+            "name = \"p2\"\n[[lean_lib]]\nname = \"P2\"\nglobs = [\"P2.+\"]\n",
+        )?;
+        fs::write(proj2.join("P2.lean"), "def p2 : Nat := 1\n")?;
+        std::os::unix::fs::symlink(&shared, proj2.join(".lake/packages/shareddep"))?;
+        fs::write(
+            proj2.join("lake-manifest.json"),
+            "{\"version\":\"1.1.0\",\"packagesDir\":\".lake/packages\",\"packages\":[{\"type\":\"path\",\"name\":\"shareddep\",\"dir\":\".lake/packages/shareddep\"}]}\n",
+        )?;
+        let proj2 = proj2.canonicalize()?;
+        assert_eq!(
+            lake_refresh_targets_for_input_closure(&proj2, &["SharedDep.D".to_string()]),
+            Vec::<String>::new(),
+            "the input-closure sweep emits no lake target for a non-owned dependency \
+             module: its own workspace refreshes it (DA 449989b1 F3, #434)"
+        );
+        assert_eq!(
+            lake_refresh_targets_for_input_closure(
+                &proj2,
+                &["P2.A".to_string(), "SharedDep.D".to_string()]
+            ),
+            vec!["P2.A".to_string()],
+            "owned root modules keep their targets while the non-owned dependency \
+             module drops out of the closure sweep (DA 449989b1 F3)"
+        );
+        assert_eq!(
+            lake_refresh_targets(&proj2, &["SharedDep.D".to_string()]),
+            vec!["shareddep/SharedDep".to_string()],
+            "the unfiltered shape stays the stale-import refresh's: asking Lake to \
+             bring a pinned dependency import up to date is that path's sanctioned job"
+        );
+        let _ = fs::remove_dir_all(&shared);
+        let _ = fs::remove_dir_all(&proj2);
         let _ = fs::remove_dir_all(&plain);
         let _ = fs::remove_dir_all(&proj);
         Ok(())

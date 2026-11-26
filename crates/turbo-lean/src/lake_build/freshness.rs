@@ -1268,47 +1268,116 @@ pub(super) fn remove_module_build_artifacts(canon_dir: &Path, rel_slash: &str) {
 /// Returns `modules` unchanged for every project without Lake file inputs and without matching
 /// `lean_exe` roots.
 pub(crate) fn lake_refresh_targets(canon_dir: &Path, modules: &[String]) -> Vec<String> {
+    lake_refresh_targets_inner(canon_dir, modules, false)
+}
+
+/// The Lake-inputs closure sweep's variant (#434 / DA 449989b1 F3): dependency-package
+/// lake targets are driven from the dependency's own workspace unless the project owns
+/// the package, so every dependency-shaped target — an input-bearing `<dep>/<lib>`, an
+/// `@<dep>/<exe>:exe`, a `+<Mod>` qualification — is emitted only for owned packages,
+/// and a non-owned module (a shared checkout behind a symlinked `.lake/packages`
+/// entry) emits nothing, matching the sweep's input-target seed gate and its purge
+/// skip. The unfiltered [`lake_refresh_targets`] stays the stale-import refresh's
+/// shape: asking Lake to bring a pinned dependency import up to date is that path's
+/// sanctioned job (the worktree opt-out is its off switch), distinct from this
+/// project driving a non-owned package's input-bearing targets.
+pub(crate) fn lake_refresh_targets_for_input_closure(
+    canon_dir: &Path,
+    modules: &[String],
+) -> Vec<String> {
+    lake_refresh_targets_inner(canon_dir, modules, true)
+}
+
+fn lake_refresh_targets_inner(
+    canon_dir: &Path,
+    modules: &[String],
+    owned_only: bool,
+) -> Vec<String> {
     let Ok(cfg) = crate::module_builder::resolve_project_config(canon_dir) else {
         return modules.to_vec();
     };
+    let owned_dep: std::collections::HashSet<&str> = if owned_only {
+        cfg.dep_pkgs
+            .iter()
+            .filter(|dp| crate::module_builder::dep_pkg_lake_targets_owned_by_project(&cfg, dp))
+            .map(crate::module_builder::pkg_target_base_name)
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let root_base = crate::module_builder::pkg_target_base_name(&cfg.root_pkg);
+    // Target shapes: "<lib>" (root), "<depBase>/<lib>", or "@<base>/<exe>:exe".
+    let dep_target_owned = |t: &str| -> bool {
+        if !owned_only {
+            return true;
+        }
+        if let Some(rest) = t.strip_prefix('@') {
+            let base = rest.split('/').next().unwrap_or("");
+            return base == root_base || owned_dep.contains(base);
+        }
+        match t.split_once('/') {
+            None => true,
+            Some((base, _)) => owned_dep.contains(base),
+        }
+    };
     let any_inputs =
         !cfg.root_pkg.inputs.is_empty() || cfg.dep_pkgs.iter().any(|dp| !dp.inputs.is_empty());
-    let any_matching_exe = modules
-        .iter()
-        .any(|m| !crate::module_builder::exe_targets_for_module(&cfg, m).is_empty());
-    let qualify_non_root_mod = |m: &str| -> String {
+    let any_matching_exe = modules.iter().any(|m| {
+        crate::module_builder::exe_targets_for_module(&cfg, m)
+            .iter()
+            .any(|t| dep_target_owned(t))
+    });
+    // `None` means a module of a non-owned dependency package: no target at all.
+    let qualify_non_root_mod = |m: &str| -> Option<String> {
         if m.starts_with('+')
             || m.starts_with('@')
             || m.contains('/')
             || crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, m).is_some()
         {
-            return m.to_string();
+            return Some(m.to_string());
         }
-        if cfg
+        match cfg
             .dep_pkgs
             .iter()
-            .any(|dp| crate::module_builder::resolve_module_in_package(dp, false, m).is_some())
+            .find(|dp| crate::module_builder::resolve_module_in_package(dp, false, m).is_some())
         {
-            format!("+{m}")
-        } else {
-            m.to_string()
+            Some(dp)
+                if !owned_only
+                    || owned_dep
+                        .contains(crate::module_builder::pkg_target_base_name(dp)) =>
+            {
+                Some(format!("+{m}"))
+            }
+            Some(_) => None,
+            None => Some(m.to_string()),
         }
     };
     if !any_inputs && !any_matching_exe {
-        return modules.iter().map(|m| qualify_non_root_mod(m)).collect();
+        return modules
+            .iter()
+            .filter_map(|m| qualify_non_root_mod(m))
+            .collect();
     }
     let mut input_lib_targets: Vec<String> = Vec::new();
     let mut other_targets: Vec<String> = Vec::new();
     for m in modules {
-        let libs = if any_inputs {
+        let libs: Vec<String> = if any_inputs {
             crate::module_builder::input_bearing_libs_for_module(&cfg, m)
+                .into_iter()
+                .filter(|t| dep_target_owned(t))
+                .collect()
         } else {
             Vec::new()
         };
-        let exes = crate::module_builder::exe_targets_for_module(&cfg, m);
+        let exes: Vec<String> = crate::module_builder::exe_targets_for_module(&cfg, m)
+            .into_iter()
+            .filter(|t| dep_target_owned(t))
+            .collect();
         input_lib_targets.extend(libs.iter().cloned());
         if libs.is_empty() && exes.is_empty() {
-            other_targets.push(qualify_non_root_mod(m));
+            if let Some(t) = qualify_non_root_mod(m) {
+                other_targets.push(t);
+            }
         } else {
             other_targets.extend(exes);
         }
@@ -3635,7 +3704,7 @@ pub(crate) fn recheck_dependents_if_nonlocal_for_check(
                             }
                             if all_ok {
                                 let check_exes: Vec<String> =
-                                    lake_refresh_targets(&dir, &closure_mods)
+                                    lake_refresh_targets_for_input_closure(&dir, &closure_mods)
                                         .into_iter()
                                         .chain(input_exes.iter().cloned())
                                         .filter(|t| t.ends_with(":exe"))
@@ -3654,7 +3723,7 @@ pub(crate) fn recheck_dependents_if_nonlocal_for_check(
                     if all_fresh_on_disk {
                         ordered_targets.clear();
                     } else {
-                        for t in lake_refresh_targets(&dir, &closure_mods) {
+                        for t in lake_refresh_targets_for_input_closure(&dir, &closure_mods) {
                             if !ordered_targets.contains(&t) {
                                 ordered_targets.push(t);
                             }
