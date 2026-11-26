@@ -283,8 +283,10 @@ fn assert_pr_verify_rejects_proof_edit(
         "SOUNDNESS: `pr-verify --mode {mode} --base {base}` passed after an edit that makes the importer's `decide +kernel` stuck: {combined}"
     );
     assert!(
-        combined.contains("W8.D3") || combined.contains("W8/D3"),
-        "the failure must come from re-checking the importer W8.D3, not from an unrelated error: {combined}"
+        (combined.contains("W8.D3") || combined.contains("W8/D3"))
+            && (combined.contains("Reduction got stuck")
+                || combined.contains("failed to reduce")),
+        "the failure must be the importer W8.D3's stuck `decide +kernel`, not an unrelated error: {combined}"
     );
 }
 
@@ -297,6 +299,15 @@ fn pr_verify_rechecks_importer_after_non_constructive_proof_edit() {
         return;
     }
     for mode in ["trusted", "untrusted"] {
+        // Untrusted mode compiles inside bwrap. Without it the case cannot run: a failure under
+        // TURBO_LEAN_REQUIRE_LEAN, a skip otherwise.
+        if mode == "untrusted" && Command::new("bwrap").arg("--version").output().is_err() {
+            assert!(
+                std::env::var_os("TURBO_LEAN_REQUIRE_LEAN").is_none(),
+                "no `bwrap` on PATH; refusing to skip the untrusted-mode case under TURBO_LEAN_REQUIRE_LEAN"
+            );
+            continue;
+        }
         assert_pr_verify_rejects_proof_edit(
             &format!("acc_rec_pr_verify_{mode}"),
             U_CONSTRUCTIVE,
@@ -344,6 +355,45 @@ fn pr_verify_rechecks_classic_importer_of_a_module_file_after_proof_edit() {
         U_MODULE_NONCONSTRUCTIVE,
         D3_SRC,
         "trusted",
+    );
+}
+
+/// A proof-only PR must not fail because of an unrelated unedited standalone file with a bad header
+/// somewhere in the project: that file cannot hold an importer, and proof-only PRs never read the graph
+/// before the importer probe.
+#[test]
+fn pr_verify_proof_edit_ignores_unedited_malformed_standalone_file() {
+    if !lean_available() {
+        return;
+    }
+    let ws = TestWorkspace::new("proof_edit_bad_scratch");
+    let proj = ws.proj();
+    fs::write(proj.join("W8/U.lean"), U_CONSTRUCTIVE).unwrap();
+    fs::write(proj.join("W8/D3.lean"), "import W8.U\ntheorem t : g = g := rfl\n").unwrap();
+    fs::write(proj.join("Scratch.lean"), [0xffu8, 0xfe, 0x0a]).unwrap(); // not UTF-8: unreadable
+    git_ok(&proj, &["init", "-q"]);
+    git_ok(&proj, &["add", "-A"]);
+    git_ok(&proj, &["commit", "-q", "-m", "base"]);
+    let base = String::from_utf8_lossy(&git_in(&proj, &["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string();
+    // A proof-only edit that keeps every importer valid.
+    fs::write(
+        proj.join("W8/U.lean"),
+        U_CONSTRUCTIVE.replace("Acc.intro () (fun _ h => False.elim h)", "Acc.intro () (fun _ h => absurd h id)"),
+    )
+    .unwrap();
+    let out = ws.run(&["pr-verify", "--project-dir", ".", "--base", &base]);
+    let combined = format!(
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The malformed scratch file may itself be rejected by other gates; what must not appear is the
+    // importer probe's own refusal.
+    assert!(
+        !combined.contains("import graph cannot be resolved"),
+        "the importer probe must not fail on an unedited malformed file: {combined}"
     );
 }
 

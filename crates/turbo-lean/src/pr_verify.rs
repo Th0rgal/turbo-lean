@@ -9907,23 +9907,27 @@ pub fn run_pr_verify_command(
         .iter()
         .filter_map(|q| q.split_once("::").map(|(rel, _)| rel))
         .collect();
-    for rel in proof_edited_rels {
-        let rel = rel.to_string();
-        if recheck_interface_files.contains(&rel) {
-            continue;
-        }
-        match crate::lake_build::project_file_has_importers(&canon_dir, &rel) {
-            Ok(true) => {
+    let candidate_rels: Vec<String> = proof_edited_rels
+        .into_iter()
+        .map(str::to_string)
+        .filter(|rel| !recheck_interface_files.contains(rel))
+        .collect();
+    // An unresolvable import graph fails the run, but after the gates that give a more specific
+    // reason for the same defect (a package `.olean` with no source, a failed kernel replay) have
+    // had their say, and before any receipt is emitted.
+    match crate::lake_build::proof_edited_files_needing_recheck(
+        &canon_dir,
+        &candidate_rels,
+        is_untrusted,
+    ) {
+        Ok(rels) => {
+            for rel in rels {
                 proof_edit_recheck_files.push(rel.clone());
                 recheck_interface_files.push(rel);
             }
-            Ok(false) => {}
-            // An unresolvable import graph fails the run, but after the gates that give a more
-            // specific reason for the same defect (a package `.olean` with no source, a failed
-            // kernel replay) have had their say, and before any receipt is emitted.
-            Err(e) => {
-                deferred_import_graph_error.get_or_insert(e);
-            }
+        }
+        Err(e) => {
+            deferred_import_graph_error.get_or_insert(e);
         }
     }
     if !recheck_interface_files.is_empty() {

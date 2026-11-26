@@ -2574,26 +2574,46 @@ pub(super) fn discover_standalone_project_modules(
     Ok(out)
 }
 
-/// Whether any other module of the project imports the project file `rel`. A project whose import
-/// graph cannot be resolved is an error (fail closed, with the resolution error). A project without a
-/// Lake config has no import graph to read, so it reports none: the dependent recheck cannot run there.
-pub(crate) fn project_file_has_importers(canon_dir: &Path, rel: &str) -> Result<bool> {
-    if !has_lake_config(canon_dir) {
-        return Ok(false);
+/// Which of the proof-edited project files `rels` need their importers re-checked. The import graph is
+/// built once for the whole set, in the run's trust mode, and an unresolvable DAG is an error (fail
+/// closed) rather than a silent fallback to "every standalone module". Unedited standalone files that
+/// cannot be read or parsed are skipped, as the lenient dependent recheck does: only an unresolvable part
+/// that could hold an importer should fail a proof-only PR. A project without a Lake config has no
+/// import graph to read, so it reports none: the dependent recheck cannot run there.
+///
+/// Sound and cheap rather than exact: if any module outside the edited set depends on an edited file,
+/// or more than one file is edited (edited files may import each other), every edited file is rechecked.
+pub(crate) fn proof_edited_files_needing_recheck(
+    canon_dir: &Path,
+    rels: &[String],
+    is_untrusted: bool,
+) -> Result<Vec<String>> {
+    if rels.is_empty() || !has_lake_config(canon_dir) {
+        return Ok(Vec::new());
     }
-    // Strict graph: an unresolvable import graph is an error here, not a silent fallback to
-    // "every standalone module", which would read as importers that do not exist.
-    let closure =
-        compute_project_dependent_closure_inner(canon_dir, &[rel.to_string()], false, true)?;
-    let target = canon_dir.join(rel);
-    let target = target.canonicalize().unwrap_or(target);
-    let is_other = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()) != target;
-    Ok(match closure.dag_files.as_ref() {
+    let closure = compute_project_dependent_closure_with_policy(
+        canon_dir,
+        rels,
+        is_untrusted,
+        true,
+        is_untrusted,
+    )?;
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let edited: HashSet<PathBuf> = rels.iter().map(|r| canon(&canon_dir.join(r))).collect();
+    let has_other_member = match closure.dag_files.as_ref() {
         Some(files) => {
-            files.iter().any(|p| is_other(p))
-                || closure.standalone_modules.iter().any(|s| is_other(&s.src_path))
+            files.iter().any(|p| !edited.contains(&canon(p)))
+                || closure
+                    .standalone_modules
+                    .iter()
+                    .any(|s| !edited.contains(&canon(&s.src_path)))
         }
         None => true,
+    };
+    Ok(if has_other_member || rels.len() > 1 {
+        rels.to_vec()
+    } else {
+        Vec::new()
     })
 }
 
@@ -2610,6 +2630,24 @@ pub(super) fn compute_project_dependent_closure_inner(
     edits: &[String],
     is_untrusted: bool,
     strict_graph: bool,
+) -> Result<ProjectDependentClosure> {
+    compute_project_dependent_closure_with_policy(
+        canon_dir,
+        edits,
+        is_untrusted,
+        strict_graph,
+        strict_graph,
+    )
+}
+
+/// `strict_graph` makes an unresolvable module DAG an error; `strict_sources` makes an unreadable or
+/// bad-headered UNEDITED standalone file an error (edited ones always are).
+pub(super) fn compute_project_dependent_closure_with_policy(
+    canon_dir: &Path,
+    edits: &[String],
+    is_untrusted: bool,
+    strict_graph: bool,
+    strict_sources: bool,
 ) -> Result<ProjectDependentClosure> {
     let cfg = crate::module_builder::resolve_project_config_with_trust(canon_dir, is_untrusted)?;
     let roots = package_source_roots(canon_dir, &cfg.root_pkg);
@@ -2703,7 +2741,7 @@ pub(super) fn compute_project_dependent_closure_inner(
         dag_opt.as_ref(),
         &edited,
         is_untrusted,
-        strict_graph,
+        strict_sources,
     )?;
     if !is_untrusted && !assurance.mod_names.is_empty() {
         standalone_all
