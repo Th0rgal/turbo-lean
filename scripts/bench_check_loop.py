@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M1 pinned benchmark of the `turbo-lean check` loop (roadmap/HORIZONS.md line 142).
+"""M1 pinned benchmark of the `turbo-lean check` loop (roadmap/HORIZONS.md, row M1).
 
 Measures the five pinned `Batteries` declarations and the pinned `PFR`
 declaration (expected `blocked` today) across three loop regimes, writes a
@@ -26,6 +26,17 @@ command of the same user holds while it runs, so the bench gives it
 DAEMON_STOP_TIMEOUT_S and then ends whatever the workload's staging namespace
 still runs itself, by turbo-lean's own scope rule widened to renamed builds
 and one-shot runs (scoped_daemon_processes).
+
+Prerequisite: a fresh `Batteries` clone at the pinned rev fails every check
+until each workload's import closure is built. Without the built `.olean`
+files the identity probe exits 1 with "produced no `.olean`" and every cold
+trial fails, so build the workloads' modules in the clone first:
+
+    lake build Batteries.Data.List.Lemmas Batteries.Data.String.Lemmas \
+        Batteries.Recycling.RBTree.Lemmas Batteries.Data.UnionFind.Basic
+
+(a single-workload run needs only its own module, as the M1b noise runs did
+with `lake build Batteries.Data.UnionFind.Basic`).
 
 Typical before/after on one machine (the only comparison this script trusts),
 with the environment it requires (TURBO_LEAN_GIT must be git >= 2.46) and the
