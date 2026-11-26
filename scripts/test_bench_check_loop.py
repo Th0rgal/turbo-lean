@@ -28,6 +28,66 @@ from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parent / "bench_check_loop.py"
 
+# The bench signals processes it finds in /proc, and several tests let it run
+# against the real /proc. For the whole test run, every way it can send a signal
+# (os.kill, os.killpg, a pidfd from os.pidfd_open) refuses a target that this
+# test process did not start, so a defect or a mutation in its scope rule can
+# never reach another process of the same user on a shared machine. A bench the
+# tests run as a subprocess starts through BENCH_CMD, which runs it inside this
+# module, so it carries the same guard. Each refusal is written to stderr and
+# recorded in REFUSED_SIGNALS; the NoForeignSignals tests fail on any.
+REFUSED_SIGNALS = []
+GUARD_REFUSAL = "test guard refused"
+BENCH_CMD = [sys.executable, str(Path(__file__).resolve()), "--run-guarded", str(SCRIPT)]
+
+
+def started_by_this_run(pid: int) -> bool:
+    """True when `pid` is this test process or one of its descendants."""
+    me = os.getpid()
+    for _ in range(64):
+        if pid == me:
+            return True
+        if pid <= 1:
+            return False
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_text().rpartition(") ")[2].split()
+            pid = int(fields[1])  # field 4: the parent pid
+        except (OSError, IndexError, ValueError):
+            return False
+    return False
+
+
+def _refuse_foreign(name, real):
+    def guarded(pid, *args):
+        if not started_by_this_run(pid):
+            REFUSED_SIGNALS.append((name, pid))
+            sys.stderr.write(f"{GUARD_REFUSAL} {name}({pid})\n")
+            raise PermissionError(f"test guard: {name}({pid}) targets a process "
+                                  "this test run did not start")
+        return real(pid, *args)
+    return guarded
+
+
+os.kill = _refuse_foreign("kill", os.kill)
+os.killpg = _refuse_foreign("killpg", os.killpg)
+if hasattr(os, "pidfd_open"):
+    os.pidfd_open = _refuse_foreign("pidfd_open", os.pidfd_open)
+
+
+class NoForeignSignals:
+    """A test fails when the bench tried to signal a process it did not start."""
+
+    def setUp(self):
+        super().setUp()
+        REFUSED_SIGNALS.clear()
+
+    def tearDown(self):
+        refused = list(REFUSED_SIGNALS)
+        REFUSED_SIGNALS.clear()
+        super().tearDown()
+        self.assertEqual(refused, [], "the bench tried to signal a process this test "
+                         "did not start")
+
 
 def load_script():
     spec = importlib.util.spec_from_file_location("bench_check_loop", SCRIPT)
@@ -129,10 +189,15 @@ def run_bench(root, extra, stub_body=None, env_extra=None, make_projects=True):
                TURBO_LEAN_ALLOWED_CSIMP="*", TURBO_LEAN_ALLOWED_UNSAFE="*",
                TURBO_LEAN_ALLOWED_IMPLEMENTED_BY="*", FAKE_PFR_FAIL="1")
     env.update(env_extra or {})
-    cmd = [sys.executable, str(SCRIPT), "--turbo-lean-bin", str(stub),
-           "--batteries-dir", str(bats), "--pfr-dir", str(pfr),
-           "--trials", "2", "--warmup", "0", "--skip-rev-check", "--allow-busy-node"] + extra
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+    cmd = BENCH_CMD + ["--turbo-lean-bin", str(stub),
+                       "--batteries-dir", str(bats), "--pfr-dir", str(pfr),
+                       "--trials", "2", "--warmup", "0", "--skip-rev-check",
+                       "--allow-busy-node"] + extra
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+    if GUARD_REFUSAL in r.stderr:
+        raise AssertionError("the bench tried to signal a process this test did not "
+                             "start:\n" + r.stderr)
+    return r
 
 
 def sample_baseline(mod, **overrides):
@@ -1097,7 +1162,7 @@ class PfrAndSourceSafety(unittest.TestCase):
             src = Path(td) / "batteries" / "Batteries" / "Data" / "String" / "Lemmas.lean"
             original = src.read_text()
             proc = subprocess.Popen(
-                [sys.executable, str(SCRIPT), "--turbo-lean-bin", str(Path(td) / "fake-turbo-lean"),
+                BENCH_CMD + ["--turbo-lean-bin", str(Path(td) / "fake-turbo-lean"),
                  "--batteries-dir", str(Path(td) / "batteries"), "--pfr-dir", str(Path(td) / "pfr"),
                  "--trials", "1", "--warmup", "0", "--skip-rev-check", "--allow-busy-node",
                  "--no-baseline", "--out", str(Path(td) / "o2.json")],
@@ -1172,7 +1237,7 @@ class Provenance(unittest.TestCase):
                        PATH=str(Path(td) / "fake-bin") + os.pathsep + os.environ.get("PATH", ""),
                        TURBO_LEAN_ALLOWED_CSIMP="*", TURBO_LEAN_ALLOWED_UNSAFE="*",
                        TURBO_LEAN_ALLOWED_IMPLEMENTED_BY="*", FAKE_PFR_FAIL="1")
-            cmd = [sys.executable, str(SCRIPT), "--turbo-lean-bin", str(stub),
+            cmd = BENCH_CMD + ["--turbo-lean-bin", str(stub),
                    "--batteries-dir", str(Path(td) / "batteries"),
                    "--pfr-dir", str(Path(td) / "pfr"),
                    "--trials", "1", "--warmup", "0", "--skip-rev-check",
@@ -1352,9 +1417,8 @@ class ComparabilityAndProvenance(unittest.TestCase):
                 mutate(base)
                 p = Path(td) / f"{name}.json"
                 p.write_text(json.dumps(base))
-                return subprocess.run(
-                    [sys.executable, str(SCRIPT), "--validate-only", str(p)],
-                    capture_output=True, text=True, timeout=300)
+                return subprocess.run(BENCH_CMD + ["--validate-only", str(p)],
+                                      capture_output=True, text=True, timeout=300)
 
             ok = cli("valid", lambda b: None)
             self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
@@ -1951,7 +2015,63 @@ class CommittedArtifactIsPathFree(unittest.TestCase):
                 self.assertIn(" home <scratch>/", e)
 
 
-class DaemonCleanup(unittest.TestCase):
+class ForeignSignalGuard(unittest.TestCase):
+    """The test run's own guard refuses a process outside its tree and lets its
+    children through. Signal 0 only checks that a target exists."""
+
+    def test_a_process_that_left_this_run_is_refused(self):
+        # The test starts a process that leaves its tree by a double fork, so
+        # init or a subreaper adopts it: to the guard it then looks like any
+        # other process of the user. It exits when the test closes `hold_w`.
+        hold_r, hold_w = os.pipe()
+        report_r, report_w = os.pipe()
+        child = os.fork()
+        if child == 0:
+            try:
+                os.close(report_r)
+                grandchild = os.fork()
+                if grandchild == 0:
+                    try:
+                        os.close(hold_w)
+                        os.read(hold_r, 1)
+                    finally:
+                        os._exit(0)
+                os.write(report_w, f"{grandchild}\n".encode())
+            finally:
+                os._exit(0)
+        os.close(hold_r)
+        os.close(report_w)
+        os.waitpid(child, 0)
+        target = int(os.read(report_r, 32).decode().strip())
+        os.close(report_r)
+        try:
+            REFUSED_SIGNALS.clear()
+            self.assertFalse(started_by_this_run(target))
+            with self.assertRaises(PermissionError):
+                os.kill(target, 0)
+            if hasattr(os, "pidfd_open"):
+                with self.assertRaises(PermissionError):
+                    os.pidfd_open(target)
+            self.assertEqual([pid for _, pid in REFUSED_SIGNALS],
+                             [target] * (2 if hasattr(os, "pidfd_open") else 1))
+        finally:
+            REFUSED_SIGNALS.clear()
+            os.close(hold_w)
+
+    def test_a_child_is_let_through(self):
+        REFUSED_SIGNALS.clear()
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            os.kill(child.pid, 0)
+            if hasattr(os, "pidfd_open"):
+                os.close(os.pidfd_open(child.pid))
+        finally:
+            child.kill()
+            child.wait(timeout=10)
+        self.assertEqual(REFUSED_SIGNALS, [])
+
+
+class DaemonCleanup(NoForeignSignals, unittest.TestCase):
     """A workload's daemons end with it, even when `daemon stop` gives up, and
     nothing outside the workload's staging namespace is touched."""
 
@@ -2080,7 +2200,7 @@ class DaemonCleanup(unittest.TestCase):
             self.assertEqual(got, [(101, "1101"), (102, "1102"), (107, "1107"), (109, "1109")])
 
 
-class ScratchRemoval(unittest.TestCase):
+class ScratchRemoval(NoForeignSignals, unittest.TestCase):
     """turbo-lean writes read-only directories (closure snapshots) under its
     home; the bench must still remove every trial directory it made."""
 
@@ -2203,4 +2323,11 @@ class HostIdLabel(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    if sys.argv[1:2] == ["--run-guarded"]:
+        # BENCH_CMD: run the bench in this process, which carries the signal
+        # guard installed above, as `python3 bench_check_loop.py ARGS` would.
+        import runpy
+        sys.argv = sys.argv[2:]
+        runpy.run_path(sys.argv[0], run_name="__main__")
+    else:
+        unittest.main(verbosity=2)
