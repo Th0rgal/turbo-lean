@@ -1,0 +1,179 @@
+import Lean.Compiler.LCNF.Basic
+import Lean.Compiler.LCNF.ToImpureType
+import LeanNative.IR.RealLCNFBridge
+import LeanNative.IR.RealLCNFCallSemantics
+import LeanNative.Semantics.Eval
+
+/-!
+# L2 (roadmap/HORIZONS.md rung L2 "Calls"): executable guards for the call semantics
+
+Contract: `lean/LeanNative/Proofs/LowerCalls.lean` (acceptance section). Three families:
+
+1. A two-declaration environment where the caller's result is WRONG unless the callee
+   body actually runs — kills call-as-noop mutants of `evalCodeF` / `evalStepF` (the
+   result is value-sensitive in the callee's contribution).
+2. A self-call falls to the old `.unsupportedCall` behavior: the environment is
+   stratified (a callee body runs under the STRICT SUFFIX), so recursion is out of scope
+   for L2 by construction, not by accident.
+3. `Δ = [] / Φ = []` runs equal the old evaluators on the same inputs (executable
+   conservativity, beside the kernel theorems `evalCodeF_nil` / `evalStepF_nil`;
+   `exceptAgrees` compares ok-payloads exactly and error-results by shape, since
+   `UBError` carries no `BEq`).
+
+Plus the end-to-end instance: lowering caller and callee with `lowerRealLCNFDecl` and
+evaluating the lowered caller under the lowered environment produces the source result —
+the executable shape of `lowerRealLCNFDecl_soundF`.
+-/
+
+namespace LeanNative.Tests.RealLCNFCallTests
+
+open Lean
+open Lean.Compiler.LCNF
+open LeanNative.IR
+open LeanNative.IR.RealLCNFBridge
+open LeanNative.IR.RealLCNFSemantics
+open LeanNative.Semantics
+
+/-- Result agreement: ok-payloads compared exactly; errors by shape (`UBError` has no
+    `BEq`); the kernel conservativity theorems carry the full equality. -/
+private def exceptAgrees : Except UBError (Val × HeapState) → Except UBError (Val × HeapState) → Bool
+  | .ok (v1, h1), .ok (v2, h2) => v1 == v2 && h1 == h2
+  | .error _, .error _ => true
+  | _, _ => false
+
+/-! ### LNIR side (`evalCodeF`) -/
+
+/-- Callee `f_sym x = x + 1` (call-free body). -/
+private def calleeL : LNIRDecl :=
+  { name := "f_sym"
+    params := [{ id := 0, name := "x", ty := .i64 }]
+    retTy := .i64
+    body := .letBind 1 .i64 (.scalar (.binOp .add (.var 0) (.constU64 1))) (.ret 1) }
+
+/-- Caller body `g x = f_sym x + x` — value-sensitive in the callee's result. -/
+private def callerBodyL : LNIRCode :=
+  .letBind 1 .i64 (.call "f_sym" [0] .i64 false)
+    (.letBind 2 .i64 (.scalar (.binOp .add (.var 1) (.var 0))) (.ret 2))
+
+private def runCodeF (Φ : FuncEnv) (body : LNIRCode) (arg : Val) : Except UBError (Val × HeapState) :=
+  evalCodeF Φ 32 (VarEnv.empty.bind 0 arg) HeapState.empty body
+
+-- 1. The callee body must actually run: g 5 = (5+1) + 5 = 11.
+#guard (match runCodeF [calleeL] callerBodyL (.u64 5) with
+        | .ok (v, hst) => v == .u64 11 && hst == HeapState.empty
+        | .error _ => false)
+
+-- 2. Self/backward call misses the stratified environment: the callee body runs under
+--    the strict suffix, so `g_self` calling itself errors like the old semantics.
+private def selfL : LNIRDecl :=
+  { name := "g_self"
+    params := [{ id := 0, name := "x", ty := .i64 }]
+    retTy := .i64
+    body := .letBind 1 .i64 (.call "g_self" [0] .i64 false) (.ret 1) }
+
+#guard (runCodeF [selfL] selfL.body (.u64 5)).isOk == false
+
+-- 3. Φ = [] agrees with the old evaluator: on a call-free body (both ok, same value) and
+--    on a call-bearing body (both error).
+#guard exceptAgrees (runCodeF [] calleeL.body (.u64 5))
+  (evalCode 32 (VarEnv.empty.bind 0 (.u64 5)) HeapState.empty calleeL.body)
+#guard (evalCode 32 (VarEnv.empty.bind 0 (.u64 5)) HeapState.empty calleeL.body).isOk == true
+#guard exceptAgrees (runCodeF [] callerBodyL (.u64 5))
+  (evalCode 32 (VarEnv.empty.bind 0 (.u64 5)) HeapState.empty callerBodyL)
+#guard (evalCode 32 (VarEnv.empty.bind 0 (.u64 5)) HeapState.empty callerBodyL).isOk == false
+
+-- `callFreeCode` classifies the fixtures.
+#guard callFreeCode calleeL.body == true
+#guard callFreeCode callerBodyL == false
+
+/-! ### Source side (`evalStepF` / `evalRealLCNFDeclF`) over real LCNF declarations -/
+
+private def fv (n : Nat) : FVarId := { name := .num `x n }
+
+private def mkParam (n : Nat) (ty : Expr) (borrow : Bool := false) : Param .impure :=
+  { fvarId := fv n, binderName := .num `p n, type := ty, borrow := borrow }
+
+private def mkLet (n : Nat) (ty : Expr) (val : LetValue .impure) : LetDecl .impure :=
+  { fvarId := fv n, binderName := .num `v n, type := ty, value := val }
+
+private def mkDecl (name : Name) (params : Array (Param .impure)) (retTy : Expr)
+    (body : Code .impure) : Decl .impure :=
+  { name := name
+    levelParams := []
+    type := retTy
+    params := params
+    value := .code body
+    inlineAttr? := none }
+
+/-- Source callee `l2_callee x = x + 1`. -/
+private def calleeS : Decl .impure :=
+  let u64 := ImpureType.uint64
+  mkDecl `l2_callee #[mkParam 10 u64] u64 <|
+    .let (mkLet 11 u64 (.lit (.uint64 1))) <|
+    .let (mkLet 12 u64 (.fap ``UInt64.add #[.fvar (fv 10), .fvar (fv 11)] rfl)) <|
+    .return (fv 12)
+
+/-- Source caller `l2_caller x = l2_callee x + x`. -/
+private def callerS : Decl .impure :=
+  let u64 := ImpureType.uint64
+  mkDecl `l2_caller #[mkParam 1 u64] u64 <|
+    .let (mkLet 3 u64 (.fap `l2_callee #[.fvar (fv 1)] rfl)) <|
+    .let (mkLet 4 u64 (.fap ``UInt64.add #[.fvar (fv 3), .fvar (fv 1)] rfl)) <|
+    .return (fv 4)
+
+private def ctxS : RealBridgeCtx :=
+  { arch := .x86_64, localCallees := [(`l2_callee, "f_sym")] }
+
+private def declProducesF (Δ : DeclEnv) (d : Decl .impure) (args : List Val)
+    (expected : Val) : Bool :=
+  match evalRealLCNFDeclF Δ 32 ctxS d args with
+  | .ok (v, hst) => v == expected && hst == HeapState.empty
+  | .error _ => false
+
+-- 1. The callee body must actually run: l2_caller 5 = (5+1) + 5 = 11.
+#guard declProducesF [calleeS] callerS [.u64 5] (.u64 11)
+
+-- The old semantics deliberately errors on the same program (the vacuity L2 closes).
+#guard (evalRealLCNFDecl 32 ctxS callerS [.u64 5]).isOk == false
+
+-- 2. A self-call errors under the stratified environment (strict suffix for the callee).
+private def selfS : Decl .impure :=
+  let u64 := ImpureType.uint64
+  mkDecl `l2_self #[mkParam 20 u64] u64 <|
+    .let (mkLet 21 u64 (.fap `l2_self #[.fvar (fv 20)] rfl)) <|
+    .return (fv 21)
+
+private def ctxSelf : RealBridgeCtx :=
+  { arch := .x86_64, localCallees := [(`l2_self, "l2_self_sym")] }
+
+#guard (evalRealLCNFDeclF [selfS] 32 ctxSelf selfS [.u64 5]).isOk == false
+
+-- 3. Δ = [] agrees with the old evaluator on the same inputs (caller errors both ways;
+--    callee succeeds both ways with the same payload).
+#guard exceptAgrees (evalRealLCNFDeclF [] 32 ctxS callerS [.u64 5])
+  (evalRealLCNFDecl 32 ctxS callerS [.u64 5])
+#guard exceptAgrees (evalRealLCNFDeclF [] 32 ctxS calleeS [.u64 5])
+  (evalRealLCNFDecl 32 ctxS calleeS [.u64 5])
+#guard (evalRealLCNFDecl 32 ctxS calleeS [.u64 5]).isOk == true
+
+/-! ### End to end: the executable shape of `lowerRealLCNFDecl_soundF` -/
+
+private def loweredPair? : Option (LNIRDecl × LNIRDecl) :=
+  match lowerRealLCNFDecl 32 ctxS calleeS "f_sym", lowerRealLCNFDecl 32 ctxS callerS "g_sym" with
+  | .ok fL, .ok gL => some (fL, gL)
+  | _, _ => none
+
+/-- Lower both declarations, then run the LOWERED caller under the LOWERED environment
+    with the declaration-entry binding convention — must produce the source result. -/
+private def e2eCallSound : Bool :=
+  match loweredPair? with
+  | some (fL, gL) =>
+    let venv := (gL.params.zip [Val.u64 5]).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty
+    match evalCodeF [fL] 32 venv HeapState.empty gL.body with
+    | .ok (v, hst) => v == .u64 11 && hst == HeapState.empty
+    | .error _ => false
+  | none => false
+
+#guard e2eCallSound == true
+
+end LeanNative.Tests.RealLCNFCallTests
