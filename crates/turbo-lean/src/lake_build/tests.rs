@@ -4599,7 +4599,8 @@ public def api := by
         Ok(())
     }
 
-    // ---- G2b: CAS expr replay on by default for warm hits (roadmap/HORIZONS.md G2b) ----
+    // ---- G2b: CAS expr replay, opt-in for warm hits (reverted from on-by-default
+    // per the H2 bench-delta rule; roadmap/HORIZONS.md G2b) ----
 
     /// Panic-safe env guard (the `module_builder.rs` `ScopedEnvVar` shape): restores the
     /// previous value on drop, so a failed assertion cannot leak the variable into later
@@ -4641,8 +4642,9 @@ public def api := by
     fn g2b_warm_default_cas_replay_decision_table() {
         // (cache_hit, opt_out) -> warm default replay?
         for (cache_hit, opt_out, want) in [
-            (true, false, true),   // the G2b default: a warm hit replays
-            (false, false, false), // cold build: elaboration ran anyway, no default replay
+            (true, false, true),   // warm hit, not opted out: replays (the caller's
+                                   // opt_out carries !opted_in since the revert)
+            (false, false, false), // cold build: elaboration ran anyway, no replay
             (true, true, false),   // TURBO_LEAN_NO_WARM_CAS_REPLAY=1 opts out
             (false, true, false),
         ] {
@@ -4914,10 +4916,11 @@ public def api := by
     }
 
     /// G2b red→green: the one build-side selector every `run_build_command_with_cas_replay`
-    /// branch calls. Explicit flag → fail-closed `"explicit"`; warm hit → best-effort
+    /// branch calls. Explicit flag → fail-closed `"explicit"`; warm hit WITH THE OPT-IN
+    /// (`TURBO_LEAN_WARM_CAS_REPLAY=1`, the reverted default) → best-effort
     /// `"warm_default"` with "never seeded" (`missing`) and "corrupted or tampered"
-    /// (`invalid`) counted separately, never merged (env opt-out honored); cold build →
-    /// `"off"`.
+    /// (`invalid`) counted separately, never merged (the explicit opt-out still wins);
+    /// warm hit with the opt-in unset → `"off"`; cold build → `"off"`.
     #[test]
     fn g2b_cas_replay_build_mode_selection() -> Result<()> {
         let _guard = crate::pack::tests::env_test_lock()
