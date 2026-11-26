@@ -344,6 +344,11 @@ class ClangResolutionOrder(unittest.TestCase):
         # PASS the callers' substring version checks.
         self.assertIsNone(fuzzer.toolchain_version_token(None))
         self.assertIsNone(fuzzer.toolchain_version_token(""))
+        # A malformed pin whose version token is empty after the rsplit/lstrip
+        # ("leanprover/lean4:", "leanprover/lean4:v") must yield None too, or
+        # the same fail-open substring check comes back through the side door.
+        self.assertIsNone(fuzzer.toolchain_version_token("leanprover/lean4:"))
+        self.assertIsNone(fuzzer.toolchain_version_token("leanprover/lean4:v"))
 
     def test_missing_pin_fails_the_version_check_closed_in_both_callers(self):
         import run_conformance_suite as suite
@@ -528,31 +533,35 @@ class PinnedEnvReachesToolchainSubprocesses(unittest.TestCase):
             fuzzer.restore_elan_toolchain(saved)
             self.assertNotIn("ELAN_TOOLCHAIN", os.environ)
 
-    def test_p0_module_imports_and_skips_on_unsupported_host_arch(self):
-        """Importing test_p0_trust_boundary must not require a supported host
-        CPU: host_arch.host_target_arch() raises on e.g. riscv64, and an
-        import-time HOST_ARCH computation breaks this module's own
-        `import test_p0_trust_boundary` too. The arch is computed lazily and
-        the arch-dependent legs skip (never KeyError off CPU_ARCH_TRIPLES)."""
+    def test_test_modules_import_and_skip_on_unsupported_host_arch(self):
+        """Importing test_p0_trust_boundary / test_scalar_frontend must not
+        require a supported host CPU: host_arch.host_target_arch() raises on
+        e.g. riscv64, and an import-time HOST_ARCH computation breaks this
+        module's own `import <test module>` too. The arch is computed lazily
+        per test and the arch-dependent legs skip (never KeyError off
+        CPU_ARCH_TRIPLES / S1B_IR_NEEDLES)."""
         import importlib
 
         import host_arch
         import test_p0_trust_boundary as tp0
+        import test_scalar_frontend as tsf
 
         try:
-            with mock.patch.object(host_arch.platform, "machine", return_value="riscv64"):
-                importlib.reload(tp0)  # must not raise on an unsupported machine
-                with self.assertRaises(unittest.SkipTest):
-                    tp0.host_arch_or_skip(self)
-            # A value off the {x86_64, arm64} CPU_ARCH_TRIPLES set skips too.
-            with mock.patch.object(tp0.host_arch, "host_target_arch", return_value="z80"):
-                with self.assertRaises(unittest.SkipTest):
-                    tp0.host_arch_or_skip(self)
-            self.assertEqual(tp0.host_arch_or_skip(self), host_arch.host_target_arch())
-            self.assertEqual(tp0.cross_arch_for("arm64"), "x86_64")
-            self.assertEqual(tp0.cross_arch_for("x86_64"), "arm64")
+            for mod in (tp0, tsf):
+                with mock.patch.object(host_arch.platform, "machine", return_value="riscv64"):
+                    importlib.reload(mod)  # must not raise on an unsupported machine
+                    with self.assertRaises(unittest.SkipTest):
+                        mod.host_arch_or_skip(self)
+                # A value off the module's {x86_64, arm64} table skips too.
+                with mock.patch.object(host_arch, "host_target_arch", return_value="z80"):
+                    with self.assertRaises(unittest.SkipTest):
+                        mod.host_arch_or_skip(self)
+                self.assertEqual(mod.host_arch_or_skip(self), host_arch.host_target_arch())
+                self.assertEqual(mod.cross_arch_for("arm64"), "x86_64")
+                self.assertEqual(mod.cross_arch_for("x86_64"), "arm64")
         finally:
             importlib.reload(tp0)
+            importlib.reload(tsf)
 
 
 class ConLecheToolchainPinConsistency(unittest.TestCase):

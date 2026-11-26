@@ -57,12 +57,24 @@ import host_arch
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CORE_BIN = ROOT / "lean" / ".lake" / "build" / "bin" / "lean-native-core"
 
-# The live CAbiEmit/compile-llvm legs emit IR for the HOST CPU (the objects are
-# linked into host-native ASan/UBSan harnesses), in the Lean `TargetArch`
-# spelling; the aarch64 triple/datalayout pair mirrors the Rust-side
-# `builtin_fastcheck_cpu_target` (crates/turbo-lean/src/gpu_fastcheck.rs) and
-# `TargetArch.llvmTriple`/`dataLayout` (lean/LeanNative/IR/Types.lean).
-HOST_ARCH = host_arch.host_target_arch()
+def runner_host_arch() -> str:
+    """Host CPU arch in the Lean `TargetArch` spelling for the live
+    CAbiEmit/compile-llvm legs (the emitted objects are linked into
+    host-native ASan/UBSan harnesses); the aarch64 triple/datalayout pair
+    mirrors the Rust-side `builtin_fastcheck_cpu_target`
+    (crates/turbo-lean/src/gpu_fastcheck.rs) and
+    `TargetArch.llvmTriple`/`dataLayout` (lean/LeanNative/IR/Types.lean).
+
+    Computed where first needed (run_sanitizer_suite's core-bin leg), never
+    at import time: this script is a runner entrypoint, not a test module,
+    so an unsupported host CPU is a named RuntimeError in find_lean_prefix's
+    fail-closed style, never a skip."""
+    try:
+        return host_arch.host_target_arch()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"cannot emit host-native IR for the CAbiEmit/compile-llvm legs: {exc}"
+        ) from None
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -77,14 +89,15 @@ def find_lean_prefix(override_lean: str | None = None) -> Path | None:
         *fuzz_san.toolchain_bin_candidates("lean"),
     ]
     pin_ver = fuzz_san.toolchain_version_token(fuzz_san.repo_pinned_toolchain())
-    if pin_ver is None:
+    if not pin_ver:
         # "" would be a substring of every `lean --version` banner, so a
-        # missing/empty lean/lean-toolchain must be a named error, never a
-        # silently passing version check.
+        # missing/empty/malformed lean/lean-toolchain must be a named error,
+        # never a silently passing version check (falsy guard, not `is None`:
+        # an empty token must never reach the substring check either).
         raise RuntimeError(
-            "repo toolchain pin is missing/empty: cannot verify lean candidates "
-            f"against `lean --version` ({fuzz_san.LEAN_TOOLCHAIN_FILE} is "
-            "missing, unreadable, or empty)"
+            "repo toolchain pin is missing/empty/malformed: cannot verify lean "
+            f"candidates against `lean --version` ({fuzz_san.LEAN_TOOLCHAIN_FILE} "
+            "is missing, unreadable, empty, or has no version token)"
         )
     seen: set[str] = set()
     for raw in candidates:
@@ -691,8 +704,9 @@ def run_sanitizer_suite(
         core_artifacts: dict[str, Any] = {"usedCoreBin": str(core_path) if core_path else None}
 
         if core_path is not None:
+            host_cpu = runner_host_arch()
             subprocess.run(
-                [str(core_path), "emit-cabi-bindings", "--canonical-benchmark", "--arch", HOST_ARCH, "--emit-header", str(hdr_path)],
+                [str(core_path), "emit-cabi-bindings", "--canonical-benchmark", "--arch", host_cpu, "--emit-header", str(hdr_path)],
                 cwd=ROOT,
                 check=True,
                 capture_output=True,
@@ -702,7 +716,7 @@ def run_sanitizer_suite(
             asan_ll_path = tmpdir / "canonical.asan.ll"
             obj_path = tmpdir / "canonical.asan.o"
             subprocess.run(
-                [str(core_path), "compile-llvm", "--canonical-benchmark", "--arch", HOST_ARCH, "-o", str(ll_path)],
+                [str(core_path), "compile-llvm", "--canonical-benchmark", "--arch", host_cpu, "-o", str(ll_path)],
                 cwd=ROOT,
                 check=True,
                 capture_output=True,
@@ -897,6 +911,20 @@ class HeapObjSanitizerSelfTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "toolchain pin"):
                 find_lean_prefix()
 
+    def test_unsupported_host_arch_is_a_named_runtime_error(self) -> None:
+        # This script is a runner entrypoint, not a test module: on a host CPU
+        # the native-emission legs do not support, the core-bin leg must fail
+        # closed with a named RuntimeError at the point of first use (the
+        # find_lean_prefix style), never skip and never crash at import time.
+        from unittest import mock
+
+        with mock.patch.object(host_arch.platform, "machine", return_value="riscv64"):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"cannot emit host-native IR .*unsupported host CPU architecture 'riscv64'",
+            ):
+                runner_host_arch()
+
     def test_toolchain_and_link_flags_discovery(self) -> None:
         pref = find_lean_prefix()
         self.assertIsNotNone(pref, "Expected Lean v4.35.0 prefix with include/lean/lean.h and libleanrt.a")
@@ -999,7 +1027,7 @@ class HeapObjSanitizerSelfTests(unittest.TestCase):
                 "attributes #0 = { nounwind uwtable \"target-cpu\"=\"x86-64-v2\" }\n'''\n"
                 # Arch parameterization keyed on the --arch argument the mock is HANDED,
                 # and FAIL CLOSED without one (a silent x86_64 default would hide a
-                # regression of run_sanitizer_suite's HOST_ARCH plumbing on x86 hosts):
+                # regression of run_sanitizer_suite's host-arch plumbing on x86 hosts):
                 # for arm64 the mock emits the triple/datalayout/attribute footer that
                 # `compile-llvm --arch arm64` produces; for x86_64 the IR bytes are
                 # identical to the literal above.
@@ -1016,7 +1044,7 @@ class HeapObjSanitizerSelfTests(unittest.TestCase):
             mock_core.chmod(0o755)
             # The mock must honor the --arch it is HANDED, not the machine it
             # happens to run on; otherwise this test cannot catch a regression
-            # of the HOST_ARCH plumbing in run_sanitizer_suite.
+            # of the host-arch plumbing in run_sanitizer_suite.
             for req_arch, needle in (
                 ("arm64", 'target triple = "aarch64-unknown-linux-gnu"'),
                 ("x86_64", 'target triple = "x86_64-unknown-linux-gnu"'),

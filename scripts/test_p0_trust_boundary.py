@@ -76,23 +76,19 @@ CPU_ARCH_TRIPLES = {"x86_64": "x86_64-unknown-linux-gnu", "arm64": "aarch64-unkn
 def host_arch_or_skip(test: unittest.TestCase) -> str:
     """The host CPU in the `--arch` spelling, computed lazily per test.
 
-    host_arch.host_target_arch() raises on unsupported machines, so an
-    import-time HOST_ARCH computation broke importing this module at all
-    (including test_fuzz_lcnf_conformance's `import test_p0_trust_boundary`).
-    The arch-dependent legs call this instead and skip on such hosts, and skip
-    (never KeyError) when the arch has no CPU_ARCH_TRIPLES entry."""
-    try:
-        arch = host_arch.host_target_arch()
-    except RuntimeError as exc:
-        test.skipTest(str(exc))
+    Delegates to the shared host_arch.host_arch_or_skip (skipping on machines
+    host_target_arch() rejects: an import-time HOST_ARCH computation broke
+    importing this module at all, including test_fuzz_lcnf_conformance's
+    `import test_p0_trust_boundary`), then skips (never KeyErrors) when the
+    arch has no CPU_ARCH_TRIPLES entry."""
+    arch = host_arch.host_arch_or_skip(test)
     if arch not in CPU_ARCH_TRIPLES:
         test.skipTest(f"host arch {arch!r} has no CPU_ARCH_TRIPLES entry")
     return arch
 
 
-def cross_arch_for(host: str) -> str:
-    """The opposite CPU arch for the symmetric cross-emission legs."""
-    return "x86_64" if host == "arm64" else "arm64"
+# The opposite CPU arch for the symmetric cross-emission legs.
+cross_arch_for = host_arch.cross_arch_for
 
 
 def find_clang() -> str:

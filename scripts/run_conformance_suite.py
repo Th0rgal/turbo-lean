@@ -330,12 +330,13 @@ def ensure_c2_external_dep(dep_key: str) -> dict[str, Any]:
 
 def find_v435_lean_and_init() -> tuple[Path, Path] | None:
     pin_token = fuzz.toolchain_version_token(PINNED_CON_LECHE_TOOLCHAIN)
-    if pin_token is None:
+    if not pin_token:
         # "" would be a substring of every `lean --version` banner, so a
-        # missing toolchain pin must fail closed here, never pass silently.
+        # missing or malformed toolchain pin must fail closed here, never
+        # pass silently (falsy guard, not `is None`).
         raise RuntimeError(
-            "PINNED_CON_LECHE_TOOLCHAIN is missing/empty: cannot verify lean "
-            "candidates against the con-leche toolchain pin"
+            "PINNED_CON_LECHE_TOOLCHAIN is missing/empty/malformed: cannot "
+            "verify lean candidates against the con-leche toolchain pin"
         )
     candidates: list[str | None] = [
         fuzz.find_lean_binary(),
