@@ -817,6 +817,14 @@ def locate_decl_block(src: str, decl: str, prefer_line=None):
 
 # ------------------------------------------------------------ host identity
 
+def read_machine_id() -> str:
+    """The machine-id, or '' when unreadable (containers commonly lack it)."""
+    try:
+        return Path("/etc/machine-id").read_text().strip()
+    except OSError:
+        return ""
+
+
 def host_id(machine_label):
     cpu_model = "unknown"
     try:
@@ -834,15 +842,17 @@ def host_id(machine_label):
                 break
     except OSError:
         pass
-    try:
-        machine_id = Path("/etc/machine-id").read_text().strip()
-    except OSError:
-        machine_id = ""
+    machine_id = read_machine_id()
     # The fingerprint is what host_matches compares: it pins the physical
     # machine without putting its name in the JSON (a label is a condition
     # tag two machines could share, so it cannot carry the machine identity).
-    fingerprint = hashlib.sha256(
+    # Without a machine-id it is None, never sha256(hostname + "\0"): that
+    # would be a confirmable hash of the node name, and ephemeral containers
+    # (fresh hostname each run) would never match each other. host_matches
+    # then falls back to the hostname/label comparison.
+    fingerprint = (hashlib.sha256(
         (platform.node() + "\0" + machine_id).encode()).hexdigest()
+        if machine_id else None)
     return {
         # With a label the label IS the recorded hostname: the live node name
         # stays out of the JSON entirely (the label exists so results never

@@ -1618,6 +1618,25 @@ class HostFingerprint(unittest.TestCase):
         self.assertIn(("a" * 64)[:12], v["skipped_reason"])
         self.assertIn(("b" * 64)[:12], v["skipped_reason"])
 
+    def test_no_machine_id_means_no_fingerprint(self):
+        # Without a machine-id the fingerprint would be sha256(hostname+"\0"),
+        # a confirmable hash of the node name — against the no-node-name
+        # claim — and ephemeral containers would never match each other.
+        # The honest degradation is None, so the hostname/label fallback
+        # applies in host_matches.
+        mod = load_script()
+        mod.read_machine_id = lambda: ""
+        h = mod.host_id("g2a-ro-192c")
+        self.assertIsNone(h["host_fingerprint"])
+        # Control: with a machine-id the fingerprint is a 64-hex digest and
+        # differs across machine-ids.
+        mod.read_machine_id = lambda: "mid-one"
+        f1 = mod.host_id("g2a-ro-192c")["host_fingerprint"]
+        mod.read_machine_id = lambda: "mid-two"
+        f2 = mod.host_id("g2a-ro-192c")["host_fingerprint"]
+        self.assertTrue(re.fullmatch(r"[0-9a-f]{64}", f1 or ""), f1)
+        self.assertNotEqual(f1, f2)
+
     def test_host_id_records_hex_fingerprint_never_node_name(self):
         mod = load_script()
         h = mod.host_id("g2a-ro-192c")
