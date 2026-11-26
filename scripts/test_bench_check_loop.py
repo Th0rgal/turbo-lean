@@ -222,19 +222,19 @@ class Stats(unittest.TestCase):
 
 class CheckTimeoutOverride(unittest.TestCase):
     def test_env_override_reaches_subprocess_timeout(self):
-        # TURBO_LEAN_BENCH_CHECK_TIMEOUT_S rebinds CHECK_TIMEOUT_S after
-        # import.  The child's `--timeout` argv already reads the global at
+        # TURBO_LEAN_BENCH_CHECK_TIMEOUT_S is read at import into
+        # CHECK_TIMEOUT_S. The child's `--timeout` argv reads the global at
         # call time; subprocess.run's own bound must carry the same value,
         # so run_check may not freeze the module global into its parameter
         # default at definition time.
-        mod = load_script()
         key = "TURBO_LEAN_BENCH_CHECK_TIMEOUT_S"
         prev = os.environ.get(key)
         os.environ[key] = "123"
         try:
-            # Re-apply the override: rebind the module global from the env,
-            # exactly as the env-override hook does after import.
-            mod.CHECK_TIMEOUT_S = int(os.environ[key])
+            # The hook is real script behavior: a fresh load under the
+            # override must carry it, with no hand rebind here.
+            mod = load_script()
+            self.assertEqual(mod.CHECK_TIMEOUT_S, 123)
 
             recorded = {}
 

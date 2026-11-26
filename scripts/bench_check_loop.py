@@ -83,7 +83,10 @@ COVERAGE_GATE = 0.90
 BUSY_LOAD_THRESHOLD = 1.0  # one 100%-CPU tenant already poisons warm medians
 DEFAULT_TRIALS = 5
 DEFAULT_WARMUP = 1
-CHECK_TIMEOUT_S = 900
+# Per-check budget default, overridable at import by the environment (the
+# --check-timeout-s flag still wins per run). A non-numeric value fails the
+# import loudly rather than running with a guessed budget.
+CHECK_TIMEOUT_S = int(os.environ.get("TURBO_LEAN_BENCH_CHECK_TIMEOUT_S") or 900)
 
 PINNED_REVS = {
     "batteries": "66e469188fe07963e5cf666c7d4433f45b8131c5",  # tag v4.35.0
