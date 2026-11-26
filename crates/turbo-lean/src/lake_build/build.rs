@@ -1077,8 +1077,22 @@ pub(crate) fn warm_cas_replay_disabled() -> bool {
     ) == Some(true)
 }
 
-/// G2b decision: CAS proof replay runs by default exactly on a warm (cache-hit) build
-/// path, unless the operator opted out. The explicit fail-closed flag never reaches this
+/// G2b revert (fm-g2a r2, 2026-11-26): the paired on-vs-off delta moved no
+/// cell of the pinned benchmark outside its noise band, so per the H2 rule
+/// the warm default reverted to opt-in. `TURBO_LEAN_WARM_CAS_REPLAY` enables
+/// the warm replay (same relaxed-bool grammar); the explicit opt-out above
+/// still forces it off; unset means off. The replay path itself is unchanged.
+pub(crate) fn warm_cas_replay_opted_in() -> bool {
+    crate::shm_cache::parse_relaxed_bool(
+        &std::env::var("TURBO_LEAN_WARM_CAS_REPLAY").unwrap_or_default(),
+    ) == Some(true)
+        && !warm_cas_replay_disabled()
+}
+
+/// G2b decision, reverted to opt-in (fm-g2a r2): CAS proof replay runs on a warm
+/// (cache-hit) build path only when the operator opted in — the on-vs-off delta on
+/// the pinned benchmark moved no cell outside its noise band, so the H2 rule
+/// reverted the on-by-default. The explicit fail-closed flag never reaches this
 /// decision: the selector's early return owns it, so there is no dead parameter here.
 pub(crate) fn should_replay_cas_expr_on_warm_hit(cache_hit: bool, opt_out: bool) -> bool {
     cache_hit && !opt_out
@@ -1140,7 +1154,7 @@ pub(crate) fn run_cas_expr_replay_for_build(
             mode: "explicit",
         });
     }
-    if should_replay_cas_expr_on_warm_hit(cache_hit, warm_cas_replay_disabled()) {
+    if should_replay_cas_expr_on_warm_hit(cache_hit, !warm_cas_replay_opted_in()) {
         // Review finding 1: an internal error here (a split-cache or config read failing)
         // must never fail a warm build whose outputs are already materialized. Contain it
         // as a mode instead of propagating through `?`.

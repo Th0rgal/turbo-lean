@@ -4678,6 +4678,42 @@ public def api := by
         assert!(!leader_branch_cache_hit(false, &report(0, 0, 0)));
     }
 
+    /// G2b revert red→green (fm-g2a r2): the on-vs-off delta on the pinned
+    /// benchmark moved no cell outside the noise band (12/12 unchanged,
+    /// artifacts bench_check_loop_g2b_{on,off}.json), so per the H2 rule the
+    /// warm default is reverted to OPT-IN: `TURBO_LEAN_WARM_CAS_REPLAY`
+    /// enables, the explicit opt-out still forces off, and unset means OFF.
+    /// The KEPT replay path itself is unchanged (the G2a 20/20 warm hit-rate
+    /// evidence stays valid for the opt-in path).
+    #[test]
+    fn g2b_revert_warm_cas_replay_is_opt_in() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _off = ScopedEnvVar::unset("TURBO_LEAN_NO_WARM_CAS_REPLAY");
+        {
+            let _on = ScopedEnvVar::unset("TURBO_LEAN_WARM_CAS_REPLAY");
+            assert!(!warm_cas_replay_opted_in(), "unset must mean OFF");
+        }
+        for (val, want) in [
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("0", false),
+            ("off", false),
+            ("bogus", false),
+        ] {
+            let _on = ScopedEnvVar::set("TURBO_LEAN_WARM_CAS_REPLAY", val);
+            assert_eq!(warm_cas_replay_opted_in(), want, "value {val:?}");
+        }
+        let _on = ScopedEnvVar::set("TURBO_LEAN_WARM_CAS_REPLAY", "1");
+        let _no = ScopedEnvVar::set("TURBO_LEAN_NO_WARM_CAS_REPLAY", "1");
+        assert!(
+            !warm_cas_replay_opted_in(),
+            "the explicit opt-out wins over the opt-in"
+        );
+    }
+
     /// G2b red→green: `TURBO_LEAN_NO_WARM_CAS_REPLAY` is the opt-out, parsed with the
     /// same relaxed-bool grammar as the other `TURBO_LEAN_NO_*` switches.
     #[test]
@@ -4686,7 +4722,10 @@ public def api := by
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _env = ScopedEnvVar::unset("TURBO_LEAN_NO_WARM_CAS_REPLAY");
-        assert!(!warm_cas_replay_disabled(), "unset must mean enabled");
+        assert!(
+            !warm_cas_replay_disabled(),
+            "unset means not explicitly disabled (the default is the opt-in's call)"
+        );
         for (val, want) in [
             ("1", true),
             ("true", true),
@@ -4834,6 +4873,9 @@ public def api := by
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _env = ScopedEnvVar::unset("TURBO_LEAN_NO_WARM_CAS_REPLAY");
+        // The warm path is opt-in since the G2b revert; this test covers the
+        // KEPT path, so it opts in.
+        let _opt_in = ScopedEnvVar::set("TURBO_LEAN_WARM_CAS_REPLAY", "1");
         let dir = std::env::temp_dir().join(format!(
             "turbo_g2b_err_{}_{}",
             std::process::id(),
@@ -4882,6 +4924,10 @@ public def api := by
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _env = ScopedEnvVar::unset("TURBO_LEAN_NO_WARM_CAS_REPLAY");
+        // The warm path is opt-in since the G2b revert; this test covers the
+        // KEPT selector behavior, so it opts in (the cold case still reads
+        // "off": the selector gates on the cache hit, not only the opt-in).
+        let _opt_in = ScopedEnvVar::set("TURBO_LEAN_WARM_CAS_REPLAY", "1");
         let dir = std::env::temp_dir().join(format!(
             "turbo_g2b_mode_{}_{}",
             std::process::id(),

@@ -33,10 +33,11 @@ the two runs were actually compared.
 
 Exit codes:
     0  measurements healthy; comparison passed, or was explicitly skipped and
-       flagged (`comparison_skipped_*`), or was not requested (`not_compared`).
+       flagged (`comparison_skipped_*`), or was not requested (`not_compared`),
+       or the run was deliberately partial (`partial_run`, --only-workloads).
        The script never reports a pass for a comparison it skipped.
     1  regression, unhealthy measurement, or (with --strict-comparison) a
-       skipped or absent comparison.
+       skipped, absent, or partial-run comparison.
     2  usage error.
     3  stale expectation: a workload expected `blocked` (PFR) passed.
     4  environment/setup failure (missing env, wrong revs, wrong git, missing
@@ -54,7 +55,7 @@ Python standard library only.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from typing import NamedTuple
 import hashlib
 import json
 import math
@@ -71,7 +72,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+# 2: check_calls renamed classified_calls (a check_calls alias stays in every
+#    bucket for old readers), cold modes carry no cas_replay block, fission
+#    sums can be None, host blocks carry host_fingerprint, filtered workloads
+#    read skipped_by_filter with a partial_run verdict.
+SCHEMA_VERSION = 2
 NOISE_FLOOR_MS = 25.0
 # Between-run floor for the gate: two runs of one binary on one node drift by
 # up to ~13% on cold workloads (import_refresh is page-cache sensitive), while
@@ -133,6 +138,10 @@ RECORDED_ENV_VARS = [
     "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY", "TURBO_LEAN_HOME", "TURBO_LEAN_STAGING_DIR",
     "TURBO_LEAN_NO_DAEMON", "TURBO_LEAN_NO_REMOTE_TELEMETRY", "TURBO_LEAN_TELEMETRY",
     "TURBO_LEAN_DAEMON_IDLE_SECS", "TURBO_LEAN_BENCH_CHECK_TIMEOUT_S",
+    # The warm CAS-expr replay switches: recorded so paired on-vs-off runs
+    # self-describe in their settings blocks (the G2b delta artifacts were
+    # indistinguishable without this) and settings-mismatch across sides.
+    "TURBO_LEAN_WARM_CAS_REPLAY", "TURBO_LEAN_NO_WARM_CAS_REPLAY",
 ]
 
 VERDICT_EXIT = {
@@ -210,10 +219,11 @@ def selected_workloads(args):
     """WORKLOADS filtered by --only-workloads, in table order.
 
     The filter applies only to the measurement loop: validate_baseline and
-    compare_run keep seeing the full table so baseline files stay complete, and
-    unselected workloads keep the same "pending" entry an unreached workload
-    has today. Name validation (exit 2 on an unknown id) happens in main's
-    argparse stage; this helper assumes the names are valid.
+    compare_run keep seeing the full table so baseline files stay complete.
+    main marks unselected workloads `skipped_by_filter` after the loop, and
+    compare_run reports such a run as `partial_run`. Name validation (exit 2
+    on an unknown id) happens in main's argparse stage; this helper assumes
+    the names are valid.
     """
     raw = getattr(args, "only_workloads", None)
     if not raw:
@@ -359,16 +369,19 @@ def summarize_cas_replay(results):
                 continue
             for mode in modes:
                 m = (w.get("modes") or {}).get(mode) or {}
-                rep = m.get("cas_replay")
-                if not rep:
+                if not m:
                     continue
-                h, mi = rep.get("hits", 0), rep.get("misses", 0)
-                hits += h
-                misses += mi
                 # Failed trials never reach the status lists, and healthy
                 # trials with a status outside the two counted ones are not
                 # classified; both counts ride along so the rates cannot hide
                 # them (classified_calls is NOT the number of calls made).
+                # They are counted from EVERY replay-mode dict: an all-failed
+                # or all-other mode emits no cas_replay block at all, and a
+                # total failure is exactly what these counts exist for.
+                rep = m.get("cas_replay") or {}
+                h, mi = rep.get("hits", 0), rep.get("misses", 0)
+                hits += h
+                misses += mi
                 failed += int(m.get("failed_trials") or 0)
                 trials = m.get("trials")
                 if isinstance(trials, int):
@@ -381,7 +394,10 @@ def summarize_cas_replay(results):
                 if wid not in workloads:
                     workloads.append(wid)
         calls = hits + misses
+        # check_calls is a schema-1 alias of classified_calls, kept for old
+        # readers; new code reads classified_calls.
         return {"workloads": workloads, "classified_calls": calls,
+                "check_calls": calls,
                 "hits": hits, "misses": misses,
                 "hit_rate": round(hits / calls, 4) if calls else None,
                 "failed_trials": failed,
@@ -491,9 +507,14 @@ def host_matches(base, res) -> bool:
         # before. An old baseline (real hostname) against a new labeled run
         # therefore mismatches; the migration path is --rebaseline.
         return False
-    # The label can only narrow the match further; it never widens it, since
-    # two machines sharing a label still differ in fingerprint above.
+    # The label narrows the match: it never admits two machines (the
+    # fingerprint check above already refused them), and a label present on
+    # only one side is a condition mismatch too — the help promises a
+    # baseline from a different label is never compared, and "no label" is
+    # a different condition.
     lb, lr = bh.get("machine_label"), rh.get("machine_label")
+    if bool(lb) != bool(lr):
+        return False
     if lb and lr and lb != lr:
         return False
     return True
@@ -526,11 +547,14 @@ def toolchain_matches(base, res) -> bool:
             and bt == rt)
 
 
-@dataclass
-class TrialSplit:
+class TrialSplit(NamedTuple):
     """Per-mode series over the HEALTHY trials (in trial order), plus the
     count of failed ones. Named fields so a new series cannot silently
-    misalign the positional unpacking that a growing tuple invited."""
+    misalign positional use; a NamedTuple rather than a dataclass because
+    external tools load this script with spec_from_file_location without
+    registering it in sys.modules, and under `from __future__ import
+    annotations` a dataclass resolves its field strings through sys.modules
+    at class creation and dies there. Positional unpacking stays available."""
     runs: list
     covs: list
     tool_covs: list
@@ -650,12 +674,18 @@ def compare_run(baseline, res):
             "refusing comparison across different Lean toolchains")
         return verdict
     if not host_matches(baseline, res):
+        bh, rh = baseline.get("host") or {}, res.get("host") or {}
+
+        def fp12(h):
+            fp = h.get("host_fingerprint")
+            return fp[:12] if isinstance(fp, str) and fp else None
         verdict["verdict"] = "comparison_skipped_host_mismatch"
         verdict["skipped_reason"] = (
-            f"baseline host {baseline.get('host', {}).get('hostname')}/"
-            f"{baseline.get('host', {}).get('machine_label')} != this host "
-            f"{res.get('host', {}).get('hostname')}/{res.get('host', {}).get('machine_label')}; "
-            "a baseline from another machine proves nothing here")
+            f"baseline host {bh.get('hostname')}/{bh.get('machine_label')}"
+            f" (fingerprint {fp12(bh)}) != this host "
+            f"{rh.get('hostname')}/{rh.get('machine_label')}"
+            f" (fingerprint {fp12(rh)}); "
+            "a baseline from another machine or condition proves nothing here")
         return verdict
     if not settings_match(baseline, res):
         verdict["verdict"] = "comparison_skipped_settings_mismatch"
@@ -801,6 +831,14 @@ def locate_decl_block(src: str, decl: str, prefer_line=None):
 
 # ------------------------------------------------------------ host identity
 
+def read_machine_id() -> str:
+    """The machine-id, or '' when unreadable (containers commonly lack it)."""
+    try:
+        return Path("/etc/machine-id").read_text().strip()
+    except OSError:
+        return ""
+
+
 def host_id(machine_label):
     cpu_model = "unknown"
     try:
@@ -818,15 +856,17 @@ def host_id(machine_label):
                 break
     except OSError:
         pass
-    try:
-        machine_id = Path("/etc/machine-id").read_text().strip()
-    except OSError:
-        machine_id = ""
+    machine_id = read_machine_id()
     # The fingerprint is what host_matches compares: it pins the physical
     # machine without putting its name in the JSON (a label is a condition
     # tag two machines could share, so it cannot carry the machine identity).
-    fingerprint = hashlib.sha256(
+    # Without a machine-id it is None, never sha256(hostname + "\0"): that
+    # would be a confirmable hash of the node name, and ephemeral containers
+    # (fresh hostname each run) would never match each other. host_matches
+    # then falls back to the hostname/label comparison.
+    fingerprint = (hashlib.sha256(
         (platform.node() + "\0" + machine_id).encode()).hexdigest()
+        if machine_id else None)
     return {
         # With a label the label IS the recorded hostname: the live node name
         # stays out of the JSON entirely (the label exists so results never
@@ -1509,8 +1549,10 @@ def main(argv=None):
                          f"used as the subprocess timeout (default {CHECK_TIMEOUT_S})")
     ap.add_argument("--only-workloads",
                     help="comma-separated workload ids; only these are measured, the "
-                         "rest stay pending. For targeted re-measurement; normally "
-                         "used with --no-baseline.")
+                         "rest are recorded as skipped_by_filter and the run verdict "
+                         "is partial_run (exit 0; exit 1 under --strict-comparison). "
+                         "For targeted re-measurement; normally used with "
+                         "--no-baseline. Not combinable with --rebaseline.")
     ap.add_argument("--out", help="write the full results JSON here")
     ap.add_argument("--baseline", help="baseline or prior results JSON to compare against "
                                        "(default: scripts/bench_check_loop_baseline.json "
@@ -1652,7 +1694,8 @@ def main(argv=None):
                   f"({g['delta_ms']:+.1f} ms, {g['delta_pct']:+.2f}%) "
                   f"band ±{g['noise_band_ms']} ms: {g['verdict']}")
         rep = results["cas_replay"]
-        if rep["overall"]["classified_calls"]:
+        if (rep["overall"]["classified_calls"] or rep["overall"]["failed_trials"]
+                or rep["overall"]["other_status_calls"] or rep["non_ok_workloads"]):
             un, ed, ov = rep["unedited_recheck"], rep["edited_recheck"], rep["overall"]
             extra = ""
             if ov["failed_trials"] or ov["other_status_calls"]:
@@ -1675,6 +1718,7 @@ def main(argv=None):
         code = VERDICT_EXIT[verdict["verdict"]]
         if (code == 0 and args.strict_comparison
                 and verdict["verdict"] in ("not_compared",
+                                           "partial_run",
                                            "comparison_skipped_host_mismatch",
                                            "comparison_skipped_settings_mismatch")):
             code = 1

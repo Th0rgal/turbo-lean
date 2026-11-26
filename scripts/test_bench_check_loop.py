@@ -222,19 +222,27 @@ class Stats(unittest.TestCase):
 
 class CheckTimeoutOverride(unittest.TestCase):
     def test_env_override_reaches_subprocess_timeout(self):
-        # TURBO_LEAN_BENCH_CHECK_TIMEOUT_S rebinds CHECK_TIMEOUT_S after
-        # import.  The child's `--timeout` argv already reads the global at
-        # call time; subprocess.run's own bound must carry the same value,
-        # so run_check may not freeze the module global into its parameter
-        # default at definition time.
-        mod = load_script()
+        # TURBO_LEAN_BENCH_CHECK_TIMEOUT_S is folded into CHECK_TIMEOUT_S by
+        # validate_environment through _apply_check_timeout_override(),
+        # validated (junk is a BenchEnvError, exit 4, never a bare crash).
+        # The child's `--timeout` argv reads the global at call time;
+        # subprocess.run's own bound must carry the same value, so run_check
+        # may not freeze the module global into its parameter default at
+        # definition time.
         key = "TURBO_LEAN_BENCH_CHECK_TIMEOUT_S"
         prev = os.environ.get(key)
         os.environ[key] = "123"
         try:
-            # Re-apply the override: rebind the module global from the env,
-            # exactly as the env-override hook does after import.
-            mod.CHECK_TIMEOUT_S = int(os.environ[key])
+            # Real script behavior, no hand rebind: import keeps the 900
+            # default; the override call applies the env value; junk raises.
+            mod = load_script()
+            self.assertEqual(mod.CHECK_TIMEOUT_S, 900)
+            mod._apply_check_timeout_override()
+            self.assertEqual(mod.CHECK_TIMEOUT_S, 123)
+            os.environ[key] = "junk"
+            with self.assertRaises(mod.BenchEnvError):
+                mod._apply_check_timeout_override()
+            os.environ[key] = "123"
 
             recorded = {}
 
@@ -802,7 +810,10 @@ class ImprovementSide(unittest.TestCase):
             self.assertEqual(r0.returncode, 0, r0.stdout + r0.stderr)
             o0 = json.loads((Path(td) / "o0.json").read_text())
             base = full_valid_baseline(self.mod)
-            base["host"]["hostname"] = o0["host"]["hostname"]
+            # Same host AND same condition: sync the whole host block (label
+            # and fingerprint included) — a labeled baseline no longer matches
+            # an unlabeled run on the same machine.
+            base["host"] = dict(o0["host"])
             base["settings"] = dict(o0["settings"])
             base["workload_revs"] = dict(o0.get("workload_revs") or base["workload_revs"])
             base["toolchain"] = dict(o0.get("toolchain") or base["toolchain"])
@@ -1359,7 +1370,10 @@ class ComparabilityAndProvenance(unittest.TestCase):
             self.assertEqual(r0.returncode, 0, r0.stdout + r0.stderr)
             o0 = json.loads((Path(td) / "o0.json").read_text())
             base = full_valid_baseline(mod)
-            base["host"]["hostname"] = o0["host"]["hostname"]
+            # Same host AND same condition: sync the whole host block (label
+            # and fingerprint included) — a labeled baseline no longer matches
+            # an unlabeled run on the same machine.
+            base["host"] = dict(o0["host"])
             base["settings"] = dict(o0["settings"])
             base["toolchain"] = dict(o0.get("toolchain") or full_valid_baseline(mod)["toolchain"])
             base["workload_revs"] = dict(o0["workload_revs"], batteries="deadbeef" * 5)
@@ -1379,7 +1393,10 @@ class ComparabilityAndProvenance(unittest.TestCase):
             self.assertEqual(r0.returncode, 0, r0.stdout + r0.stderr)
             o0 = json.loads((Path(td) / "o0.json").read_text())
             base = full_valid_baseline(mod)
-            base["host"]["hostname"] = o0["host"]["hostname"]
+            # Same host AND same condition: sync the whole host block (label
+            # and fingerprint included) — a labeled baseline no longer matches
+            # an unlabeled run on the same machine.
+            base["host"] = dict(o0["host"])
             base["settings"] = dict(o0["settings"])
             base["workload_revs"] = dict(o0["workload_revs"])
             base["toolchain"] = {"lean_toolchain": "leanprover/lean4:v4.34.0",
@@ -1406,7 +1423,10 @@ class ComparabilityAndProvenance(unittest.TestCase):
                 for m in wl["modes"].values():
                     m["median_ms"] = 1_000_000.0
                     m["runs_ms"] = [1_000_000.0] * m["trials"]
-            base["host"]["hostname"] = o0["host"]["hostname"]
+            # Same host AND same condition: sync the whole host block (label
+            # and fingerprint included) — a labeled baseline no longer matches
+            # an unlabeled run on the same machine.
+            base["host"] = dict(o0["host"])
             base["settings"] = dict(o0["settings"])
             base["workload_revs"] = dict(o0["workload_revs"])
             base["toolchain"] = dict(o0.get("toolchain") or full_valid_baseline(mod)["toolchain"])
@@ -1445,7 +1465,10 @@ class ComparabilityAndProvenance(unittest.TestCase):
                 for m in wl["modes"].values():
                     m["median_ms"] = 1_000_000.0
                     m["runs_ms"] = [1_000_000.0] * m["trials"]
-            base["host"]["hostname"] = o0["host"]["hostname"]
+            # Same host AND same condition: sync the whole host block (label
+            # and fingerprint included) — a labeled baseline no longer matches
+            # an unlabeled run on the same machine.
+            base["host"] = dict(o0["host"])
             base["settings"] = dict(o0["settings"])
             base["workload_revs"] = dict(o0["workload_revs"])
             base["toolchain"] = dict(o0.get("toolchain") or full_valid_baseline(mod)["toolchain"])
@@ -1540,6 +1563,23 @@ class PeakRssRecording(unittest.TestCase):
         self.assertEqual(ts.failed, 1)
 
 
+class ScriptLoadsUnregistered(unittest.TestCase):
+    def test_script_loads_without_sys_modules_registration(self):
+        # External tools load this script exactly like this, without first
+        # registering it in sys.modules; class creation must survive that
+        # (under future annotations a dataclass resolves its field strings
+        # through sys.modules and dies here with AttributeError).
+        spec = importlib.util.spec_from_file_location(
+            "bench_check_loop_unregistered", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        ts = mod.Runner.split_trials([])
+        self.assertEqual((ts.runs, ts.failed), ([], 0))
+        # Positional unpacking stays available to external callers.
+        runs, covs, tool_covs, statuses, phases, psis, fissions, rss, failed = ts
+        self.assertEqual((runs, failed), ([], 0))
+
+
 class HostFingerprint(unittest.TestCase):
     @staticmethod
     def _host(hostname, label, fp):
@@ -1578,6 +1618,48 @@ class HostFingerprint(unittest.TestCase):
                                           self._host("g2a-ro-192c", "g2a-ro-192c",
                                                      "a" * 64)))
 
+    def test_label_on_one_side_only_does_not_match(self):
+        # The help promises a labeled baseline is never compared with a run
+        # under another condition; an unlabeled run is another condition,
+        # same machine or not.
+        mod = load_script()
+        labeled = self._host("quiet", "quiet", "a" * 64)
+        unlabeled = self._host("node-1", None, "a" * 64)
+        self.assertFalse(mod.host_matches(labeled, unlabeled))
+        self.assertFalse(mod.host_matches(unlabeled, labeled))
+
+    def test_host_mismatch_reason_names_fingerprints(self):
+        mod = load_script()
+        base = full_valid_baseline(mod)
+        base["host"]["host_fingerprint"] = "a" * 64
+        base["host"]["machine_label"] = "quiet"
+        base["host"]["hostname"] = "quiet"
+        res = mod_results_like(mod, base, 1000.0)
+        res["host"] = dict(base["host"], host_fingerprint="b" * 64)
+        v = mod.compare_run(base, res)
+        self.assertEqual(v["verdict"], "comparison_skipped_host_mismatch")
+        self.assertIn(("a" * 64)[:12], v["skipped_reason"])
+        self.assertIn(("b" * 64)[:12], v["skipped_reason"])
+
+    def test_no_machine_id_means_no_fingerprint(self):
+        # Without a machine-id the fingerprint would be sha256(hostname+"\0"),
+        # a confirmable hash of the node name — against the no-node-name
+        # claim — and ephemeral containers would never match each other.
+        # The honest degradation is None, so the hostname/label fallback
+        # applies in host_matches.
+        mod = load_script()
+        mod.read_machine_id = lambda: ""
+        h = mod.host_id("g2a-ro-192c")
+        self.assertIsNone(h["host_fingerprint"])
+        # Control: with a machine-id the fingerprint is a 64-hex digest and
+        # differs across machine-ids.
+        mod.read_machine_id = lambda: "mid-one"
+        f1 = mod.host_id("g2a-ro-192c")["host_fingerprint"]
+        mod.read_machine_id = lambda: "mid-two"
+        f2 = mod.host_id("g2a-ro-192c")["host_fingerprint"]
+        self.assertTrue(re.fullmatch(r"[0-9a-f]{64}", f1 or ""), f1)
+        self.assertNotEqual(f1, f2)
+
     def test_host_id_records_hex_fingerprint_never_node_name(self):
         mod = load_script()
         h = mod.host_id("g2a-ro-192c")
@@ -1606,6 +1688,17 @@ class ReplaySummaryHonesty(unittest.TestCase):
         self.assertIsNone(un["fission_verified_subshards"])
         self.assertEqual(rep["non_ok_workloads"], ["w1"])
 
+    def test_schema_bumped_and_buckets_carry_check_calls_alias(self):
+        # The count field was renamed classified_calls and cold modes lost
+        # their cas_replay block: a schema change, so SCHEMA_VERSION moves to
+        # 2 and old readers keep a check_calls alias in every bucket.
+        mod = load_script()
+        self.assertEqual(mod.SCHEMA_VERSION, 2)
+        rep = mod.summarize_cas_replay({"trials": 2, "workloads": {}})
+        for bucket in ("unedited_recheck", "edited_recheck", "overall"):
+            self.assertEqual(rep[bucket]["check_calls"],
+                             rep[bucket]["classified_calls"])
+
     def test_fission_counters_keep_none_distinct_from_zero(self):
         mod = load_script()
         m = mod.mode_result([100.0], [0.99], ["theorem_verified"],
@@ -1617,6 +1710,72 @@ class ReplaySummaryHonesty(unittest.TestCase):
         mod = load_script()
         m = mod.mode_result([100.0], [0.99], ["theorem_verified"])
         self.assertNotIn("cas_replay", m)
+
+
+class ReplayFailureVisibility(unittest.TestCase):
+    def test_all_failed_warm_mode_still_counts_failed_trials(self):
+        # mode_result emits no cas_replay when every trial failed; the bucket
+        # must count those failures anyway — a total failure is exactly what
+        # the counts exist for.
+        mod = load_script()
+        res = {"trials": 5, "workloads": {"w1": {
+            "expected_status": "active", "status": "failed",
+            "modes": {"warm_cache_hit_daemon": {"trials": 0,
+                                                "failed_trials": 5}}}}}
+        rep = mod.summarize_cas_replay(res)
+        un = rep["unedited_recheck"]
+        self.assertEqual(un["failed_trials"], 5)
+        self.assertEqual(un["classified_calls"], 0)
+        self.assertIn("w1", un["workloads"])
+
+    def test_all_other_status_warm_mode_still_counts_other_calls(self):
+        mod = load_script()
+        res = {"trials": 3, "workloads": {"w1": {
+            "expected_status": "active", "status": "failed",
+            "modes": {"warm_cache_hit_daemon": {"trials": 3,
+                                                "failed_trials": 0}}}}}
+        rep = mod.summarize_cas_replay(res)
+        self.assertEqual(rep["unedited_recheck"]["other_status_calls"], 3)
+
+    def test_g2a_line_prints_for_an_all_failed_warm_loop(self):
+        # Warm trials run with the daemon (TURBO_LEAN_NO_DAEMON unset); this
+        # stub fails every one of them while cold trials and the warm setup
+        # (both no_daemon) succeed, so every replay call fails and
+        # classified_calls is 0 run-wide.
+        stub_body = (
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "args = sys.argv[1:]\n"
+            "if os.environ.get('FAKE_PFR_FAIL') and '--no-auto-worktree-link' in args:\n"
+            "    print(json.dumps({'error': 'stale imports: import_refresh fail-closed'}))\n"
+            "    sys.exit(1)\n"
+            "if not os.environ.get('TURBO_LEAN_NO_DAEMON'):\n"
+            "    sys.exit(1)\n"
+            "out = {'status': 'theorem_verified', 'decl': 'd', 'elapsed_ms': 50,\n"
+            "       'phase_timings': {'wall_ms': 200.0, 'phase_sum_ms': 199.0,\n"
+            "                         'phase_covered_ms': 199.0, 'phase_overlap_ms': 0.0,\n"
+            "                         'coverage_ratio': 0.99,\n"
+            "                         'phases_ms': {'setup': 10.0}}}\n"
+            "print(json.dumps(out)); sys.exit(0)\n")
+        with tempfile.TemporaryDirectory(prefix="m1-allfail-") as td:
+            r = run_bench(Path(td), ["--no-baseline", "--only-workloads",
+                                     "batteries_list_lemmas_top",
+                                     "--out", str(Path(td) / "o.json")],
+                          stub_body=stub_body)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("G2A CAS REPLAY:", r.stdout)
+            self.assertIn("failed_trials=4", r.stdout)
+            self.assertIn("non_ok_workloads=['batteries_list_lemmas_top']", r.stdout)
+
+
+class ProvenanceEnvVars(unittest.TestCase):
+    def test_warm_replay_switches_are_recorded_settings(self):
+        # The G2b on-vs-off artifacts were indistinguishable by their settings
+        # blocks: neither replay switch was recorded. Both are provenance now,
+        # so paired runs self-describe and settings-mismatch across sides.
+        mod = load_script()
+        self.assertIn("TURBO_LEAN_NO_WARM_CAS_REPLAY", mod.RECORDED_ENV_VARS)
+        self.assertIn("TURBO_LEAN_WARM_CAS_REPLAY", mod.RECORDED_ENV_VARS)
 
 
 class OnlyWorkloadsPartialRun(unittest.TestCase):
@@ -1633,6 +1792,20 @@ class OnlyWorkloadsPartialRun(unittest.TestCase):
                              "skipped_by_filter")
             self.assertEqual(data["verdict"]["verdict"], "partial_run")
             self.assertIn("VERDICT: partial_run", r.stdout)
+
+    def test_partial_run_fails_under_strict_comparison(self):
+        # --strict-comparison promises "a comparison really happened"; a
+        # filtered run never compares, so with a baseline given it must
+        # exit 1, not slip through as exit 0.
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-filter-strict-") as td:
+            bp = Path(td) / "b.json"
+            bp.write_text(json.dumps(full_valid_baseline(mod)))
+            r = run_bench(Path(td), ["--baseline", str(bp), "--strict-comparison",
+                                     "--only-workloads", "batteries_list_lemmas_top",
+                                     "--out", str(Path(td) / "o.json")])
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("partial_run", r.stdout)
 
     def test_rebaseline_with_only_workloads_is_usage_error(self):
         mod = load_script()
