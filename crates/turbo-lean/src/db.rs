@@ -398,6 +398,9 @@ const KERNEL_AUDITED_OLEANS_AUTH_DDL: &str = "
         replay_version INTEGER NOT NULL,
         toolchain_hash TEXT NOT NULL,
         policy_digest TEXT NOT NULL,
+        -- Retained but unused: removing a column that shipped in the v9 schema would break
+        -- a downgrade to a binary that still selects it. Rows are written without it.
+        csimp_posture_digest TEXT NOT NULL DEFAULT '',
         module_name TEXT NOT NULL DEFAULT '',
         audit_mac TEXT NOT NULL,
         verified_at INTEGER NOT NULL,
@@ -869,19 +872,6 @@ impl TurboStore {
                         KERNEL_AUDITED_OLEANS_AUTH_DDL
                     ))?;
                 }
-                if uver < 10 {
-                    // G1a r2 (review 22ae951a F2): the `csimp_posture_digest` column is dropped.
-                    // It was MAC-attested but part of no cache key (the lookup never received a
-                    // caller digest, the primary key omits it, the upsert overwrote it), and the
-                    // (artifact, environment, policy) key already binds every byte it was
-                    // derived from. The audit MAC domain bumps to v4 over the five remaining
-                    // fields; audited rows are re-derivable, so the table is rebuilt,
-                    // transactionally like v9 (review 22ae951a F5).
-                    conn.execute_batch(&format!(
-                        "BEGIN IMMEDIATE;\nDROP TABLE IF EXISTS kernel_audited_oleans_auth;\n{}\nPRAGMA user_version = 10;\nCOMMIT;",
-                        KERNEL_AUDITED_OLEANS_AUTH_DDL
-                    ))?;
-                }
             }
         } else {
             conn.execute_batch(&format!(
@@ -936,7 +926,7 @@ impl TurboStore {
                      path_key TEXT PRIMARY KEY, mtime_sec INTEGER NOT NULL, mtime_nsec INTEGER NOT NULL,
                      size_bytes INTEGER NOT NULL, split_key TEXT NOT NULL, updated_at INTEGER NOT NULL
                  );
-                 PRAGMA user_version = 10;
+                 PRAGMA user_version = 9;
                  COMMIT;
                  PRAGMA wal_checkpoint(TRUNCATE);",
                 WORKTREE_LEASES_DDL,
@@ -9190,7 +9180,7 @@ mod tests {
         let uv: i64 = store
             .conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
-        assert_eq!(uv, 10);
+        assert_eq!(uv, 9);
         assert!(!store.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
         assert!(store
             .record_kernel_replayed_olean("", "env1", 2, "tc1", "M", &[])
@@ -9317,7 +9307,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sqlite_v7_to_v10_migration_clears_stale_epoch_state_and_binds_keys() -> Result<()> {
+    fn test_sqlite_v7_to_v9_migration_clears_stale_epoch_state_and_binds_keys() -> Result<()> {
         let tmp_dir = std::env::temp_dir().join(format!(
             "turbo_lean_db_v8_epoch_{}_{}",
             std::process::id(),
@@ -9352,7 +9342,7 @@ mod tests {
         let uv: i64 = migrated
             .conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
-        assert_eq!(uv, 10);
+        assert_eq!(uv, 9);
         assert!(migrated.get_lake_env("proj_v7")?.is_none());
         assert!(migrated
             .batch_get_file_splits(&["split_v7".to_string()])?
