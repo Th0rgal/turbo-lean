@@ -713,16 +713,25 @@ import LeanNative.IR.Bridge
 
 open Lean Lean.Compiler.LCNF LeanNative.IR
 
-partial def codeHasLocalCall (localSet : Std.HashSet Name) (c : Code .impure) : Bool :=
+/-- Whether `c` makes a local call (a `.fap` whose callee is in `localSet`). The walk has
+    the arms of `codeHasSelfTailCall` (`lean/LeanNative/IR/BridgeHelpers/StateAndIntrinsics.lean`),
+    which builds the call graph, so the RC and field-set instructions of impure code (`inc`,
+    `dec`, `del`, `oset`, `uset`, `sset`, `setTag`) are walked through instead of ending the
+    walk. The match is exhaustive: a constructor added upstream fails to compile here rather
+    than reading as "no call". -/
+partial def codeHasLocalCall {pu} (localSet : Std.HashSet Name) (c : Code pu) : Bool :=
   match c with
   | .let d k =>
     let hit := match d.value with
       | .fap fn _ _ => localSet.contains fn
       | _ => false
     hit || codeHasLocalCall localSet k
-  | .jp j k => codeHasLocalCall localSet j.value || codeHasLocalCall localSet k
+  | .fun d k _ | .jp d k => codeHasLocalCall localSet d.value || codeHasLocalCall localSet k
+  | .inc _ _ _ _ k _ | .dec _ _ _ _ _ k _ | .del _ k _
+  | .oset _ _ _ k _ | .uset _ _ _ k _ | .sset _ _ _ _ _ k _ | .setTag _ _ k _ =>
+    codeHasLocalCall localSet k
   | .cases cs => cs.alts.any (fun a => codeHasLocalCall localSet a.getCode)
-  | _ => false
+  | .jmp _ _ | .return _ | .unreach _ => false
 
 partial def declInMutualCycle (declMap : Std.HashMap Name (List Name)) (target : Name) : Bool :=
   let rec reaches (visited : List Name) (frontier : List Name) : Bool :=
@@ -3686,6 +3695,48 @@ class TestLcnfCoverage(unittest.TestCase):
             )
         tot, prv, unp, rej, cyc, _aux = counts
         self.assertEqual((tot, prv, unp, rej, cyc), (1, 0, 0, 1, 0), counts)
+
+    def test_local_call_after_an_rc_instruction_counts_as_a_local_call(self) -> None:
+        # The has-local-call walk follows every impure-code constructor, as
+        # the call graph (`collectCodeLocalCallees` -> `codeHasSelfTailCall`)
+        # does. It used to stop at the first `inc`/`dec`/`del`/`oset`/`uset`/
+        # `sset`/`setTag`, so `bumpThenRec` below, whose impure body starts
+        # with `inc o` (it keeps `o` after handing it to the consuming
+        # `bump`) and then calls `bump` and the rejected `selfRec`, was
+        # counted proved: a vacuous declaration presented as proved. Measured
+        # with the old walk on the pinned toolchain: (3, 2, 0, 1, 0).
+        got = measure_fixture_corpus(
+            ROOT_DIR,
+            "inductive Opt where\n"
+            "  | none\n"
+            "  | some (v : UInt64)\n"
+            "partial def selfRec (x : UInt64) : UInt64 := if x == 0 then 0 else selfRec (x - 1) + 2\n"
+            "@[noinline] def bump (o : Opt) : Opt :=\n"
+            "  match o with\n"
+            "  | .none => .none\n"
+            "  | .some v => .some (v + 1)\n"
+            "def bumpThenRec (o : Opt) (x : UInt64) : UInt64 :=\n"
+            "  match bump o with\n"
+            "  | .none => selfRec x\n"
+            "  | .some _ =>\n"
+            "    match o with\n"
+            "    | .none => 1\n"
+            "    | .some _ => selfRec (x + 1)\n",
+            mod_name="RcFirstCall",
+        )
+        # bump: proved (no local call); selfRec: rejected (self-recursion);
+        # bumpThenRec: lowered, with local calls -> lowered_unproved.
+        self.assertEqual(
+            (
+                got["total_declarations"],
+                got["proved"],
+                got["lowered_unproved"],
+                got["rejected"],
+                got["rejected_not_lowered"],
+            ),
+            (3, 1, 1, 1, 0),
+            got,
+        )
 
     def test_audit_driver_never_silently_drops_a_module(self) -> None:
         # H1.0a-S acceptance: an EXECUTABLE failure reproduction of the silent
