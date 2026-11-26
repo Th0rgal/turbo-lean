@@ -358,16 +358,19 @@ def summarize_cas_replay(results):
                 continue
             for mode in modes:
                 m = (w.get("modes") or {}).get(mode) or {}
-                rep = m.get("cas_replay")
-                if not rep:
+                if not m:
                     continue
-                h, mi = rep.get("hits", 0), rep.get("misses", 0)
-                hits += h
-                misses += mi
                 # Failed trials never reach the status lists, and healthy
                 # trials with a status outside the two counted ones are not
                 # classified; both counts ride along so the rates cannot hide
                 # them (classified_calls is NOT the number of calls made).
+                # They are counted from EVERY replay-mode dict: an all-failed
+                # or all-other mode emits no cas_replay block at all, and a
+                # total failure is exactly what these counts exist for.
+                rep = m.get("cas_replay") or {}
+                h, mi = rep.get("hits", 0), rep.get("misses", 0)
+                hits += h
+                misses += mi
                 failed += int(m.get("failed_trials") or 0)
                 trials = m.get("trials")
                 if isinstance(trials, int):
@@ -1634,7 +1637,8 @@ def main(argv=None):
                   f"({g['delta_ms']:+.1f} ms, {g['delta_pct']:+.2f}%) "
                   f"band ±{g['noise_band_ms']} ms: {g['verdict']}")
         rep = results["cas_replay"]
-        if rep["overall"]["classified_calls"]:
+        if (rep["overall"]["classified_calls"] or rep["overall"]["failed_trials"]
+                or rep["overall"]["other_status_calls"] or rep["non_ok_workloads"]):
             un, ed, ov = rep["unedited_recheck"], rep["edited_recheck"], rep["overall"]
             extra = ""
             if ov["failed_trials"] or ov["other_status_calls"]:

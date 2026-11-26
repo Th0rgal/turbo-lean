@@ -1659,6 +1659,62 @@ class ReplaySummaryHonesty(unittest.TestCase):
         self.assertNotIn("cas_replay", m)
 
 
+class ReplayFailureVisibility(unittest.TestCase):
+    def test_all_failed_warm_mode_still_counts_failed_trials(self):
+        # mode_result emits no cas_replay when every trial failed; the bucket
+        # must count those failures anyway — a total failure is exactly what
+        # the counts exist for.
+        mod = load_script()
+        res = {"trials": 5, "workloads": {"w1": {
+            "expected_status": "active", "status": "failed",
+            "modes": {"warm_cache_hit_daemon": {"trials": 0,
+                                                "failed_trials": 5}}}}}
+        rep = mod.summarize_cas_replay(res)
+        un = rep["unedited_recheck"]
+        self.assertEqual(un["failed_trials"], 5)
+        self.assertEqual(un["classified_calls"], 0)
+        self.assertIn("w1", un["workloads"])
+
+    def test_all_other_status_warm_mode_still_counts_other_calls(self):
+        mod = load_script()
+        res = {"trials": 3, "workloads": {"w1": {
+            "expected_status": "active", "status": "failed",
+            "modes": {"warm_cache_hit_daemon": {"trials": 3,
+                                                "failed_trials": 0}}}}}
+        rep = mod.summarize_cas_replay(res)
+        self.assertEqual(rep["unedited_recheck"]["other_status_calls"], 3)
+
+    def test_g2a_line_prints_for_an_all_failed_warm_loop(self):
+        # Warm trials run with the daemon (TURBO_LEAN_NO_DAEMON unset); this
+        # stub fails every one of them while cold trials and the warm setup
+        # (both no_daemon) succeed, so every replay call fails and
+        # classified_calls is 0 run-wide.
+        stub_body = (
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "args = sys.argv[1:]\n"
+            "if os.environ.get('FAKE_PFR_FAIL') and '--no-auto-worktree-link' in args:\n"
+            "    print(json.dumps({'error': 'stale imports: import_refresh fail-closed'}))\n"
+            "    sys.exit(1)\n"
+            "if not os.environ.get('TURBO_LEAN_NO_DAEMON'):\n"
+            "    sys.exit(1)\n"
+            "out = {'status': 'theorem_verified', 'decl': 'd', 'elapsed_ms': 50,\n"
+            "       'phase_timings': {'wall_ms': 200.0, 'phase_sum_ms': 199.0,\n"
+            "                         'phase_covered_ms': 199.0, 'phase_overlap_ms': 0.0,\n"
+            "                         'coverage_ratio': 0.99,\n"
+            "                         'phases_ms': {'setup': 10.0}}}\n"
+            "print(json.dumps(out)); sys.exit(0)\n")
+        with tempfile.TemporaryDirectory(prefix="m1-allfail-") as td:
+            r = run_bench(Path(td), ["--no-baseline", "--only-workloads",
+                                     "batteries_list_lemmas_top",
+                                     "--out", str(Path(td) / "o.json")],
+                          stub_body=stub_body)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("G2A CAS REPLAY:", r.stdout)
+            self.assertIn("failed_trials=4", r.stdout)
+            self.assertIn("non_ok_workloads=['batteries_list_lemmas_top']", r.stdout)
+
+
 class OnlyWorkloadsPartialRun(unittest.TestCase):
     def test_only_workloads_marks_skipped_and_partial_run(self):
         with tempfile.TemporaryDirectory(prefix="m1-filter-") as td:
