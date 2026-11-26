@@ -10,6 +10,7 @@ import LeanNative.Proofs.PeepholeProofs
 import LeanNative.Proofs.LoopOptProofs
 import LeanNative.Proofs.RealLCNFBridgeProofs
 import LeanNative.Proofs.LowerCalls
+import LeanNative.Proofs.LowerRec
 import LeanNative.Proofs.BackendProofs
 import LeanNative.Proofs.KernelElabProofs
 import LeanNative.Proofs.SymbolicTV
@@ -832,12 +833,26 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.lowerImpureStepPure_soundF
   , ``LeanNative.Proofs.lowerRealLCNFCode_soundF
   , ``LeanNative.Proofs.lowerRealLCNFDecl_soundF
+  , ``LeanNative.Proofs.evalCodeR_nil
+  , ``LeanNative.Proofs.evalStepR_nil
+  , ``LeanNative.Proofs.evalRealLCNFDeclR_nil
+  , ``LeanNative.Proofs.evalCodeR_fuel_mono
+  , ``LeanNative.Proofs.evalCodeR_call_fuel_zero
+  , ``LeanNative.Proofs.evalCodeR_call_unfold
+  , ``LeanNative.Proofs.evalStepR_localCall_unfold
+  , ``LeanNative.Proofs.evalStepR_localCall_miss
+  , ``LeanNative.Proofs.evalExpr_call_ok_reserved
+  , ``LeanNative.Proofs.evalCodeR_extend_of_ok
+  , ``LeanNative.Proofs.DeclEnvLowersR.fresh
+  , ``LeanNative.Proofs.lowerRealLCNFDecl_soundR_base
+  , ``LeanNative.Proofs.evalStep_recursive_jp_unsupported
+  , ``LeanNative.Proofs.lowerImpureStepPure_recursive_jp_rejected
   , ``TurboLean.PolicyGates.specAuditWitnessReplay_eq_gate
   , ``TurboLean.PolicyGates.specAuditWitnessReplay_sound_pos
   , ``TurboLean.PolicyGates.specAuditWitnessReplay_sound_neg
   ]
 
-#guard auditedTheoremNames.length == 874
+#guard auditedTheoremNames.length == 888
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/
