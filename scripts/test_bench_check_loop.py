@@ -1768,6 +1768,35 @@ class ReplayFailureVisibility(unittest.TestCase):
             self.assertIn("non_ok_workloads=['batteries_list_lemmas_top']", r.stdout)
 
 
+class CheckTimeoutMainPath(unittest.TestCase):
+    def test_env_override_reaches_a_real_run(self):
+        # Through main(), the path a real run takes: no --check-timeout-s
+        # flag, env override set. The recorded args must carry the value
+        # actually used (argparse's import-time default froze 900 in and the
+        # validated global was never read back).
+        with tempfile.TemporaryDirectory(prefix="m1-timeout-main-") as td:
+            r = run_bench(Path(td), ["--no-baseline", "--only-workloads",
+                                     "batteries_list_lemmas_top",
+                                     "--out", str(Path(td) / "o.json")],
+                          env_extra={"TURBO_LEAN_BENCH_CHECK_TIMEOUT_S": "123"})
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            data = json.loads((Path(td) / "o.json").read_text())
+            self.assertEqual(data["args"]["check_timeout_s"], 123)
+            self.assertEqual(
+                data["settings"]["TURBO_LEAN_BENCH_CHECK_TIMEOUT_S"], "123")
+
+    def test_explicit_flag_beats_env_override(self):
+        with tempfile.TemporaryDirectory(prefix="m1-timeout-flag-") as td:
+            r = run_bench(Path(td), ["--no-baseline", "--only-workloads",
+                                     "batteries_list_lemmas_top",
+                                     "--check-timeout-s", "77",
+                                     "--out", str(Path(td) / "o.json")],
+                          env_extra={"TURBO_LEAN_BENCH_CHECK_TIMEOUT_S": "123"})
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            data = json.loads((Path(td) / "o.json").read_text())
+            self.assertEqual(data["args"]["check_timeout_s"], 77)
+
+
 class ProvenanceEnvVars(unittest.TestCase):
     def test_warm_replay_switches_are_recorded_settings(self):
         # The G2b on-vs-off artifacts were indistinguishable by their settings

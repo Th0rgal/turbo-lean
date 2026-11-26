@@ -1544,9 +1544,13 @@ def main(argv=None):
     ap.add_argument("--trials", type=int, default=DEFAULT_TRIALS)
     ap.add_argument("--warmup", type=int, default=DEFAULT_WARMUP,
                     help="discarded settling runs before measured trials (default 1)")
-    ap.add_argument("--check-timeout-s", type=int, default=CHECK_TIMEOUT_S,
+    ap.add_argument("--check-timeout-s", type=int, default=None,
                     help="per-check budget in seconds, passed to `check --timeout` and "
-                         f"used as the subprocess timeout (default {CHECK_TIMEOUT_S})")
+                         "used as the subprocess timeout (default: "
+                         "TURBO_LEAN_BENCH_CHECK_TIMEOUT_S if set, else 900). The "
+                         "default is resolved AFTER environment validation, so the env "
+                         "override reaches real runs; a default captured at parser "
+                         "build would freeze the import-time 900 in.")
     ap.add_argument("--only-workloads",
                     help="comma-separated workload ids; only these are measured, the "
                          "rest are recorded as skipped_by_filter and the run verdict "
@@ -1579,7 +1583,7 @@ def main(argv=None):
         ap.error(f"--trials must be >= 1, got {args.trials}")
     if args.warmup < 0:
         ap.error(f"--warmup must be >= 0, got {args.warmup}")
-    if args.check_timeout_s <= 0:
+    if args.check_timeout_s is not None and args.check_timeout_s <= 0:
         ap.error(f"--check-timeout-s must be >= 1, got {args.check_timeout_s}")
     if args.only_workloads is not None:
         names = [n.strip() for n in args.only_workloads.split(",") if n.strip()]
@@ -1620,6 +1624,12 @@ def main(argv=None):
     except BenchEnvError as e:
         print(f"ENVIRONMENT ERROR (exit 4): {e}", file=sys.stderr)
         return 4
+    if args.check_timeout_s is None:
+        # Resolved only now: validate_environment has folded the (validated)
+        # TURBO_LEAN_BENCH_CHECK_TIMEOUT_S override into the global, so the
+        # recorded args carry the value every trial actually used. An explicit
+        # --check-timeout-s flag wins over the env override.
+        args.check_timeout_s = CHECK_TIMEOUT_S
     runner = Runner(args)
     install_signal_restore(runner)
     t_start = time.monotonic()
