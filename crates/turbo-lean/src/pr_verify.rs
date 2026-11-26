@@ -4481,7 +4481,12 @@ pub fn run_ci_verify_command(
         let search_paths: Vec<PathBuf> = std::env::split_paths(&lp)
             .filter(|p| !p.as_os_str().is_empty())
             .collect();
-        let bin = crate::kernel::discover_con_leche_binary(Some(&canon_dir))?;
+        // G1c r2: execution uses the same discovery as the selection probe (review 22ae951a F1).
+        let bin = crate::kernel::discover_con_leche_binary_for_selection(
+            kernel_prov.requested_engine,
+            &kernel_prov.lean_toolchain,
+            Some(&canon_dir),
+        )?;
         let rep = crate::kernel::verify_olean_modules_with_con_leche(
             &bin,
             &search_paths,
@@ -7976,7 +7981,13 @@ fn certify_head_statement_modules_and_replay(
             let search_paths: Vec<PathBuf> = std::env::split_paths(&search_path_str)
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect();
-            let bin = crate::kernel::discover_con_leche_binary(Some(head_project))?;
+            // G1c r2: execution uses the same discovery as the selection probe
+            // (review 22ae951a F1).
+            let bin = crate::kernel::discover_con_leche_binary_for_selection(
+                prov.requested_engine,
+                &prov.lean_toolchain,
+                Some(head_project),
+            )?;
             let rep = crate::kernel::verify_olean_modules_with_con_leche(
                 &bin,
                 &search_paths,

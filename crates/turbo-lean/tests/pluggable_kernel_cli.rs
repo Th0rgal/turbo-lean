@@ -327,10 +327,44 @@ fn pr_and_ci_verify_base_policy_isolation_and_receipt_verification() {
         .unwrap();
     assert_ok(&ci_out, "ci-verify without --base ignores checkout config");
     let ci_json: Value = serde_json::from_slice(&ci_out.stdout).unwrap();
-    assert_eq!(ci_json["kernel_engine"], "standard");
     assert_eq!(ci_json["kernel_requested"], "auto");
     assert_eq!(ci_json["lean_toolchain"], toolchain);
-    assert!(ci_json["con_leche_rev"].is_null());
+    // Host-honest resolved-engine assertion (G1c r2): `auto` accepts the toolchain-bundled
+    // con-leche when the host has one, so compute bundled-binary presence the way the
+    // resolver's probe computes it (`ELAN_HOME` else `$HOME/.elan`, elan's mangling of the
+    // pinned toolchain, an executable file at `bin/con-leche`) and assert the resolved
+    // engine / rev against that presence instead of pinning one host's answer.
+    let bundled_present = kernel::normalize_lean_toolchain(toolchain)
+        == kernel::PINNED_CON_LECHE_TOOLCHAIN
+        && std::env::var_os("ELAN_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".elan")))
+            .filter(|elan_home| elan_home.is_absolute())
+            .map(|elan_home| {
+                let dir_name = kernel::PINNED_CON_LECHE_TOOLCHAIN
+                    .replace('/', "--")
+                    .replace(':', "---");
+                let bin = elan_home
+                    .join("toolchains")
+                    .join(dir_name)
+                    .join("bin")
+                    .join("con-leche");
+                bin.metadata()
+                    .map(|m| {
+                        m.is_file()
+                            && std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o111
+                                != 0
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+    if bundled_present {
+        assert_eq!(ci_json["kernel_engine"], "con-leche");
+        assert_eq!(ci_json["con_leche_rev"], kernel::PINNED_CON_LECHE_REV);
+    } else {
+        assert_eq!(ci_json["kernel_engine"], "standard");
+        assert!(ci_json["con_leche_rev"].is_null());
+    }
 
     // Explicit caller env (without FROM_CONFIG=1) in `ci-verify` without `--base` still applies and fails closed.
     let ci_env_fail = f
