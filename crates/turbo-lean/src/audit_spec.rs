@@ -632,6 +632,42 @@ pub(super) fn extract_local_def_unfoldings(clean_src: &str) -> Vec<LocalDefUnfol
 /// elaborate, and a probe that fails to elaborate certifies nothing — or when
 /// gathering stopped at a blank line that an indented continuation follows (the
 /// gathered text may truncate the real body).
+/// Column-0 command starts that end a def-body gather. Shared between the gather
+/// break and the truncation peek, so a line that would NOT break the gather as a
+/// new command marks the gathered text truncation-suspect instead of being lost.
+const DECL_GATHER_BREAK_PREFIXES: &[&str] = &[
+    "def ",
+    "abbrev ",
+    "theorem ",
+    "lemma ",
+    "structure ",
+    "inductive ",
+    "class ",
+    "opaque ",
+    "axiom ",
+    "namespace ",
+    "end ",
+    "section ",
+    "mutual ",
+    "open ",
+    "import ",
+    "infix ",
+    "infixl",
+    "infixr",
+    "prefix ",
+    "postfix ",
+    "notation ",
+    "private ",
+    "protected ",
+    "scoped ",
+    "local ",
+    "partial ",
+    "unsafe ",
+    "@[",
+    "noncomputable ",
+    "#",
+];
+
 pub(super) fn extract_local_def_unfoldings_and_sources(
     clean_src: &str,
 ) -> (
@@ -817,7 +853,19 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
                         .unwrap_or(src.len());
                     let pt = &src[peek..pe];
                     if !pt.trim().is_empty() {
-                        truncation_suspect = pt.starts_with(' ') || pt.starts_with('\t');
+                        // Lean term bodies do not depend on indentation: an unindented
+                        // continuation (`+ 1`) is as truncation-shaped as an indented
+                        // one, so anything that is not a recognized column-0 command
+                        // start marks the gathered text suspect.
+                        let next_is_command = matches!(
+                            pt.trim_end(),
+                            "end" | "section" | "mutual"
+                        ) || DECL_GATHER_BREAK_PREFIXES
+                            .iter()
+                            .any(|p| pt.starts_with(p));
+                        truncation_suspect = pt.starts_with(' ')
+                            || pt.starts_with('\t')
+                            || !next_is_command;
                         break;
                     }
                     peek = pe + 1;
@@ -825,40 +873,9 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
                 break;
             }
             if matches!(next_trim, "end" | "section" | "mutual")
-                || [
-                    "def ",
-                    "abbrev ",
-                    "theorem ",
-                    "lemma ",
-                    "structure ",
-                    "inductive ",
-                    "class ",
-                    "opaque ",
-                    "axiom ",
-                    "namespace ",
-                    "end ",
-                    "section ",
-                    "mutual ",
-                    "open ",
-                    "import ",
-                    "infix ",
-                    "infixl",
-                    "infixr",
-                    "prefix ",
-                    "postfix ",
-                    "notation ",
-                    "private ",
-                    "protected ",
-                    "scoped ",
-                    "local ",
-                    "partial ",
-                    "unsafe ",
-                    "@[",
-                    "noncomputable ",
-                    "#",
-                ]
-                .iter()
-                .any(|p| next_trim.starts_with(p))
+                || DECL_GATHER_BREAK_PREFIXES
+                    .iter()
+                    .any(|p| next_trim.starts_with(p))
             {
                 break;
             }
@@ -882,7 +899,9 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
                     break;
                 }
             }
-            let raw = s[..end].trim();
+            // A universe-polymorphic `foo.{u}` stops the scan at '{' leaving a
+            // trailing dot; trim it so the short name is `foo`, not "".
+            let raw = s[..end].trim().trim_end_matches('.');
             raw.rsplit('.').next().unwrap_or(raw).to_string()
         };
         let Some((sig, body_raw)) = split_at_first_top_level_assign(&combined) else {
@@ -923,7 +942,7 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
         if name_end == 0 {
             continue;
         }
-        let raw_def_name = sig[..name_end].trim();
+        let raw_def_name = sig[..name_end].trim().trim_end_matches('.');
         let def_name = crate::splitter::qualified_decl_name(raw_def_name, &scope_stack);
         let after_name = sig[name_end..].trim();
         let mut params = Vec::new();
@@ -3687,13 +3706,22 @@ pub(super) fn kernel_witness_mode_from_env() -> KernelWitnessMode {
 const KERNEL_WITNESS_HARNESS_BEGIN: &str = "-- TURBO_SPEC_AUDIT_KERNEL_WITNESS_HARNESS_BEGIN";
 const KERNEL_WITNESS_HARNESS_END: &str = "-- TURBO_SPEC_AUDIT_KERNEL_WITNESS_HARNESS_END";
 
-/// Appended after every verbatim probe's generated block. Its `#check` info output is
-/// the positive evidence that Lean elaborated the appended suffix at all: a failed
-/// header, an unterminated literal swallowing the suffix, or a `#exit` inside the
-/// audited block suppresses it, while per-command error recovery still emits it when
-/// individual witness theorems fail.
+/// PREFIX of the sentinel appended after every verbatim probe's generated block. Its
+/// `#check` info output is the positive evidence that Lean elaborated the appended
+/// suffix at all: a failed header, an unterminated literal swallowing the suffix, or
+/// a `#exit` inside the audited block suppresses it, while per-command error recovery
+/// still emits it when individual witness theorems fail. The EMITTED name appends a
+/// hash of the audited source (see [`derived_kernel_witness_sentinel_name`]), so the
+/// audited text cannot print the marker itself: a file cannot contain its own hash.
 const KERNEL_WITNESS_SENTINEL_NAME: &str = "_turbo_audit_kw_probe_sentinel";
-const KERNEL_WITNESS_SENTINEL_MARKER: &str = "_turbo_audit_kw_probe_sentinel : Nat";
+
+/// The per-probe sentinel name: the fixed prefix plus a digest of the audited source.
+/// The matched marker stops at " :" so the printed TYPE may be renamed by notation in
+/// scope without suppressing the sentinel.
+fn derived_kernel_witness_sentinel_name(audited_src: &str) -> String {
+    let digest = blake3::hash(audited_src.as_bytes()).to_hex();
+    format!("{KERNEL_WITNESS_SENTINEL_NAME}_x{}", &digest.as_str()[..16])
+}
 
 /// The Lean-side kernel witness replay harness, inlined byte-identically from
 /// `lean/TurboLean/PolicyGates.lean` (the single source of truth) into every probe.
@@ -3873,8 +3901,9 @@ pub(super) fn build_kernel_witness_probe_src(
         .collect::<Vec<_>>()
         .join("\n");
     let (theorems, gates, names) = kernel_witness_probe_theorems(candidates, include_gates)?;
+    let sentinel = derived_kernel_witness_sentinel_name(audited_src);
     let probe = format!(
-        "{audited_src}\n\n-- generated by `turbo-lean audit-spec --kernel-witness`; never written into the audited tree\n{open_lines}\nnamespace _TurboAuditKernelWitnessProbe\n{harness}\nend _TurboAuditKernelWitnessProbe\n\n{theorems}{gates}\ndef {KERNEL_WITNESS_SENTINEL_NAME} : Nat := 2026\n#check {KERNEL_WITNESS_SENTINEL_NAME}\n",
+        "{audited_src}\n\n-- generated by `turbo-lean audit-spec --kernel-witness`; never written into the audited tree\n{open_lines}\nnamespace _TurboAuditKernelWitnessProbe\n{harness}\nend _TurboAuditKernelWitnessProbe\n\n{theorems}{gates}\ndef {sentinel} : Nat := 2026\n#check {sentinel}\n",
     );
     Some((probe, names))
 }
@@ -4186,6 +4215,15 @@ pub(super) fn run_kernel_witness_probe(
 /// (`<path>:<line>:<col>: error: ...`), counting only the probe module's own file
 /// (its scratch name carries `TurboAuditedShard`), never a diagnostic some other file
 /// or a quoted message happens to print.
+/// Whether the per-probe sentinel's `#check` output is in the diagnostics. The
+/// `#check` info message arrives WITHOUT a file:line prefix (measured on the live
+/// toolchain), so positional acceptance is impossible; soundness comes from the
+/// derived marker instead: the sentinel name embeds a hash of the audited source,
+/// so audited text cannot print it — a file cannot contain its own hash.
+fn sentinel_present(diagnostics: &str, derived_marker: &str) -> bool {
+    diagnostics.contains(derived_marker)
+}
+
 fn lean_error_lines(diagnostics: &str) -> Vec<usize> {
     let mut out = Vec::new();
     for line in diagnostics.lines() {
@@ -4269,7 +4307,10 @@ fn audited_src_declares_probe_hostile_commands(clean_src: &str) -> bool {
                 let Some(end) = close else {
                     return true;
                 };
-                if rest[..end].contains("instance") {
+                if rest[..end].contains("instance")
+                    || rest[..end].contains("macro")
+                    || rest[..end].contains("elab")
+                {
                     return true;
                 }
                 t = rest[end + 1..].trim_start();
@@ -4304,6 +4345,10 @@ fn audited_src_declares_probe_hostile_commands(clean_src: &str) -> bool {
             "postfix",
             "attribute",
             "deriving instance",
+            "export",
+            "binder_predicate",
+            "unif_hint",
+            "#exit",
         ]
         .iter()
         .any(|kw| {
@@ -5145,6 +5190,8 @@ fn audit_spec_file_or_source_with_policy_inner(
         // downgrades nothing: the eval-level labels simply stand.
         if kernel_witness == KernelWitnessMode::Replay && !kw_src_candidates.is_empty() {
             let clean_for_ns = strip_audit_comments(src);
+            let kw_sentinel_marker =
+                format!("{} :", derived_kernel_witness_sentinel_name(src));
             let audited_line_count = src.lines().count();
             let header_import_lines = lean_header_import_lines(src);
             // The sibling sweep re-emits defs from neighboring sources into the
@@ -5211,7 +5258,7 @@ fn audit_spec_file_or_source_with_policy_inner(
                             if !minimal {
                                 let errs = lean_error_lines(&diagnostics);
                                 let suffix_elaborated =
-                                    diagnostics.contains(KERNEL_WITNESS_SENTINEL_MARKER);
+                                    sentinel_present(&diagnostics, &kw_sentinel_marker);
                                 if !suffix_elaborated
                                     && !errs.is_empty()
                                     && errs.iter().all(|l| header_import_lines.contains(l))
@@ -5249,7 +5296,13 @@ fn audit_spec_file_or_source_with_policy_inner(
                         cert.fill((true, with_gates, self_contained));
                     }
                     Ok((None, _)) if kw_src_candidates.len() == 1 => kw_rejected_probes += 1,
-                    Ok((None, batch_verdict)) => per_candidate_seed = Some(batch_verdict),
+                    // Only a POSITIVE block-broken verdict holds for every candidate
+                    // subset; a negative one may have come from another candidate's
+                    // out-of-block failure, so a retry must re-derive it or the
+                    // fallback is wrongly disabled for candidates the base certified.
+                    Ok((None, batch_verdict)) => {
+                        per_candidate_seed = Some(batch_verdict.filter(|b| *b));
+                    }
                 }
                 if let Some(seed) = per_candidate_seed {
                     for (i, entry) in kw_src_candidates.iter().enumerate() {
@@ -6016,6 +6069,67 @@ pub fn run_audit_spec_command_with_options(
 #[cfg(test)]
 mod lexer_tests {
     use super::*;
+
+    #[test]
+    fn sentinel_name_is_audited_source_dependent_and_gate_matches_it() {
+        let src_a = "theorem t : 1 = 1 := rfl\n";
+        let src_b = "theorem t : 2 = 2 := rfl\n";
+        let name_a = derived_kernel_witness_sentinel_name(src_a);
+        let name_b = derived_kernel_witness_sentinel_name(src_b);
+        assert_ne!(name_a, name_b, "the sentinel must depend on the audited bytes");
+        assert!(name_a.starts_with(KERNEL_WITNESS_SENTINEL_NAME));
+        // The audited source cannot name its own sentinel: the name embeds a hash
+        // of the source, so embedding the name would change the hash.
+        assert!(!src_a.contains(&name_a));
+        let marker_a = format!("{name_a} :");
+        assert!(sentinel_present(&format!("{name_a} : Nat"), &marker_a));
+        // A type printed under notation still matches: the marker stops at " :".
+        assert!(sentinel_present(&format!("{name_a} : \u{2115}"), &marker_a));
+        // The old FIXED marker shape (what audited text could fake) does not match.
+        assert!(!sentinel_present(
+            "_turbo_audit_kw_probe_sentinel : Nat",
+            &marker_a
+        ));
+        // Another source's sentinel does not satisfy this probe's gate.
+        assert!(!sentinel_present(&format!("{name_b} : Nat"), &marker_a));
+        // The probe builder emits the derived sentinel, not the bare prefix.
+        let (probe, _) = build_kernel_witness_probe_src(src_a, src_a, &[], true)
+            .map(|p| p)
+            .unwrap_or_else(|| (String::new(), Vec::new()));
+        if !probe.is_empty() {
+            assert!(probe.contains(&name_a));
+        }
+    }
+
+    #[test]
+    fn extractor_handles_universe_names_and_unindented_continuations() {
+        // A universe-polymorphic def's short name is the name, not "".
+        let src = "def upoly.{u} (a : Sort u) : Sort u := by exact a\n";
+        let (_, _, skipped) = extract_local_def_unfoldings_and_sources(src);
+        assert!(
+            skipped.iter().any(|n| n == "upoly"),
+            "universe-polymorphic by-body def must be skipped under its short name, got {skipped:?}"
+        );
+        // An unindented continuation after a blank line marks the gather suspect.
+        let src2 = "def g (n : Nat) : Nat := n\n\n+ 1\n";
+        let (_, def_srcs, _) = extract_local_def_unfoldings_and_sources(src2);
+        let g = def_srcs
+            .iter()
+            .find(|(n, _, _)| n == "g" || n.ends_with(".g"))
+            .expect("extractor must capture g");
+        assert!(
+            g.2,
+            "an unindented continuation must mark the gathered body truncation-suspect"
+        );
+        // A following column-0 command keeps the def re-emittable.
+        let src3 = "def h (n : Nat) : Nat := n\n\ndef k (n : Nat) : Nat := n\n";
+        let (_, def_srcs3, _) = extract_local_def_unfoldings_and_sources(src3);
+        let h = def_srcs3
+            .iter()
+            .find(|(n, _, _)| n == "h" || n.ends_with(".h"))
+            .expect("extractor must capture h");
+        assert!(!h.2, "a following command start is not a continuation");
+    }
 
     #[test]
     fn extractor_flags_only_semantics_changing_prefixes() {
