@@ -658,8 +658,12 @@ fn template_shm_path() -> (PathBuf, u32) {
     };
     let uid = unsafe { libc::geteuid() };
     (
+        // The template name's `v9` tracks the schema's `PRAGMA user_version` (9).
+        // Earlier builds of this branch published `v10`-named templates while the
+        // schema was still at 9, so that name is burned: the NEXT schema bump must
+        // take user_version 11 and name `v11`, never 10.
         shm_base.join(format!(
-            "turbo_lean_template_state_v10_{}_{}.db",
+            "turbo_lean_template_state_v9_{}_{}.db",
             crate::build_epoch_short(),
             uid
         )),
@@ -816,6 +820,17 @@ impl TurboStore {
                 let uver: i64 = conn
                     .query_row("PRAGMA user_version", [], |r| r.get(0))
                     .unwrap_or(0);
+                // The schema this build writes; the migrations below only move
+                // forward, so a store stamped by a NEWER build is refused rather
+                // than reinterpreted. (The next bump must take user_version 11,
+                // never 10; see the comment beside `turbo_lean_template_state_v9`.)
+                const SCHEMA_USER_VERSION: i64 = 9;
+                if uver > SCHEMA_USER_VERSION {
+                    anyhow::bail!(
+                        "state DB at {} has user_version {uver}, newer than this build's schema {SCHEMA_USER_VERSION}; refusing to open it",
+                        db_path.display()
+                    );
+                }
                 if uver < 2 {
                     conn.execute_batch(&format!(
                         "{}\nPRAGMA user_version = 2;",
@@ -3043,14 +3058,19 @@ impl TurboStore {
         );
         let now = now_unix();
         self.conn.execute(
+            // `csimp_posture_digest` is written as an explicit empty string rather
+            // than left to the column DEFAULT: the audited-authority MAC is derived
+            // over an empty posture, and the write site should say so instead of
+            // depending on the DDL staying in sync.
             "INSERT INTO kernel_audited_oleans_auth (
-                artifact_digest, environment_digest, replay_version, toolchain_hash, policy_digest, module_name, audit_mac, verified_at
+                artifact_digest, environment_digest, replay_version, toolchain_hash, policy_digest, module_name, audit_mac, verified_at, csimp_posture_digest
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '')
              ON CONFLICT(artifact_digest, environment_digest, replay_version, toolchain_hash, policy_digest) DO UPDATE SET
                 module_name = excluded.module_name,
                 audit_mac = excluded.audit_mac,
-                verified_at = excluded.verified_at",
+                verified_at = excluded.verified_at,
+                csimp_posture_digest = excluded.csimp_posture_digest",
             params![
                 artifact_digest,
                 environment_digest,
