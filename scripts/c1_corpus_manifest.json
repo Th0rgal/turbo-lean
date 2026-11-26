@@ -1,6 +1,6 @@
 {
   "categoriesNote": "matrixConstructs/emphasis are syntactic selection markers (regexes over program source), chosen to exercise the lowered_unproved and rejected rows of the LCNF coverage matrix; they are not executed-lowering measurements. The executed classification is recorded per program by run_conformance_suite.py --tier C1.",
-  "detectorDigest": "1460234bd94b8d035888c4a027700e1d1918b5c9bd090563f2bc36527df617e8",
+  "detectorDigest": "abe7905f887e02546ede230580f4bc2cfa0e0688aff01ede87113d8a10248711",
   "emphasis": {
     "array_bytearray_sharing": {
       "count": 67,
@@ -4143,14 +4143,14 @@
     "Code.fun": "rejected",
     "Code.jp.recursive": "rejected",
     "DeclValue.extern": "rejected",
-    "LetValue.const": "lowered_unproved",
+    "LetValue.const": "rejected",
     "LetValue.ctor.general": "rejected",
     "LetValue.fap.general": "rejected",
     "LetValue.fap.local_call": "lowered_unproved",
     "LetValue.fvar.app": "rejected",
     "LetValue.lit.str": "rejected",
     "LetValue.pap": "rejected",
-    "LetValue.proj": "lowered_unproved",
+    "LetValue.proj": "rejected",
     "LetValue.reset_reuse": "rejected",
     "Type.signed_scalars": "rejected"
   }

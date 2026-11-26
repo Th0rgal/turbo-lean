@@ -1,16 +1,15 @@
 {
   "bridge_file_sha256": {
-    "lean/LeanNative/IR/Bridge.lean": "35bc45aaeaedb10a9e5d5987821f8a6d66592fbe1634ccccdd7175896eb4471d",
-    "lean/LeanNative/IR/BridgeHelpers.lean": "223552ea889239dd90f8b8e8ecec17ca6017e482314c05c909b63d5261f28660",
-    "lean/LeanNative/IR/BridgeHelpers/DeclIngestAndValidation.lean": "251a4a5437bcd1327fb3b77eed984ba578a4b0f30020c7d95d711af9a5f401d4",
-    "lean/LeanNative/IR/BridgeHelpers/HeapAndConstructors.lean": "8373c434f4b8716c6c39230239202e493793e8749165a9c4afefae995d729c26",
-    "lean/LeanNative/IR/BridgeHelpers/RealBridgeCtxAndSlices.lean": "5577bb7347139e4d96ee7739dd85e55a5abdf20dc5a8786c6eb5f7a5c3a9a47d",
-    "lean/LeanNative/IR/BridgeHelpers/ScalarDagAndJoinPoints.lean": "42bdac7e56063d12506f9af947f0f7eaf4260374cf74a54a3b2f80665a9af031",
-    "lean/LeanNative/IR/BridgeHelpers/StateAndIntrinsics.lean": "f0a9d71675a70a6e2637b00d264bfa7ed2aafad7b8f7ddf137a781c4aa095b10",
+    "lean/LeanNative/IR/Bridge.lean": "aee5ee6b107dad027edcd1bd5926a09f8aa4e92b7d2b08cbf7b578728813483a",
+    "lean/LeanNative/IR/BridgeHelpers.lean": "1216446277d18a33a142b93126a706e065d08fdf821d87d223dffc5a59c9a0ef",
+    "lean/LeanNative/IR/BridgeHelpers/DeclIngestAndValidation.lean": "af7d417a768d0f02445575a687399efe3d673cf21b0192abdbb126b55b566195",
+    "lean/LeanNative/IR/BridgeHelpers/HeapAndConstructors.lean": "043b69583ca22c5376716c10439dfe9175abf7db344fcb37dccbd491d480d7ce",
+    "lean/LeanNative/IR/BridgeHelpers/RealBridgeCtxAndSlices.lean": "4389b6369024886ef7558c4a4d3b99064e7c9abe3222aba8b75ed5a4ac34231c",
+    "lean/LeanNative/IR/BridgeHelpers/StateAndIntrinsics.lean": "b0dcc03cf2c9b375ab51616a6526dea162bd607a8847df46b5a9637d3d4b7529",
     "lean/LeanNative/IR/BridgeHelpers/TypesAndSigs.lean": "1e6d6f4c07d6684435c11a64a672f89dc7a0c781271e5a04b45c8250828a2223",
-    "lean/LeanNative/IR/RealLCNFBridge.lean": "7b60916a77f117d7a69243801c78c68f42e3be59deedba8e980230382d25ac9f",
+    "lean/LeanNative/IR/RealLCNFBridge.lean": "cc32468508d6aa1bd2d907b0a2b5a3f1818082000729e38e551b37943d001848",
     "lean/LeanNative/IR/RealLCNFSemantics.lean": "82bc8345586d1ecd333a778d7a25091b8938c69dacdffef53a9ff47c61e32c3e",
-    "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean": "2b652b961f78656b494c8f45a58293b0fb01f1f44c8d81c409f4201d546a5b16"
+    "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean": "3f0627ba90ef74acb3093cf4703ee18abf9380ba3752f01b5f9266b846f1bc4b"
   },
   "corpora": {
     "c1_corpus": {
@@ -61,7 +60,7 @@
       "total_declarations": 1805
     }
   },
-  "measured_source_commit": "1b2b7d060feaa5315be37e9052207feb27768e2a",
+  "measured_source_commit": "19ae99cd36c4dbe30f71a776f933e9258372081d",
   "measured_source_commit_note": "`measured_source_commit` is the commit of the tree the measurement was taken from (recorded when `--write-results` ran, i.e. the parent of the commit that updates this file).",
   "schemaVersion": "turbo-lean-lcnf-coverage-results-v3",
   "toolchain": "leanprover/lean4:v4.35.0"

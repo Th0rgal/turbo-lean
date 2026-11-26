@@ -140,6 +140,14 @@ jobs:
           ./target/release/turbo-lean --version
           SKIP_LAKE_BUILD=1 SKIP_TRUSTED_CI_VERIFY=1 ./scripts/ci_verify.sh
 
+      # H1.0 accept (roadmap/HORIZONS.md): a CI job emits the generated LCNF coverage
+      # matrix JSON. The `lake build` above provides `LeanNative.IR.Bridge` and its cone;
+      # the in-repo corpora are measured live with the real lowerer and the bridge-source
+      # digests are gated against scripts/lcnf_coverage_results.json. This job builds no
+      # pinned Batteries or con-leche tree, so those corpora report `not_measured`.
+      - name: Generated LCNF coverage matrix JSON (H1.0)
+        run: python3 scripts/lcnf_coverage.py --json
+
       # `libsqlite3-sys` and `blake3` compile C via cc-rs, which looks for
       # `aarch64-linux-gnu-gcc` when cross-targeting, and turbo-lean's own
       # build.rs compiles/archives the C-ABI objects with CC_<target>/AR_<target>

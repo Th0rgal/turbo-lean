@@ -21,27 +21,29 @@ are sequenced after the L2 lane's F-proofs merge (the reason is named there — 
 pipeline-sequencing fact at the bytes, not an unprovability).
 
 Status (gap-l3, 2026-11-26): Part I is PROVED at the end of this file — the 14 theorems
-with the statements below, registered in `AxiomAudit.lean` (874 → 888; L2's raise landed
-first), each depending only on `propext`, `Classical.choice` and `Quot.sound`; the
-executable guards are in `Tests/RealLCNFRecTests.lean`. Two shape notes. `DeclEnvLowersR`
-is a recursive `Prop` whose two matching clauses are the contract's `nil`/`cons`: the
-strict-proofs policy forbids a new `inductive` under `Proofs/` (L2's `DeclEnvLowers` has
-the same shape for the same reason). `reservedRuntimeCallee` is defined as L2's
-`reservedRuntimeName`, so the two lanes share one predicate. Part II is NOT proved, and
-its headline is refuted over the landed `evalStepR` — see "Part II status" below.
+with the statements below plus the four lemmas amendment 2 adds, registered in
+`AxiomAudit.lean` (874 → 892; L2's raise landed first), each depending only on `propext`,
+`Classical.choice` and `Quot.sound`; the executable guards are in
+`Tests/RealLCNFRecTests.lean`. Two shape notes. `DeclEnvLowersR` is a conjunction of
+recursive `Prop`s (the positional clauses `DeclEnvLowersPosR` and per-entry `CtxMapsEnvR`
+coherence): the strict-proofs policy forbids a new `inductive` under `Proofs/` (L2's
+`DeclEnvLowers` has the same shape for the same reason). `reservedRuntimeCallee` is
+defined as L2's `reservedRuntimeName`, so the two lanes share one predicate. Part II is
+NOT proved and stays OPEN: amendment 3 fixed the step rule its first refutation rested
+on, and the remaining work is listed in "Part II status" below.
 
-Pipeline note: this leaf is cut against the L2 CONTRACT (`Proofs/LowerCalls.lean`,
-415256b1); L2's definitions (`FuncEnv`, `evalCodeF`, `DeclEnv`, `evalStepF`,
-`evalRealLCNFDeclF`, `DeclEnvLowers`, `CodeRefinesF`, `reservedRuntimeName`) are not in
-the tree at this tip — only their contract is. Nothing here edits L2's files
-(`Semantics/Eval.lean` stays append-only for L2; `IR/RealLCNFCallSemantics.lean` and
-`Tests/RealLCNFCallTests.lean` stay L2's to create), proves L2's theorems, or states
-R-forms of anything outside L2's non-BLOCKED contracted set. The driver's compression
-post-pass surface is being removed by the L1 fix round (a review proved it never changes
-any declaration), so the driver-shaped soundness statement reduces to
-`lowerRealLCNFDecl_sound` and this contract names no post-pass symbol; this worktree
-merges `main` again once the L1 fix round and L2 land, before its final proofs commit.
-The sha-pinned files (`scripts/lcnf_coverage_results.json` pins
+Pipeline note: this leaf was cut against the L2 CONTRACT; L2 has since landed its F-stack,
+and Part I is proved against the landed definitions: `FuncEnv` and `evalCodeF`
+(`Semantics/Eval.lean`), `DeclEnv`, `evalStepF` and `evalRealLCNFDeclF`
+(`IR/RealLCNFCallSemantics.lean`), `reservedRuntimeName` with its non-capture lemmas and
+the per-case step mirrors (`Proofs/RealLCNFBridge/CallsF.lean`, imported here), and
+`CtxMapsEnv`, `DeclEnvLowers` and the proved headline `lowerRealLCNFDecl_soundF`
+(`Proofs/LowerCalls.lean`). L2 dropped its contract's `CodeRefinesF`, which had no
+consumer once the compression post-pass was removed (`LowerCalls.lean`'s definitions
+paragraph). Nothing here edits L2's files or proves L2's theorems. L1 fix round 1 removed
+the post-pass (`applyValidatedCompression` is defined nowhere in the tree), so the
+driver-shaped soundness statement is `lowerRealLCNFDecl_sound` and this contract names no
+post-pass symbol. The sha-pinned files (`scripts/lcnf_coverage_results.json` pins
 `IR/RealLCNFSemantics.lean`, `IR/RealLCNFBridge.lean`, `IR/Bridge.lean`,
 `IR/BridgeHelpers*.lean`, `Proofs/RealLCNFBridgeProofs.lean`) are read, cited and proved
 ABOUT, never edited; every new definition goes in new files, as L2's layering prescribes.
@@ -62,9 +64,99 @@ governing only the caller's own clauses; the EVALUATION fuel stays the single st
 — distinct from the per-entry LOWERING fuel, never per-entry. `CodeRefinesR` (the LNIR
 side carries no `RealBridgeCtx`) and `lowerRealLCNFDecl_soundR_base` (already one
 declaration with its own context and the pointwise freshness hypothesis) are unchanged;
-every Part II frozen name stays. The L2 lane is applying the same-shape correction to its
+every Part II frozen name stays. The L2 lane applied the same-shape correction to its
 `DeclEnv`/`DeclEnvLowers` (entries `Decl × RealBridgeCtx × Nat`), so the two lanes stay
 parallel and the fold meets one entry shape.
+
+Amendment 2 (gap-l3, 2026-11-26; devil's-advocate review 80ac7f68 of 7793bb37, five
+findings folded before the Part II statements freeze):
+
+- F1, coherence (the Part II statements were false as first frozen). The source rule
+  looks a callee up by Lean name (`lookupDeclRec? Δ fn`), the target by mangled symbol
+  (`lookupFuncRec? Φ sym` with `ctx.findLocalCallee? fn = some sym`), and the first cut
+  of `DeclEnvLowersR` related only each entry's OWN name to its own lowered name.
+  Witness: `Δ = [(A, ctxA, _), (B, ctxB, _)]`, `Φ = [ldA "A", ldB "B"]`, each entry's
+  context correct, but the top context maps `A ↦ "B"`; the body `let x := A (); ret x`
+  runs A on the source side and B on the target side. Fixed as L2 fixed the same gap:
+  `CtxMapsEnvR ctx Δ Φ` (position by position, a context that maps a source name maps it
+  to that position's lowered name) is required per entry, for the entry's own context,
+  inside `DeclEnvLowersR`, and as `h_map` for the top caller in every Part II statement.
+  It ranges over the WHOLE lists, not the tail as in L2: R's lookup is not stratified,
+  and a recursive call reaches earlier entries. `lookupDeclRec?_align` and
+  `declEnvLowersR_lookup_align` prove the hypotheses suffice: at a coherent call site the
+  two lookups land on one position, the LNIR entry there is the lowering of the source
+  entry there, and the callee's own context coheres again, so its nested call sites
+  align too. Rejected: the strong equality `ctx.findLocalCallee? sd.name = some ld.name`
+  at every position (L2's review showed it fails for a call chain under per-declaration
+  `localCallees`, where a context need not know every name).
+- F4, strict arity. `evalCodeR`'s call arm bound parameters by `zip`, so extra arguments
+  were dropped and missing ones stayed unbound; L2's `evalCodeF` errors on a count
+  mismatch because the source side's `bindParams` is strict. The call arm now errors
+  `.typeError "call arity mismatch"` when `vals.length ≠ ld.params.length`, and
+  `evalCodeR_call_unfold`'s right-hand side states the check, so the two lanes' LNIR call
+  rules agree. Guard: a two-argument call to a one-parameter callee errors
+  (`Tests/RealLCNFRecTests.lean`, family 5); an empty argument list would not pin it,
+  since the unbound parameter errors either way.
+- F2, fuel monotonicity. One evaluation fuel with per-entry lowering fuel needs
+  `evalStepR` monotone in fuel (L2 avoided the obligation with per-entry evaluation
+  fuel). Proved: `evalStepR_fuel_mono`, with `hasJmpToPure_false_succ`. The review's worry
+  that a deeper search could turn an accepted join point into a "recursive join point"
+  error runs the other way at the bytes: `hasJmpToPure 0` answers `true`, so more fuel can
+  only turn a "recursive" verdict into "non-recursive". Rejected: per-entry evaluation
+  fuel. Under the full environment a self-call would re-enter at the same entry fuel, so
+  the evaluator would have no decreasing measure and a diverging source program no budget
+  to exhaust.
+- F3, one non-capture lemma. `evalExpr_call_ok_reserved` is proved from L2's
+  `FuncEnv.callTarget?_of_evalExpr_ok` through the definitional alias, instead of listing
+  the intrinsic names by hand, so a change to `reservedRuntimeName` or to `evalExpr`'s
+  intrinsic set moves one proof, not two.
+- F5, this block. The pipeline note, the `reservedRuntimeCallee` and `DeclEnvLowersR`
+  contract text, the audit pin and the Part II sequencing text below describe the landed
+  code.
+
+Amendment 3 (gap-l3, 2026-11-26; the lead's decision on the Part II status question, and
+review a2aa208f findings 1-2): the resolved local-call rule binds the call result at the
+caller's declared lowered type `rawTy`. Until this amendment it bound at
+`if isUnboxedScalarOrTuple rawTy then rawTy else .i64`, the unresolved `.fap` arm's
+fallback, while the lowering allocates the destination at `rawTy` itself
+(`IR/RealLCNFBridge.lean`, the `.fap` arm with `ctx.findLocalCallee? fnName = some sym`)
+and L2's `evalStepF` binds at `some rawTy`. The witness is guard family 6 of
+`Tests/RealLCNFRecTests.lean`: callee `l3_mk x = ObjBox.left (box x)` returns a fresh
+object, caller `l3_use x = let o := l3_mk x; dec o; 0`, one context with heap lowering
+on, `ObjBox.left`'s layout, and `l3_mk` local. Under the old rule the source run stored `o`
+at `.i64`, its `dec` was a no-op, and the run returned `0` with the object live, while the
+lowered caller under `Φ` and L2's run returned `0` with it freed. Under the amended rule
+the three runs agree exactly on value and heap; the family-6 guards fail at the old rule
+and pass at this one. The Part I statement `evalStepR_localCall_unfold` pinned the old
+binding, so its right-hand side changes with the rule: a frozen statement changes here
+because the semantics it described were wrong. Its continuation was
+`evalStepR Δ fuel ctx (env.bind decl.fvarId v none (some (if isUnboxedScalarOrTuple
+(lowerGroundImpureTypeWith ctx decl.type) then lowerGroundImpureTypeWith ctx decl.type
+else .i64))) st' (.inl k)` and is now
+`evalStepR Δ fuel ctx (env.bind decl.fvarId v none (some (lowerGroundImpureTypeWith ctx
+decl.type))) st' (.inl k)`. Nothing else moved, and the build of the amendment's commit
+checked it: `evalStepR_nil` never reaches the arm (an empty `Δ` misses),
+`evalStepR_fuel_mono`'s unchanged proof script re-ran green against the new rule, and
+every earlier guard's call result is `UInt64`, whose lowered type the old rule kept.
+Rejected: keeping the `.i64` binding with a warning, which would have certified a step
+rule that leaks objects on heap-typed local calls to keep a refutation of the headline
+standing.
+
+Amendment 4 (gap-l3, 2026-11-26; review de0391f1 of fcc0b33f, three rows):
+
+- `DeclEnvLowersPosR` drops its per-entry clause `ctx.findLocalCallee? sd.name = some
+  ld.name` (each entry's own context knows its own name). No proof used it, the maps-to
+  half is already in the per-entry `CtxMapsEnvR`, L2's `DeclEnvLowers` has no such
+  clause, and it excluded the suite's own even/odd environment, whose contexts know only
+  their partner, contradicting F1's reason for rejecting the strong equality. A Part II
+  case that needs a name to be present states it where it is used.
+- The arity guard gains the too-few direction with the exact error: a two-parameter
+  callee whose body reads only the first parameter, called with one argument, must end
+  on "call arity mismatch". A `≤` mutant of the check passed the two earlier guards.
+- `evalStepR_fuel_mono` keeps its lockstep search; its docstring says how the script
+  fails when `evalStepR` changes, and amendment 3's claim that the rule change left it
+  untouched is a checked fact. `evalExpr_call_ok_reserved` and `lookupDeclRec?_align`
+  use `simp only`, like the rest of the file.
 
 ### What the AST actually carries for recursion and loops (read first, stated only if it exists)
 
@@ -130,7 +222,9 @@ rule: on `.letBind dst ty (.call fn args retTy false) k` with
 
 - at fuel `0`: `.error .fuelExhausted` (the budget check comes FIRST, before `args` are
   read — the evaluator budget shape of `evalParFor`, never source UB);
-- at fuel `fuel' + 1`: `evalVarList env args`, then the callee body
+- at fuel `fuel' + 1`: `evalVarList env args`; an argument count other than
+  `ld.params.length` is `.error (.typeError "call arity mismatch")` (amendment 2, below);
+  otherwise the callee body
   `evalCodeR Φ fuel' ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val)
   VarEnv.empty) st ld.body` — the declaration-entry binding convention of
   `lowerRealLCNFDecl_sound` — and on `.ok (v, st')` the continuation
@@ -183,10 +277,10 @@ on: on `.let decl k` with `decl.value = .fap fn args _` and
   as `evalStepR Δ fuel sdCtx env' st (.inl c)` at the step's decremented fuel UNDER THE
   FULL `Δ` and the callee's paired `sdCtx` — the differences from L2's rule, and what
   makes a self or mutual call evaluate under the context the driver actually builds for
-  that callee; its `.ok (v, st')` binds into the caller exactly as the old `.fap` arm
-  would (`storedTy := if isUnboxedScalarOrTuple rawTy then rawTy else .i64`, no ctor;
-  `rawTy` from the CALLER'S `ctx`) and continues with `k` at the decremented fuel under
-  `Δ` and the caller's `ctx`.
+  that callee; its `.ok (v, st')` binds into the caller at `storedTy := rawTy`, no ctor
+  (`rawTy` from the CALLER'S `ctx`: the type the lowering allocates the destination at,
+  as L2's `evalStepF` binds; amendment 3), and continues with `k` at the decremented fuel
+  under `Δ` and the caller's `ctx`.
 - lookup miss: `.error (.unsupportedCall fn.toString)` — byte-for-byte the old behavior,
   so `Δ = []` is the old semantics (theorem `evalStepR_nil`).
 
@@ -198,10 +292,9 @@ In this file, namespace `LeanNative.Proofs`:
 ```
 /-- Reserved runtime symbols `evalExpr` interprets as intrinsics
     (`lean_native_*`, `lean_mark_mt`); a lowered local callee must not shadow them.
-    Same predicate L2's contract names `reservedRuntimeName`; this leaf spells it
-    `reservedRuntimeCallee` so the two lanes cannot collide on one declaration name —
-    the fold keeps one spelling. -/
-def reservedRuntimeCallee (s : String) : Bool
+    Defined as L2's `reservedRuntimeName` (`RealLCNFBridge/CallsF.lean`): one predicate
+    under the L3 spelling, so the lanes cannot disagree on it. -/
+def reservedRuntimeCallee (s : String) : Bool := reservedRuntimeName s
 
 /-- The evaluation-side environment of a lowering environment: each entry keeps its
     declaration and its own context; the per-entry LOWERING fuel is a lowering-time
@@ -211,26 +304,41 @@ def declEnvR (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat
     List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx) :=
   Δ.map fun e => (e.1, e.2.1)
 
-/-- Pointwise "Δ lowers to Φ" for the FULL-environment semantics, with PER-ENTRY context
-    and lowering fuel (the driver builds a per-declaration `RealBridgeCtx`; the amendment
-    note above). Clause-for-clause the shape of L2's `DeclEnvLowers` under the same
-    per-entry correction: each entry's own context maps its own declaration's name to its
-    LNIR name, the lowering hypothesis holds at the entry's own fuel, lowered names are
-    unreserved, and tail freshness over the whole list is exactly what makes
-    `lookupDeclRec?` and `lookupFuncRec?` find corresponding positions WITHOUT
-    stratification. -/
-inductive DeclEnvLowersR :
+/-- A context's mangled-name map COHERES with an environment pairing, position by
+    position: WHEN it maps a source declaration's name, it maps it to the lowered
+    declaration's name at the same position (L2's `CtxMapsEnv`, for the R entry shape;
+    amendment 2, F1). Length-mismatched lists cohere never. -/
+def CtxMapsEnvR (ctx : RealBridgeCtx) :
     List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat) → List LNIRDecl → Prop
-  | nil : DeclEnvLowersR [] []
-  | cons : ∀ {sd : Lean.Compiler.LCNF.Decl .impure} {ctx : RealBridgeCtx} {fuel : Nat}
-      {ld : LNIRDecl} {Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)}
-      {Φ : List LNIRDecl},
-      ctx.findLocalCallee? sd.name = some ld.name →
-      lowerRealLCNFDecl fuel ctx sd ld.name = .ok ld →
-      reservedRuntimeCallee ld.name = false →
-      (∀ ld' ∈ Φ, ld'.name ≠ ld.name) →
-      DeclEnvLowersR Δ Φ →
-      DeclEnvLowersR ((sd, ctx, fuel) :: Δ) (ld :: Φ)
+  | [], [] => True
+  | (sd, _, _) :: Δ, ld :: Φ =>
+      (∀ m, ctx.findLocalCallee? sd.name = some m → m = ld.name) ∧ CtxMapsEnvR ctx Δ Φ
+  | _, _ => False
+
+/-- The positional clauses: the lowering hypothesis holds at the entry's own context and
+    fuel, lowered names are unreserved, and no later lowered name repeats an earlier one.
+    Whether a context knows a name is left to the coherence clause (amendment 4). -/
+def DeclEnvLowersPosR :
+    List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat) → List LNIRDecl → Prop
+  | [], [] => True
+  | (sd, ctx, fuel) :: Δ, ld :: Φ =>
+      lowerRealLCNFDecl fuel ctx sd ld.name = .ok ld ∧
+      reservedRuntimeCallee ld.name = false ∧
+      (∀ ld' ∈ Φ, ld'.name ≠ ld.name) ∧
+      DeclEnvLowersPosR Δ Φ
+  | _, _ => False
+
+/-- Pointwise "Δ lowers to Φ" for the FULL-environment semantics, with PER-ENTRY context
+    and lowering fuel (the driver builds a per-declaration `RealBridgeCtx`; amendment 1):
+    the positional clauses, and every entry's own context coheres with the WHOLE pairing.
+    Name freshness alone cannot align a lookup keyed on a Lean name with one keyed on a
+    mangled symbol; coherence pins the symbol a context resolves to the position the
+    source lookup lands on, and freshness keeps every other position from matching it
+    (`declEnvLowersR_lookup_align`). Recursive `Prop`s, not an `inductive`: the
+    strict-proofs scope admits no new `inductive` under `Proofs/`. -/
+def DeclEnvLowersR (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat))
+    (Φ : List LNIRDecl) : Prop :=
+  DeclEnvLowersPosR Δ Φ ∧ ∀ e ∈ Δ, CtxMapsEnvR e.2.1 Δ Φ
 
 /-- `CodeRefines` with the recursion-capable environment (the L3 form of refinement). -/
 def CodeRefinesR (Φ : List LNIRDecl) (src tgt : LNIRCode) : Prop :=
@@ -238,7 +346,7 @@ def CodeRefinesR (Φ : List LNIRDecl) (src tgt : LNIRCode) : Prop :=
     evalCodeR Φ fuel env st tgt = .ok (v, st')
 ```
 
-### Part I — theorems proved by this leaf (14; appended to `AxiomAudit.lean`, 874 → 888 at the proving tip)
+### Part I — theorems proved by this leaf (14, plus amendment 2's four; appended to `AxiomAudit.lean`, 874 → 892 at the proving tip)
 
 Conservativity — the old semantics is the empty-environment instance:
 
@@ -284,11 +392,13 @@ theorem evalCodeR_call_unfold (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
       match evalVarList env args with
       | .error e => .error e
       | .ok vals =>
-        match evalCodeR Φ fuel
-            ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
-            st ld.body with
-        | .error e => .error e
-        | .ok (v, st') => evalCodeR Φ (fuel + 1) (env.bind dst v) st' k
+        if vals.length = ld.params.length then
+          match evalCodeR Φ fuel
+              ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
+              st ld.body with
+          | .error e => .error e
+          | .ok (v, st') => evalCodeR Φ (fuel + 1) (env.bind dst v) st' k
+        else .error (.typeError "call arity mismatch")
 
 theorem evalStepR_localCall_unfold (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx))
     (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
@@ -312,9 +422,7 @@ theorem evalStepR_localCall_unfold (Δ : List (Lean.Compiler.LCNF.Decl .impure �
             | .error e => .error e
             | .ok (v, st') =>
               evalStepR Δ fuel ctx
-                (env.bind decl.fvarId v none
-                  (some (if isUnboxedScalarOrTuple (lowerGroundImpureTypeWith ctx decl.type)
-                         then lowerGroundImpureTypeWith ctx decl.type else .i64)))
+                (env.bind decl.fvarId v none (some (lowerGroundImpureTypeWith ctx decl.type)))
                 st' (.inl k)
 
 theorem evalStepR_localCall_miss (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx))
@@ -388,6 +496,43 @@ theorem lowerImpureStepPure_recursive_jp_rejected (fuel : Nat) (ctx : RealBridge
       .error s!"[lean-native] unsupported recursive join point `{decl.fvarId.name}`: no qualified loop lowering"
 ```
 
+Amendment 2's four, registered with the 14 (F2: fuel monotonicity of the LCNF evaluator;
+F1: the lookup alignment the coherence hypotheses buy):
+
+```
+theorem hasJmpToPure_false_succ :
+    ∀ (fuel : Nat) (t : Lean.FVarId)
+      (target : Lean.Compiler.LCNF.Code .impure ⊕ List (Lean.Compiler.LCNF.Alt .impure)),
+      hasJmpToPure fuel t target = false → hasJmpToPure (fuel + 1) t target = false
+
+theorem evalStepR_fuel_mono (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx)) :
+    ∀ (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
+      (target : Lean.Compiler.LCNF.Code .impure ⊕
+        (Val × Bool × Nat × Option Lean.FVarId × List (Lean.Compiler.LCNF.Alt .impure)))
+      (r : Val × HeapState),
+      evalStepR Δ fuel ctx env st target = .ok r →
+      evalStepR Δ (fuel + 1) ctx env st target = .ok r
+
+theorem lookupDeclRec?_align :
+    ∀ (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) (Φ : List LNIRDecl),
+      DeclEnvLowersPosR Δ Φ →
+      ∀ (ctx : RealBridgeCtx) (fn : Lean.Name) (sym : String)
+        (sd : Lean.Compiler.LCNF.Decl .impure) (sdCtx : RealBridgeCtx),
+      CtxMapsEnvR ctx Δ Φ → ctx.findLocalCallee? fn = some sym →
+      lookupDeclRec? (declEnvR Δ) fn = some (sd, sdCtx) →
+      ∃ fuelD ld, (sd, sdCtx, fuelD) ∈ Δ ∧ lookupFuncRec? Φ sym = some ld ∧
+        lowerRealLCNFDecl fuelD sdCtx sd ld.name = .ok ld
+
+theorem declEnvLowersR_lookup_align
+    (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) (Φ : List LNIRDecl)
+    (h : DeclEnvLowersR Δ Φ) (ctx : RealBridgeCtx) (fn : Lean.Name) (sym : String)
+    (sd : Lean.Compiler.LCNF.Decl .impure) (sdCtx : RealBridgeCtx)
+    (hmap : CtxMapsEnvR ctx Δ Φ) (hsym : ctx.findLocalCallee? fn = some sym)
+    (hlk : lookupDeclRec? (declEnvR Δ) fn = some (sd, sdCtx)) :
+    ∃ fuelD ld, lookupFuncRec? Φ sym = some ld ∧
+      lowerRealLCNFDecl fuelD sdCtx sd ld.name = .ok ld ∧ CtxMapsEnvR sdCtx Δ Φ
+```
+
 Expected helper lemmas landing with the proofs (shapes not frozen by this contract):
 `lookupFuncRec?_mem` / `lookupDeclRec?_mem` (a hit is a member with that name),
 `evalSeqLoop_mono_of_step_mono` (pointwise transport through the loop closure),
@@ -403,19 +548,20 @@ inductions: `letHeadR` is the value a `.letBind` binds at one level of `evalCode
 says a level simulates any level whose let heads reproduce its successful ones at a budget
 at least as large; `evalCodeR_fuel_mono` instantiates it through `letHeadR_mono`, and
 `evalCodeR_extend_of_ok` through `letHeadR_of_evalExpr_ok`. The `evalStepR`
-fuel-monotonicity pair did not land; it is Part II's.
+fuel-monotonicity pair landed with amendment 2 (statements above), proved by a lockstep
+unfolding of the two runs rather than per-arm lemmas.
 
 Executable guards land in `lean/LeanNative/Tests/RealLCNFRecTests.lean` (NEW file; L2's
-planned `Tests/RealLCNFCallTests.lean` is untouched): a self-recursive declaration
+`Tests/RealLCNFCallTests.lean` is untouched): a self-recursive declaration
 (countdown-accumulate) whose `evalRealLCNFDeclR` result is wrong unless the callee body
 re-enters (kills call-as-noop mutants), the same declaration exhausting fuel at too-small
 a budget (`.error .fuelExhausted`, never a wrong `.ok`), a two-declaration MUTUAL pair
 (even/odd-style) evaluating through `Δ` with both orders of `Δ`, the `Δ = [] / Φ = []`
-runs equal to the old evaluators on a call-bearing body, and an `evalCodeR` run of a
-lowered self-call body under `Φ = [d]`.
+runs equal to the old evaluators on a call-bearing body, an `evalCodeR` run of a lowered
+self-call body under `Φ = [d]`, and the strict-arity pin of amendment 2.
 
-### Part II — the recursion headline, stated for the fold (signatures frozen; proofs
-### sequenced after the L2 lane's F-stack merges)
+### Part II — the recursion headline, stated for the fold (signatures as amended; not
+### proved, see "Part II status")
 
 The step-level forward simulation with recursion-capable environments on both sides, and
 its code- and declaration-level corollaries. These are the L3 names H1.4 dispatches on:
@@ -429,6 +575,7 @@ theorem lowerImpureStepPure_soundR (fuel : Nat) (ctx : RealBridgeCtx)
       (VarId × Bool × Nat × Option Lean.FVarId × List (Lean.Compiler.LCNF.Alt .impure)))
     (code : LNIRCode) :
     DeclEnvLowersR Δ Φ →
+    CtxMapsEnvR ctx Δ Φ →
     BridgeStateInv st lenv venv →
     lowerImpureStepPure fuel ctx st target = .ok (code, st') →
     (match target with
@@ -447,6 +594,7 @@ theorem lowerRealLCNFCode_soundR (fuel : Nat) (ctx : RealBridgeCtx)
     (lenv : LEnv) (venv : VarEnv) (hst hst' : HeapState) (v : Val)
     (code : Lean.Compiler.LCNF.Code .impure) (lnir : LNIRCode) (st' : RealBridgeState)
     (h_env : DeclEnvLowersR Δ Φ)
+    (h_map : CtxMapsEnvR ctx Δ Φ)
     (h_inv : BridgeStateInv st lenv venv)
     (h_lower : lowerRealLCNFCode fuel ctx st code = .ok (lnir, st'))
     (h_eval : evalRealLCNFCodeR (declEnvR Δ) fuel ctx lenv hst code = .ok (v, hst')) :
@@ -457,6 +605,7 @@ theorem lowerRealLCNFDecl_soundR (fuel : Nat) (ctx : RealBridgeCtx)
     (decl : Lean.Compiler.LCNF.Decl .impure) (args : List Val) (hst hst' : HeapState)
     (v : Val) (d : LNIRDecl) (mangled : String)
     (h_env : DeclEnvLowersR Δ Φ)
+    (h_map : CtxMapsEnvR ctx Δ Φ)
     (h_lower : lowerRealLCNFDecl fuel ctx decl mangled = .ok d)
     (h_eval : evalRealLCNFDeclR (declEnvR Δ) fuel ctx decl args hst = .ok (v, hst')) :
     evalCodeR Φ fuel
@@ -471,25 +620,21 @@ fuel, and the conclusion is the lowered body's run under the lowered environment
 `evalRealLCNFDeclR_nil` collapses it to L1's `lowerRealLCNFDecl_sound` shape, and Part I's
 `lowerRealLCNFDecl_soundR_base` is its already-proved restriction to old-semantics runs.
 
-Why Part II's proofs are sequenced, at the bytes: `lowerImpureStepPure_soundR`'s induction
-needs every per-case lemma of the L1 simulation stack
-(`Proofs/RealLCNFBridge/{CtorIntrinsic,CtorScalarCall,JpTag,LetValue,Scalar,StateInv,
-StepCases,StepMono,UnaryCast}.lean` plus the aux in `RealLCNFBridgeProofs.lean` —
-5,441 lines at this tip) restated against an environment-carrying target semantics; every
-one of those lemmas concludes in `evalCode`/`evalStep` and is monomorphic in the
-semantics. The L2 lane is landing exactly that restatement for F in its own follow-up
-commits right now. Cutting an independent R-restatement of the same 5,441 lines in this
-leaf would fork one proof stack into two concurrent rewrites that the fold must then
-reconcile line by line — the same hazard HORIZONS marks with "do not run in parallel" on
-shared files. The sequencing is recorded here the way L2 recorded its own deferred pair:
-the names and binders above are frozen for H1.4; the proofs are follow-up commits of the
-L3 lane once L2's F-stack merges. Candidate resolutions (the fold owner's call, not this
-leaf's): (a) default — R-twin the landed F-stack (mechanical: the per-case bodies differ
-only in the lookup rule, full-env-at-decremented-fuel against strict-suffix); (b)
-parameterize the per-case stack over the call rule so F and R instantiate one proof; (c)
-prove R independently now (forks the stack; rejected above). Also stated for the fold,
-elaborable only once L2's definitions exist — the F-to-R embeddings that make the two
-semantics one ladder (an F-run is an R-run with the stratification depth paid as fuel):
+Why Part II's proofs were sequenced (superseded by "Part II status" below; kept as the
+record): `lowerImpureStepPure_soundR`'s induction needs every per-case lemma of the L1
+simulation stack (`Proofs/RealLCNFBridge/{CtorIntrinsic,CtorScalarCall,JpTag,LetValue,
+Scalar,StateInv,StepCases,StepMono,UnaryCast}.lean` plus the aux in
+`RealLCNFBridgeProofs.lean`, 5,441 lines when this contract was cut) restated against an
+environment-carrying target semantics, and the L2 lane was landing that restatement for F
+at the time; an independent R-restatement would have forked one proof stack into two
+concurrent rewrites. Candidate resolutions as recorded then: (a) R-twin the landed
+F-stack; (b) parameterize the per-case stack over the call rule so F and R instantiate
+one proof; (c) prove R independently (forks the stack; rejected). L2 has since landed its
+stack with the per-case step mirrors "parameterized over the call rule, L3's recorded
+option (b)" (`LowerCalls.lean`'s helper paragraph): per `RealLCNFBridge/CallsF.lean`'s
+header the call rule enters through hypothesis parameters, and the mirrors still conclude
+in `evalStepF`/`evalCodeF`. The F-to-R embeddings, stated for the fold as first cut (an
+F-run is an R-run with the stratification depth paid as fuel; both are refuted below):
 
 ```
 theorem evalCodeF_toR (Φ : FuncEnv) (fuel : Nat) (env : VarEnv) (st : HeapState)
@@ -504,51 +649,56 @@ theorem evalRealLCNFDeclF_toR (Δ : DeclEnv) (fuel : Nat) (ctx : RealBridgeCtx)
     evalRealLCNFDeclR (declEnvR Δ) fuel ctx decl args st = .ok (v, st')
 ```
 
-(The second needs no fuel padding: on the LCNF side both semantics burn the step budget
-identically and R's lookup is a superset of F's stratified lookup on `DeclEnvLowersR`
-environments, whose names are duplicate-free. Its `Δ : DeclEnv` is L2's, under the same
-per-entry correction — entries `Decl × RealBridgeCtx × Nat` — so `declEnvR` applies to it
-unchanged; elaborable once L2's definitions exist.)
+(As cut, this contract said the second needs no fuel padding: on the LCNF side both
+semantics burn the step budget identically, and R's lookup is a superset of F's
+stratified lookup on `DeclEnvLowersR` environments, whose names are duplicate-free. Its
+`Δ : DeclEnv` is L2's, entries `Decl × RealBridgeCtx × Nat`, so `declEnvR` applies to it
+unchanged. Reason 2 below refutes the remark.)
 
-#### Part II status (gap-l3, 2026-11-26): refuted as frozen; proofs not started
+#### Part II status (gap-l3, 2026-11-26): open; the semantic refutation is fixed
 
 L2's F-stack has merged (`Proofs/LowerCalls.lean` proves `lowerRealLCNFDecl_soundF`), so
-the sequencing reason above no longer holds. The frozen statements are not provable over
-the landed definitions, for three measured reasons (probe fixtures recorded with the leaf's
-report; each is a few lines of real LCNF):
+the sequencing reason above no longer holds, and the statements above carry the coherence
+hypotheses review 80ac7f68 found missing (amendment 2, F1; `declEnvLowersR_lookup_align`
+proves them enough for the call case's lookup step). This section's first status refuted
+the headline over the landed `evalStepR`; amendment 3 fixed the step rule that refutation
+rested on. What stands, each point pinned by a committed guard of
+`Tests/RealLCNFRecTests.lean`:
 
-1. The headline is false over the landed `evalStepR`. Its local-call rule binds the call
-   result at `if isUnboxedScalarOrTuple rawTy then rawTy else .i64`, while the lowering
-   allocates the destination at `rawTy` itself (`IR/RealLCNFBridge.lean`, the `.fap` arm
-   with `ctx.findLocalCallee? fnName = some sym`). For a heap-typed result the source run
-   records `.i64`, so a later `dec` of it is a no-op on the source side and a `.decRef` on
-   the LNIR side. Witness: callee `l3_mk x = ObjBox.left (box x)` (a fresh object), caller
-   `l3_use x = let o := l3_mk x; dec o; 0`, both under a context with `allowStage1DHeap`
-   and `ObjBox.left`'s layout and `localCallees = [(l3_mk, "mk_sym")]`, `Δ = [(l3_mk, ctx,
-   64)]`, `Φ = [the lowered callee]`. Every hypothesis of `lowerRealLCNFDecl_soundR` holds
-   at fuel 64 and argument `5`; the source R-run returns `0` with the object still live
-   (rc 1), the lowered caller under `Φ` returns `0` with the object freed. L2 met the same
-   divergence and binds at `some rawTy` (the comment in `IR/RealLCNFCallSemantics.lean`'s
-   resolved-call arm); L2's F-run of this fixture frees the object too.
-2. `evalRealLCNFDeclF_toR` is refuted by the same fixture: the F-run returns `0` with the
-   object freed, the R-run `0` with it live. Independently, L2's per-entry amendment runs an
-   F callee at its ENTRY fuel while R runs it at the caller's decremented fuel, so the
-   contract's "needs no fuel padding" remark no longer holds.
+1. The headline's counterexample no longer applies. It was a heap-typed local-call result
+   stored at `.i64` on the source side and at `rawTy` on the LNIR side, so a `dec` freed
+   the object on the LNIR side only. With the result bound at `rawTy`, the source run,
+   L2's run and the lowered run of that module agree exactly on value and heap (family 6).
+   The headline is not proved; no counterexample to it is known at these bytes.
+2. `evalRealLCNFDeclF_toR` as written is false for fuel. L2's per-entry amendment runs an
+   F callee at its ENTRY fuel, while R runs it at the caller's decremented step fuel, so
+   at a step budget the caller's own steps fit and the callee's do not, the F-run
+   succeeds and the R-run at the same budget ends on it (family 8: a three-addition callee
+   with entry fuel 64 under a caller at budget 3). The contract's "needs no fuel padding"
+   remark does not hold. The heap half of this item's first refutation is gone: family 6
+   compares the F and R runs and they agree.
 3. `evalCodeF_toR` does not elaborate (it passes a `FuncEnv`, a list of declaration/fuel
    pairs since L2's amendment, where `evalCodeR` takes `List LNIRDecl`), and with the
    projection `Φ.map Prod.fst` it is false for repeated names: with two entries named `f`,
-   the first calling `f` and the second returning `7`, the F-run of `f ()` returns `7`
-   (the nested call resolves in the strict suffix) and the R-run exhausts its budget at
-   every fuel (every nested call re-resolves to the first entry). A distinct-names
-   hypothesis, and a fuel bound covering the per-entry fuels, are missing.
+   the first calling `f` and the second returning `7`, the F-run returns `7` (the nested
+   call resolves in the strict suffix) and the R-run ends on its call budget at every
+   fuel, since every nested call re-resolves to the first entry (family 7).
 
-What would unblock it, for the fold owner (not taken here): bind the resolved-call result
-at `some rawTy` in `evalStepR` exactly as L2's `evalStepF` does, which changes Part I's
-`evalStepR_localCall_unfold` right-hand side the same way (`evalStepR_nil` and the guards
-are unaffected: no `Δ = []` run reaches the arm, and every guard's call result is `UInt64`);
-then R-twin L2's step stack (`RealLCNFBridge/CallsF.lean` and the U6 induction in
-`LowerCalls.lean`, about 2,600 lines that conclude in `evalStepF`/`evalCodeF`), and restate
-the two embeddings with distinct names and a fuel bound over the entry fuels.
+The open work, for the fold owner:
+
+- Restate L2's step stack over R: the per-case mirrors in `RealLCNFBridge/CallsF.lean`
+  conclude in `evalStepF`/`evalCodeF`, so their conclusions move to `evalStepR`/`evalCodeR`
+  with the call-rule hypotheses instantiated by R's rule, and the U6 induction in
+  `LowerCalls.lean` is twinned (about 2,600 lines together).
+- Meet the two fuels in the call case. A callee's lowering ran at its entry fuel `fuel_j`;
+  its body is evaluated at the caller's decremented step fuel. Both evaluators are monotone
+  in their budget (`evalStepR_fuel_mono`, `evalCodeR_fuel_mono`, proved). Not stated here:
+  monotonicity of the pinned lowering in its fuel (a lowering that succeeds at `fuel_j`
+  returns the same declaration at any larger fuel), or a simulation stated for a lowering
+  fuel at least the evaluation fuel. Which of these the induction takes, and whether the
+  LNIR fuel of the conclusion stays the source fuel, is the first design decision.
+- Restate the two embeddings with a distinct-names hypothesis (family 7's environment
+  violates it) and a fuel bound covering the entry fuels (family 8's run violates it).
 
 ### Named exclusions (recorded, not silently dropped)
 
@@ -578,10 +728,10 @@ the two embeddings with distinct names and a fuel bound over the entry fuels.
   `lowerRealLCNFDecl_soundR` exists; the semantics and statement here already admit
   cyclic `Δ`. Recorded as a handoff to the matrix owner, as L2 recorded its
   reclassification.
-- E6 Driver-shaped R-forms: none stated. The driver's compression post-pass surface is
-  being removed by the L1 fix round (a review proved it never changes any declaration),
-  so the driver-shaped statement reduces to `lowerRealLCNFDecl_sound`, whose R-form IS
-  Part II's `lowerRealLCNFDecl_soundR`. One standing caution for consumers of
+- E6 Driver-shaped R-forms: none stated. L1 fix round 1 removed the driver's compression
+  post-pass (a review proved it never changes any declaration), so the driver-shaped
+  statement is `lowerRealLCNFDecl_sound`, whose R-form IS Part II's
+  `lowerRealLCNFDecl_soundR`. One standing caution for consumers of
   `CodeRefinesR`: the generic transfer `CodeRefines src tgt → CodeRefinesR Φ src tgt` is
   FALSE — `src = .letBind x ty (.call f [] ty false) (.ret x)` with `f` bound in `Φ` has
   no env-free `.ok` run, so env-free `CodeRefines src tgt` holds for EVERY `tgt`, while
@@ -591,10 +741,10 @@ the two embeddings with distinct names and a fuel bound over the entry fuels.
 
 ### Acceptance (quoted) and gates
 
-- "leaf `0 sorryAx`": every Part I theorem lands kernel-checked; the 14 names are appended
-  to `AxiomAudit.lean`'s `auditedTheoremNames` with the pinned count raised exactly
-  (865 → 879 at this tip; the L2 lane raises the same pin for its own set, so the fold
-  resolves the raises additively, the convention L2's contract records).
+- "leaf `0 sorryAx`": every Part I theorem lands kernel-checked; the 14 names and
+  amendment 2's four are appended to `AxiomAudit.lean`'s `auditedTheoremNames` with the
+  pinned count raised exactly (874 → 892; L2's raise for its own set landed first, the
+  additive convention L2's contract records).
 - "matrix moves": Part I makes the `LetValue.fap.local_call` row's vacuity REMOVABLE for
   recursive callees (the semantics now runs them) and Part II's headline is the condition
   `scripts/lcnf_coverage.py`'s methodology needs to reclassify self/mutual-recursive
@@ -636,24 +786,45 @@ def declEnvR (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat
     List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx) :=
   Δ.map fun e => (e.1, e.2.1)
 
-/-- Pointwise "Δ lowers to Φ" for the FULL-environment semantics, with PER-ENTRY context
-    and lowering fuel: each entry's own context maps its own declaration's name to its
-    LNIR name, the lowering hypothesis holds at the entry's own fuel, lowered names are
-    unreserved, and tail freshness over the whole list makes `lookupDeclRec?` and
-    `lookupFuncRec?` find corresponding positions WITHOUT stratification. The contract's
-    `nil`/`cons` constructors are the two matching clauses of this recursive `Prop`
-    (strict-proofs scope admits no new `inductive` under `Proofs/`, the shape L2's
-    `DeclEnvLowers` takes for the same reason); length-mismatched lists relate never. -/
-def DeclEnvLowersR :
+/-- A context's mangled-name map COHERES with an environment pairing, position by
+    position: WHEN it maps a source declaration's name, it maps it to the lowered
+    declaration's name at the same position (L2's `CtxMapsEnv`, for the R entry shape).
+    This is what ties a call site's source lookup, by Lean name, to its LNIR lookup, by
+    mangled symbol; length-mismatched lists cohere never. -/
+def CtxMapsEnvR (ctx : RealBridgeCtx) :
+    List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat) → List LNIRDecl → Prop
+  | [], [] => True
+  | (sd, _, _) :: Δ, ld :: Φ =>
+      (∀ m, ctx.findLocalCallee? sd.name = some m → m = ld.name) ∧ CtxMapsEnvR ctx Δ Φ
+  | _, _ => False
+
+/-- The positional clauses of `DeclEnvLowersR`: the lowering hypothesis holds at the
+    entry's own context and fuel, lowered names are unreserved, and no later lowered name
+    repeats an earlier one. Whether a context knows a name is left to the coherence clause
+    (`CtxMapsEnvR`; amendment 4 dropped a per-entry "knows its own name" clause no proof
+    used). A recursive `Prop` (strict-proofs scope admits no new `inductive` under
+    `Proofs/`, the shape L2's `DeclEnvLowers` takes for the same reason);
+    length-mismatched lists relate never. -/
+def DeclEnvLowersPosR :
     List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat) → List LNIRDecl → Prop
   | [], [] => True
   | (sd, ctx, fuel) :: Δ, ld :: Φ =>
-      ctx.findLocalCallee? sd.name = some ld.name ∧
       lowerRealLCNFDecl fuel ctx sd ld.name = .ok ld ∧
       reservedRuntimeCallee ld.name = false ∧
       (∀ ld' ∈ Φ, ld'.name ≠ ld.name) ∧
-      DeclEnvLowersR Δ Φ
+      DeclEnvLowersPosR Δ Φ
   | _, _ => False
+
+/-- Pointwise "Δ lowers to Φ" for the FULL-environment semantics, with PER-ENTRY context
+    and lowering fuel: the positional clauses, and every entry's own context coheres with
+    the WHOLE pairing (`CtxMapsEnvR`). Name freshness alone cannot align a lookup keyed on
+    a Lean name with one keyed on a mangled symbol; coherence pins the symbol a context
+    resolves to the position the source lookup lands on, and freshness then keeps every
+    other position from matching it (`declEnvLowersR_lookup_align`). Coherence is over the
+    whole lists, not the tail, because a recursive call may reach an earlier entry. -/
+def DeclEnvLowersR (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat))
+    (Φ : List LNIRDecl) : Prop :=
+  DeclEnvLowersPosR Δ Φ ∧ ∀ e ∈ Δ, CtxMapsEnvR e.2.1 Δ Φ
 
 /-- `CodeRefines` with the recursion-capable environment (the L3 form of refinement). -/
 def CodeRefinesR (Φ : List LNIRDecl) (src tgt : LNIRCode) : Prop :=
@@ -678,8 +849,10 @@ def letHeadR (Φ : List LNIRDecl)
       | some callee =>
         match evalVarList env args with
         | .ok vals =>
-          callee ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
-            st ld.body
+          if vals.length = ld.params.length then
+            callee ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
+              st ld.body
+          else .error (.typeError "call arity mismatch")
         | .error err => .error err
     | none => evalExpr env st (.call fn args retTy false)
   | _ => evalExpr env st val
@@ -700,7 +873,11 @@ theorem evalCodeRAux_letBind (Φ : List LNIRDecl) (budget : Nat)
       cases lookupFuncRec? Φ fn <;> try rfl
       cases callee? <;> try rfl
       dsimp only
-      cases evalVarList env args <;> rfl
+      cases evalVarList env args with
+      | error _ => rfl
+      | ok vals =>
+        dsimp only
+        split <;> rfl
     · rfl
 
 /-- With no environment the let head is `evalExpr`'s, whatever the callee slot holds. -/
@@ -949,7 +1126,11 @@ theorem letHeadR_mono (Φ : List LNIRDecl)
           rw [hc1] at h; rw [hc2]; dsimp only at h ⊢
           cases hvl : evalVarList env args with
           | error _ => rw [hvl] at h; exact nomatch h
-          | ok vals => rw [hvl] at h; exact hf _ _ _ r h
+          | ok vals =>
+            rw [hvl] at h; dsimp only at h ⊢
+            by_cases hl : vals.length = ld.params.length
+            · simp only [hl, ↓reduceIte] at h ⊢; exact hf _ _ _ r h
+            · simp only [hl, ↓reduceIte] at h; exact nomatch h
     · exact h
 
 theorem evalCodeR_fuel_mono (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
@@ -966,6 +1147,64 @@ theorem evalCodeR_fuel_mono (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
     injection h1 with h1
     subst h1
     exact ⟨_, rfl, fun env st code r hr => by obtain ⟨a, b⟩ := r; exact ih env st code a b hr⟩
+
+/-- A `false` recursive-join-point verdict survives more fuel: `hasJmpToPure 0` answers
+    `true` (an exhausted search counts as recursive), so `false` is a completed search,
+    and a deeper one finds the same nothing. This is the direction the `evalStepR`
+    monotonicity below needs: a `.jp` the source run accepted at fuel `n` is accepted at
+    `n + 1`. -/
+theorem hasJmpToPure_false_succ :
+    ∀ (fuel : Nat) (t : Lean.FVarId)
+      (target : Lean.Compiler.LCNF.Code .impure ⊕ List (Lean.Compiler.LCNF.Alt .impure)),
+      hasJmpToPure fuel t target = false → hasJmpToPure (fuel + 1) t target = false
+  | 0, _, _, h => by rw [hasJmpToPure.eq_1] at h; exact nomatch h
+  | fuel + 1, t, target, h => by
+    rw [hasJmpToPure.eq_def] at h ⊢
+    dsimp only at h ⊢
+    have ih := hasJmpToPure_false_succ fuel t
+    cases target with
+    | inr alts =>
+      cases alts with
+      | nil => exact h
+      | cons alt rest =>
+        dsimp only at h ⊢
+        rw [Bool.or_eq_false_iff] at h ⊢
+        exact ⟨ih _ h.1, ih _ h.2⟩
+    | inl code =>
+      cases code <;> dsimp only at h ⊢ <;>
+        first
+        | exact h
+        | exact ih _ h
+        | (rw [Bool.or_eq_false_iff] at h ⊢; exact ⟨ih _ h.1, ih _ h.2⟩)
+
+/-- Fuel monotonicity of the recursion-capable LCNF evaluator: a successful run keeps its
+    result with one more unit of step budget. The two sides unfold in lockstep (`split`
+    the hypothesis, replay its equation into the goal); the discriminants agree except at
+    the two places that read the budget — the resolved callee's run, upgraded by the
+    induction hypothesis, and the recursive-join-point gate, upgraded by
+    `hasJmpToPure_false_succ`. The script searches the unfolding rather than naming arms,
+    so it re-checks itself on every change to `evalStepR`: a new discriminant that reads
+    the budget makes it fail at build time with a leftover goal, never silently, and that
+    arm then needs its own case (amendment 3's rule change re-ran it green unchanged). -/
+theorem evalStepR_fuel_mono (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx)) :
+    ∀ (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
+      (target : Lean.Compiler.LCNF.Code .impure ⊕
+        (Val × Bool × Nat × Option Lean.FVarId × List (Lean.Compiler.LCNF.Alt .impure)))
+      (r : Val × HeapState),
+      evalStepR Δ fuel ctx env st target = .ok r →
+      evalStepR Δ (fuel + 1) ctx env st target = .ok r
+  | 0, _, _, _, _, _, h => by rw [evalStepR.eq_1] at h; cases h
+  | fuel + 1, ctx, env, st, target, r, h => by
+    rw [evalStepR.eq_def] at h ⊢
+    dsimp only at h ⊢
+    repeat' (first
+      | (cases h; done)
+      | exact h
+      | exact evalStepR_fuel_mono Δ fuel _ _ _ _ _ h
+      | (rename_i hcall; simp only [evalStepR_fuel_mono Δ fuel _ _ _ _ _ hcall])
+      | (split at h <;> (try simp only [Bool.not_eq_true] at *) <;>
+          (try subst_vars) <;>
+          (try simp only [*, hasJmpToPure_false_succ fuel, ↓reduceIte, Bool.false_eq_true] at h ⊢)))
 
 /-! ### Part I — the call rule, pinned as kernel equations -/
 
@@ -986,11 +1225,13 @@ theorem evalCodeR_call_unfold (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
       match evalVarList env args with
       | .error e => .error e
       | .ok vals =>
-        match evalCodeR Φ fuel
-            ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
-            st ld.body with
-        | .error e => .error e
-        | .ok (v, st') => evalCodeR Φ (fuel + 1) (env.bind dst v) st' k := by
+        if vals.length = ld.params.length then
+          match evalCodeR Φ fuel
+              ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty)
+              st ld.body with
+          | .error e => .error e
+          | .ok (v, st') => evalCodeR Φ (fuel + 1) (env.bind dst v) st' k
+        else .error (.typeError "call arity mismatch") := by
   show evalCodeRAux Φ (fuel + 1) (some (evalCodeR Φ fuel)) env st
     (.letBind dst ty (.call fn args retTy false) k) = _
   dsimp only [evalCodeRAux]
@@ -1000,10 +1241,13 @@ theorem evalCodeR_call_unfold (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
   | error e => rfl
   | ok vals =>
     dsimp only
-    cases evalCodeR Φ fuel ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val)
-        VarEnv.empty) st ld.body with
-    | error e => rfl
-    | ok p => rfl
+    by_cases hl : vals.length = ld.params.length
+    · simp only [hl, ↓reduceIte]
+      cases evalCodeR Φ fuel ((ld.params.zip vals).foldl (fun acc (p, val) => acc.bind p.id val)
+          VarEnv.empty) st ld.body with
+      | error e => rfl
+      | ok p => rfl
+    · simp only [hl, ↓reduceIte]
 
 theorem evalStepR_localCall_unfold (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx))
     (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
@@ -1027,9 +1271,7 @@ theorem evalStepR_localCall_unfold (Δ : List (Lean.Compiler.LCNF.Decl .impure �
             | .error e => .error e
             | .ok (v, st') =>
               evalStepR Δ fuel ctx
-                (env.bind decl.fvarId v none
-                  (some (if isUnboxedScalarOrTuple (lowerGroundImpureTypeWith ctx decl.type)
-                         then lowerGroundImpureTypeWith ctx decl.type else .i64)))
+                (env.bind decl.fvarId v none (some (lowerGroundImpureTypeWith ctx decl.type)))
                 st' (.inl k) := by
   rw [evalStepR.eq_def]
   simp only [hval, hloc, hlk, ↓reduceIte]
@@ -1053,35 +1295,21 @@ theorem evalExpr_call_ok_reserved (env : VarEnv) (st : HeapState) (fn : String)
     (args : List VarId) (retTy : LNIRType) (isExt : Bool) (r : Val × HeapState)
     (h : evalExpr env st (.call fn args retTy isExt) = .ok r) :
     reservedRuntimeCallee fn = true := by
-  cases hres : reservedRuntimeCallee fn with
-  | true => rfl
-  | false =>
-    exfalso
-    have hne : ∀ L : String, reservedRuntimeCallee L = true → (fn == L) = false := by
-      intro L hL
-      cases hb : (fn == L) with
-      | false => rfl
-      | true => rw [eq_of_beq hb] at hres; rw [hres] at hL; exact nomatch hL
+  cases isExt
+  · -- L2's non-capture lemma, applied to a one-entry environment named `fn`: such an
+    -- environment captures the call unless `fn` is reserved, and an environment of
+    -- unreserved names captures no call `evalExpr` succeeds on.
+    cases hres : reservedRuntimeCallee fn with
+    | true => rfl
+    | false =>
+      have hnone := FuncEnv.callTarget?_of_evalExpr_ok
+        (Φ := [({ name := fn, params := [], retTy := retTy, body := .unreachable }, 0)])
+        (fun p hp => by rw [List.mem_singleton] at hp; subst hp; exact hres) h
+      simp only [FuncEnv.callTarget?, FuncEnv.lookup?, BEq.rfl, ↓reduceIte, Option.map_some,
+        reduceCtorEq] at hnone
+  · -- `evalExpr` refuses every extern call.
     dsimp only [evalExpr] at h
-    cases hvl : evalVarList env args with
-    | error _ => rw [hvl] at h; exact nomatch h
-    | ok vals =>
-      rw [hvl] at h
-      cases isExt
-      · simp only [Bool.false_eq_true, ↓reduceIte, Bool.or_false,
-          hne "lean_native_box_u64" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_native_unbox_u64" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_native_ensure_exclusive" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_native_sarray_len" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_mark_mt" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_native_ctor_set" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_native_ctor_set_scalar" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_native_ctor_set_tag" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_native_del_obj" (by simp [reservedRuntimeCallee, reservedRuntimeName]),
-          hne "lean_native_ctor_tag" (by simp [reservedRuntimeCallee, reservedRuntimeName])] at h
-        all_goals exact nomatch h
-      · simp only [↓reduceIte] at h
-        all_goals exact nomatch h
+    cases hvl : evalVarList env args <;> rw [hvl] at h <;> simp only [↓reduceIte, reduceCtorEq] at h
 
 /-- Under an environment of unreserved names every successful `evalExpr` is the let head,
     whatever the callee slot holds: a call `evalExpr` succeeds on names a reserved
@@ -1122,25 +1350,79 @@ theorem evalCodeR_extend_of_ok (Φ : List LNIRDecl) (fuel : Nat) (env : VarEnv)
     exact evalCodeRAux_sim [] Φ (n + 1) (n + 1) (Nat.le_refl _) none (some (evalCodeR Φ n))
       (hhead _) c env st _ h
 
+/-- Every lowered name the positional clauses admit is unreserved. -/
+theorem DeclEnvLowersPosR.fresh :
+    ∀ (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) (Φ : List LNIRDecl),
+      DeclEnvLowersPosR Δ Φ → ∀ ld ∈ Φ, reservedRuntimeCallee ld.name = false
+  | [], [], _, _, hm => nomatch hm
+  | [], _ :: _, h, _, _ => nomatch h
+  | _ :: _, [], h, _, _ => nomatch h
+  | (_, _, _) :: Δ, _ :: Φ, h, ld, hm => by
+    obtain ⟨_, hres, _, htail⟩ := h
+    cases hm with
+    | head => exact hres
+    | tail _ hm => exact DeclEnvLowersPosR.fresh Δ Φ htail ld hm
+
 theorem DeclEnvLowersR.fresh
     (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) (Φ : List LNIRDecl)
     (h : DeclEnvLowersR Δ Φ) :
-    ∀ ld ∈ Φ, reservedRuntimeCallee ld.name = false := by
-  induction Δ generalizing Φ with
-  | nil =>
-    cases Φ with
-    | nil => intro ld hm; exact nomatch hm
-    | cons _ _ => exact nomatch h
-  | cons e Δ ih =>
-    obtain ⟨sd, ctx, fuel⟩ := e
-    cases Φ with
-    | nil => exact nomatch h
-    | cons ld0 Φ =>
-      obtain ⟨_, _, hres, _, htail⟩ := h
-      intro ld hm
-      cases hm with
-      | head => exact hres
-      | tail _ hm => exact ih Φ htail ld hm
+    ∀ ld ∈ Φ, reservedRuntimeCallee ld.name = false :=
+  DeclEnvLowersPosR.fresh Δ Φ h.1
+
+/-- At a call site whose context resolves `fn` to `sym` and coheres with the pairing, the
+    source lookup by Lean name and the LNIR lookup by mangled symbol land on ONE position:
+    coherence pins `sym` to the lowered name where the source lookup stops, and the
+    pairwise freshness of lowered names keeps every earlier position from matching it. -/
+theorem lookupDeclRec?_align :
+    ∀ (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) (Φ : List LNIRDecl),
+      DeclEnvLowersPosR Δ Φ →
+      ∀ (ctx : RealBridgeCtx) (fn : Lean.Name) (sym : String)
+        (sd : Lean.Compiler.LCNF.Decl .impure) (sdCtx : RealBridgeCtx),
+      CtxMapsEnvR ctx Δ Φ → ctx.findLocalCallee? fn = some sym →
+      lookupDeclRec? (declEnvR Δ) fn = some (sd, sdCtx) →
+      ∃ fuelD ld, (sd, sdCtx, fuelD) ∈ Δ ∧ lookupFuncRec? Φ sym = some ld ∧
+        lowerRealLCNFDecl fuelD sdCtx sd ld.name = .ok ld
+  | [], [], _, _, _, _, _, _, _, _, hlk => nomatch hlk
+  | [], _ :: _, h, _, _, _, _, _, _, _, _ => nomatch h
+  | _ :: _, [], h, _, _, _, _, _, _, _, _ => nomatch h
+  | (sd0, c0, f0) :: Δ, ld0 :: Φ, hpos, ctx, fn, sym, sd, sdCtx, hmap, hsym, hlk => by
+    obtain ⟨hlow, _, hfresh, hpos'⟩ := hpos
+    obtain ⟨hhead, hmap'⟩ := hmap
+    simp only [declEnvR, List.map_cons] at hlk
+    dsimp only [lookupDeclRec?] at hlk
+    split at hlk
+    · next hb =>
+      injection hlk with hlk
+      cases hlk
+      have hsym0 : sym = ld0.name := hhead sym (by rw [eq_of_beq hb]; exact hsym)
+      refine ⟨f0, ld0, List.mem_cons_self .., ?_, hlow⟩
+      simp only [lookupFuncRec?, hsym0, BEq.rfl, ↓reduceIte]
+    · obtain ⟨fuelD, ld, hmem, hlkΦ, hlow'⟩ :=
+        lookupDeclRec?_align Δ Φ hpos' ctx fn sym sd sdCtx hmap' hsym hlk
+      refine ⟨fuelD, ld, List.mem_cons_of_mem _ hmem, ?_, hlow'⟩
+      obtain ⟨hm, hn⟩ := lookupFuncRec?_mem Φ sym ld hlkΦ
+      have hne : (ld0.name == sym) = false := by
+        cases hb : (ld0.name == sym) with
+        | false => rfl
+        | true => exact absurd (by rw [hn, eq_of_beq hb]) (hfresh ld hm)
+      simp only [lookupFuncRec?, hne, Bool.false_eq_true, ↓reduceIte]
+      exact hlkΦ
+
+/-- The alignment the recursion headline's call case consumes: under an admitted
+    environment, a coherent call site resolves to the LOWERING of the callee its source
+    lookup finds, at that entry's own context and fuel, and that callee's own context
+    coheres with the whole pairing again, so its nested call sites align too. -/
+theorem declEnvLowersR_lookup_align
+    (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx × Nat)) (Φ : List LNIRDecl)
+    (h : DeclEnvLowersR Δ Φ) (ctx : RealBridgeCtx) (fn : Lean.Name) (sym : String)
+    (sd : Lean.Compiler.LCNF.Decl .impure) (sdCtx : RealBridgeCtx)
+    (hmap : CtxMapsEnvR ctx Δ Φ) (hsym : ctx.findLocalCallee? fn = some sym)
+    (hlk : lookupDeclRec? (declEnvR Δ) fn = some (sd, sdCtx)) :
+    ∃ fuelD ld, lookupFuncRec? Φ sym = some ld ∧
+      lowerRealLCNFDecl fuelD sdCtx sd ld.name = .ok ld ∧ CtxMapsEnvR sdCtx Δ Φ := by
+  obtain ⟨fuelD, ld, hmem, hlkΦ, hlow⟩ :=
+    lookupDeclRec?_align Δ Φ h.1 ctx fn sym sd sdCtx hmap hsym hlk
+  exact ⟨fuelD, ld, hlkΦ, hlow, h.2 _ hmem⟩
 
 theorem lowerRealLCNFDecl_soundR_base (fuel : Nat) (ctx : RealBridgeCtx)
     (Φ : List LNIRDecl)

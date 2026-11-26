@@ -2,6 +2,7 @@ import Lean.Compiler.LCNF.Basic
 import Lean.Compiler.LCNF.ToImpureType
 import LeanNative.IR.RealLCNFBridge
 import LeanNative.IR.RealLCNFRecSemantics
+import LeanNative.IR.RealLCNFCallSemantics
 import LeanNative.Semantics.EvalRec
 
 /-!
@@ -16,14 +17,29 @@ Contract: `lean/LeanNative/Proofs/LowerRec.lean` (Part I, "Executable guards"). 
 2. The same declaration at too small a step budget ends in `.error .fuelExhausted`,
    never a wrong `.ok`.
 3. A two-declaration MUTUAL pair (even/odd) evaluating through `Δ`, with both orders of
-   `Δ`, each callee under its OWN paired context.
-4. `Δ = [] / Φ = []` runs agree with the old evaluators on a call-bearing body
-   (`exceptAgrees` compares ok-payloads exactly and errors by shape, since `UBError`
-   carries no `BEq`; the kernel theorems `evalStepR_nil` / `evalCodeR_nil` carry the full
-   equality).
+   `Δ`, each callee under its OWN paired context; a callee paired with the wrong context
+   ends on the exact old refusal.
+4. `Δ = [] / Φ = []` runs agree EXACTLY with the old evaluators on a call-bearing body
+   (`exceptAgrees` compares values, heaps and errors with their own `BEq`; the kernel
+   theorems `evalStepR_nil` / `evalCodeR_nil` carry the same equality for every input),
+   and a lookup miss ends on the old `.unsupportedCall` refusal by name.
 5. An `evalCodeR` run of the LOWERED self-call body under `Φ = [d]` produces the source
    result; the LNIR call budget counts call DEPTH, so too little fuel is
-   `.error .fuelExhausted` and the empty environment keeps the old refusal.
+   `.error .fuelExhausted`, an argument-count mismatch in either direction ends on the
+   exact arity error (strict arity, as L2's `evalCodeF`), and the empty environment keeps
+   the old refusal.
+6. A HEAP-typed local-call result (contract amendment 3): a callee returns a fresh
+   object, the caller `dec`s it. The source R-run, L2's F-run and the lowered LNIR run
+   agree exactly on value and heap, so the object is freed on every side. Under the
+   pre-amendment rule, which stored the result at `.i64`, the source `dec` was a no-op
+   and these guards failed with the object live.
+7. Repeated names: with two LNIR entries named `f`, L2's strict-suffix lookup resolves
+   the nested call to the second entry and returns its value, while the full-environment
+   lookup re-resolves to the first entry and ends on the call budget at every fuel —
+   why the F-to-R embedding the contract states for the fold needs distinct names.
+8. Entry fuel: L2 runs a callee at its entry's own fuel, R at the caller's remaining step
+   budget, so at a budget that fits the caller's steps and not the callee's, the F-run
+   succeeds and the R-run ends on the budget — why that embedding needs a fuel bound.
 -/
 
 namespace LeanNative.Tests.RealLCNFRecTests
@@ -35,11 +51,17 @@ open LeanNative.IR.RealLCNFBridge
 open LeanNative.IR.RealLCNFSemantics
 open LeanNative.Semantics
 
-/-- Result agreement: ok-payloads compared exactly; errors by shape. -/
+/-- Exact result agreement: values, heaps and errors each compared with their own `BEq`
+    (`UBError` derives it). -/
 private def exceptAgrees : Except UBError (Val × HeapState) → Except UBError (Val × HeapState) → Bool
   | .ok (v1, h1), .ok (v2, h2) => v1 == v2 && h1 == h2
-  | .error _, .error _ => true
+  | .error e1, .error e2 => e1 == e2
   | _, _ => false
+
+/-- The run ended on the old semantics' refusal of an unresolved call to `fn`. -/
+private def isUnsupportedCall (fn : String) : Except UBError (Val × HeapState) → Bool
+  | .error (.unsupportedCall s) => s == fn
+  | _ => false
 
 /-- The run ended on the evaluator budget, not on a value or on source UB. -/
 private def isFuelExhausted : Except UBError (Val × HeapState) → Bool
@@ -148,20 +170,22 @@ private def envOE : List (Decl .impure × RealBridgeCtx) := [(oddDecl, ctxOdd), 
 
 -- Per-entry context, negative control: with `l3_odd` paired with `ctxEven` (which does not
 -- map `l3_even`), the callee's own call is not `ctx`-local, so it falls to
--- `evalLetValue`, which has no rule for the name: the run errors instead of resolving.
-#guard (evalRealLCNFDeclR [(evenDecl, ctxEven), (oddDecl, ctxEven)] 256 ctxEven evenDecl
-          [.u64 6]).isOk == false
+-- `evalLetValue`, which refuses the name: the run ends on that refusal instead of
+-- resolving.
+#guard isUnsupportedCall "l3_even"
+  (evalRealLCNFDeclR [(evenDecl, ctxEven), (oddDecl, ctxEven)] 256 ctxEven evenDecl [.u64 6])
 
 /-! ### 4. The empty environment is the old semantics on a call-bearing body -/
 
 #guard exceptAgrees (evalRealLCNFDeclR [] 256 ctxSum sumDecl [.u64 4, .u64 0])
   (evalRealLCNFDecl 256 ctxSum sumDecl [.u64 4, .u64 0])
-#guard (evalRealLCNFDecl 256 ctxSum sumDecl [.u64 4, .u64 0]).isOk == false
+#guard isUnsupportedCall "l3_sum" (evalRealLCNFDecl 256 ctxSum sumDecl [.u64 4, .u64 0])
 #guard exceptAgrees (evalRealLCNFDeclR [] 256 ctxSum sumDecl [.u64 0, .u64 7])
   (evalRealLCNFDecl 256 ctxSum sumDecl [.u64 0, .u64 7])
 #guard (evalRealLCNFDecl 256 ctxSum sumDecl [.u64 0, .u64 7]).isOk == true
 -- A lookup MISS under a `ctx`-local name keeps the old refusal (`evalStepR_localCall_miss`).
-#guard (evalRealLCNFDeclR [(evenDecl, ctxEven)] 256 ctxSum sumDecl [.u64 4, .u64 0]).isOk == false
+#guard isUnsupportedCall "l3_sum"
+  (evalRealLCNFDeclR [(evenDecl, ctxEven)] 256 ctxSum sumDecl [.u64 4, .u64 0])
 
 /-! ### 5. LNIR side: the lowered self-call body under `Φ = [d]` -/
 
@@ -192,6 +216,32 @@ private def runLoweredSum (Φ : List LNIRDecl) (fuel : Nat) (d : LNIRDecl) (n ac
 #guard (match loweredSum? with
         | some d => isFuelExhausted (runLoweredSum [d] 3 d 4 0)
         | none => false)
+-- Strict arity, as L2's `evalCodeF`, pinned in both directions with the exact error.
+-- Too many: TWO arguments to a one-parameter callee error instead of the extra one being
+-- dropped.
+private def idL : LNIRDecl :=
+  { name := "id_sym", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
+    body := .ret 0 }
+#guard (match evalCodeR [idL] 8 (VarEnv.empty.bind 0 (.u64 5)) HeapState.empty
+          (.letBind 1 .i64 (.call "id_sym" [0, 0] .i64 false) (.ret 1)) with
+        | .error (.typeError s) => s == "call arity mismatch"
+        | _ => false)
+#guard okValue? (evalCodeR [idL] 8 (VarEnv.empty.bind 0 (.u64 5)) HeapState.empty
+          (.letBind 1 .i64 (.call "id_sym" [0] .i64 false) (.ret 1))) == some (.u64 5)
+-- Too few: ONE argument to a two-parameter callee whose body reads only the first one
+-- errors too. The callee would succeed with the second parameter unbound, so this case
+-- pins the check where a callee reading its only parameter cannot (that one errors on
+-- the unbound variable either way), and it kills a `≤` mutant the too-many case passes.
+private def fstL : LNIRDecl :=
+  { name := "fst_sym",
+    params := [{ id := 0, name := "x", ty := .i64 }, { id := 1, name := "y", ty := .i64 }],
+    retTy := .i64, body := .ret 0 }
+#guard (match evalCodeR [fstL] 8 (VarEnv.empty.bind 0 (.u64 5)) HeapState.empty
+          (.letBind 1 .i64 (.call "fst_sym" [0] .i64 false) (.ret 1)) with
+        | .error (.typeError s) => s == "call arity mismatch"
+        | _ => false)
+#guard okValue? (evalCodeR [fstL] 8 (VarEnv.empty.bind 0 (.u64 5)) HeapState.empty
+          (.letBind 1 .i64 (.call "fst_sym" [0, 0] .i64 false) (.ret 1))) == some (.u64 5)
 -- `Φ = []` is `evalCode`, which refuses the unknown symbol.
 #guard (match loweredSum? with
         | some d =>
@@ -200,5 +250,116 @@ private def runLoweredSum (Φ : List LNIRDecl) (fuel : Nat) (d : LNIRDecl) (n ac
               (fun acc (p, val) => acc.bind p.id val) VarEnv.empty) HeapState.empty d.body) &&
           (runLoweredSum [] 16 d 4 0).isOk == false
         | none => false)
+
+/-! ### 6. A heap-typed local-call result: every run frees the object the caller drops -/
+
+/-- `l3_mk x = ObjBox.left (box x)`: returns a fresh heap object. -/
+private def mkHeapDecl : Decl .impure :=
+  let obj := ImpureType.object
+  let u64 := ImpureType.uint64
+  let ci : CtorInfo := { name := `ObjBox.left, cidx := 0, size := 1, usize := 0, ssize := 0 }
+  mkDecl `l3_mk #[mkParam 1 u64] obj <|
+    .let (mkLet 3 obj (.box u64 (fv 1) rfl)) <|
+    .let (mkLet 4 obj (.ctor ci #[.fvar (fv 3)] rfl)) <|
+    .return (fv 4)
+
+/-- `l3_use x = let o := l3_mk x; dec o; 0`: the caller drops the object it received. -/
+private def useHeapDecl : Decl .impure :=
+  let obj := ImpureType.object
+  let u64 := ImpureType.uint64
+  mkDecl `l3_use #[mkParam 1 u64] u64 <|
+    .let (mkLet 2 obj (.fap `l3_mk #[.fvar (fv 1)] rfl)) <|
+    .dec (fv 2) 1 true false none (
+      .let (mkLet 5 u64 (.lit (.uint64 0))) <|
+      .return (fv 5)) rfl
+
+private def boxLayout : RcCtorLayoutSpec :=
+  { ctorName := `ObjBox.left, cidx := 0, objSlots := 1, usizeSlots := 0, scalarSlots := [] }
+
+/-- One context for both declarations: heap lowering on, the constructor's layout, and
+    the callee mapped as local. -/
+private def ctxHeap : RealBridgeCtx :=
+  { arch := .x86_64, allowStage1DHeap := true, ctorLayouts := [(`ObjBox.left, boxLayout)],
+    localCallees := [(`l3_mk, "mk_sym")] }
+
+/-- The source run under the recursion-capable semantics, the callee in `Δ`. -/
+private def heapRunR : Except UBError (Val × HeapState) :=
+  evalRealLCNFDeclR [(mkHeapDecl, ctxHeap)] 64 ctxHeap useHeapDecl [.u64 5]
+
+/-- The same module under L2's `evalStepF` (the callee's entry carries its fuel). -/
+private def heapRunF : Except UBError (Val × HeapState) :=
+  evalRealLCNFDeclF [(mkHeapDecl, ctxHeap, 64)] 64 ctxHeap useHeapDecl [.u64 5]
+
+/-- The lowered caller under `Φ = [the lowered callee]`, entered with the same argument. -/
+private def heapRunLowered : Except UBError (Val × HeapState) :=
+  match lowerRealLCNFDecl 64 ctxHeap mkHeapDecl "mk_sym",
+        lowerRealLCNFDecl 64 ctxHeap useHeapDecl "use_sym" with
+  | .ok dm, .ok du =>
+    evalCodeR [dm] 64 ((du.params.zip [Val.u64 5]).foldl
+      (fun acc (p, val) => acc.bind p.id val) VarEnv.empty) HeapState.empty du.body
+  | _, _ => .error (.typeError "fixture lowering failed")
+
+-- The caller's `dec` frees the object it received, so the source run ends with no live
+-- heap object. Before amendment 3 the local-call rule stored the result at `.i64`, the
+-- `dec` was a no-op on a non-heap variable, and this guard failed with the object live.
+#guard (match heapRunR with
+        | .ok (v, hst) => v == .u64 0 && hst.heapObjs.isEmpty
+        | .error _ => false)
+-- The lowered run frees it too, and agrees with the source run exactly (value and heap);
+-- so does L2's run of the same module.
+#guard heapRunLowered.isOk
+#guard exceptAgrees heapRunR heapRunLowered
+#guard exceptAgrees heapRunR heapRunF
+
+/-! ### 7. Repeated names: why the F-to-R embedding needs distinct names -/
+
+/-- Two LNIR entries with ONE name `f`: the first calls `f`, the second returns 7. -/
+private def fOuter : LNIRDecl :=
+  { name := "f", params := [], retTy := .i64,
+    body := .letBind 0 .i64 (.call "f" [] .i64 false) (.ret 0) }
+private def fInner : LNIRDecl :=
+  { name := "f", params := [], retTy := .i64,
+    body := .letBind 0 .i64 (.scalar (.constU64 7)) (.ret 0) }
+private def callF : LNIRCode := .letBind 1 .i64 (.call "f" [] .i64 false) (.ret 1)
+
+-- L2's strict-suffix lookup resolves the outer entry's nested call to the inner entry.
+#guard okValue? (evalCodeF [(fOuter, 8), (fInner, 8)] 8 VarEnv.empty HeapState.empty callF)
+  == some (.u64 7)
+-- The full-environment lookup re-resolves every nested call to the first entry, so no
+-- budget reproduces the F result: every run ends on the call budget.
+#guard (List.range 40).all fun f =>
+  isFuelExhausted (evalCodeR [fOuter, fInner] f VarEnv.empty HeapState.empty callF)
+
+/-! ### 8. Entry fuel: why the F-to-R embedding needs a fuel bound -/
+
+/-- `l3_inc3 x = x + 1 + 1 + 1`: five steps, no calls. -/
+private def inc3Decl : Decl .impure :=
+  let u64 := ImpureType.uint64
+  mkDecl `l3_inc3 #[mkParam 1 u64] u64 <|
+    .let (mkLet 2 u64 (.lit (.uint64 1))) <|
+    .let (mkLet 3 u64 (.fap ``UInt64.add #[.fvar (fv 1), .fvar (fv 2)] rfl)) <|
+    .let (mkLet 4 u64 (.fap ``UInt64.add #[.fvar (fv 3), .fvar (fv 2)] rfl)) <|
+    .let (mkLet 5 u64 (.fap ``UInt64.add #[.fvar (fv 4), .fvar (fv 2)] rfl)) <|
+    .return (fv 5)
+
+/-- `l3_top x = l3_inc3 x`: two steps of its own around one local call. -/
+private def topDecl : Decl .impure :=
+  let u64 := ImpureType.uint64
+  mkDecl `l3_top #[mkParam 1 u64] u64 <|
+    .let (mkLet 6 u64 (.fap `l3_inc3 #[.fvar (fv 1)] rfl)) <|
+    .return (fv 6)
+
+private def ctxTop : RealBridgeCtx :=
+  { arch := .x86_64, localCallees := [(`l3_inc3, "inc3_sym")] }
+private def ctxInc3 : RealBridgeCtx := { arch := .x86_64 }
+
+-- At step budget 3 the caller's own steps fit and the callee's do not: L2 runs the callee
+-- at its entry fuel (64) and succeeds; R runs it at the caller's remaining budget and ends
+-- on it. With budget to spare R computes the same value.
+#guard okValue? (evalRealLCNFDeclF [(inc3Decl, ctxInc3, 64)] 3 ctxTop topDecl [.u64 5])
+  == some (.u64 8)
+#guard isFuelExhausted (evalRealLCNFDeclR [(inc3Decl, ctxInc3)] 3 ctxTop topDecl [.u64 5])
+#guard okValue? (evalRealLCNFDeclR [(inc3Decl, ctxInc3)] 64 ctxTop topDecl [.u64 5])
+  == some (.u64 8)
 
 end LeanNative.Tests.RealLCNFRecTests

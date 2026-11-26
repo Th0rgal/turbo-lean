@@ -16,7 +16,7 @@ evaluator by theorem (`evalStepR_nil`, `Proofs/LowerRec.lean`).
 
 This file is NEW and imports `LeanNative.IR.RealLCNFSemantics` only, preserving the H1.1
 separation pin (`Tests/RealLCNFSeparationPin.lean`): nothing here imports the lowerer.
-It does not touch the L2 lane's planned `IR/RealLCNFCallSemantics.lean` or its names.
+It does not touch L2's `IR/RealLCNFCallSemantics.lean` or its names.
 -/
 
 namespace LeanNative.IR.RealLCNFSemantics
@@ -107,7 +107,9 @@ def letStoredR (ctx : RealBridgeCtx) (env : LEnv)
     with ONE new rule, replacing exactly the arm the old semantics deliberately errors
     on: a `.let` whose value is a `.fap` to a `ctx`-local callee resolves the callee in
     the FULL `Δ` and runs its body at the decremented fuel under the CALLEE'S OWN paired
-    context and the declaration-entry binding convention; a lookup miss is
+    context and the declaration-entry binding convention, and binds the result at the
+    caller's declared lowered type `rawTy` (the type the lowering allocates the
+    destination at; contract amendment 3); a lookup miss is
     `.error (.unsupportedCall ...)` byte-for-byte like `evalLetValue`. -/
 def evalStepR (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx)) (fuel : Nat)
     (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
@@ -192,10 +194,13 @@ def evalStepR (Δ : List (Lean.Compiler.LCNF.Decl .impure × RealBridgeCtx)) (fu
                     match evalStepR Δ fuel sdCtx env' st (.inl c) with
                     | .error e => .error e
                     | .ok (v, st') =>
-                      evalStepR Δ fuel ctx
-                        (env.bind decl.fvarId v none
-                          (some (if isUnboxedScalarOrTuple rawTy then rawTy else .i64)))
-                        st' (.inl k)
+                      -- The continuation binds the call result at the DECLARED lowered
+                      -- type `rawTy`, as L2's `evalStepF` does: the resolved-call
+                      -- lowering allocates its destination at exactly that type, so the
+                      -- `.i64` fallback of the unresolved `.fap` arm would leave a
+                      -- heap-typed result untracked here while the LNIR side tracks it
+                      -- (a later `dec` would free the object on the LNIR side only).
+                      evalStepR Δ fuel ctx (env.bind decl.fvarId v none (some rawTy)) st' (.inl k)
             | none => .error (.unsupportedCall fn.toString)
           else
             match evalLetValue ctx env st decl.value rawTy with

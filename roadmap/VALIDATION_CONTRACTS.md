@@ -85,13 +85,16 @@ Cheap models delegated to implement a milestone must prove these **exact theorem
 ```lean
 namespace TurboLean.Kernel.ConLeche
 
-/-- Zero-copy `.olean` / `Environment` bridge preserves constant declarations bit-for-bit. -/
+/-- A shard the model parser accepts is a well-formed kernel environment. Stated over the in-repo
+    `"OLEN"` v1 (`0x4F4C454E`) shard model, not real Lean 4 `.olean` files (`roadmap/HORIZONS.md` G1b). -/
 theorem olean_mmap_bridge_sound (bytes : ByteArray) (env : ConLeche.Env)
     (h_parse : parseOleanShard bytes = .ok env) :
      EnvWellFormed env
 
-/-- Every declaration accepted by the compiled `con-leche` checker is type-correct in CIC/ZFC. -/
-theorem con_leche_verify_decl_sound (env : ConLeche.Env) (d : ConLeche.Decl)
+/-- Every declaration the in-repo model checker `checkDecl` accepts is `CICValid` in that model, and
+    the extended environment stays well-formed. Stated over the `"OLEN"` v1 model, not the compiled
+    upstream `con-leche` or real `.olean` files (`roadmap/HORIZONS.md` G1b). -/
+theorem con_leche_verify_decl_sound (env env' : ConLeche.Env) (d : ConLeche.Decl)
     (h_wf : EnvWellFormed env)
     (h_ok : checkDecl env d = .ok env') :
     EnvWellFormed env' ∧ CICValid env d

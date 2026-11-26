@@ -620,18 +620,6 @@ pub(super) fn extract_local_def_unfoldings(clean_src: &str) -> Vec<LocalDefUnfol
     extract_local_def_unfoldings_and_sources(clean_src).0
 }
 
-/// Like [`extract_local_def_unfoldings`], but also returns each captured `def`/`abbrev`
-/// command's original one-line source as `(qualified name, command text, unsafe to
-/// re-emit)`, plus the short names of definitions the extractor had to SKIP (`by`/`do`/
-/// `where`/signature-only bodies), for the self-contained kernel witness fallback
-/// probes. A def is unsafe to re-emit when a semantics-changing `partial`/`unsafe`/
-/// `noncomputable` modifier (or an evaluation-bearing attribute such as
-/// `@[implemented_by ...]` or `@[extern ...]`) was consumed — a visibility or hint
-/// prefix (`private`, `scoped`, `local`, `@[simp]`, `@[inline]`, `@[reducible]`)
-/// either leaves the re-emitted meaning unchanged or makes the probe fail to
-/// elaborate, and a probe that fails to elaborate certifies nothing — or when
-/// gathering stopped at a blank line that an indented continuation follows (the
-/// gathered text may truncate the real body).
 /// Column-0 command starts that end a def-body gather. Shared between the gather
 /// break and the truncation peek, so a line that would NOT break the gather as a
 /// new command marks the gathered text truncation-suspect instead of being lost.
@@ -665,9 +653,31 @@ const DECL_GATHER_BREAK_PREFIXES: &[&str] = &[
     "unsafe ",
     "@[",
     "noncomputable ",
+    "example ",
+    "variable ",
+    "universe ",
+    "set_option ",
+    "alias ",
+    "omit ",
+    "include ",
+    "public ",
+    "meta ",
+    "deriving ",
     "#",
 ];
 
+/// Like [`extract_local_def_unfoldings`], but also returns each captured `def`/`abbrev`
+/// command's original one-line source as `(qualified name, command text, unsafe to
+/// re-emit)`, plus the short names of definitions the extractor had to SKIP (`by`/`do`/
+/// `where`/signature-only bodies), for the self-contained kernel witness fallback
+/// probes. A def is unsafe to re-emit when a semantics-changing `partial`/`unsafe`/
+/// `noncomputable` modifier (or an evaluation-bearing attribute such as
+/// `@[implemented_by ...]` or `@[extern ...]`) was consumed — a visibility or hint
+/// prefix (`private`, `scoped`, `local`, `@[simp]`, `@[inline]`, `@[reducible]`)
+/// either leaves the re-emitted meaning unchanged or makes the probe fail to
+/// elaborate, and a probe that fails to elaborate certifies nothing — or when
+/// gathering stopped at a blank line that an indented continuation follows (the
+/// gathered text may truncate the real body).
 pub(super) fn extract_local_def_unfoldings_and_sources(
     clean_src: &str,
 ) -> (
@@ -857,12 +867,7 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
                         // continuation (`+ 1`) is as truncation-shaped as an indented
                         // one, so anything that is not a recognized column-0 command
                         // start marks the gathered text suspect.
-                        let next_is_command = matches!(
-                            pt.trim_end(),
-                            "end" | "section" | "mutual"
-                        ) || DECL_GATHER_BREAK_PREFIXES
-                            .iter()
-                            .any(|p| pt.starts_with(p));
+                        let next_is_command = is_gather_break_command(pt);
                         truncation_suspect = pt.starts_with(' ')
                             || pt.starts_with('\t')
                             || !next_is_command;
@@ -872,12 +877,15 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
                 }
                 break;
             }
-            if matches!(next_trim, "end" | "section" | "mutual")
-                || DECL_GATHER_BREAK_PREFIXES
-                    .iter()
-                    .any(|p| next_trim.starts_with(p))
-            {
+            // Only a column-0 command start ends the gather. An indented line that
+            // looks like a command (a term-level `set_option … in` continuation) is
+            // kept in the body and marks the gathered text truncation-suspect.
+            let next_line = &src[next_ls..nl_end];
+            if is_gather_break_command(next_line) {
                 break;
+            }
+            if next_line.starts_with([' ', '\t']) && is_gather_break_command(next_trim) {
+                truncation_suspect = true;
             }
             combined.push(' ');
             combined.push_str(next_trim);
@@ -944,7 +952,29 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
         }
         let raw_def_name = sig[..name_end].trim().trim_end_matches('.');
         let def_name = crate::splitter::qualified_decl_name(raw_def_name, &scope_stack);
-        let after_name = sig[name_end..].trim();
+        // A universe-polymorphic `foo.{u, v}` leaves the scan at the `{`: skip the
+        // balanced `.{...}` block so the universe names are not read as binders.
+        let mut after_name = sig[name_end..].trim();
+        if sig[..name_end].ends_with('.') && after_name.starts_with('{') {
+            let mut depth = 0usize;
+            let mut close = None;
+            for (ci, c) in after_name.char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(ci);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(ci) = close {
+                after_name = after_name[ci + 1..].trim();
+            }
+        }
         let mut params = Vec::new();
         let mut type_dependencies = String::new();
         let chars: Vec<char> = after_name.chars().collect();
@@ -4212,19 +4242,23 @@ pub(super) fn run_kernel_witness_probe(
     Ok(KernelWitnessProbeRun::Rejected { diagnostics })
 }
 
-/// Line numbers of `error:` diagnostics in a Lean compile log
-/// (`<path>:<line>:<col>: error: ...`), counting only the probe module's own file
-/// (its scratch name carries `TurboAuditedShard`), never a diagnostic some other file
-/// or a quoted message happens to print.
 /// Whether the per-probe sentinel's `#check` output is in the diagnostics. The
 /// `#check` info message arrives WITHOUT a file:line prefix (measured on the live
 /// toolchain), so positional acceptance is impossible; soundness comes from the
 /// derived marker instead: the sentinel name embeds a hash of the audited source,
-/// so audited text cannot print it — a file cannot contain its own hash.
+/// so the audited LITERAL source text cannot contain it — a file cannot contain its
+/// own hash. Code that runs at elaboration time (`run_cmd`, any `#eval`/`#eval!`
+/// line whatever its monad, ...) can read the probe file and print the marker; such
+/// commands are detected by `audited_src_declares_probe_hostile_commands`, which
+/// disables the fallback for them.
 fn sentinel_present(diagnostics: &str, derived_marker: &str) -> bool {
     diagnostics.contains(derived_marker)
 }
 
+/// Line numbers of `error:` diagnostics in a Lean compile log
+/// (`<path>:<line>:<col>: error: ...`), counting only the probe module's own file
+/// (its scratch name carries `TurboAuditedShard`), never a diagnostic some other file
+/// or a quoted message happens to print.
 fn lean_error_lines(diagnostics: &str) -> Vec<usize> {
     let mut out = Vec::new();
     for line in diagnostics.lines() {
@@ -4265,10 +4299,102 @@ fn lean_header_import_lines(src: &str) -> Vec<usize> {
     out
 }
 
+/// Whether the inside of an `@[...]` group names an attribute that registers
+/// something the probe cannot reproduce. Matches exact attribute names and known
+/// families, never substrings: `@[macro_inline]` and `@[elab_as_elim]` are harmless.
+fn attr_group_is_probe_hostile(group: &str) -> bool {
+    group.split(',').any(|attr| {
+        let mut words = attr.split_whitespace();
+        let mut name = words.next().unwrap_or("");
+        // `local`/`scoped` scope an attribute application: `@[local instance]`.
+        if matches!(name, "local" | "scoped") {
+            name = words.next().unwrap_or("");
+        }
+        matches!(
+            name,
+            "instance"
+                | "default_instance"
+                | "macro"
+                | "tactic"
+                | "delab"
+                | "app_unexpander"
+                | "unification_hint"
+                | "builtin_macro"
+                | "builtin_tactic"
+        ) || name.ends_with("_elab")
+            || name.ends_with("_parser")
+            || name.ends_with("_delab")
+    })
+}
+
+/// Command keywords that change how appended or reconstructed text elaborates
+/// (instances, notation, macros, syntax, elaborators, attribute applications,
+/// elaboration-time code). Shared by the hostile-command scan and the def-body gather
+/// break, so a def body is never gathered across one of these commands.
+const HOSTILE_COMMAND_KEYWORDS: &[&str] = &[
+    "instance",
+    "notation3",
+    "notation",
+    "macro_rules",
+    "macro",
+    "syntax",
+    "elab_rules",
+    "elab",
+    "infixl",
+    "infixr",
+    "infix",
+    "prefix",
+    "postfix",
+    "attribute",
+    "deriving instance",
+    "export",
+    "binder_predicate",
+    "unif_hint",
+    "#exit",
+    "run_cmd",
+    "run_elab",
+    "run_meta",
+    "initialize",
+    "builtin_initialize",
+    "declare_syntax_cat",
+];
+
+/// Commands written as `<command> … in <next command>`: the prefix reaches the command
+/// it modifies, so the scan strips it before matching keywords.
+const COMMAND_COMBINATOR_PREFIXES: &[&str] = &[
+    "open ",
+    "set_option ",
+    "#guard_msgs",
+    "variable ",
+    "omit ",
+    "include ",
+];
+
+/// Whether `t` starts with the command keyword `kw` as a whole word.
+fn starts_with_command_keyword(t: &str, kw: &str) -> bool {
+    t.strip_prefix(kw).is_some_and(|rest| {
+        rest.is_empty()
+            || rest.starts_with(|c: char| c.is_whitespace() || c == ':' || c == '(' || c == '[')
+    })
+}
+
+/// Whether `line` (untrimmed, so only a column-0 start counts) begins a new top-level
+/// command and therefore ends a def-body gather.
+fn is_gather_break_command(line: &str) -> bool {
+    matches!(line.trim_end(), "end" | "section" | "mutual")
+        || DECL_GATHER_BREAK_PREFIXES
+            .iter()
+            .any(|p| line.starts_with(p))
+        || HOSTILE_COMMAND_KEYWORDS
+            .iter()
+            .any(|kw| starts_with_command_keyword(line, kw))
+}
+
 /// Commands in the audited source that change how appended or reconstructed text
 /// elaborates (instances, notation, macros, custom syntax and elaborators, attribute
-/// applications): a self-contained probe cannot reproduce them, so their presence
-/// disables the fallback shapes for the whole file.
+/// applications, and commands that run code at elaboration time and so can register
+/// any of those or read the probe file): a self-contained probe cannot reproduce
+/// them, so their presence disables the fallback shapes for the whole file.
 fn audited_src_declares_probe_hostile_commands(clean_src: &str) -> bool {
     clean_src.lines().any(|line| {
         let mut t = line.trim_start();
@@ -4308,20 +4434,14 @@ fn audited_src_declares_probe_hostile_commands(clean_src: &str) -> bool {
                 let Some(end) = close else {
                     return true;
                 };
-                if rest[..end].contains("instance")
-                    || rest[..end].contains("macro")
-                    || rest[..end].contains("elab")
-                    // Review 29baa2ab F4 residual: `@[tactic k]` registers a tactic
-                    // elaborator without carrying any of the three substrings above.
-                    || rest[..end].contains("tactic")
-                {
+                if attr_group_is_probe_hostile(&rest[..end]) {
                     return true;
                 }
                 t = rest[end + 1..].trim_start();
                 continue;
             }
-            // `open … in` / `set_option … in` prefixes reach the command they modify.
-            for p in ["open ", "set_option "] {
+            // `<combinator> … in` prefixes reach the command they modify.
+            for p in COMMAND_COMBINATOR_PREFIXES {
                 if t.starts_with(p) {
                     if let Some(ix) = t.find(" in ") {
                         t = t[ix + 4..].trim_start();
@@ -4333,36 +4453,15 @@ fn audited_src_declares_probe_hostile_commands(clean_src: &str) -> bool {
                 break;
             }
         }
-        [
-            "instance",
-            "notation3",
-            "notation",
-            "macro_rules",
-            "macro",
-            "syntax",
-            "elab_rules",
-            "elab",
-            "infixl",
-            "infixr",
-            "infix",
-            "prefix",
-            "postfix",
-            "attribute",
-            "deriving instance",
-            "export",
-            "binder_predicate",
-            "unif_hint",
-            "#exit",
-        ]
-        .iter()
-        .any(|kw| {
-            t.strip_prefix(kw).is_some_and(|rest| {
-                rest.is_empty()
-                    || rest.starts_with(|c: char| {
-                        c.is_whitespace() || c == ':' || c == '(' || c == '['
-                    })
-            })
-        })
+        HOSTILE_COMMAND_KEYWORDS
+            .iter()
+            .any(|kw| starts_with_command_keyword(t, kw))
+            // Any `#eval`/`#eval!` runs code at elaboration time in some monad (a
+            // `def` of type `CommandElabM`, `MetaM`, or plain `IO` can register
+            // syntax or instances or read the probe file), and the monad is not
+            // visible on the `#eval` line itself. A false positive only disables
+            // the optional self-contained fallback.
+            || t.starts_with("#eval")
     })
 }
 
@@ -6098,11 +6197,76 @@ mod lexer_tests {
         // Another source's sentinel does not satisfy this probe's gate.
         assert!(!sentinel_present(&format!("{name_b} : Nat"), &marker_a));
         // The probe builder emits the derived sentinel, not the bare prefix.
-        let (probe, _) = build_kernel_witness_probe_src(src_a, src_a, &[], true)
-            .map(|p| p)
-            .unwrap_or_else(|| (String::new(), Vec::new()));
-        if !probe.is_empty() {
-            assert!(probe.contains(&name_a));
+        let cand = SpecKernelWitnessCandidate {
+            pos: None,
+            neg: Some(KernelWitnessSide {
+                lets: vec!["let n : Nat := 0x0".to_string()],
+                body: "n = 0".to_string(),
+                assign_desc: "n=0".to_string(),
+                upgrade_label: true,
+            }),
+        };
+        let (probe, _) = build_kernel_witness_probe_src(src_a, src_a, &[(0, cand)], true)
+            .expect("a candidate with a neg side must yield a probe");
+        assert!(
+            probe.contains(&format!("def {name_a} : Nat")),
+            "the probe must define the derived sentinel the gate looks for"
+        );
+    }
+
+    /// Review f9807eb0 F1: `def liftU.{u} (n : Nat) ...` must not record the universe
+    /// name `u` as a parameter, and the def must unfold with its one real argument.
+    #[test]
+    fn extractor_skips_universe_block_after_def_name() {
+        let src = "def liftU.{u} (n : Nat) : ULift.{u} Nat := ⟨n⟩\n";
+        let defs = extract_local_def_unfoldings(src);
+        let d = defs
+            .iter()
+            .find(|(n, _, _, _)| n == "liftU" || n.ends_with(".liftU"))
+            .unwrap_or_else(|| panic!("liftU must be captured: {defs:?}"));
+        assert_eq!(d.1, vec!["n".to_string()], "universe names are not parameters");
+        let src2 = "def two.{u, v} (a : Nat) (b : Nat) : Nat := a + b\n";
+        let defs2 = extract_local_def_unfoldings(src2);
+        let d2 = defs2
+            .iter()
+            .find(|(n, _, _, _)| n == "two" || n.ends_with(".two"))
+            .unwrap_or_else(|| panic!("two must be captured: {defs2:?}"));
+        assert_eq!(d2.1, vec!["a".to_string(), "b".to_string()]);
+        let unfolded = unfold_expr_single_step("liftU 3", &defs);
+        assert!(unfolded.contains('3') && !unfolded.contains("liftU"), "got {unfolded}");
+    }
+
+    /// Review f9807eb0 F3: a blank line followed by a non-def command start such as
+    /// `example` keeps the preceding def re-emittable, and `example` does not get
+    /// absorbed into a def body with no blank line before it.
+    #[test]
+    fn extractor_treats_example_variable_universe_as_command_starts() {
+        for next in [
+            "example : f 1 = 2 := rfl",
+            "variable (n : Nat)",
+            "universe u",
+            "set_option maxRecDepth 100",
+            "alias g := f",
+            "omit n",
+            "include n",
+            "public def h : Nat := 0",
+            "meta def m : Nat := 0",
+        ] {
+            let src = format!("def f (n : Nat) : Nat := n + 1\n\n{next}\n");
+            let (_, def_srcs, _) = extract_local_def_unfoldings_and_sources(&src);
+            let f = def_srcs
+                .iter()
+                .find(|(n, _, _)| n == "f" || n.ends_with(".f"))
+                .unwrap_or_else(|| panic!("f must be captured for {next}"));
+            assert!(!f.2, "`{next}` must keep f re-emittable");
+            let src_nb = format!("def f (n : Nat) : Nat := n + 1\n{next}\n");
+            let (defs, _, _) = extract_local_def_unfoldings_and_sources(&src_nb);
+            let body = &defs
+                .iter()
+                .find(|(n, _, _, _)| n == "f" || n.ends_with(".f"))
+                .expect("f captured")
+                .2;
+            assert!(!body.contains(next.split(' ').next().unwrap()), "absorbed `{next}` into body: {body}");
         }
     }
 
@@ -6134,6 +6298,51 @@ mod lexer_tests {
             .find(|(n, _, _)| n == "h" || n.ends_with(".h"))
             .expect("extractor must capture h");
         assert!(!h.2, "a following command start is not a continuation");
+    }
+
+    /// Review 4de545db F3: a def directly followed (no blank line) by `attribute`,
+    /// `instance` and the other hostile commands is not extended over them, and a body
+    /// continuing on an indented term-level `set_option … in` line is kept whole.
+    #[test]
+    fn extractor_gather_breaks_at_hostile_commands_and_keeps_indented_continuations() {
+        let text_of = |src: &str, name: &str| -> String {
+            let (_, def_srcs, _) = extract_local_def_unfoldings_and_sources(src);
+            def_srcs
+                .iter()
+                .find(|(n, _, _)| n == name || n.ends_with(&format!(".{name}")))
+                .unwrap_or_else(|| panic!("extractor must capture {name}: {def_srcs:?}"))
+                .1
+                .clone()
+        };
+        for follower in [
+            "attribute [simp] f",
+            "instance : Inhabited Nat := ⟨0⟩",
+            "deriving instance Repr for Foo",
+            "export Foo (bar)",
+            "macro \"m\" : term => `(1)",
+            "syntax \"s\" : term",
+            "elab \"e\" : term => pure ()",
+            "notation3 \"n\" => f",
+            "run_cmd logInfo \"x\"",
+            "initialize r : IO.Ref Nat <- IO.mkRef 0",
+            "declare_syntax_cat c",
+            "macro_rules | `(m) => `(2)",
+            "deriving Repr",
+        ] {
+            let src = format!("def f (n : Nat) : Nat := n + 1\n{follower}\n");
+            let text = text_of(&src, "f");
+            assert!(
+                !text.contains(follower.split_whitespace().next().unwrap()),
+                "the gather must stop before `{follower}`, got: {text}"
+            );
+        }
+        // An indented term-level `set_option … in` continuation stays in the body.
+        let src = "def g (n : Nat) : Nat :=\n  n +\n  set_option maxRecDepth 2000 in n + 1\n";
+        let text = text_of(src, "g");
+        assert!(
+            text.contains("set_option maxRecDepth 2000 in n + 1"),
+            "an indented continuation must not be cut, got: {text}"
+        );
     }
 
     #[test]
@@ -6906,6 +7115,17 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
             // registers a tactic elaborator without the `instance`/`macro`/`elab`
             // attribute substrings.
             "@[tactic fooElab] def f : Nat := 0\n",
+            // Review f9807eb0 F2/F4: elaboration-time commands and exact attribute families.
+            "run_cmd logInfo \"x\"\n",
+            "run_elab pure ()\n",
+            "run_meta pure ()\n",
+            "initialize fooRef : IO.Ref Nat <- IO.mkRef 0\n",
+            "declare_syntax_cat foo\n",
+            "#eval show CommandElabM Unit from do pure ()\n",
+            "@[term_elab foo] def e : Nat := 0\n",
+            "@[local instance] def i : Nat := 0\n",
+            "@[simp, macro foo] def m : Nat := 0\n",
+            "@[app_unexpander foo] def u : Nat := 0\n",
         ] {
             assert!(
                 audited_src_declares_probe_hostile_commands(src),
@@ -6917,6 +7137,9 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
             "def infixes (n : Nat) : Nat := n\n",
             // A benign attribute must not be flagged (a64324fd F9 control case).
             "@[simp] theorem s : True := trivial\n",
+            "@[macro_inline] def mi (n : Nat) : Nat := n\n",
+            "@[elab_as_elim] theorem ee : True := trivial\n",
+            "@[elab_without_expected_type] def ew : Nat := 0\n",
         ] {
             assert!(
                 !audited_src_declares_probe_hostile_commands(src),
@@ -7002,6 +7225,17 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
             "@[default_instance] def d : Nat := 0\n",
             "open Foo in instance : LE Nat := ⟨fun _ _ => False⟩\n",
             "set_option pp.all true in notation \"!!\" => f\n",
+            // Review 4de545db F2: other `<command> … in` combinators reach the command.
+            "#guard_msgs in run_cmd logInfo \"x\"\n",
+            "#guard_msgs (drop info) in #eval 1\n",
+            "#guard_msgs in instance : LE Nat := ⟨fun _ _ => False⟩\n",
+            "variable (x : Nat) in instance : Inhabited Nat := ⟨x⟩\n",
+            "omit [Foo] in attribute [simp] f\n",
+            "include h in macro \"m\" : term => `(1)\n",
+            // Review 4de545db F1: any `#eval` line is hostile, with no `ElabM` on it.
+            "def evil : Lean.Elab.Command.CommandElabM Unit := pure ()\n#eval evil\n",
+            "#eval show MetaM Unit from pure ()\n",
+            "#eval! IO.FS.readFile \"x\"\n",
             "deriving instance Repr for Foo\n",
             "notation3 \"sum\" => f\n",
             "@[simp,\n  reducible] def unterminatedAttrOnThisLine : Nat := 0\n",
@@ -7016,6 +7250,11 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
             "open Foo in def g (n : Nat) : Nat := n\n",
             "set_option pp.all true\ndef h (n : Nat) : Nat := n\n",
             "inductive T where\n  | mk\nderiving Repr\n",
+            // A plain `#guard_msgs` check line and a theorem-only file stay clean.
+            "#guard_msgs in\ntheorem t : True := trivial\n",
+            "#guard_msgs (drop info) in theorem t : True := trivial\n",
+            "variable (x : Nat) in theorem t : x = x := rfl\n",
+            "theorem a : True := trivial\ntheorem b : 1 = 1 := rfl\n",
         ] {
             assert!(
                 !audited_src_declares_probe_hostile_commands(src),

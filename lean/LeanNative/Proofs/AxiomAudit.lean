@@ -847,12 +847,16 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.lowerRealLCNFDecl_soundR_base
   , ``LeanNative.Proofs.evalStep_recursive_jp_unsupported
   , ``LeanNative.Proofs.lowerImpureStepPure_recursive_jp_rejected
+  , ``LeanNative.Proofs.hasJmpToPure_false_succ
+  , ``LeanNative.Proofs.evalStepR_fuel_mono
+  , ``LeanNative.Proofs.lookupDeclRec?_align
+  , ``LeanNative.Proofs.declEnvLowersR_lookup_align
   , ``TurboLean.PolicyGates.specAuditWitnessReplay_eq_gate
   , ``TurboLean.PolicyGates.specAuditWitnessReplay_sound_pos
   , ``TurboLean.PolicyGates.specAuditWitnessReplay_sound_neg
   ]
 
-#guard auditedTheoremNames.length == 888
+#guard auditedTheoremNames.length == 892
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/

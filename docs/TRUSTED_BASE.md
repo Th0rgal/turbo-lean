@@ -53,11 +53,12 @@
 - `lean/LeanNative/IR/RealLCNFSemantics.lean` — an operational semantics of real
   `Lean.Compiler.LCNF` declarations (namespace at `RealLCNFSemantics.lean:7`, section header at `:14`,
   ends at `:872`).
-- Independence caveat, stated honestly: `lean/LeanNative/IR/RealLCNFBridge.lean:17` calls it the
-  "independent `RealLCNFSemantics` evaluator", while `roadmap/HORIZONS.md` ("What the review found")
-  records that it imports the lowerer's file and shares layout/type-lowering definitions. Both are
-  claims-in-files; whether the semantics is independent of the lowerer is **not yet established** —
-  that separation is leaf `H1.1` in the work graph (acceptance: shared definitions separated).
+- Independence, as separated by `H1.1` (`8922a03`, pin `40275bc`): `RealLCNFSemantics.lean` no
+  longer imports the lowerer. It and `RealLCNFBridge.lean` both import the shared-definitions module
+  `lean/LeanNative/IR/RealLCNFShared.lean` (operator tables, width/mask helpers, ground type
+  lowering, the C1.2 layout spec, `RealBridgeCtx`), and `lean/LeanNative/Tests/RealLCNFSeparationPin.lean`
+  fails the build if the semantics' import closure reaches `RealLCNFBridge`. The semantics is thus
+  independent of the lowering functions, not of the definitions in `RealLCNFShared.lean`.
 
 ## 3. The `LNIR` semantics
 
@@ -110,15 +111,22 @@
 
 ## 8. Assumptions register (relied on, not proved in-repo)
 
-1. `RealLCNFSemantics` agrees with Lean's own evaluation — differential test not landed (`H1.1`,
-   acceptance `mismatch_count == 0`; no such test result exists yet).
+1. `RealLCNFSemantics` agrees with Lean's own evaluation — tested, not proved. The `H1.1`
+   differential driver (`eval-lcnf`, `lean/LeanNative/Driver/EvalLCNFCLI.lean`, landed `8922a03`)
+   compares it with compiled Lean on its corpus, and the contract script fails unless
+   `mismatch_count == 0` with at least 12 declarations and 100 vectors compared
+   (`scripts/contract.d/35_h11_lcnf_differential.sh`). Agreement outside that corpus is assumed.
 2. The H1 theorem statement is frozen and hash-pinned (`H1.F`, w-h1f 2026-11-26):
    `lean/LeanNative/SpecLocked.lean` restates `lowerRealLCNFDecl_sound` verbatim (proved by
    delegation), and an in-file `#eval` gate fails every `lake build` of the `LeanNative` library
    unless the live `ConstantInfo.type` structurally equals the frozen copy (modulo the documented
    per-declaration matcher renaming) and its `Expr.hash` equals the pinned `306234630` (measured
    on v4.35.0); the file-level SHA-256 is recorded in the freezing commit.
-3. No generated coverage matrix exists yet (`H1.0` is an open leaf; no JSON is committed).
+3. The generated coverage matrix is a measurement, not a proof (`H1.0`): `scripts/lcnf_coverage.py`
+   runs the real lowerer over its corpora, the committed results (`scripts/lcnf_coverage_results.json`,
+   measured at `19ae99c`) pin the bridge-source digests, and CI's `verify` job emits the JSON. A
+   declaration counts as `proved` when the proved path lowers it with no local call, so
+   `lowerRealLCNFDecl_sound` applies to it; the count does not re-check that theorem.
 4. The `Contract V4 M2`/`M3` theorems are stated over the in-repo `"OLEN"` v1 model — `ConLeche.lean`
    says so in-file (`lean/TurboLean/ConLeche.lean:7,12`: "binary `"OLEN"` v1 … shard model format,
    NOT raw Lean 4 `.olean`"), as does the root `README.md:42`; the proof against real `.olean`
