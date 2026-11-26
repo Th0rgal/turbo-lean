@@ -72,8 +72,11 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
         // traces do not cover host reads, and deleting is not ours to do (#434: the
         // package belongs to a shared or foreign checkout), so the walk fails closed,
         // deletes nothing, and names the action that clears the condition: an
-        // own-workspace rebuild refreshes the stale artifact, after which this walk
-        // takes the mark-spreading arm instead.
+        // own-workspace rebuild refreshes the stale artifact, after which the walk no
+        // longer refuses. Staleness is the mtime gate of
+        // `spec_own_artifact_stale_on_disk` (source, package config, resolved
+        // `include_str` targets); a `run_cmd` host read whose external input changed
+        // is beyond it and stays undetected here by design.
         let refuse_purge = |spec: &DiscoveredModuleSpec| -> Result<()> {
             anyhow::bail!(
                 "Failed to purge stale build artifact(s) of {} ({}): the module's \
@@ -138,9 +141,13 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
 }
 
 /// Whether `spec`'s own on-disk `.olean` is stale by the cheap mtime gates the
-/// dependency freshness check also applies: present but older than the module source
-/// or a package config file. A missing artifact is NOT stale here — nothing is on
-/// disk for a later build to reuse, so a purge refusal would protect nothing.
+/// dependency freshness check also applies: present but older than the module source,
+/// a package config file, or a resolved literal `include_str` target (a regenerated
+/// gitignored target goes stale with no source mtime change, DA 71add786 finding 1).
+/// A missing artifact is NOT stale here — nothing is on disk for a later build to
+/// reuse, so a purge refusal would protect nothing. Beyond an mtime gate by design,
+/// and so undetected here: a `run_cmd` host read whose external input changed, and a
+/// non-literal or unresolvable `include_str` target.
 fn spec_own_artifact_stale_on_disk(spec: &DiscoveredModuleSpec) -> bool {
     let olean = spec_olean_path(spec);
     let Ok(om) = fs::metadata(&olean) else {
@@ -154,10 +161,27 @@ fn spec_own_artifact_stale_on_disk(spec: &DiscoveredModuleSpec) -> bool {
             .and_then(|m| m.modified())
             .is_ok_and(|t| ot < t)
     };
-    newer_than_olean(&spec.src_path)
+    if newer_than_olean(&spec.src_path)
         || ["lakefile.toml", "lakefile.lean", "lean-toolchain"]
             .iter()
             .any(|f| newer_than_olean(&spec.pkg_root.join(f)))
+    {
+        return true;
+    }
+    // Resolved literal `include_str` targets are part of the artifact's input set.
+    let Ok(src_raw) = fs::read_to_string(&spec.src_path) else {
+        return true;
+    };
+    if !source_uses_include_str(&src_raw) {
+        return false;
+    }
+    let Some(rels) = crate::splitter::extract_include_relative_paths(&src_raw) else {
+        return false;
+    };
+    let Some(src_dir) = spec.src_path.parent() else {
+        return false;
+    };
+    rels.iter().any(|rel| newer_than_olean(&src_dir.join(rel)))
 }
 
 /// #433: how a module's source can make its compiled artifacts depend on host state.
@@ -3304,6 +3328,58 @@ mod host_effect_taint_tests {
             !dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
             "an out-of-tree git clone behind a path entry is not lake-built from this \
              project (#434, DA finding 4)"
+        );
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// A pinned module whose gitignored `include_str` target is regenerated goes
+    /// stale with no change to its source or lakefile mtimes: the resolved targets
+    /// are part of the artifact's input set, so the staleness gate reads them too
+    /// (DA 71add786 finding 1). With the target untouched the walk completes and
+    /// leaves everything in place.
+    #[test]
+    fn host_effects_regenerated_include_str_target_makes_pinned_artifact_stale() -> Result<()> {
+        let include_src = "def g := include_str \"gen.txt\"\n";
+        let (dir, cfg, spec) = pinned_dep_fixture("regen_include", include_src)?;
+        // Present but gitignored: untracked at the pin, so the module is SelfOnly.
+        fs::write(spec.pkg_root.join("gen.txt"), "generated v1\n")?;
+        assert_eq!(
+            spec_source_host_effect_taint(&cfg, &spec, include_src),
+            HostEffectTaint::SelfOnly,
+            "an untracked include target is not covered by the pin"
+        );
+        let dep_olean = spec.build_lib_lean_dir.join("LintLib.olean");
+        fs::create_dir_all(dep_olean.parent().unwrap())?;
+        fs::write(&dep_olean, b"fake dep olean")?;
+        let root_spec = resolve_module_in_package(&cfg.root_pkg, true, "Proj")
+            .expect("root module resolves");
+        let root_olean = root_spec.build_lib_lean_dir.join("Proj.olean");
+        fs::create_dir_all(root_olean.parent().unwrap())?;
+        fs::write(&root_olean, b"fake root olean")?;
+        let fresh = purge_elab_host_effect_artifacts_in_closure(&cfg, &["Proj".to_string()])?;
+        assert!(!fresh, "a fresh unowned SelfOnly module purges nothing");
+        assert!(
+            dep_olean.is_file() && root_olean.is_file(),
+            "the fresh leg leaves every artifact in place"
+        );
+        // Regenerate the target: strictly newer than the artifact, source untouched.
+        fs::write(spec.pkg_root.join("gen.txt"), "generated v2\n")?;
+        fs::File::options()
+            .write(true)
+            .open(spec.pkg_root.join("gen.txt"))?
+            .set_modified(
+                std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+            )?;
+        let err = purge_elab_host_effect_artifacts_in_closure(&cfg, &["Proj".to_string()])
+            .expect_err("a regenerated include target makes the pinned artifact stale");
+        assert!(
+            format!("{err:#}").contains("Failed to purge stale build artifact"),
+            "the refusal names the purge failure, got: {err:#}"
+        );
+        assert!(
+            dep_olean.is_file() && root_olean.is_file(),
+            "a refusal deletes nothing"
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())
