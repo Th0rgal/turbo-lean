@@ -2324,7 +2324,9 @@ def _refuse_dropped_corpora(report: dict[str, Any], doc: dict[str, Any], results
     )
 
 
-def _validate_measured_entry(path: str, entry: Any, errors: list[str], depth: int = 0) -> None:
+def _validate_measured_entry(
+    path: str, entry: Any, errors: list[str], depth: int = 0, pinned_external: bool = False
+) -> None:
     """Fail-closed validation of one measured baseline corpus/subcorpus entry."""
     if not isinstance(entry, dict):
         errors.append(f"Results file `{path}` must be a JSON object, got {type(entry).__name__}")
@@ -2354,11 +2356,15 @@ def _validate_measured_entry(path: str, entry: Any, errors: list[str], depth: in
         return
     allowed_keys = set(MEASURED_INT_FIELDS) | {"rejected_not_lowered_reason"}
     if depth == 0:
-        allowed_keys.update(("subcorpora", "commit_sha"))
+        allowed_keys.add("subcorpora")
+    if pinned_external:
+        # Only a pinned external corpus records the revision it was measured
+        # at; the in-repo counts belong to `measured_source_commit`.
+        allowed_keys.add("commit_sha")
     unknown = sorted(set(entry) - allowed_keys)
     if unknown:
         errors.append(f"Results file `{path}` carries unknown keys: {', '.join(unknown)}")
-    if depth == 0 and "commit_sha" in entry and not _is_hex_digest(entry["commit_sha"], 40):
+    if pinned_external and "commit_sha" in entry and not _is_hex_digest(entry["commit_sha"], 40):
         errors.append(
             f"Results file `{path}` field `commit_sha` must be a 40-hex commit, "
             f"got {entry['commit_sha']!r}"
@@ -2490,7 +2496,9 @@ def validate_results_document(doc: Any) -> list[str]:
         errors.append("Results file `corpora` must be a JSON object")
         return errors
     for cname, entry in corpora.items():
-        _validate_measured_entry(f"corpora.{cname}", entry, errors)
+        _validate_measured_entry(
+            f"corpora.{cname}", entry, errors, pinned_external=cname in PINNED_EXTERNAL_REVISIONS
+        )
     return errors
 
 
@@ -3302,6 +3310,20 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertIn(PINNED_BATTERIES_REV, str(ctx.exception))
         self.assertEqual(doc["corpora"]["external_batteries"]["commit_sha"], PINNED_BATTERIES_REV)
         self.assertEqual([e for e in validate_results_document(doc) if "commit_sha" in e], [])
+
+    def test_commit_sha_is_refused_on_an_in_repo_corpus(self) -> None:
+        # Only the pinned external corpora record the revision they were
+        # measured at; the in-repo counts belong to measured_source_commit, so
+        # a commit_sha planted on one of them is an unknown key.
+        baseline = self._v_committed_baseline()
+        self.assertEqual([e for e in validate_results_document(baseline) if "commit_sha" in e], [])
+        for cname in ("c1_corpus", "std_init_and_c2"):
+            planted = json.loads(json.dumps(baseline))
+            planted["corpora"][cname]["commit_sha"] = PINNED_BATTERIES_REV
+            errors = validate_results_document(planted)
+            self.assertTrue(
+                any(f"corpora.{cname}" in e and "unknown keys: commit_sha" in e for e in errors), errors
+            )
 
     def test_write_results_refuses_to_drop_a_measured_corpus(self) -> None:
         # results_document keeps only the corpora this run measured, so a
