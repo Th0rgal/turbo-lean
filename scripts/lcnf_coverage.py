@@ -2188,9 +2188,10 @@ def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[
         digests[rel] = actual
     if not digests:
         raise RuntimeError("refusing to write results: live report tracks no bridge files")
-    # Defense in depth: main() runs this before the measurement; a direct
-    # results_document caller gets the same refusal here.
+    # Defense in depth: main() runs these before the measurement; a direct
+    # results_document caller gets the same refusals here.
     _refuse_dirty_measurement_inputs(root_dir)
+    _refuse_toolchain_file_mismatch(root_dir)
     classifier = report.get("classifier_source_sha256")
     if not _is_hex_digest(classifier, 64):
         raise RuntimeError(
@@ -2626,25 +2627,51 @@ def _compare_committed_toolchain(committed: Any, errors: list[str]) -> None:
         )
 
 
-def _compare_toolchain_file(root_dir: Path, errors: list[str]) -> None:
-    """Refuse a PINNED_TOOLCHAIN other than the toolchain `lean/lean-toolchain` names.
+def _toolchain_file_mismatch(root_dir: Path) -> str | None:
+    """Why `lean/lean-toolchain` does not match PINNED_TOOLCHAIN, or None when it does.
 
     The measurement runs `lake` in `lean/`, so elan builds and runs it with the
-    toolchain that file names, while the results record PINNED_TOOLCHAIN. With
-    the committed-toolchain comparison this holds the committed value, the
-    constant and the file equal. A root without the file (a sparse test
-    fixture) is not compared; every checkout tracks it.
+    toolchain that file names, while the results record PINNED_TOOLCHAIN. A
+    `lean/` without the file falls back to elan's default toolchain, so that is
+    a mismatch too. Only a root with no `lean/` at all (a sparse test fixture)
+    is not compared.
     """
-    path = root_dir / "lean" / "lean-toolchain"
-    if not path.is_file():
-        return
-    named = path.read_text(encoding="utf-8").strip()
+    lean_dir = root_dir / "lean"
+    if not lean_dir.is_dir():
+        return None
+    path = lean_dir / "lean-toolchain"
+    try:
+        named = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return (
+            f"lean/ has no readable lean-toolchain ({exc}), so elan would build with its "
+            f"default toolchain instead of PINNED_TOOLCHAIN {PINNED_TOOLCHAIN!r}"
+        )
     if named != PINNED_TOOLCHAIN:
-        errors.append(
+        return (
             f"lean/lean-toolchain names {named!r} but PINNED_TOOLCHAIN is {PINNED_TOOLCHAIN!r}, "
             "so the measurement runs under a toolchain the results do not record (update "
             "PINNED_TOOLCHAIN and re-run --write-results)"
         )
+    return None
+
+
+def _compare_toolchain_file(root_dir: Path, errors: list[str]) -> None:
+    """Refuse a PINNED_TOOLCHAIN other than the toolchain `lean/lean-toolchain` names.
+
+    With the committed-toolchain comparison this holds the committed value, the
+    constant and the file equal on the `--check` and `--json` paths.
+    """
+    mismatch = _toolchain_file_mismatch(root_dir)
+    if mismatch is not None:
+        errors.append(mismatch)
+
+
+def _refuse_toolchain_file_mismatch(root_dir: Path = ROOT_DIR) -> None:
+    """Refuse `--write-results` before it measures under a toolchain the results would not record."""
+    mismatch = _toolchain_file_mismatch(root_dir)
+    if mismatch is not None:
+        raise RuntimeError(f"refusing to write results: {mismatch}")
 
 
 def check_coverage_report(
@@ -3386,6 +3413,83 @@ class TestLcnfCoverage(unittest.TestCase):
                     check_coverage_report(root, rep, results=baseline),
                 ):
                     self.assertEqual(bool(gate_errors(chk["errors"])), want_gate_error, chk["errors"])
+
+    def test_toolchain_file_check_fails_closed_when_lean_has_no_toolchain_file(self) -> None:
+        # Without lean/lean-toolchain, elan falls back to its default toolchain,
+        # so a checkout's lean/ without the file is refused rather than passed.
+        # Only a root with no lean/ at all (a sparse test fixture) is skipped.
+        rep = self._v_fake_live_report()
+
+        def gate_errors(errors: list[str]) -> list[str]:
+            return [e for e in errors if "lean-toolchain" in e]
+
+        with tempfile.TemporaryDirectory(prefix="lcnf-no-toolchain-file-") as tmp:
+            root = Path(tmp)
+            self.assertEqual(gate_errors(check_coverage_report(root, rep)["errors"]), [])
+            (root / "lean").mkdir()
+            chk = check_coverage_report(root, rep)
+            self.assertTrue(gate_errors(chk["errors"]), chk["errors"])
+
+    def test_write_results_refuses_a_toolchain_lean_does_not_build_with(self) -> None:
+        # The toolchain-file comparison ran only on the check paths, so
+        # --write-results measured under a bumped lean/lean-toolchain and wrote
+        # a file stamped with the old PINNED_TOOLCHAIN. It is refused before the
+        # measurement now.
+        import contextlib
+        import io
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        doc = self._v_committed_baseline()
+        with tempfile.TemporaryDirectory(prefix="lcnf-write-toolchain-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            (root / "lean").mkdir()
+            (root / "lean" / "lean-toolchain").write_text("leanprover/lean4:v4.36.0\n", encoding="utf-8")
+            results = root / "scripts" / "lcnf_coverage_results.json"
+            err = io.StringIO()
+            with mock.patch.object(m, "ROOT_DIR", root), mock.patch.object(
+                m, "RESULTS_FILE", results
+            ), mock.patch.object(m, "_refuse_dirty_measurement_inputs"), mock.patch.object(
+                m, "check_coverage_report", return_value={"ok": True, "errors": [], "report": {"corpora": {}}}
+            ) as measured, mock.patch.object(
+                m, "results_document", return_value=doc
+            ), mock.patch.object(
+                sys, "argv", ["lcnf_coverage.py", "--write-results"]
+            ), contextlib.redirect_stderr(err):
+                rc = m.main()
+            self.assertEqual(rc, 1, err.getvalue())
+            measured.assert_not_called()
+            self.assertFalse(results.exists())
+            self.assertIn("lean/lean-toolchain", err.getvalue())
+
+    def test_write_results_prints_the_check_errors_it_exits_on(self) -> None:
+        # --write-results writes the measurement and exits 1 when the check
+        # found errors; it now names them instead of exiting 1 in silence.
+        import contextlib
+        import io
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        planted = "planted check error"
+        doc = self._v_committed_baseline()
+        with tempfile.TemporaryDirectory(prefix="lcnf-write-errors-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            results = root / "scripts" / "lcnf_coverage_results.json"
+            err = io.StringIO()
+            with mock.patch.object(m, "ROOT_DIR", root), mock.patch.object(
+                m, "RESULTS_FILE", results
+            ), mock.patch.object(m, "_refuse_dirty_measurement_inputs"), mock.patch.object(
+                m, "check_coverage_report", return_value={"ok": False, "errors": [planted], "report": {"corpora": {}}}
+            ), mock.patch.object(
+                m, "results_document", return_value=doc
+            ), mock.patch.object(
+                sys, "argv", ["lcnf_coverage.py", "--write-results"]
+            ), contextlib.redirect_stderr(err):
+                rc = m.main()
+            self.assertEqual(rc, 1)
+            self.assertIn(f"[ERROR] {planted}", err.getvalue())
 
     def test_write_results_records_the_external_revision(self) -> None:
         # The live external entry names the revision its measurement verified
@@ -4264,6 +4368,9 @@ class TestLcnfCoverage(unittest.TestCase):
                 dst = root / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(ROOT_DIR / rel, dst)
+            # A checkout always tracks lean/lean-toolchain, and the toolchain
+            # check refuses a lean/ without it.
+            shutil.copy2(ROOT_DIR / "lean" / "lean-toolchain", root / "lean" / "lean-toolchain")
             (root / "scripts").mkdir()
             (root / "scripts" / "lcnf_coverage_results.json").write_text(
                 json.dumps(baseline), encoding="utf-8"
@@ -4436,6 +4543,7 @@ class TestLcnfCoverage(unittest.TestCase):
                 dst = root / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(ROOT_DIR / rel, dst)
+            shutil.copy2(ROOT_DIR / "lean" / "lean-toolchain", root / "lean" / "lean-toolchain")
             rep = build_coverage_report(root)
             rep["lcnf_constructor_matrix"] = {
                 "rows": [],
@@ -5557,11 +5665,13 @@ def main() -> int:
         return 2
 
     if args.write_results:
-        # Fail in seconds on a dirty measurement tree, or on a committed external
-        # corpus with no tree to measure it, not minutes into the audit: the same
-        # guards run again inside results_document and _refuse_dropped_corpora.
+        # Fail in seconds on a dirty measurement tree, a lean/lean-toolchain other
+        # than PINNED_TOOLCHAIN, or a committed external corpus with no tree to
+        # measure it, not minutes into the audit: the same guards run again inside
+        # results_document and _refuse_dropped_corpora.
         try:
             _refuse_dirty_measurement_inputs(ROOT_DIR)
+            _refuse_toolchain_file_mismatch(ROOT_DIR)
             _refuse_missing_external_trees(RESULTS_FILE, ROOT_DIR)
         except RuntimeError as exc:
             print(f"  [ERROR] {exc}", file=sys.stderr)
@@ -5582,7 +5692,11 @@ def main() -> int:
         RESULTS_FILE.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(f"[lcnf-coverage] wrote {RESULTS_FILE.relative_to(ROOT_DIR)}", file=sys.stderr)
         if not args.json:
-            return 0 if chk["ok"] else 1
+            if not chk["ok"]:
+                for err in chk["errors"]:
+                    print(f"  [ERROR] {err}", file=sys.stderr)
+                return 1
+            return 0
 
     if args.json or not args.check:
         out = dict(chk["report"])
