@@ -2232,6 +2232,69 @@ def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[
     }
 
 
+def _committed_measured_corpora(results_path: Path) -> set[str] | None:
+    """The corpora the committed results measure, or None when there is no committed file.
+
+    Only a missing file means a first baseline. A file that exists but cannot be
+    read or parsed (merge-conflict markers after a rebase are the usual cause)
+    raises, because the corpora it measures cannot be checked.
+    """
+    try:
+        text = results_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError(
+            f"refusing to write results: cannot read {results_path.name} ({exc}), so the "
+            "corpora it measures cannot be checked"
+        ) from exc
+    try:
+        committed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"refusing to write results: {results_path.name} is not valid JSON ({exc}), so the "
+            "corpora it measures cannot be checked; repair it (merge-conflict markers are the "
+            "usual cause) or delete it to write a first baseline"
+        ) from exc
+    corpora = committed.get("corpora") if isinstance(committed, dict) else None
+    if not isinstance(corpora, dict):
+        raise RuntimeError(
+            f"refusing to write results: {results_path.name} has no `corpora` object, so the "
+            "corpora it measures cannot be checked; repair it or delete it to write a first baseline"
+        )
+    return {
+        cname
+        for cname, entry in corpora.items()
+        if isinstance(entry, dict) and entry.get("measurement_source") != "not_measured"
+    }
+
+
+def _refuse_missing_external_trees(results_path: Path, root_dir: Path = ROOT_DIR) -> None:
+    """Fail in seconds when `--write-results` has no tree for a committed external corpus.
+
+    `_refuse_dropped_corpora` makes the same refusal after the measurement; this
+    catches the common case, no tree at all, before the minutes-long audit.
+    """
+    base = _committed_measured_corpora(results_path)
+    if base is None:
+        return
+    trees = {
+        "external_batteries": (_batteries_olean_root, BATTERIES_OLEANS_ENV),
+        "con_leche_h3_benchmark": (_con_leche_olean_root, CON_LECHE_OLEANS_ENV),
+    }
+    missing = [
+        (cname, env)
+        for cname, (find_root, env) in sorted(trees.items())
+        if cname in base and find_root(root_dir) is None
+    ]
+    if missing:
+        raise RuntimeError(
+            "refusing to write results: no prebuilt `.olean` tree for "
+            + ", ".join(f"`{cname}` (set {env})" for cname, env in missing)
+            + f", which {results_path.name} measures, so this run would drop its counts"
+        )
+
+
 def _refuse_dropped_corpora(report: dict[str, Any], doc: dict[str, Any], results_path: Path) -> None:
     """Refuse a new baseline that leaves out a corpus the committed one measured.
 
@@ -2240,21 +2303,10 @@ def _refuse_dropped_corpora(report: dict[str, Any], doc: dict[str, Any], results
     would replace that corpus's committed counts with nothing and still report
     success. Dropping a corpus from the baseline takes an edit of the file.
     """
-    try:
-        committed = json.loads(results_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return  # no readable baseline to drop from; this run writes the first one
-    base = committed.get("corpora") if isinstance(committed, dict) else None
-    if not isinstance(base, dict):
+    base = _committed_measured_corpora(results_path)
+    if base is None:
         return
-    kept = doc.get("corpora", {})
-    dropped = [
-        cname
-        for cname, entry in sorted(base.items())
-        if isinstance(entry, dict)
-        and entry.get("measurement_source") != "not_measured"
-        and cname not in kept
-    ]
+    dropped = sorted(base - set(doc.get("corpora", {})))
     if not dropped:
         return
     live = report.get("corpora", {})
@@ -3241,9 +3293,14 @@ class TestLcnfCoverage(unittest.TestCase):
                 results.write_text(json.dumps(committed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
                 before = results.read_text(encoding="utf-8")
                 err = io.StringIO()
+                # TURBO_BATTERIES_OLEANS names an existing directory, so the tree
+                # check before the measurement passes and this exercises the
+                # guard after it, the one that sees what the run measured.
                 with mock.patch.object(m, "ROOT_DIR", root), mock.patch.object(
                     m, "RESULTS_FILE", results
-                ), mock.patch.object(m, "_refuse_dirty_measurement_inputs"), mock.patch.object(
+                ), mock.patch.object(m, "_refuse_dirty_measurement_inputs"), mock.patch.dict(
+                    os.environ, {BATTERIES_OLEANS_ENV: str(root)}
+                ), mock.patch.object(
                     m, "check_coverage_report", return_value={"ok": True, "errors": [], "report": report}
                 ), mock.patch.object(m, "results_document", return_value=doc), mock.patch.object(
                     sys, "argv", ["lcnf_coverage.py", "--write-results"]
@@ -3256,6 +3313,104 @@ class TestLcnfCoverage(unittest.TestCase):
                     self.assertIn(reason, err.getvalue())
                 else:
                     self.assertEqual(json.loads(results.read_text(encoding="utf-8")), committed)
+
+    def test_write_results_refuses_a_corrupt_committed_results_file(self) -> None:
+        # Only a missing file means a first baseline. A committed file that
+        # exists but does not parse (merge-conflict markers after a rebase)
+        # read as missing, so the drop guard let the write replace it.
+        import contextlib
+        import io
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        committed = self._v_committed_baseline()
+        partial = json.loads(json.dumps(committed))
+        del partial["corpora"]["external_batteries"]
+        report = {"corpora": {"external_batteries": {"measurement_source": "not_measured", "reason": "no tree"}}}
+        with tempfile.TemporaryDirectory(prefix="lcnf-corrupt-results-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            results = root / "scripts" / "lcnf_coverage_results.json"
+            text = json.dumps(committed, indent=2, sort_keys=True) + "\n"
+            corrupt = "<<<<<<< HEAD\n" + text + "=======\n" + text + ">>>>>>> other\n"
+            results.write_text(corrupt, encoding="utf-8")
+            err = io.StringIO()
+            with mock.patch.object(m, "ROOT_DIR", root), mock.patch.object(
+                m, "RESULTS_FILE", results
+            ), mock.patch.object(m, "_refuse_dirty_measurement_inputs"), mock.patch.dict(
+                os.environ, {BATTERIES_OLEANS_ENV: str(root)}
+            ), mock.patch.object(
+                m, "check_coverage_report", return_value={"ok": True, "errors": [], "report": report}
+            ), mock.patch.object(m, "results_document", return_value=partial), mock.patch.object(
+                sys, "argv", ["lcnf_coverage.py", "--write-results"]
+            ), contextlib.redirect_stderr(err):
+                rc = m.main()
+            self.assertEqual(rc, 1, err.getvalue())
+            self.assertEqual(results.read_text(encoding="utf-8"), corrupt)
+            self.assertIn("not valid JSON", err.getvalue())
+
+    def test_write_results_fails_before_measuring_without_a_committed_external_tree(self) -> None:
+        # The drop guard runs after the minutes-long measurement. With no tree
+        # at all for a committed external corpus, the refusal comes before it.
+        import contextlib
+        import io
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        committed = self._v_committed_baseline()
+        with tempfile.TemporaryDirectory(prefix="lcnf-no-tree-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            results = root / "scripts" / "lcnf_coverage_results.json"
+            results.write_text(json.dumps(committed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            before = results.read_text(encoding="utf-8")
+            err = io.StringIO()
+            with mock.patch.object(m, "ROOT_DIR", root), mock.patch.object(
+                m, "RESULTS_FILE", results
+            ), mock.patch.object(m, "_refuse_dirty_measurement_inputs"), mock.patch.dict(
+                os.environ, {BATTERIES_OLEANS_ENV: str(root / "no-such-tree")}
+            ), mock.patch.object(
+                m, "check_coverage_report", return_value={"ok": True, "errors": [], "report": {"corpora": {}}}
+            ) as measured, mock.patch.object(
+                m, "results_document", return_value=committed
+            ), mock.patch.object(
+                sys, "argv", ["lcnf_coverage.py", "--write-results"]
+            ), contextlib.redirect_stderr(err):
+                rc = m.main()
+            self.assertEqual(rc, 1, err.getvalue())
+            measured.assert_not_called()
+            self.assertEqual(results.read_text(encoding="utf-8"), before)
+            self.assertIn("`external_batteries`", err.getvalue())
+            self.assertIn(BATTERIES_OLEANS_ENV, err.getvalue())
+
+    def test_write_results_reports_a_results_document_refusal_as_an_error(self) -> None:
+        # results_document's refusals (a dirty tree, a missing digest, an
+        # external entry measured at another revision) print as a named
+        # [ERROR] with exit 1, like the guards around them, not a traceback.
+        import contextlib
+        import io
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        refusal = "refusing to write results: corpus `external_batteries` was measured at revision 'x'"
+        with tempfile.TemporaryDirectory(prefix="lcnf-doc-refusal-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            results = root / "scripts" / "lcnf_coverage_results.json"
+            err = io.StringIO()
+            with mock.patch.object(m, "ROOT_DIR", root), mock.patch.object(
+                m, "RESULTS_FILE", results
+            ), mock.patch.object(m, "_refuse_dirty_measurement_inputs"), mock.patch.object(
+                m, "check_coverage_report", return_value={"ok": True, "errors": [], "report": {"corpora": {}}}
+            ), mock.patch.object(
+                m, "results_document", side_effect=RuntimeError(refusal)
+            ), mock.patch.object(
+                sys, "argv", ["lcnf_coverage.py", "--write-results"]
+            ), contextlib.redirect_stderr(err):
+                rc = m.main()
+            self.assertEqual(rc, 1)
+            self.assertIn(f"[ERROR] {refusal}", err.getvalue())
+            self.assertFalse(results.exists())
 
     def test_executes_live_lean_lowerer_on_corpora(self) -> None:
         live = execute_live_lean_audit(ROOT_DIR)
@@ -5224,10 +5379,12 @@ def main() -> int:
         return 2
 
     if args.write_results:
-        # Fail in seconds on a dirty measurement tree, not minutes into the
-        # audit: the same guard runs again inside results_document.
+        # Fail in seconds on a dirty measurement tree, or on a committed external
+        # corpus with no tree to measure it, not minutes into the audit: the same
+        # guards run again inside results_document and _refuse_dropped_corpora.
         try:
             _refuse_dirty_measurement_inputs(ROOT_DIR)
+            _refuse_missing_external_trees(RESULTS_FILE, ROOT_DIR)
         except RuntimeError as exc:
             print(f"  [ERROR] {exc}", file=sys.stderr)
             return 1
@@ -5238,8 +5395,8 @@ def main() -> int:
         compare_results_digests=not args.write_results,
     )
     if args.write_results:
-        doc = results_document(chk["report"], ROOT_DIR)
         try:
+            doc = results_document(chk["report"], ROOT_DIR)
             _refuse_dropped_corpora(chk["report"], doc, RESULTS_FILE)
         except RuntimeError as exc:
             print(f"  [ERROR] {exc}", file=sys.stderr)
