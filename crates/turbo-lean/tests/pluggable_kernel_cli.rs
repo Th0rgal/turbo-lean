@@ -28,6 +28,10 @@ mod lake_build {
     }
 }
 
+mod shm_cache {
+    pub(crate) fn record_child_exit_status(_: std::process::ExitStatus) {}
+}
+
 #[allow(dead_code)]
 #[path = "../src/kernel.rs"]
 mod kernel;
