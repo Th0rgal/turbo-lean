@@ -53,7 +53,7 @@
 - `lean/LeanNative/IR/RealLCNFSemantics.lean` — an operational semantics of real
   `Lean.Compiler.LCNF` declarations (namespace at `RealLCNFSemantics.lean:7`, section header at `:14`,
   ends at `:872`).
-- Independence, as separated by `H1.1` (`8922a03`, pin `40275bc`): `RealLCNFSemantics.lean` no
+- Independence, as separated by `H1.1` (`5549b99`, pin `4c904f8`): `RealLCNFSemantics.lean` no
   longer imports the lowerer. It and `RealLCNFBridge.lean` both import the shared-definitions module
   `lean/LeanNative/IR/RealLCNFShared.lean` (operator tables, width/mask helpers, ground type
   lowering, the C1.2 layout spec, `RealBridgeCtx`), and `lean/LeanNative/Tests/RealLCNFSeparationPin.lean`
@@ -117,7 +117,7 @@
 ## 8. Assumptions register (relied on, not proved in-repo)
 
 1. `RealLCNFSemantics` agrees with Lean's own evaluation — tested, not proved. The `H1.1`
-   differential driver (`eval-lcnf`, `lean/LeanNative/Driver/EvalLCNFCLI.lean`, landed `8922a03`)
+   differential driver (`eval-lcnf`, `lean/LeanNative/Driver/EvalLCNFCLI.lean`, landed `5549b99`)
    compares it with compiled Lean on its corpus, and the contract script fails unless
    `mismatch_count == 0` with at least 12 declarations and 100 vectors compared
    (`scripts/contract.d/35_h11_lcnf_differential.sh`). Agreement outside that corpus is assumed.
@@ -129,7 +129,7 @@
    on v4.35.0); the file-level SHA-256 is recorded in the freezing commit.
 3. The generated coverage matrix is a measurement, not a proof (`H1.0`): `scripts/lcnf_coverage.py`
    runs the real lowerer over its corpora, the committed results (`scripts/lcnf_coverage_results.json`,
-   measured at `138b287`) pin four things: the digests of the tracked Lean sources, the digest of
+   measured at `11b3c17`) pin four things: the digests of the tracked Lean sources, the digest of
    the script's own audit drivers and classifier, the toolchain, and the revision the `Batteries`
    counts were measured at. CI's `verify` job emits the JSON and gates all four. The tracked
    sources (`TRACKED_BRIDGE_FILES` and `TRACKED_BRIDGE_DIRS` in the script) are the bridge with its

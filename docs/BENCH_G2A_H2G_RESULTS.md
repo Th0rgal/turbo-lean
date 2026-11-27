@@ -6,7 +6,7 @@ batched hashing against the 10% line.
 
 Setup: machine label `g2a-ro-192c` (recorded as the host hostname; the live node
 name appears nowhere in the artifact), binary `target-g2a/release/turbo-lean`
-built at commit `ed26b375` (clean tree), binary sha256
+built at commit `0773522c` (clean tree), binary sha256
 `8ac9a35b81353fb602964d4e1996502769a8718bf73771194ae6785f7b446d80`, 5 trials per
 cell, per-check timeout 2400 s, load1 at start/end 84.15 / 63.39, run started
 2026-11-26T05:34:09Z. Artifact: `scripts/bench_check_loop_g2a_replay.json`,
@@ -114,7 +114,7 @@ quiet node.
 
 ## G2b: warm CAS-expr replay, on-vs-off delta
 
-Paired sequential runs on one rebuilt binary at `a3ad5f4d` (sha256
+Paired sequential runs on one rebuilt binary at `d885a9b8` (sha256
 `e4fccb2515a3ac08…`, opt-out string present in the binary with a grep
 control), same venue, flags, and label as above; 5 trials per cell; four
 active Batteries workloads. Artifacts:
@@ -152,7 +152,7 @@ occurrences). The deletion then removed the mode field altogether.
 
 The first forward option above, taken. This section records a feature that
 was deleted afterwards (see its end), and it describes
-`scripts/bench_build_loop.py` as it was at `0a593169`, with the ON and OFF
+`scripts/bench_build_loop.py` as it was at `ae8afc38`, with the ON and OFF
 sides it no longer has. The script drives the `build` path that the
 check-loop bench cannot reach. It generates a Lake
 fixture of 4 independent modules with 50 distinct `omega` theorems each, runs
@@ -167,14 +167,14 @@ replayed shard per seeded receipt, OFF must report `off`, and any other answer
 fails the run. That is the assert the check-loop delta lacked: a side whose
 opt-in never reaches the replay cannot pass as a measured null.
 
-Setup: commit `0a593169` (clean tree), binary `target/release/turbo-lean`
+Setup: commit `ae8afc38` (clean tree), binary `target/release/turbo-lean`
 sha256 `1abed53058499c27d6a5287002f772902c51742d583d08c7a41383670a2bc93e`,
 Lean 4.35.0, machine label `g2b-build-192c` (192 CPUs), run started
 2026-11-26T18:58:15Z, `/proc/loadavg` `53.18 55.35 84.11` at start and
 `66.83 57.98 84.05` at end (`busy_allowed` true), PSI not contended
 (memory.some and io.some at most 3.63). Cold seeded build: 26.4 s, 5 modules
 compiled, 200 shards seeded. Artifact: `scripts/bench_build_loop_g2b.json`.
-Command, as run at `0a593169`. It reproduces the table below only at that
+Command, as run at `ae8afc38`. It reproduces the table below only at that
 commit: the current script has no sides, and its `--out` must not point at this
 artifact:
 
@@ -208,7 +208,7 @@ fixture. Limits: one run, on a loaded node, on a synthetic 200-shard fixture;
 the cost should scale with the replayed shard count of a real warm build,
 which this run does not measure.
 
-Outcome: the warm trigger was deleted in `f4dfa82e`. This measurement closed
+Outcome: the warm trigger was deleted in `cf766a08`. This measurement closed
 the leaf on its deleted branch. The replay bought
 nothing on this path: the warm build's outputs are already in place, and the
 replay only read the CAS, filled derived split caches and reported counters,
