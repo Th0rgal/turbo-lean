@@ -682,6 +682,12 @@ pub fn atomic_write_shm(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
         debug_log_cache_err("atomic_write_shm(write)", &e);
         return Err(e);
     }
+    if let Err(e) = tmp_f.sync_all() {
+        drop(tmp_f);
+        let _ = fs::remove_file(&tmp_path);
+        debug_log_cache_err("atomic_write_shm(sync)", &e);
+        return Err(e);
+    }
     drop(tmp_f);
     if let Err(e) = fs::rename(&tmp_path, target) {
         let _ = fs::remove_file(&tmp_path);
@@ -1534,26 +1540,544 @@ pub(crate) fn parse_macos_vm_stat_budget_mb(vm_stat_out: &str) -> Option<u64> {
     Some((avail_mb.saturating_mul(7) / 10).max(1))
 }
 
-fn parse_cgroup_memory_limit_mb() -> Option<u64> {
-    for path in [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ] {
-        if let Ok(raw) = fs::read_to_string(path) {
-            let trimmed = raw.trim();
-            if trimmed != "max" {
-                if let Ok(bytes) = trimmed.parse::<u64>() {
-                    if bytes > 0 && bytes < (1u64 << 50) {
-                        let mb = bytes / (1024 * 1024);
-                        if mb > 0 {
-                            return Some((mb.saturating_mul(3) / 4).max(1));
-                        }
-                    }
-                }
+/// Default cgroup v2 unified hierarchy mount point.
+pub const CGROUP_V2_ROOT: &str = "/sys/fs/cgroup";
+
+/// Extract the cgroup v2 relative path (`0::<rel>`) from `/proc/self/cgroup` contents.
+pub fn parse_proc_self_cgroup_v2_path(text: &str) -> Option<String> {
+    let rel = text
+        .lines()
+        .find_map(|line| line.trim_end().strip_prefix("0::"))?
+        .trim();
+    if !rel.starts_with('/') || rel.split('/').any(|seg| seg == ".." || seg == ".") {
+        return None;
+    }
+    Some(rel.to_string())
+}
+
+/// Extract the cgroup v1 `memory` controller relative path (e.g. `12:memory:/foo` or
+/// `4:cpu,memory:/foo`) from `/proc/self/cgroup` contents.
+pub fn parse_proc_self_cgroup_v1_memory_path(text: &str) -> Option<String> {
+    let rel = text.lines().find_map(|line| {
+        let mut parts = line.trim_end().splitn(3, ':');
+        let _id = parts.next()?;
+        let controllers = parts.next()?;
+        let path = parts.next()?.trim();
+        controllers
+            .split(',')
+            .any(|ctrl| ctrl == "memory")
+            .then_some(path)
+    })?;
+    if !rel.starts_with('/') || rel.split('/').any(|seg| seg == ".." || seg == ".") {
+        return None;
+    }
+    Some(rel.to_string())
+}
+
+/// Parse a cgroup `memory.max` / `memory.limit_in_bytes` value: `max` (or absurd sentinel
+/// values) means unlimited (`None`); otherwise a positive byte count.
+pub fn parse_cgroup_memory_max_bytes(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if trimmed == "max" {
+        return None;
+    }
+    trimmed
+        .parse::<u64>()
+        .ok()
+        .filter(|&bytes| bytes > 0 && bytes < (1u64 << 50))
+}
+
+/// Ancestor cgroup directories of `rel` under `cgroup_root`, leaf first, mount root last.
+fn cgroup_v2_ancestor_dirs(cgroup_root: &Path, rel: &str) -> Vec<PathBuf> {
+    let segs: Vec<&str> = rel
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .collect();
+    (0..=segs.len())
+        .rev()
+        .map(|n| {
+            segs[..n]
+                .iter()
+                .fold(cgroup_root.to_path_buf(), |p, s| p.join(s))
+        })
+        .collect()
+}
+
+/// Probe `<root><rel>/memory.max` up through every ancestor to `<root>/memory.max`, returning
+/// `(saw_any_v2_memory_max_file, min_numeric_limit)`.
+fn resolve_cgroup_v2_memory_max_probe(cgroup_root: &Path, rel: &str) -> (bool, Option<u64>) {
+    let mut saw_v2_file = false;
+    let mut min_limit: Option<u64> = None;
+    for dir in cgroup_v2_ancestor_dirs(cgroup_root, rel) {
+        if let Ok(raw) = fs::read_to_string(dir.join("memory.max")) {
+            saw_v2_file = true;
+            if let Some(limit) = parse_cgroup_memory_max_bytes(&raw) {
+                min_limit = Some(min_limit.map_or(limit, |cur| cur.min(limit)));
             }
         }
     }
-    None
+    (saw_v2_file, min_limit)
+}
+
+/// Walk `<root><rel>/memory.max` up through every ancestor to `<root>/memory.max`, returning the
+/// tightest (minimum) numeric limit, or `None` when every level is `max` / unreadable.
+pub fn resolve_cgroup_v2_memory_max_bytes_at(cgroup_root: &Path, rel: &str) -> Option<u64> {
+    resolve_cgroup_v2_memory_max_probe(cgroup_root, rel).1
+}
+
+/// Walk `<root>/memory<rel>/memory.limit_in_bytes` up through every ancestor to
+/// `<root>/memory/memory.limit_in_bytes`, returning the tightest numeric limit.
+pub fn resolve_cgroup_v1_memory_limit_bytes_at(cgroup_root: &Path, rel: &str) -> Option<u64> {
+    let v1_mem_root = cgroup_root.join("memory");
+    cgroup_v2_ancestor_dirs(&v1_mem_root, rel)
+        .into_iter()
+        .filter_map(|dir| fs::read_to_string(dir.join("memory.limit_in_bytes")).ok())
+        .filter_map(|raw| parse_cgroup_memory_max_bytes(&raw))
+        .min()
+}
+
+/// Resolve the effective cgroup memory limit under `cgroup_root` using `/proc/self/cgroup`
+/// contents.
+///
+/// When cgroup v2 is active (any readable `memory.max` along the v2 ancestor chain, or a unified
+/// v2 mount with `cgroup.controllers`), v2 is authoritative: an explicit `max` returns `None` and
+/// never falls through to cgroup v1 `memory.limit_in_bytes`. Otherwise, falls back to the cgroup
+/// v1 `memory` controller hierarchy.
+pub fn resolve_effective_cgroup_memory_max_bytes_at(
+    cgroup_root: &Path,
+    proc_self_cgroup: Option<&str>,
+) -> Option<u64> {
+    let is_unified_v2_mount = cgroup_root.join("cgroup.controllers").is_file();
+    if let Some(v2_rel) = proc_self_cgroup.and_then(parse_proc_self_cgroup_v2_path) {
+        let (saw_v2_file, v2_limit) = resolve_cgroup_v2_memory_max_probe(cgroup_root, &v2_rel);
+        if saw_v2_file || is_unified_v2_mount {
+            return v2_limit;
+        }
+    } else if proc_self_cgroup.is_none() {
+        let (saw_v2_file, v2_limit) = resolve_cgroup_v2_memory_max_probe(cgroup_root, "/");
+        if saw_v2_file || is_unified_v2_mount {
+            return v2_limit;
+        }
+    }
+    let v1_rel = proc_self_cgroup.and_then(parse_proc_self_cgroup_v1_memory_path);
+    resolve_cgroup_v1_memory_limit_bytes_at(cgroup_root, v1_rel.as_deref().unwrap_or("/"))
+}
+
+fn current_cgroup_v2_rel_path() -> Option<String> {
+    parse_proc_self_cgroup_v2_path(&fs::read_to_string("/proc/self/cgroup").ok()?)
+}
+
+/// Effective cgroup memory limit in bytes for this process (cgroup v2 ancestor walk; falls back
+/// to cgroup v1 `memory.limit_in_bytes` only when cgroup v2 is not active).
+pub fn effective_cgroup_memory_max_bytes() -> Option<u64> {
+    let proc_cgroup = fs::read_to_string("/proc/self/cgroup").ok();
+    resolve_effective_cgroup_memory_max_bytes_at(
+        Path::new(CGROUP_V2_ROOT),
+        proc_cgroup.as_deref(),
+    )
+}
+
+/// Compute the cgroup `oom_kill` counter delta across a run.
+/// If the counter was absent before the run (`before == None`) and appears mid-run
+/// (`after == Some(n)`), treat the missing baseline as `0` rather than masking the OOM event.
+pub fn cgroup_oom_kill_delta(before: Option<u64>, after: Option<u64>) -> Option<u64> {
+    after.map(|a| a.saturating_sub(before.unwrap_or(0)))
+}
+
+/// Parse the `oom_kill` counter from a cgroup v2 `memory.events` file.
+pub fn parse_cgroup_memory_events_oom_kill(text: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == "oom_kill")
+            .then(|| fields.next()?.parse::<u64>().ok())
+            .flatten()
+    })
+}
+
+/// Read `<root><rel>/memory.events` `oom_kill` count.
+pub fn read_cgroup_oom_kill_count_at(cgroup_root: &Path, rel: &str) -> Option<u64> {
+    let dir = cgroup_v2_ancestor_dirs(cgroup_root, rel)
+        .into_iter()
+        .next()?;
+    parse_cgroup_memory_events_oom_kill(&fs::read_to_string(dir.join("memory.events")).ok()?)
+}
+
+/// `oom_kill` count of this process' own cgroup v2 (`None` when unavailable).
+pub fn current_cgroup_oom_kill_count() -> Option<u64> {
+    read_cgroup_oom_kill_count_at(Path::new(CGROUP_V2_ROOT), &current_cgroup_v2_rel_path()?)
+}
+
+/// Pre-flight memory guard: fail fast with an actionable diagnostic when the recorded historical
+/// peak RSS (`historical_peak_rss_mb`) or the requested `--max-memory-mb` budget cannot fit under
+/// the effective cgroup `memory.max` (`cgroup_max_bytes`). Unknown inputs pass.
+pub fn preflight_memory_guard(
+    what: &str,
+    historical_peak_rss_mb: Option<u64>,
+    max_memory_mb: Option<u64>,
+    cgroup_max_bytes: Option<u64>,
+) -> anyhow::Result<()> {
+    let Some(limit_bytes) = cgroup_max_bytes else {
+        return Ok(());
+    };
+    let limit_mb = limit_bytes / (1024 * 1024);
+    if let Some(peak_mb) = historical_peak_rss_mb.filter(|&mb| mb > limit_mb) {
+        anyhow::bail!(
+            "[turbo-lean] pre-flight memory guard: `{what}` previously peaked at {peak_mb} MiB RSS but the effective cgroup `memory.max` is only {limit_mb} MiB; it would be OOM-killed. Run it under a larger cgroup (e.g. `systemd-run --user -p MemoryMax={}M`) or a bigger machine, reduce parallelism (`--jobs 1`), or set `TURBO_LEAN_SKIP_MEMORY_PREFLIGHT=1` to bypass (`--max-memory-mb` cannot raise a cgroup limit)",
+            peak_mb.saturating_add(peak_mb / 4)
+        );
+    }
+    if let Some(budget_mb) = max_memory_mb.filter(|&mb| mb > limit_mb) {
+        anyhow::bail!(
+            "[turbo-lean] pre-flight memory guard: `--max-memory-mb {budget_mb}` (`TURBO_LEAN_MAX_MEMORY_MB`) for `{what}` exceeds the effective cgroup `memory.max` of {limit_mb} MiB; the kernel would OOM-kill before the budget is reached. Pass `--max-memory-mb {}` or less, or raise the cgroup `MemoryMax`",
+            (limit_mb.saturating_mul(9) / 10).max(1)
+        );
+    }
+    Ok(())
+}
+
+/// Read an explicit historical peak RSS override in MiB from `TURBO_LEAN_HISTORICAL_PEAK_RSS_MB`.
+pub fn historical_peak_rss_mb_from_env() -> Option<u64> {
+    std::env::var("TURBO_LEAN_HISTORICAL_PEAK_RSS_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&mb| mb > 0)
+}
+
+/// Read `peak_rss_kib` (converted to MiB) from an existing JSON `BuildReceipt` file, if present.
+pub fn read_receipt_peak_rss_mb(receipt_path: &Path) -> Option<u64> {
+    let raw = fs::read(receipt_path).ok()?;
+    let receipt: BuildReceipt = serde_json::from_slice(&raw).ok()?;
+    receipt
+        .peak_rss_kib
+        .map(|kib| kib / 1024)
+        .filter(|&mb| mb > 0)
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedPeakRss {
+    peak_rss_kib: u64,
+}
+
+fn project_peak_rss_cache_path(project_dir: &Path) -> PathBuf {
+    let canonical = fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    let key = &blake3::hash(canonical.to_string_lossy().as_bytes())
+        .to_hex()
+        .to_string()[..28];
+    cache_root().join("peak_rss").join(format!("{key}.json"))
+}
+
+/// Read the cached historical peak RSS in MiB for `project_dir`, if previously recorded.
+pub fn read_project_peak_rss_mb(project_dir: &Path) -> Option<u64> {
+    let raw = fs::read(project_peak_rss_cache_path(project_dir)).ok()?;
+    let rec: PersistedPeakRss = serde_json::from_slice(&raw).ok()?;
+    let mb = rec.peak_rss_kib / 1024;
+    (mb > 0).then_some(mb)
+}
+
+/// Best-effort atomic persistence of the high-water peak RSS (KiB) for `project_dir` under
+/// `cache_root()`: a smaller (e.g. cache-hit) run never lowers a previously recorded peak.
+pub fn record_project_peak_rss_kib(project_dir: &Path, peak_rss_kib: u64) {
+    let path = project_peak_rss_cache_path(project_dir);
+    let existing = fs::read(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<PersistedPeakRss>(&raw).ok())
+        .map_or(0, |rec| rec.peak_rss_kib);
+    if peak_rss_kib <= existing {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec(&PersistedPeakRss { peak_rss_kib }) {
+        let _ = atomic_write_shm(&path, &bytes);
+    }
+}
+
+/// Resolve the live historical peak RSS in MiB for pre-flight checking: the explicit
+/// `TURBO_LEAN_HISTORICAL_PEAK_RSS_MB` override, else the larger of the prior JSON receipt at
+/// `receipt_path` (rewritten every run, so it may hold a small cache-hit peak) and the persisted
+/// per-project high-water mark under `cache_root()/peak_rss/`.
+pub fn resolve_historical_peak_rss_mb(
+    project_dir: Option<&Path>,
+    receipt_path: Option<&Path>,
+) -> Option<u64> {
+    historical_peak_rss_mb_from_env().or_else(|| {
+        receipt_path
+            .and_then(read_receipt_peak_rss_mb)
+            .max(project_dir.and_then(read_project_peak_rss_mb))
+    })
+}
+
+/// Live pre-flight guard: `TURBO_LEAN_MAX_MEMORY_MB` (`--max-memory-mb`) and the optional
+/// historical peak (falling back to `TURBO_LEAN_HISTORICAL_PEAK_RSS_MB`) against this process'
+/// effective cgroup `memory.max`. Disabled by `TURBO_LEAN_SKIP_MEMORY_PREFLIGHT=1`.
+pub fn preflight_memory_guard_live(
+    what: &str,
+    historical_peak_rss_mb: Option<u64>,
+) -> anyhow::Result<()> {
+    if std::env::var("TURBO_LEAN_SKIP_MEMORY_PREFLIGHT").as_deref() == Ok("1") {
+        return Ok(());
+    }
+    let max_memory_mb = std::env::var("TURBO_LEAN_MAX_MEMORY_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&mb| mb > 0);
+    let effective_peak_mb = historical_peak_rss_mb.or_else(historical_peak_rss_mb_from_env);
+    preflight_memory_guard(
+        what,
+        effective_peak_mb,
+        max_memory_mb,
+        effective_cgroup_memory_max_bytes(),
+    )
+}
+
+/// Outstanding (not yet recovered) failed child `ExitStatus`es of this invocation.
+static FAILED_CHILD_STATUSES: std::sync::Mutex<Vec<std::process::ExitStatus>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn failed_child_statuses() -> std::sync::MutexGuard<'static, Vec<std::process::ExitStatus>> {
+    FAILED_CHILD_STATUSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn child_status_severity(status: &std::process::ExitStatus) -> u8 {
+    if status.success() {
+        return 0;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal() == Some(libc::SIGKILL) || status.code() == Some(128 + libc::SIGKILL) {
+            return 3;
+        }
+        if status.signal().is_some() {
+            return 2;
+        }
+    }
+    #[cfg(not(unix))]
+    if status.code() == Some(137) {
+        return 3;
+    }
+    1
+}
+
+/// Record a failed child's `ExitStatus` for parent invocation receipt emission.
+pub fn record_child_exit_status(status: std::process::ExitStatus) {
+    if child_status_severity(&status) > 0 {
+        failed_child_statuses().push(status);
+    }
+}
+
+/// Withdraw one recorded failure equal to `status` once the caller has recovered from it (worker
+/// respawn + replay, closure-to-single-module fallback, audit bisection), so a recovered
+/// `SIGKILL` never bleeds into the receipt or exit code of an unrelated later failure.
+pub fn forgive_child_exit_status(status: &std::process::ExitStatus) {
+    let mut guard = failed_child_statuses();
+    if let Some(i) = guard.iter().rposition(|s| s == status) {
+        guard.remove(i);
+    }
+}
+
+/// Take the highest-severity outstanding failed child `ExitStatus` (`SIGKILL` / exit `137`, then
+/// other signals, then non-zero exits; latest wins ties) and clear the ledger.
+pub fn take_recorded_child_exit_status() -> Option<std::process::ExitStatus> {
+    std::mem::take(&mut *failed_child_statuses())
+        .into_iter()
+        .max_by_key(child_status_severity)
+}
+
+/// Clear any recorded child `ExitStatus` (called at invocation startup and in tests).
+pub fn reset_recorded_child_exit_status() {
+    failed_child_statuses().clear();
+}
+
+/// Structured JSON build / OOM receipt, emitted for every child invocation including children
+/// killed by `SIGKILL` (cgroup OOM killer) or aborted with `SIGABRT`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BuildReceipt {
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub peak_rss_kib: Option<u64>,
+    pub cgroup_oom_kill: Option<u64>,
+    pub elapsed_s: f64,
+    pub olean_sha256: Option<String>,
+    /// `true` when the child was `SIGKILL`ed (or exited `137`) or the cgroup `oom_kill` counter advanced.
+    pub oom_suspected: bool,
+}
+
+impl BuildReceipt {
+    /// Build a receipt from a finished child's `ExitStatus`. `cgroup_oom_kill` is the delta of the
+    /// cgroup `oom_kill` counter across the run (when known); `olean` is hashed when it exists.
+    pub fn from_exit_status(
+        status: &std::process::ExitStatus,
+        elapsed: std::time::Duration,
+        peak_rss_kib: Option<u64>,
+        cgroup_oom_kill: Option<u64>,
+        olean: Option<&Path>,
+    ) -> Self {
+        #[cfg(unix)]
+        let signal = {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal()
+        };
+        #[cfg(not(unix))]
+        let signal: Option<i32> = None;
+        let exit_code = status.code();
+        #[cfg(unix)]
+        let killed = signal == Some(libc::SIGKILL) || exit_code == Some(128 + libc::SIGKILL);
+        #[cfg(not(unix))]
+        let killed = exit_code == Some(137);
+        Self {
+            exit_code,
+            signal,
+            peak_rss_kib,
+            cgroup_oom_kill,
+            elapsed_s: elapsed.as_secs_f64(),
+            olean_sha256: olean
+                .filter(|p| p.is_file())
+                .and_then(|p| sha256_file_hex(p).ok()),
+            oom_suspected: killed || cgroup_oom_kill.is_some_and(|n| n > 0),
+        }
+    }
+
+    /// Build a parent-invocation receipt, preferring a real child `ExitStatus` (explicit or
+    /// recorded on failure) so `SIGKILL` / exit `137` and signal terminations are faithfully
+    /// reported instead of collapsed to a generic `exit_code: 1, signal: None`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_invocation(
+        ok: bool,
+        explicit_status: Option<&std::process::ExitStatus>,
+        recorded_child_status: Option<&std::process::ExitStatus>,
+        fallback_exit_code: Option<i32>,
+        elapsed: std::time::Duration,
+        peak_rss_kib: Option<u64>,
+        cgroup_oom_kill: Option<u64>,
+        olean: Option<&Path>,
+    ) -> Self {
+        if let Some(status) = explicit_status {
+            return Self::from_exit_status(status, elapsed, peak_rss_kib, cgroup_oom_kill, olean);
+        }
+        if !ok {
+            if let Some(status) = recorded_child_status {
+                return Self::from_exit_status(
+                    status,
+                    elapsed,
+                    peak_rss_kib,
+                    cgroup_oom_kill,
+                    olean,
+                );
+            }
+        }
+        let exit_code = Some(if ok {
+            0
+        } else {
+            fallback_exit_code.unwrap_or(1)
+        });
+        Self {
+            exit_code,
+            signal: None,
+            peak_rss_kib,
+            cgroup_oom_kill,
+            elapsed_s: elapsed.as_secs_f64(),
+            olean_sha256: olean
+                .filter(|p| p.is_file())
+                .and_then(|p| sha256_file_hex(p).ok()),
+            oom_suspected: exit_code == Some(137) || cgroup_oom_kill.is_some_and(|n| n > 0),
+        }
+    }
+}
+
+/// Lowercase hex SHA-256 of the file at `path`.
+pub fn sha256_file_hex(path: &Path) -> std::io::Result<String> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    std::io::copy(&mut fs::File::open(path)?, &mut hasher)?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+#[cfg(unix)]
+fn getrusage_maxrss_kib(who: libc::c_int) -> Option<u64> {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(who, &mut usage) } != 0 {
+        return None;
+    }
+    let raw = u64::try_from(usage.ru_maxrss).ok()?;
+    // macOS reports bytes, Linux KiB.
+    Some(if cfg!(target_os = "macos") {
+        raw / 1024
+    } else {
+        raw
+    })
+}
+
+/// Peak RSS in KiB over all waited-for children of this process (`getrusage(RUSAGE_CHILDREN)`).
+pub fn children_peak_rss_kib() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        getrusage_maxrss_kib(libc::RUSAGE_CHILDREN)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Peak RSS in KiB of this process itself (`getrusage(RUSAGE_SELF)`).
+pub fn self_peak_rss_kib() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        getrusage_maxrss_kib(libc::RUSAGE_SELF)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Atomically (write-then-rename) persist `receipt` as pretty JSON at `path`.
+pub fn write_build_receipt_atomic(path: &Path, receipt: &BuildReceipt) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(receipt).map_err(std::io::Error::other)?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    atomic_write_shm(path, &bytes)
+}
+
+/// Spawn `cmd`, wait for it (whatever signal kills it), and atomically emit a `BuildReceipt` at
+/// `receipt_path` before returning the captured output.
+pub fn run_command_with_receipt(
+    cmd: &mut std::process::Command,
+    receipt_path: &Path,
+    olean: Option<&Path>,
+) -> std::io::Result<(std::process::Output, BuildReceipt)> {
+    let oom_before = current_cgroup_oom_kill_count();
+    let started = std::time::Instant::now();
+    let output = cmd.output()?;
+    if !output.status.success() {
+        record_child_exit_status(output.status);
+    }
+    let elapsed = started.elapsed();
+    let cgroup_oom_kill = cgroup_oom_kill_delta(oom_before, current_cgroup_oom_kill_count());
+    let receipt = BuildReceipt::from_exit_status(
+        &output.status,
+        elapsed,
+        children_peak_rss_kib(),
+        cgroup_oom_kill,
+        olean,
+    );
+    write_build_receipt_atomic(receipt_path, &receipt)?;
+    Ok((output, receipt))
+}
+
+fn parse_cgroup_memory_limit_mb() -> Option<u64> {
+    let bytes = effective_cgroup_memory_max_bytes()?;
+    let mb = bytes / (1024 * 1024);
+    (mb > 0).then(|| (mb.saturating_mul(3) / 4).max(1))
 }
 
 fn probe_system_budget_mb() -> u64 {
@@ -2879,6 +3403,579 @@ mod tests {
             Ok(r) => r,
             Err(p) => std::panic::resume_unwind(p),
         }
+    }
+
+    fn cgroup_fixture_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "turbo_cgroup_{tag}_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn test_parse_proc_self_cgroup_v2_path() {
+        assert_eq!(
+            parse_proc_self_cgroup_v2_path("0::/user.slice/user-1000.slice/app.scope\n"),
+            Some("/user.slice/user-1000.slice/app.scope".to_string())
+        );
+        // Hybrid hierarchy: v1 controllers first, unified `0::` entry later.
+        assert_eq!(
+            parse_proc_self_cgroup_v2_path("12:memory:/foo\n1:name=systemd:/bar\n0::/svc.scope\n"),
+            Some("/svc.scope".to_string())
+        );
+        assert_eq!(
+            parse_proc_self_cgroup_v2_path("0::/\n"),
+            Some("/".to_string())
+        );
+        assert_eq!(parse_proc_self_cgroup_v2_path("12:memory:/foo\n"), None);
+        assert_eq!(parse_proc_self_cgroup_v2_path(""), None);
+        // Path traversal must never escape the cgroup mount.
+        assert_eq!(parse_proc_self_cgroup_v2_path("0::/../../etc\n"), None);
+        assert_eq!(parse_proc_self_cgroup_v2_path("0::relative\n"), None);
+    }
+
+    #[test]
+    fn test_parse_cgroup_memory_max_bytes() {
+        assert_eq!(parse_cgroup_memory_max_bytes("max\n"), None);
+        assert_eq!(parse_cgroup_memory_max_bytes(""), None);
+        assert_eq!(parse_cgroup_memory_max_bytes("0"), None);
+        assert_eq!(parse_cgroup_memory_max_bytes("garbage"), None);
+        assert_eq!(
+            parse_cgroup_memory_max_bytes("8976400384\n"),
+            Some(8_976_400_384)
+        );
+        // cgroup v1 "unlimited" sentinel (PAGE_COUNTER_MAX * page size).
+        assert_eq!(parse_cgroup_memory_max_bytes("9223372036854771712"), None);
+    }
+
+    #[test]
+    fn test_resolve_cgroup_v2_memory_max_walks_ancestors_and_takes_minimum() {
+        let root = cgroup_fixture_root("walk");
+        let leaf = root.join("user.slice/app.slice/job.scope");
+        fs::create_dir_all(&leaf).unwrap();
+        fs::write(root.join("memory.max"), "max\n").unwrap();
+        fs::write(root.join("user.slice/memory.max"), "8589934592\n").unwrap(); // 8 GiB
+        fs::write(root.join("user.slice/app.slice/memory.max"), "max\n").unwrap();
+        fs::write(leaf.join("memory.max"), "17179869184\n").unwrap(); // 16 GiB
+        assert_eq!(
+            resolve_cgroup_v2_memory_max_bytes_at(&root, "/user.slice/app.slice/job.scope"),
+            Some(8_589_934_592),
+            "the tightest ancestor limit wins"
+        );
+        // Missing leaf file (e.g. the root cgroup has no memory.max) still walks ancestors.
+        fs::remove_file(leaf.join("memory.max")).unwrap();
+        assert_eq!(
+            resolve_cgroup_v2_memory_max_bytes_at(&root, "/user.slice/app.slice/job.scope"),
+            Some(8_589_934_592)
+        );
+        fs::write(root.join("user.slice/memory.max"), "max").unwrap();
+        assert_eq!(
+            resolve_cgroup_v2_memory_max_bytes_at(&root, "/user.slice/app.slice/job.scope"),
+            None
+        );
+        fs::write(root.join("memory.max"), "1073741824").unwrap();
+        assert_eq!(
+            resolve_cgroup_v2_memory_max_bytes_at(&root, "/user.slice/app.slice/job.scope"),
+            Some(1_073_741_824),
+            "the mount-root memory.max is included"
+        );
+        assert_eq!(
+            resolve_cgroup_v2_memory_max_bytes_at(&root, "/"),
+            Some(1_073_741_824)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_cgroup_memory_events_oom_kill() {
+        let text = "low 0\nhigh 12\nmax 40\noom 3\noom_kill 2\noom_group_kill 0\n";
+        assert_eq!(parse_cgroup_memory_events_oom_kill(text), Some(2));
+        assert_eq!(parse_cgroup_memory_events_oom_kill("low 0\n"), None);
+        let root = cgroup_fixture_root("events");
+        fs::create_dir_all(root.join("a.scope")).unwrap();
+        fs::write(root.join("a.scope/memory.events"), text).unwrap();
+        assert_eq!(read_cgroup_oom_kill_count_at(&root, "/a.scope"), Some(2));
+        assert_eq!(read_cgroup_oom_kill_count_at(&root, "/missing.scope"), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_preflight_memory_guard_rejects_insufficient_memory_max() {
+        let gib = 1024u64 * 1024 * 1024;
+        // Unknown cgroup limit or unknown demand: pass.
+        assert!(preflight_memory_guard("M", Some(28_000), Some(30_000), None).is_ok());
+        assert!(preflight_memory_guard("M", None, None, Some(8 * gib)).is_ok());
+        // Fits.
+        assert!(preflight_memory_guard("M", Some(4_000), Some(6_000), Some(8 * gib)).is_ok());
+        // Historical peak (27.8 GiB) exceeds an 8 GiB cgroup.
+        let err = preflight_memory_guard("IdleCDOEpochVariant", Some(28_467), None, Some(8 * gib))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("IdleCDOEpochVariant"), "{err}");
+        assert!(err.contains("memory.max"), "{err}");
+        assert!(err.contains("28467"), "{err}");
+        assert!(err.contains("8192"), "{err}");
+        assert!(err.contains("--max-memory-mb"), "{err}");
+        // `--max-memory-mb` above the cgroup limit is unsatisfiable.
+        let err = preflight_memory_guard("M", None, Some(10_000), Some(8 * gib))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--max-memory-mb 10000"), "{err}");
+        assert!(err.contains("memory.max"), "{err}");
+    }
+
+    #[test]
+    fn test_preflight_memory_guard_live_skip_env() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("TURBO_LEAN_SKIP_MEMORY_PREFLIGHT");
+        std::env::set_var("TURBO_LEAN_SKIP_MEMORY_PREFLIGHT", "1");
+        assert!(preflight_memory_guard_live("M", Some(u64::MAX / 2)).is_ok());
+        match prev {
+            Some(v) => std::env::set_var("TURBO_LEAN_SKIP_MEMORY_PREFLIGHT", v),
+            None => std::env::remove_var("TURBO_LEAN_SKIP_MEMORY_PREFLIGHT"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_receipt_is_emitted_for_sigkill_and_sigabrt_children() {
+        let dir = cgroup_fixture_root("receipt");
+        let olean = dir.join("M.olean");
+        fs::write(&olean, b"olean-bytes").unwrap();
+        for (sig, script) in [
+            (libc::SIGKILL, "kill -KILL $$"),
+            (libc::SIGABRT, "kill -ABRT $$"),
+        ] {
+            let receipt_path = dir.join(format!("receipt_{sig}.json"));
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args(["-c", script]);
+            let (out, receipt) =
+                run_command_with_receipt(&mut cmd, &receipt_path, Some(&olean)).unwrap();
+            assert!(!out.status.success());
+            assert_eq!(receipt.exit_code, None);
+            assert_eq!(receipt.signal, Some(sig));
+            assert_eq!(receipt.oom_suspected, sig == libc::SIGKILL);
+            assert!(receipt.elapsed_s >= 0.0);
+            let on_disk: BuildReceipt =
+                serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+            assert_eq!(on_disk, receipt);
+            let raw: serde_json::Value =
+                serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+            for key in [
+                "exit_code",
+                "signal",
+                "peak_rss_kib",
+                "cgroup_oom_kill",
+                "elapsed_s",
+                "olean_sha256",
+            ] {
+                assert!(raw.get(key).is_some(), "missing `{key}` in {raw}");
+            }
+            // No leftover staging files beside the receipt.
+            let leftovers: Vec<_> = fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+                .collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+        }
+        let receipt_path = dir.join("receipt_ok.json");
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "exit 3"]);
+        let (_, receipt) = run_command_with_receipt(&mut cmd, &receipt_path, Some(&olean)).unwrap();
+        assert_eq!(receipt.exit_code, Some(3));
+        assert_eq!(receipt.signal, None);
+        assert!(!receipt.oom_suspected);
+        let expected = sha256_file_hex(&olean).unwrap();
+        assert_eq!(expected.len(), 64);
+        assert_eq!(receipt.olean_sha256.as_deref(), Some(expected.as_str()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_receipt_oom_kill_delta_marks_oom() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = std::process::ExitStatus::from_raw(0);
+        let r = BuildReceipt::from_exit_status(
+            &status,
+            std::time::Duration::from_millis(1500),
+            Some(1024),
+            Some(1),
+            None,
+        );
+        assert_eq!(r.exit_code, Some(0));
+        assert!(r.oom_suspected, "a cgroup oom_kill delta marks OOM");
+        assert!((r.elapsed_s - 1.5).abs() < 1e-9);
+        assert_eq!(r.peak_rss_kib, Some(1024));
+        assert_eq!(r.olean_sha256, None);
+    }
+
+    #[test]
+    fn test_cgroup_oom_kill_delta_when_counter_appears_mid_run() {
+        assert_eq!(cgroup_oom_kill_delta(None, Some(1)), Some(1));
+        assert_eq!(cgroup_oom_kill_delta(None, Some(0)), Some(0));
+        assert_eq!(cgroup_oom_kill_delta(Some(2), Some(5)), Some(3));
+        assert_eq!(cgroup_oom_kill_delta(Some(5), Some(2)), Some(0));
+        assert_eq!(cgroup_oom_kill_delta(Some(2), None), None);
+        assert_eq!(cgroup_oom_kill_delta(None, None), None);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            let status = std::process::ExitStatus::from_raw(0);
+            let delta = cgroup_oom_kill_delta(None, Some(1));
+            let receipt = BuildReceipt::from_exit_status(
+                &status,
+                std::time::Duration::from_millis(250),
+                Some(2048),
+                delta,
+                None,
+            );
+            assert_eq!(receipt.cgroup_oom_kill, Some(1));
+            assert!(receipt.oom_suspected);
+        }
+    }
+
+    #[test]
+    fn test_resolve_effective_cgroup_v2_max_does_not_fall_through_to_v1() {
+        // Parse v1 memory path including multi-controller lines and traversal rejection.
+        assert_eq!(
+            parse_proc_self_cgroup_v1_memory_path("12:memory:/app.scope\n"),
+            Some("/app.scope".to_string())
+        );
+        assert_eq!(
+            parse_proc_self_cgroup_v1_memory_path("4:cpu,memory:/sub/job\n0::/svc.scope\n"),
+            Some("/sub/job".to_string())
+        );
+        assert_eq!(
+            parse_proc_self_cgroup_v1_memory_path("12:memory:/../etc\n"),
+            None
+        );
+
+        // v2 `memory.max` == `max` MUST NOT fall through to v1 `memory/memory.limit_in_bytes`.
+        let root = cgroup_fixture_root("v2_max_no_v1_fallthrough");
+        fs::create_dir_all(root.join("user.slice/job.scope")).unwrap();
+        fs::create_dir_all(root.join("memory/app.scope")).unwrap();
+        fs::write(root.join("user.slice/memory.max"), "max\n").unwrap();
+        fs::write(root.join("user.slice/job.scope/memory.max"), "max\n").unwrap();
+        fs::write(root.join("memory/memory.limit_in_bytes"), "1073741824\n").unwrap();
+        fs::write(
+            root.join("memory/app.scope/memory.limit_in_bytes"),
+            "536870912\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_effective_cgroup_memory_max_bytes_at(
+                &root,
+                Some("0::/user.slice/job.scope\n"),
+            ),
+            None,
+            "v2 memory.max=max must stay unlimited and not fall through to v1"
+        );
+        assert_eq!(
+            resolve_effective_cgroup_memory_max_bytes_at(
+                &root,
+                Some("12:memory:/app.scope\n0::/user.slice/job.scope\n"),
+            ),
+            None,
+            "hybrid /proc/self/cgroup with v2 memory.max=max must not fall through to v1"
+        );
+
+        // Pure unified v2 root (has `cgroup.controllers`, no `memory.max` at `/`) also skips v1.
+        let v2_root_only = cgroup_fixture_root("v2_unified_root");
+        fs::create_dir_all(v2_root_only.join("memory")).unwrap();
+        fs::write(v2_root_only.join("cgroup.controllers"), "cpu memory io\n").unwrap();
+        fs::write(
+            v2_root_only.join("memory/memory.limit_in_bytes"),
+            "1073741824\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_effective_cgroup_memory_max_bytes_at(&v2_root_only, Some("0::/\n")),
+            None
+        );
+
+        // Pure cgroup v1 (no v2 memory.max, no cgroup.controllers) resolves v1 ancestor walk cleanly.
+        let v1_root = cgroup_fixture_root("v1_only");
+        fs::create_dir_all(v1_root.join("memory/app.scope")).unwrap();
+        fs::write(
+            v1_root.join("memory/memory.limit_in_bytes"),
+            "4294967296\n",
+        )
+        .unwrap();
+        fs::write(
+            v1_root.join("memory/app.scope/memory.limit_in_bytes"),
+            "2147483648\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_effective_cgroup_memory_max_bytes_at(&v1_root, Some("12:memory:/app.scope\n")),
+            Some(2_147_483_648)
+        );
+        // Tighter root limit wins in v1 ancestor walk too.
+        fs::write(
+            v1_root.join("memory/memory.limit_in_bytes"),
+            "1073741824\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_effective_cgroup_memory_max_bytes_at(&v1_root, Some("12:memory:/app.scope\n")),
+            Some(1_073_741_824)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&v2_root_only);
+        let _ = fs::remove_dir_all(&v1_root);
+    }
+
+    #[test]
+    fn test_resolve_historical_peak_rss_mb_env_receipt_and_project_cache() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var_os("TURBO_LEAN_HOME");
+        let prev_peak = std::env::var_os("TURBO_LEAN_HISTORICAL_PEAK_RSS_MB");
+        let dir = cgroup_fixture_root("hist_peak");
+        let project = dir.join("proj");
+        let cache = dir.join("cache");
+        let receipt_path = dir.join("prev_receipt.json");
+        fs::create_dir_all(&project).unwrap();
+        std::env::set_var("TURBO_LEAN_HOME", &cache);
+        std::env::remove_var("TURBO_LEAN_HISTORICAL_PEAK_RSS_MB");
+
+        // Initially unknown.
+        assert_eq!(
+            resolve_historical_peak_rss_mb(Some(&project), Some(&receipt_path)),
+            None
+        );
+
+        // Persisted project cache feeds historical peak (28 GiB vs 8 GiB cgroup rejects).
+        record_project_peak_rss_kib(&project, 28_467 * 1024);
+        assert_eq!(
+            resolve_historical_peak_rss_mb(Some(&project), Some(&receipt_path)),
+            Some(28_467)
+        );
+        let err = preflight_memory_guard(
+            "turbo-lean build (proj)",
+            resolve_historical_peak_rss_mb(Some(&project), Some(&receipt_path)),
+            None,
+            Some(8 * 1024 * 1024 * 1024),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("28467"), "{err}");
+        assert!(err.contains("8192"), "{err}");
+
+        // A later small (cache-hit) run never lowers the recorded high-water peak.
+        record_project_peak_rss_kib(&project, 200 * 1024);
+        assert_eq!(read_project_peak_rss_mb(&project), Some(28_467));
+        record_project_peak_rss_kib(&project, 0);
+        assert_eq!(read_project_peak_rss_mb(&project), Some(28_467));
+        // A larger run raises it.
+        record_project_peak_rss_kib(&project, 30_000 * 1024);
+        assert_eq!(read_project_peak_rss_mb(&project), Some(30_000));
+
+        // A prior receipt rewritten by a small cache-hit run cannot hide the project peak.
+        write_build_receipt_atomic(
+            &receipt_path,
+            &BuildReceipt {
+                exit_code: Some(0),
+                peak_rss_kib: Some(200 * 1024),
+                ..BuildReceipt::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_historical_peak_rss_mb(Some(&project), Some(&receipt_path)),
+            Some(30_000)
+        );
+
+        // A prior receipt with a larger peak (e.g. from another host's cache) wins.
+        write_build_receipt_atomic(
+            &receipt_path,
+            &BuildReceipt {
+                exit_code: Some(137),
+                signal: None,
+                peak_rss_kib: Some(40_000 * 1024),
+                cgroup_oom_kill: Some(1),
+                elapsed_s: 12.0,
+                olean_sha256: None,
+                oom_suspected: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_historical_peak_rss_mb(Some(&project), Some(&receipt_path)),
+            Some(40_000)
+        );
+
+        // Explicit env override takes highest precedence.
+        std::env::set_var("TURBO_LEAN_HISTORICAL_PEAK_RSS_MB", "32000");
+        assert_eq!(
+            resolve_historical_peak_rss_mb(Some(&project), Some(&receipt_path)),
+            Some(32_000)
+        );
+
+        match prev_home {
+            Some(v) => std::env::set_var("TURBO_LEAN_HOME", v),
+            None => std::env::remove_var("TURBO_LEAN_HOME"),
+        }
+        match prev_peak {
+            Some(v) => std::env::set_var("TURBO_LEAN_HISTORICAL_PEAK_RSS_MB", v),
+            None => std::env::remove_var("TURBO_LEAN_HISTORICAL_PEAK_RSS_MB"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_invocation_receipt_propagates_child_sigkill_and_exit_137() {
+        use std::os::unix::process::ExitStatusExt;
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_recorded_child_exit_status();
+
+        // Lower-severity exit 1 followed by SIGKILL: SIGKILL wins; subsequent exit 1 does not overwrite it.
+        let sigkill_out = std::process::Command::new("/bin/sh")
+            .args(["-c", "kill -KILL $$"])
+            .output()
+            .unwrap();
+        let exit1_status = std::process::ExitStatus::from_raw(1 << 8);
+        record_child_exit_status(exit1_status);
+        record_child_exit_status(sigkill_out.status);
+        record_child_exit_status(exit1_status);
+        let recorded = take_recorded_child_exit_status().expect("SIGKILL recorded");
+        assert_eq!(recorded.signal(), Some(libc::SIGKILL));
+
+        let r_sigkill = BuildReceipt::for_invocation(
+            false,
+            None,
+            Some(&recorded),
+            None,
+            std::time::Duration::from_millis(500),
+            Some(4096),
+            None,
+            None,
+        );
+        assert_eq!(r_sigkill.signal, Some(libc::SIGKILL));
+        assert_eq!(r_sigkill.exit_code, None);
+        assert!(r_sigkill.oom_suspected, "SIGKILL must mark oom_suspected");
+
+        // Wrapped child exiting with 137 (128 + SIGKILL) also marks oom_suspected.
+        let exit137_out = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 137"])
+            .output()
+            .unwrap();
+        let r_137 = BuildReceipt::for_invocation(
+            false,
+            None,
+            Some(&exit137_out.status),
+            None,
+            std::time::Duration::from_millis(500),
+            Some(4096),
+            None,
+            None,
+        );
+        assert_eq!(r_137.exit_code, Some(137));
+        assert_eq!(r_137.signal, None);
+        assert!(r_137.oom_suspected, "exit 137 must mark oom_suspected");
+
+        // Successful invocation does not inherit a stale child failure.
+        let r_ok = BuildReceipt::for_invocation(
+            true,
+            None,
+            Some(&recorded),
+            None,
+            std::time::Duration::from_millis(100),
+            Some(1024),
+            Some(0),
+            None,
+        );
+        assert_eq!(r_ok.exit_code, Some(0));
+        assert_eq!(r_ok.signal, None);
+        assert!(!r_ok.oom_suspected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_recovered_child_sigkill_does_not_bleed_into_later_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_recorded_child_exit_status();
+        let sigkill = std::process::ExitStatus::from_raw(libc::SIGKILL);
+        let exit1 = std::process::ExitStatus::from_raw(1 << 8);
+
+        // A worker is SIGKILLed, respawned and the retry succeeds: the crash is withdrawn.
+        record_child_exit_status(sigkill);
+        forgive_child_exit_status(&sigkill);
+        // Later, an unrelated ordinary elaboration failure terminates the invocation.
+        record_child_exit_status(exit1);
+        let recorded = take_recorded_child_exit_status().expect("exit 1 recorded");
+        assert_eq!(recorded.code(), Some(1));
+        let r = BuildReceipt::for_invocation(
+            false,
+            None,
+            Some(&recorded),
+            None,
+            std::time::Duration::from_millis(10),
+            None,
+            Some(0),
+            None,
+        );
+        assert_eq!(r.exit_code, Some(1));
+        assert_eq!(r.signal, None);
+        assert!(
+            !r.oom_suspected,
+            "a recovered SIGKILL must not mark a later failure as OOM"
+        );
+
+        // Only the recovered instance is withdrawn: an unrecovered second SIGKILL still wins.
+        record_child_exit_status(sigkill);
+        record_child_exit_status(sigkill);
+        forgive_child_exit_status(&sigkill);
+        record_child_exit_status(exit1);
+        assert_eq!(
+            take_recorded_child_exit_status().and_then(|s| s.signal()),
+            Some(libc::SIGKILL)
+        );
+        // `take` drains the ledger; forgiving an unknown status is a no-op.
+        forgive_child_exit_status(&exit1);
+        assert_eq!(take_recorded_child_exit_status(), None);
+
+        // A failure with no recorded child (pure elaboration error) is a plain exit 1.
+        let r = BuildReceipt::for_invocation(
+            false,
+            None,
+            None,
+            None,
+            std::time::Duration::from_millis(10),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(r.exit_code, Some(1));
+        assert!(!r.oom_suspected);
+    }
+
+    #[test]
+    fn test_sha256_file_hex_known_vector() {
+        let dir = cgroup_fixture_root("sha");
+        let p = dir.join("abc");
+        fs::write(&p, b"abc").unwrap();
+        assert_eq!(
+            sha256_file_hex(&p).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

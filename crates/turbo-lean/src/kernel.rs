@@ -531,6 +531,9 @@ fn classify_con_leche_status(
     stdout: String,
     stderr: String,
 ) -> Result<ConLecheRunReport> {
+    if !status.success() {
+        crate::shm_cache::record_child_exit_status(status);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;

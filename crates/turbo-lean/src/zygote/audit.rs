@@ -609,10 +609,7 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
         ensure_live_closure_matches_snapshot(&snap, "audit_complete")?;
         return Ok(Some(snap));
     }
-    let parallelism = std::env::var("TURBO_LEAN_JOBS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
+    let parallelism = super::replay_jobs_env()
         .unwrap_or_else(|| {
             let cores = std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -787,10 +784,7 @@ pub(crate) fn replay_and_audit_modules_with_zygote_snapshot(
     if !sorted_audit.is_empty() {
         let batch_sz = audit_batch_size().max(32);
         let chunks: Vec<&[String]> = sorted_audit.chunks(batch_sz).collect();
-        let parallelism = std::env::var("TURBO_LEAN_JOBS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
+        let parallelism = super::replay_jobs_env()
             .unwrap_or_else(|| {
                 std::thread::available_parallelism()
                     .map(|n| n.get())
@@ -1092,15 +1086,11 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
     let worker_budget = if is_untrusted {
         1
     } else {
-        std::env::var("TURBO_LEAN_JOBS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4)
-            })
+        super::replay_jobs_env().unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        })
     };
     let explicit_batch_cap = std::env::var("TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE")
         .ok()
@@ -1177,15 +1167,15 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
                 String::from_utf8_lossy(&single_out.stderr).trim()
             );
         }
+        // Every module of the failed closure replayed alone: the closure child's failure (often
+        // an OOM `SIGKILL` of a too-large batch) was recovered and must not mark this run.
+        crate::shm_cache::forgive_child_exit_status(&out.status);
         Ok(())
     };
     let parallelism = if is_untrusted {
         1
     } else {
-        std::env::var("TURBO_LEAN_JOBS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
+        super::replay_jobs_env()
             .unwrap_or_else(|| {
                 std::thread::available_parallelism()
                     .map(|n| n.get())

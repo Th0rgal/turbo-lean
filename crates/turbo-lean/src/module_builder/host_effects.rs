@@ -338,6 +338,9 @@ pub(crate) fn run_command_with_timeout_pinned_fd(
     let mut poll_iter = 0u32;
     loop {
         if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                crate::shm_cache::record_child_exit_status(status);
+            }
             #[cfg(unix)]
             {
                 let pgid = child.id() as i32;
@@ -1496,6 +1499,7 @@ pub(super) fn run_audit_chunk_subprocess(
     let out =
         run_command_with_timeout_pinned_fd(&mut cmd, timeout, is_untrusted, pinned_dir_raw_fd);
     record_scheduler_test_event("audit_subprocess_end", mod_names);
+    let chunk_status = out.as_ref().ok().map(|o| o.status);
     match out.and_then(|o| parse_worker_audit_reply(&o, mod_names)) {
         Ok(()) => Ok(()),
         Err(_) if mod_names.len() > 1 => {
@@ -1519,7 +1523,12 @@ pub(super) fn run_audit_chunk_subprocess(
                 is_untrusted,
                 skip_child_replay,
                 pinned_dir_raw_fd,
-            )
+            )?;
+            // Both halves audited cleanly: the batch child's failure was recovered.
+            if let Some(st) = chunk_status {
+                crate::shm_cache::forgive_child_exit_status(&st);
+            }
+            Ok(())
         }
         Err(e) => Err(e),
     }
