@@ -958,7 +958,7 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
                     // The line ends with `in`: either the COMMAND form modifying the
                     // declaration on the next line, or a multiline term-level `in`.
                     let after = if nl_end < src.len() { nl_end + 1 } else { src.len() };
-                    if next_nonblank_line_starts_decl(src, after) {
+                    if next_nonblank_line_starts_decl(&src, after) {
                         // Command form: not part of this body; nothing was cut.
                         break;
                     }
