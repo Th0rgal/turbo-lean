@@ -2618,6 +2618,27 @@ def _compare_committed_toolchain(committed: Any, errors: list[str]) -> None:
         )
 
 
+def _compare_toolchain_file(root_dir: Path, errors: list[str]) -> None:
+    """Refuse a PINNED_TOOLCHAIN other than the toolchain `lean/lean-toolchain` names.
+
+    The measurement runs `lake` in `lean/`, so elan builds and runs it with the
+    toolchain that file names, while the results record PINNED_TOOLCHAIN. With
+    the committed-toolchain comparison this holds the committed value, the
+    constant and the file equal. A root without the file (a sparse test
+    fixture) is not compared; every checkout tracks it.
+    """
+    path = root_dir / "lean" / "lean-toolchain"
+    if not path.is_file():
+        return
+    named = path.read_text(encoding="utf-8").strip()
+    if named != PINNED_TOOLCHAIN:
+        errors.append(
+            f"lean/lean-toolchain names {named!r} but PINNED_TOOLCHAIN is {PINNED_TOOLCHAIN!r}, "
+            "so the measurement runs under a toolchain the results do not record (update "
+            "PINNED_TOOLCHAIN and re-run --write-results)"
+        )
+
+
 def check_coverage_report(
     root_dir: Path = ROOT_DIR,
     report: dict[str, Any] | None = None,
@@ -2633,6 +2654,7 @@ def check_coverage_report(
     for rel in rep.get("bridge_source_digests", {}):
         if not (root_dir / rel).is_file():
             errors.append(f"Missing tracked bridge file: {rel}")
+    _compare_toolchain_file(root_dir, errors)
 
     for row in rep["lcnf_constructor_matrix"]["rows"]:
         ev_file = root_dir / row["evidence_file"]
@@ -3328,6 +3350,34 @@ class TestLcnfCoverage(unittest.TestCase):
         # The --check path still names the mismatch once.
         chk = check_coverage_report(ROOT_DIR, rep, results=bumped)
         self.assertEqual(len(gate_errors(chk["errors"])), 1, chk["errors"])
+
+    def test_check_and_json_refuse_a_pinned_toolchain_lean_does_not_build_with(self) -> None:
+        # The measurement runs `lake` in lean/, so elan uses the toolchain
+        # lean/lean-toolchain names, while the results record PINNED_TOOLCHAIN.
+        # Nothing tied the two: a bump of lean/lean-toolchain alone left the
+        # old toolchain's committed counts passing --json. Both paths now hold
+        # the file equal to the constant.
+        rep = self._v_fake_live_report()
+        baseline = self._v_committed_baseline()
+
+        def gate_errors(errors: list[str]) -> list[str]:
+            return [e for e in errors if "lean/lean-toolchain" in e]
+
+        named = (ROOT_DIR / "lean" / "lean-toolchain").read_text(encoding="utf-8").strip()
+        self.assertEqual(named, PINNED_TOOLCHAIN)
+        self.assertEqual(gate_errors(check_coverage_report(ROOT_DIR, rep, results=baseline)["errors"]), [])
+        with tempfile.TemporaryDirectory(prefix="lcnf-toolchain-file-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            (root / "lean").mkdir()
+            (root / "scripts" / "lcnf_coverage_results.json").write_text(json.dumps(baseline), encoding="utf-8")
+            for text, want_gate_error in (("leanprover/lean4:v4.36.0\n", True), (PINNED_TOOLCHAIN + "\n", False)):
+                (root / "lean" / "lean-toolchain").write_text(text, encoding="utf-8")
+                for chk in (
+                    check_coverage_report(root, rep, compare_results_digests=True),
+                    check_coverage_report(root, rep, results=baseline),
+                ):
+                    self.assertEqual(bool(gate_errors(chk["errors"])), want_gate_error, chk["errors"])
 
     def test_write_results_records_the_external_revision(self) -> None:
         # The live external entry names the revision its measurement verified
