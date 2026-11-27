@@ -142,25 +142,40 @@ _BATTERIES_CACHE: dict[str, dict[str, Any]] = {}
 # The committed results pin the sha256 of every tracked bridge/semantics/proof
 # source they were measured from (`bridge_file_sha256` in
 # `scripts/lcnf_coverage_results.json`, written by `--write-results` and gated
-# by `--check`). The script itself carries no hard-coded digest: editing a
-# tracked file fails `--check` against the committed results until the
-# measurement is regenerated, and L1-L3 bridge PRs regenerate the JSON instead
-# of hand-editing this script. The same file pins `classifier_source_sha256`,
+# by `--check` and `--json`). The tracked set is the lowering's bridge sources
+# with the helpers they take operator tables and ground-type lowering from
+# (RealLCNFShared.lean), the semantics the bridge proofs are stated in, and the
+# proofs the `proved` counts rest on. It is not the whole import cone of
+# LeanNative.IR.Bridge: the IR data types and codec (AST, Types, LCNF, Codec),
+# Semantics/, Transform/, Backend/, Frontend/ProofRetention.lean and the
+# SymbolicTV, loop-opt and peephole proofs are unpinned, so an edit there
+# reaches the committed counts only through `--check`'s live re-measure. The
+# script itself carries no hard-coded digest: editing a tracked file fails
+# `--check` against the committed results until the measurement is
+# regenerated, and L1-L3 bridge PRs regenerate the JSON instead of hand-editing
+# this script. The same file pins `classifier_source_sha256`,
 # the digest of this script's own audit drivers and facts path
 # (`classifier_source_digest`), and the `commit_sha` each external corpus was
 # measured at (`PINNED_EXTERNAL_REVISIONS`); `--json` gates both too.
 TRACKED_BRIDGE_FILES: tuple[str, ...] = (
     "lean/LeanNative/IR/Bridge.lean",
     "lean/LeanNative/IR/RealLCNFBridge.lean",
+    "lean/LeanNative/IR/RealLCNFShared.lean",
     "lean/LeanNative/IR/RealLCNFSemantics.lean",
+    "lean/LeanNative/IR/RealLCNFCallSemantics.lean",
     "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean",
+    "lean/LeanNative/Proofs/LowerCalls.lean",
     "lean/LeanNative/IR/BridgeHelpers.lean",
 )
-# Every split helper module under these directories is tracked too (the S3a
-# split moved the helper bodies out of BridgeHelpers.lean); a helper file
-# added or removed changes the tracked set and fails `--check` until the
-# committed results are re-measured.
-TRACKED_BRIDGE_DIRS: tuple[str, ...] = ("lean/LeanNative/IR/BridgeHelpers",)
+# Every module directly under these directories is tracked too: the S3a split
+# moved the helper bodies out of BridgeHelpers.lean, and RealLCNFBridgeProofs.lean
+# is a re-export of the proof split under Proofs/RealLCNFBridge/. A module
+# added or removed there changes the tracked set and fails `--check` and
+# `--json` until the committed results are re-measured.
+TRACKED_BRIDGE_DIRS: tuple[str, ...] = (
+    "lean/LeanNative/IR/BridgeHelpers",
+    "lean/LeanNative/Proofs/RealLCNFBridge",
+)
 # Everything the measurement compiles or executes: the Lean tree (the tracked
 # bridge dirs included, so an untracked `*.lean` stray shows as `??`), this
 # script with its embedded audit driver, the C1 generators, and the C2 lake
@@ -637,8 +652,9 @@ def _tracked_bridge_paths(root_dir: Path = ROOT_DIR) -> list[str]:
 
     The static `TRACKED_BRIDGE_FILES` plus every git-tracked `*.lean` directly
     under the `TRACKED_BRIDGE_DIRS` directories (`git ls-files`, so a scratch
-    or dotfile `.lean` stray never joins the measured set), following the S3a
-    BridgeHelpers/ split without hand-editing a list. Outside a git work tree
+    or dotfile `.lean` stray never joins the measured set), following the
+    BridgeHelpers/ and Proofs/RealLCNFBridge/ splits without hand-editing a
+    list. Outside a git work tree
     (test fixture roots), the direct-children filesystem glob is the fallback.
     """
     paths = set(TRACKED_BRIDGE_FILES)
@@ -2062,7 +2078,8 @@ def build_live_corpora(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
 def _classifier_source_texts() -> list[str]:
     """The source of everything in this script that decides a declaration's class.
 
-    The bridge-file digests pin only the Lean sources, so without this an edit
+    The bridge-file digests pin the tracked Lean files (TRACKED_BRIDGE_FILES and
+    TRACKED_BRIDGE_DIRS), not this script, so without this an edit
     to the audit drivers or to the Python facts path would pass `--json`
     against committed counts the edited code never produced; CI builds no
     `Batteries` tree and cannot re-measure. Covered: the two Lean drivers and
@@ -3043,6 +3060,39 @@ class TestLcnfCoverage(unittest.TestCase):
             any("NotTracked.lean" in e and "not tracked" in e for e in chk["errors"]),
             chk["errors"],
         )
+
+    def test_tracked_set_covers_the_shared_helpers_and_the_proof_split(self) -> None:
+        # The lowerer imports RealLCNFShared.lean for its operator tables,
+        # width and mask helpers and ground-type lowering, so an edit there
+        # changes the lowering behind every committed count. The `proved` rule
+        # rests on lowerRealLCNFDecl_soundF (Proofs/LowerCalls.lean), on the
+        # call semantics its conclusion is stated in, and on the proof split
+        # that RealLCNFBridgeProofs.lean, a one-line re-export, imports. All of
+        # them are pinned, the split by directory like the BridgeHelpers/ one.
+        tracked = set(_tracked_bridge_paths(ROOT_DIR))
+        for rel in (
+            "lean/LeanNative/IR/RealLCNFShared.lean",
+            "lean/LeanNative/IR/RealLCNFCallSemantics.lean",
+            "lean/LeanNative/Proofs/LowerCalls.lean",
+        ):
+            self.assertIn(rel, tracked)
+        split = subprocess.run(
+            ["git", "ls-files", "--", "lean/LeanNative/Proofs/RealLCNFBridge"],
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        self.assertIn("lean/LeanNative/Proofs/RealLCNFBridge/CallsF.lean", split)
+        self.assertLessEqual(set(split), tracked)
+        # The re-export pins nothing by itself, so what it imports is pinned.
+        reexport = (ROOT_DIR / "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean").read_text(
+            encoding="utf-8"
+        )
+        imported = [line.split()[1] for line in reexport.splitlines() if line.startswith("import LeanNative.")]
+        self.assertTrue(imported)
+        for mod in imported:
+            self.assertIn(f"lean/{mod.replace('.', '/')}.lean", tracked)
 
     def test_check_and_json_refuse_classifier_source_drift(self) -> None:
         # The bridge-file digests pin only Lean sources, so an edit to the audit
