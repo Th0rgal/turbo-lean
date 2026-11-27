@@ -2113,7 +2113,9 @@ impl AuditSpecPolicyConfig {
             extra_forbid_namespaces,
             extra_forbid_decl_kinds,
         )
-        .unwrap_or_default()
+        .unwrap_or_else(|err| {
+            panic!("audit-spec policy config failed closed (never silently default): {err:#}")
+        })
     }
 
     pub fn try_parse_config_str(text: &str) -> Result<Option<Self>> {
@@ -2145,6 +2147,14 @@ impl AuditSpecPolicyConfig {
                 !(has_underscore && has_hyphen),
                 "Config cannot specify both `audit_spec` and `audit-spec`"
             );
+            if has_underscore || has_hyphen {
+                for key in obj.keys() {
+                    anyhow::ensure!(
+                        key == "audit_spec" || key == "audit-spec",
+                        "JSON audit-spec config must not contain top-level entries other than the `audit_spec`/`audit-spec` object, found `{key}`"
+                    );
+                }
+            }
             let target_val = if has_underscore {
                 obj["audit_spec"].clone()
             } else if has_hyphen {
@@ -2196,7 +2206,12 @@ impl AuditSpecPolicyConfig {
     }
 
     pub fn parse_config_str(text: &str) -> Option<Self> {
-        Self::try_parse_config_str(text).ok().flatten()
+        match Self::try_parse_config_str(text) {
+            Ok(cfg) => cfg,
+            Err(err) => panic!(
+                "audit-spec config failed closed (unknown keys are never silently ignored): {err:#}"
+            ),
+        }
     }
 
     pub fn effective_forbidden_for_path(
@@ -5113,6 +5128,64 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
     }
 
     #[test]
+    fn audit_spec_toml_typo_key_wrappers_fail_closed() {
+        let typo_toml = "[audit_spec]\npolicy = \"default\"\nreject_identity_stub = true\n";
+        // The convenience parse wrapper must fail closed on the same typo key
+        // instead of silently flattening the error into `None` (fail-open).
+        let wrapper = std::panic::catch_unwind(|| {
+            AuditSpecPolicyConfig::parse_config_str(typo_toml)
+        });
+        match wrapper {
+            Ok(Some(cfg)) => panic!("typo-key config silently parsed as {cfg:?}"),
+            Ok(None) => {
+                panic!("parse_config_str silently ignored a typo key in [audit_spec]")
+            }
+            Err(payload) => {
+                let msg = panic_message(&payload);
+                assert!(
+                    msg.contains("reject_identity_stub"),
+                    "fail-closed error must name the typo key, got: {msg}"
+                );
+            }
+        }
+
+        // The file-based convenience loader must not silently degrade a
+        // project config with a typo key to the default policy.
+        let root = std::env::temp_dir().join(format!(
+            "turbo_a1_audit_spec_typo_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let spec = root.join("Spec.lean");
+        fs::write(&spec, "theorem good_spec (n : Nat) (h : n > 0) : n >= 1 := by omega\n").unwrap();
+        fs::write(root.join("turbo-lean.toml"), typo_toml).unwrap();
+        let loaded = std::panic::catch_unwind(|| {
+            AuditSpecPolicyConfig::load_for_target(&spec, None, None, &[], &[])
+        });
+        match loaded {
+            Ok(cfg) => {
+                let _ = fs::remove_dir_all(&root);
+                panic!(
+                    "load_for_target silently degraded a typo'd turbo-lean.toml to default policy {:?}",
+                    cfg.policy
+                )
+            }
+            Err(_) => {}
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+        payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[test]
     fn audit_spec_project_toml_near_miss_table_name_fails_closed() {
         for name in ["audit_specs", "audit-spce", "auditspecs"] {
             let err = AuditSpecPolicyConfig::try_parse_config_str(&format!("[{name}]\nx = 1\n"))
@@ -5147,6 +5220,67 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
                 "clear error must name the sibling entry `{name}`: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn audit_spec_json_sibling_top_level_keys_fail_closed() {
+        for (extra, name) in [
+            ("\"unrelated\": true", "unrelated"),
+            ("\"stray\": {\"allow\": []}", "stray"),
+            ("\"audit_specs\": true", "audit_specs"),
+        ] {
+            let text =
+                format!("{{\"audit_spec\": {{\"policy\": \"default\"}}, {extra}}}");
+            let err = AuditSpecPolicyConfig::try_parse_config_str(&text).expect_err(
+                "a JSON audit-spec config with top-level entries beside the `audit_spec`/`audit-spec` object must fail closed, never be silently ignored",
+            );
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(name),
+                "clear error must name the sibling entry `{name}`: {msg}"
+            );
+        }
+
+        // A near-miss with no exact `audit_spec`/`audit-spec` key already fails
+        // closed at the top level via `deny_unknown_fields`.
+        let near = AuditSpecPolicyConfig::try_parse_config_str(
+            "{\"audit-specs\": {\"policy\": \"default\"}}",
+        )
+        .expect_err("a near-miss `audit-specs` JSON key must fail closed");
+        assert!(
+            format!("{near:#}").contains("audit-specs"),
+            "clear error must name the near-miss key: {near:#}"
+        );
+
+        // The file loader must fail closed on the same typo'd JSON config
+        // instead of silently running the audit with the parsed policy.
+        let root = std::env::temp_dir().join(format!(
+            "turbo_a1j_audit_spec_json_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let spec = root.join("Spec.lean");
+        fs::write(&spec, "theorem good_spec (n : Nat) (h : n > 0) : n >= 1 := by omega\n").unwrap();
+        let cfg_path = root.join("audit-spec.json");
+        fs::write(&cfg_path, "{\"audit_spec\": {\"policy\": \"default\"}, \"reject_identity_stub\": true}\n")
+            .unwrap();
+        let err = AuditSpecPolicyConfig::try_load_for_target(
+            &spec,
+            None,
+            Some(&cfg_path),
+            &[],
+            &[],
+        )
+        .expect_err(
+            "a JSON config whose top level has an entry beside `audit_spec` must fail closed in the loader",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reject_identity_stub"),
+            "fail-closed loader error must name the sibling key, got: {msg}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
