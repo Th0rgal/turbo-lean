@@ -72,8 +72,13 @@
 
 ## 4. The proved bridge (what the above are used for)
 
-- `theorem lowerRealLCNFDecl_sound`, `lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean:479` — the
-  statement `roadmap/HORIZONS.md` cites as the one proved `LCNF → LNIR` path.
+- `theorem lowerRealLCNFDecl_sound`, `lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean:590` — the
+  declaration-level `LCNF → LNIR` theorem for declarations with no local call, frozen by
+  `lean/LeanNative/SpecLocked.lean` (§8 item 2).
+- `theorem lowerRealLCNFDecl_soundF`, `lean/LeanNative/Proofs/LowerCalls.lean:1410` — L2's
+  generalization to declarations whose local calls resolve, without recursion, to declarations in a
+  lowered environment (`DeclEnvLowers`, `CtxMapsEnv`); with an empty environment it collapses to
+  `lowerRealLCNFDecl_sound`.
 - Per-case proof modules: `lean/LeanNative/Proofs/RealLCNFBridge/{CtorIntrinsic,CtorScalarCall,JpTag,LetValue,Scalar}.lean`.
 - Static axiom scan (this pass, no build): `grep -c "^axiom"` returns **0** in
   `Proofs/RealLCNFBridgeProofs.lean`, `IR/RealLCNFBridge.lean`, `IR/RealLCNFSemantics.lean`, and
@@ -124,9 +129,15 @@
    on v4.35.0); the file-level SHA-256 is recorded in the freezing commit.
 3. The generated coverage matrix is a measurement, not a proof (`H1.0`): `scripts/lcnf_coverage.py`
    runs the real lowerer over its corpora, the committed results (`scripts/lcnf_coverage_results.json`,
-   measured at `19ae99c`) pin the bridge-source digests, and CI's `verify` job emits the JSON. A
-   declaration counts as `proved` when the proved path lowers it with no local call, so
-   `lowerRealLCNFDecl_sound` applies to it; the count does not re-check that theorem.
+   measured at `138b287`) pin the bridge-source digests and the digest of the script's own audit
+   drivers and classifier, and CI's `verify` job emits the JSON. A declaration counts as `proved`
+   when the proved path lowers it with no local call, so `lowerRealLCNFDecl_sound` applies to it, or
+   when `lowerRealLCNFDecl_soundF` (§4) applies to its local calls: everything it reaches lowers,
+   sits on no call cycle, makes no self-call, and passes only `.fvar` arguments, and their lowered
+   names are unreserved (a copy of `reservedRuntimeName`), equal to the name each caller's map holds
+   (`mangleDeclNameInEnv`), and pairwise distinct. The count does not re-check either theorem, and
+   those copied name checks are assumed to match the proof's definitions (a test pins the
+   `reservedRuntimeName` copies to `CallsF.lean`).
 4. The `Contract V4 M2`/`M3` theorems are stated over the in-repo `"OLEN"` v1 model — `ConLeche.lean`
    says so in-file (`lean/TurboLean/ConLeche.lean:7,12`: "binary `"OLEN"` v1 … shard model format,
    NOT raw Lean 4 `.olean`"), as does the root `README.md:42`; the proof against real `.olean`
