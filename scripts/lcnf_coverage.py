@@ -35,7 +35,10 @@ Methodology & Honesty Rules:
   (the `DeclEnvLowers` and `CtxMapsEnv` hypotheses). Any other lowered declaration with a local
   call stays `lowered_unproved` (`lowered_vacuous_local_call`), and a callee the facts do not cover
   never counts as qualifying. `auditMods` (Lean) and `_classify_decl_facts` (the sharded `Batteries`
-  path) implement the same rule, and a test runs both on one compiled fixture.
+  path) implement the same rule, and the L2 tests run both on each compiled fixture. The facts line
+  percent-escapes every name: the pinned `Batteries` compiles declarations whose names hold `,`
+  (`«term∃ᵉ_,_»._closed_5`), and an unescaped callee list split them into names with no facts row
+  (`test_shard_facts_carry_comma_named_declarations_exactly`).
 - Local calls are found by a walk over every impure-code constructor (`codeLocalCallSites`, with the
   arms of the call graph's `codeHasSelfTailCall`). An earlier walk stopped at the first `inc`, `dec`,
   `del`, `oset`, `uset`, `sset` or `setTag` and so counted some declarations that call helpers as
@@ -763,9 +766,9 @@ partial def declInMutualCycle (declMap : Std.HashMap Name (List Name)) (target :
 def auditReservedRuntimeName (s : String) : Bool :=
   s.startsWith "lean_native_" || s == "lean_mark_mt"
 
-/-- A name as a facts row carries it: `%`, `|` and `,` are percent-escaped, so no field
-    separator (`|` between fields, `,` inside the callee list) survives, and two names are
-    equal exactly when their escapes are. The facts comparisons rely on that injectivity. -/
+/-- A name as the shard facts line carries it: `%`, `|` and `,` are percent-escaped, so no
+    field separator (`|` between fields, `,` inside the callee list) survives, and the escape
+    is injective, so the parser's `_unescape_facts_name` recovers the name exactly. -/
 def auditEscape (s : String) : String :=
   ((s.replace "%" "%25").replace "|" "%7C").replace "," "%2C"
 
@@ -886,14 +889,14 @@ unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat ×
       match (← runCoreOnEnv env (ingestLCNFImpureDecl d corpusNames .x86_64 true)) with
       | .ok ld =>
         ok := true
-        lowered := auditEscape ld.name
+        lowered := ld.name
       | .error _ => pure ()
     let f : AuditFacts := {
       cyc, ok, lowered
       hasCall := !sites.isEmpty
       selfCall := sites.any (fun s => s.1 == d.name)
       allFVar := sites.all (fun s => s.2)
-      mapped := auditEscape (mangleDeclNameInEnv env d.name)
+      mapped := mangleDeclNameInEnv env d.name
       callees := callGraph.getD d.name [] }
     rows := rows.push (d.name, f)
     facts := facts.insert d.name f
@@ -1516,10 +1519,28 @@ def _is_full_batteries_build(olean_root: Path) -> bool:
 # One per-declaration facts row, as both audit drivers derive it (the Lean `AuditFacts`):
 # (decl name, has_local_call, same-corpus callees minus self, ingest verdict "ok" or
 # "err:<head>", has_self_call, every local call site's arguments are `.fvar`, the mangled
-# name a caller's map holds, the lowered declaration's name or ""). The two symbol names
-# arrive percent-escaped (`auditEscape`); the escape is injective, so comparing them is
-# comparing the names.
+# name a caller's map holds, the lowered declaration's name or ""). Every name is the one
+# the driver holds: the facts line percent-escapes the declaration, callee and symbol names
+# (`auditEscape`) and `_unescape_facts_name` decodes them.
 DeclFacts = tuple[str, bool, list[str], str, bool, bool, str, str]
+
+_FACTS_NAME_ESCAPES = {"25": "%", "7C": "|", "2C": ","}
+
+
+def _unescape_facts_name(field: str) -> str:
+    """Invert the driver's `auditEscape` (`%25`, `%7C`, `%2C`).
+
+    Every `%` in an escaped name starts one of the three escapes, so decoding is
+    unambiguous; any other `%` raises ValueError instead of yielding a guessed name.
+    """
+    head, *rest = field.split("%")
+    out = [head]
+    for piece in rest:
+        code = piece[:2]
+        if code not in _FACTS_NAME_ESCAPES:
+            raise ValueError(f"bad escape %{code} in facts name {field!r}")
+        out.append(_FACTS_NAME_ESCAPES[code] + piece[2:])
+    return "".join(out)
 
 
 def _reserved_runtime_name(name: str) -> bool:
@@ -1669,7 +1690,10 @@ def _lean_shard_facts_driver(all_modules: list[str], shard_modules: list[str]) -
     emission) is restricted to this shard's modules. Each `SHARD_DECL` line is
     one `DeclFacts` row: name | has_local_call | callees | has_self_call |
     all-.fvar call arguments | the name a caller's map holds | the lowered name
-    | ingest verdict (last, as it is free text). The whole-corpus cycle pass and
+    | ingest verdict (last, as it is free text). Every name in the line is
+    percent-escaped (`auditEscape`), so a name holding `,` or `|` (the pinned
+    Batteries compiles some, such as `«term∃ᵉ_,_»._closed_5`) cannot split the
+    callee list or a field. The whole-corpus cycle pass and
     the classification run once in `_classify_decl_facts` over the merged facts.
     Cycle members' ingest verdicts are computed here but ignored by the merger,
     which is sound because each ingest runs in a fresh `runCoreOnEnv` state and
@@ -1717,12 +1741,13 @@ unsafe def main (args : List String) : IO Unit := do
         let (verdict, lowered) := match r with
           | .ok ld => ("ok", auditEscape ld.name)
           | .error e => ("err:" ++ (((e.replace "\\n" " ").replace "|" "/").take 200), "")
-        let calleeStr := String.intercalate "," (callees.map (fun n => n.toString))
+        let calleeStr := String.intercalate "," (callees.map (fun n => auditEscape n.toString))
         let hc := if sites.isEmpty then "0" else "1"
         let sc := if sites.any (fun s => s.1 == d.name) then "1" else "0"
         let af := if sites.all (fun s => s.2) then "1" else "0"
         let mapped := auditEscape (mangleDeclNameInEnv env d.name)
-        IO.println s!"SHARD_DECL:{{d.name}}|{{hc}}|{{calleeStr}}|{{sc}}|{{af}}|{{mapped}}|{{lowered}}|{{verdict}}"
+        let name := auditEscape d.name.toString
+        IO.println s!"SHARD_DECL:{{name}}|{{hc}}|{{calleeStr}}|{{sc}}|{{af}}|{{mapped}}|{{lowered}}|{{verdict}}"
     IO.println s!"PROGRESS ingest {{modName}}"
   IO.println "SHARD_DONE"
 """
@@ -1761,7 +1786,8 @@ def _collect_shard_facts(
 
     Each shard is one `lake env lean --run` of the facts driver. Fail-closed: a
     shard that exits non-zero, omits `SHARD_DONE`, drops or duplicates a
-    module's `SHARD_AUX` line, or emits an unparsable facts line raises; a
+    module's `SHARD_AUX` line, or emits an unparsable facts line (a bad name
+    escape included) raises; a
     failed run is never converted into counts. `TURBO_BATTERIES_AUDIT_WORKERS`
     overrides the worker count; `TURBO_BATTERIES_AUDIT_LOG_DIR` (or `log_dir`)
     streams each shard's stdout to `<dir>/batteries-shard-<i>.log` for
@@ -1829,7 +1855,11 @@ def _collect_shard_facts(
                 if len(parts) != 8 or any(parts[i] not in ("0", "1") for i in (1, 3, 4)):
                     raise RuntimeError(f"unparsable shard facts line: {ln!r}")
                 name, hc, callees_s, sc, af, mapped, lowered, verdict = parts
-                callees = [c for c in callees_s.split(",") if c]
+                try:
+                    name, mapped, lowered = (_unescape_facts_name(s) for s in (name, mapped, lowered))
+                    callees = [_unescape_facts_name(c) for c in callees_s.split(",") if c]
+                except ValueError as exc:
+                    raise RuntimeError(f"unparsable shard facts line: {ln!r} ({exc})") from exc
                 decl_rows.append((name, hc == "1", callees, verdict, sc == "1", af == "1", mapped, lowered))
     missing = sorted(set(modules) - set(aux_by_module))
     if missing:
@@ -4324,12 +4354,11 @@ unsafe def main (args : List String) : IO Unit := do
             self.assertEqual(_reserved_runtime_name(name), want, name)
 
     def test_facts_name_escape_is_injective(self) -> None:
-        # The mapped-equals-lowered and distinct-lowered-names conditions compare
-        # the strings a facts row carries, so they are exact only if the driver's
-        # escape is injective and leaves no field separator behind. Red first: an
-        # escape that replaced `|` and `,` by `/` mapped "a|b", "a,b" and "a/b" to
-        # one string (these 10 inputs gave 7 distinct outputs). The reserved-name
-        # predicate must read an escaped name exactly as the raw one.
+        # The facts line carries every name through the driver's escape and the
+        # parser decodes it, so the facts path sees the driver's names only if
+        # the escape is injective and leaves no field separator behind. Red
+        # first: an escape that replaced `|` and `,` by `/` mapped "a|b", "a,b"
+        # and "a/b" to one string (these 10 inputs gave 7 distinct outputs).
         main_src = """
 unsafe def main (_args : List String) : IO Unit := do
   let raws : List String :=
@@ -4337,14 +4366,28 @@ unsafe def main (_args : List String) : IO Unit := do
   let outs := raws.map auditEscape
   let distinct := (outs.foldl (fun (s : Std.HashSet String) x => s.insert x) {}).size
   let withSep := (outs.filter (fun s => s.contains '|' || s.contains ',')).length
-  let rsvOk := auditReservedRuntimeName (auditEscape "lean_native_x") &&
-    auditReservedRuntimeName (auditEscape "lean_mark_mt") &&
-    !auditReservedRuntimeName (auditEscape "lean_mark_mt,")
-  IO.println s!"AUDIT_RESULT:{raws.length},{distinct},{withSep},{if rsvOk then 0 else 1},0,0"
+  IO.println s!"AUDIT_RESULT:{raws.length},{distinct},{withSep},0,0,0"
 """
         _ensure_lean_build(ROOT_DIR)
         got = _run_audit_driver(ROOT_DIR, _LEAN_AUDIT_DRIVER_HEAD + main_src, [])
         self.assertEqual(got, (10, 10, 0, 0, 0, 0), got)
+
+    def test_unescape_facts_name_inverts_the_driver_escape(self) -> None:
+        # `auditEscape` maps `%` to %25, `|` to %7C and `,` to %2C; the decoder
+        # inverts exactly that and refuses any other `%` rather than guess.
+        for escaped, raw in (
+            ("Foo.bar", "Foo.bar"),
+            ("A.«term∃ᵉ_%2C_»._closed_5", "A.«term∃ᵉ_,_»._closed_5"),
+            ("a%7Cb%2Cc", "a|b,c"),
+            ("a%25b", "a%b"),
+            ("%252C", "%2C"),
+            ("%25%2C%7C", "%,|"),
+            ("", ""),
+        ):
+            self.assertEqual(_unescape_facts_name(escaped), raw, escaped)
+        for bad in ("a%b", "a%", "a%2", "%7c", "%20"):
+            with self.assertRaises(ValueError, msg=bad):
+                _unescape_facts_name(bad)
 
     def _both_paths(self, mod_name: str, body: str) -> tuple[tuple[int, ...], dict[str, str], dict[str, DeclFacts]]:
         """Compile `body` as module `mod_name` and measure it on both paths: one
@@ -4415,6 +4458,32 @@ unsafe def main (_args : List String) : IO Unit := do
         self.assertTrue(rows["L2Rec.selfRec"][4], rows["L2Rec.selfRec"])  # has_self_call
         self.assertEqual(classes["L2Rec.selfRec"], "rejected", classes)
         self.assertEqual(classes["L2Rec.callsSelfRec"], "lowered_unproved", classes)
+
+    def test_shard_facts_carry_comma_named_declarations_exactly(self) -> None:
+        # The facts path's call graph must be the one auditMods walks. A compiled
+        # declaration's name can hold a comma: the pinned Batteries has
+        # `«term∃ᵉ_,_»._closed_5`, Init.Data.Array.Basic has `«term#[_,]»`.
+        # When the facts line printed names raw, the parser's split of the
+        # callee list on "," turned such a callee into fragments with no facts
+        # row, so its callers could not qualify and a cycle through it was
+        # missed. This fixture has both shapes; `_both_paths` asserts the two
+        # paths agree, and every callee must resolve to a facts row.
+        counts, classes, rows = self._both_paths(
+            "L2Comma",
+            "@[noinline] def «leaf,x» (x : UInt64) : UInt64 := x * 3 + 1\n"
+            "def callsComma (x : UInt64) : UInt64 := «leaf,x» x + 2\n"
+            "mutual\n"
+            "partial def «even,p» (n : UInt64) : Bool := if n == 0 then true else «odd,p» (n - 1)\n"
+            "partial def «odd,p» (n : UInt64) : Bool := if n == 0 then false else «even,p» (n - 1)\n"
+            "end\n",
+        )
+        self.assertEqual(counts[:5], (4, 2, 0, 2, 2), counts)
+        for callee in (c for row in rows.values() for c in row[2]):
+            self.assertIn(callee, rows, "a callee without a facts row")
+        self.assertEqual(classes["L2Comma.«leaf,x»"], "proved", classes)
+        self.assertEqual(classes["L2Comma.callsComma"], "proved", classes)
+        self.assertEqual(classes["L2Comma.«even,p»"], "rejected_not_lowered", classes)
+        self.assertEqual(classes["L2Comma.«odd,p»"], "rejected_not_lowered", classes)
 
     def test_con_leche_reports_natoppins_exclusion_and_rejects_partial_tree(self) -> None:
         # Point 4: con-leche output must state the NatOpPins exclusion and its reason
