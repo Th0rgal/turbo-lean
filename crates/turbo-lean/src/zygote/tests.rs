@@ -2107,8 +2107,11 @@ use super::*;
         );
 
         // Unsupported `filter := .text` or missing `input_file` must mark the Zygote context
-        // uncacheable (`lake_inputs_uncacheable == true`) and emit fresh nonces so SHM/pool caches
-        // never replay stale verdicts.
+        // uncacheable (`lake_inputs_uncacheable == true`) so SHM/pool caches never replay stale
+        // verdicts. The unresolved tag itself must be DETERMINISTIC: the daemon pre-resolves its
+        // execution identity and compares it against the identity executed a moment later, so a
+        // per-call nonce made every `/eval` on such a workspace fail with HTTP 409 `eval
+        // execution identity changed` -- repeated resolutions of the same failure must agree.
         fs::write(
             tmp_dir.join("lakefile.lean"),
             "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .text\n@[default_target]\nlean_lib Smoke where\n  globs := #[.submodules `Smoke]\n  needs := #[smokeSources]\n",
@@ -2123,8 +2126,8 @@ use super::*;
             "unsupported filter must mark Zygote context uncacheable"
         );
         assert!(
-            !u1.is_empty() && !u2.is_empty() && u1 != u2,
-            "uncacheable workspaces must receive distinct per-call nonces: {u1} vs {u2}"
+            !u1.is_empty() && u1 == u2,
+            "uncacheable workspaces must resolve a deterministic tag: {u1} vs {u2}"
         );
         let cache_dir = tmp_dir.join("isolated_cache");
         let eval_file = tmp_dir.join("SmokeEval.lean");

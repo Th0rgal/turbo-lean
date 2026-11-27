@@ -573,6 +573,13 @@ pub(crate) struct MaterializedClosure {
     /// `ctime` of a probe created in the snapshot root after verification, strictly newer than
     /// every recorded directory and file `ctime` (`None`: unavailable, so nothing is proven).
     pub(super) fence: Option<i128>,
+    /// Shared `flock` lease on `<snapshot root>/<label>.lock`, held for as long as this run
+    /// uses the snapshot: `collect_closure_snapshots` takes a non-blocking exclusive lock on
+    /// that file before evicting, so an open lease keeps an active run's snapshot in place.
+    /// Released when the run ends and this handle (and the fd) is dropped; never read.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    pub(super) lease_fd: Option<std::os::unix::io::OwnedFd>,
 }
 
 #[cfg(unix)]
@@ -963,6 +970,27 @@ pub(super) const CLOSURE_SNAPSHOT_KEEP: usize = 32;
 /// Snapshots used within this window are never collected (a pooled worker may still use one).
 pub(super) const CLOSURE_SNAPSHOT_MIN_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
 pub(super) const CLOSURE_SNAPSHOT_USAGE_DIR: &str = ".last-used";
+/// Suffix of the `flock` lease file guarding each snapshot (`<label>.lock`).
+pub(super) const LOCK_SUFFIX: &str = ".lock";
+
+#[cfg(unix)]
+fn snapshot_leased(root: &Path, label: &str) -> bool {
+    closure_snapshot_lease_held(root, label)
+}
+
+#[cfg(not(unix))]
+fn snapshot_leased(_root: &Path, _label: &str) -> bool {
+    false
+}
+
+/// Remove the lease file of an already-evicted snapshot. Never removes a held lease: the
+/// caller only gets here after observing the lease uncontended and evicting the snapshot.
+fn remove_snapshot_lease(root: &Path, label: &str) {
+    #[cfg(unix)]
+    let _ = fs::remove_file(closure_snapshot_lease_path(root, label));
+    #[cfg(not(unix))]
+    let _ = (root, label);
+}
 
 thread_local! {
     /// Per-test-thread override for `closure_snapshot_root()` so ancestor-rename tests do not
@@ -1000,6 +1028,70 @@ pub(super) fn mark_closure_snapshot_used(label: &str) {
         if let Ok(root) = ensure_private_dir(&closure_snapshot_root()) {
             let _ = mark_closure_snapshot_used_in(&root, label);
         }
+    }
+}
+
+/// The lease file guarding snapshot `label` in `root`: a sibling of the snapshot directory.
+#[cfg(unix)]
+pub(super) fn closure_snapshot_lease_path(root: &Path, label: &str) -> PathBuf {
+    root.join(format!("{label}.lock"))
+}
+
+/// Acquire a shared `flock` lease on snapshot `label` in `root`, held for the lifetime of the
+/// returned fd: `collect_closure_snapshots` refuses to evict any snapshot whose lease file is
+/// locked, so an active run never loses its snapshot to a concurrent worker's collection pass.
+/// Best-effort by design: `None` (no lease) when the lock file cannot be created or is briefly
+/// contended, and the run then relies on the `.last-used` idle window alone.
+#[cfg(unix)]
+pub(super) fn acquire_closure_snapshot_lease(
+    root: &Path,
+    label: &str,
+) -> Option<std::os::unix::io::OwnedFd> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    if label.is_empty() || !label.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(closure_snapshot_lease_path(root, label))
+        .ok()?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+        return None;
+    }
+    Some(std::os::unix::io::OwnedFd::from(file))
+}
+
+/// Whether snapshot `label` in `root` is currently leased by an active run: a non-blocking
+/// exclusive `flock` on its lease file fails exactly when a shared (or exclusive) lease is open.
+#[cfg(unix)]
+pub(super) fn closure_snapshot_lease_held(root: &Path, label: &str) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    if label.is_empty() || !label.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return false;
+    }
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(closure_snapshot_lease_path(root, label))
+    else {
+        return false;
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        false
+    } else {
+        true
     }
 }
 
@@ -1360,6 +1452,11 @@ pub(super) fn materialize_closure(
             }
         }
         let fence = fence_after_in(&fence_probe_dir, newest);
+        // Hold a shared lease on this snapshot for the lifetime of the returned handle: an
+        // active run's snapshot must not be evicted by a concurrent worker's collection pass
+        // merely because its `.last-used` marker went idle while the run still needs it.
+        #[cfg(unix)]
+        let lease_fd = acquire_closure_snapshot_lease(&root, &label);
         Ok(MaterializedClosure {
             fence,
             label: label.clone(),
@@ -1375,6 +1472,8 @@ pub(super) fn materialize_closure(
             taken_at_ns,
             dirs: verified_dirs,
             files: verified_files,
+            #[cfg(unix)]
+            lease_fd,
         })
     };
     if dir.is_dir() {
@@ -1652,6 +1751,11 @@ pub(super) fn fence_after_in(dir: &Path, newest: i128) -> Option<i128> {
 
 /// Keep the `CLOSURE_SNAPSHOT_KEEP` most recently used snapshots (plus `keep`), never
 /// removing one used within `CLOSURE_SNAPSHOT_MIN_IDLE`, and drop abandoned temp dirs.
+///
+/// A snapshot currently leased by an active run (shared `flock` on its sibling `<label>.lock`,
+/// see `acquire_closure_snapshot_lease`) is never evicted, however idle its `.last-used`
+/// marker: concurrent workers must not lose the snapshot they imported out from under their
+/// run. Orphaned lease files whose snapshot is gone are collected again once uncontended.
 pub(super) fn collect_closure_snapshots(root: &Path, keep: &str) {
     let Ok(rd) = fs::read_dir(root) else { return };
     let now = std::time::SystemTime::now();
@@ -1664,12 +1768,20 @@ pub(super) fn collect_closure_snapshots(root: &Path, keep: &str) {
     };
     let usage_dir = root.join(CLOSURE_SNAPSHOT_USAGE_DIR);
     let mut snaps = Vec::new();
+    let mut orphan_locks = Vec::new();
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         let path = e.path();
         if name.starts_with(".tmp-") {
             if idle(&path) > 6 * CLOSURE_SNAPSHOT_MIN_IDLE {
                 purge_snapshot_dir(&path);
+            }
+        } else if name.ends_with(LOCK_SUFFIX) {
+            if !path
+                .with_file_name(name.trim_end_matches(LOCK_SUFFIX))
+                .is_dir()
+            {
+                orphan_locks.push((name, path));
             }
         } else if name != keep && name != CLOSURE_BLOB_DIR && name != CLOSURE_SNAPSHOT_USAGE_DIR {
             let marker = usage_dir.join(&name);
@@ -1681,15 +1793,22 @@ pub(super) fn collect_closure_snapshots(root: &Path, keep: &str) {
             snaps.push((age, name, path));
         }
     }
-    if snaps.len() <= CLOSURE_SNAPSHOT_KEEP {
-        return;
-    }
-    snaps.sort_by_key(|(age, _, _)| std::cmp::Reverse(*age));
-    let excess = snaps.len() - CLOSURE_SNAPSHOT_KEEP;
-    for (age, name, path) in snaps.into_iter().take(excess) {
-        if age > CLOSURE_SNAPSHOT_MIN_IDLE {
-            purge_snapshot_dir(&path);
-            let _ = fs::remove_file(usage_dir.join(name));
+    if snaps.len() > CLOSURE_SNAPSHOT_KEEP {
+        snaps.sort_by_key(|(age, _, _)| std::cmp::Reverse(*age));
+        let excess = snaps.len() - CLOSURE_SNAPSHOT_KEEP;
+        let mut removed = 0usize;
+        // Oldest first; a leased snapshot is skipped, spilling over to the next-oldest, so a
+        // long-lived lease never wedges collection entirely.
+        for (age, name, path) in &snaps {
+            if removed >= excess {
+                break;
+            }
+            if *age > CLOSURE_SNAPSHOT_MIN_IDLE && !snapshot_leased(root, name) {
+                purge_snapshot_dir(path);
+                remove_snapshot_lease(root, name);
+                let _ = fs::remove_file(usage_dir.join(name));
+                removed += 1;
+            }
         }
     }
     // Blobs no snapshot links any more (link count 1), once idle.
@@ -1705,10 +1824,38 @@ pub(super) fn collect_closure_snapshots(root: &Path, keep: &str) {
             let _ = fs::remove_file(e.path());
         }
     }
+    for (_, path) in orphan_locks {
+        let label = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.trim_end_matches(LOCK_SUFFIX).to_string())
+            .unwrap_or_default();
+        if !snapshot_leased(root, &label) {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
-/// Digest of the declarative Lake file inputs of every package whose build directory is on the
-/// worker's search path.
+/// Deterministic stand-in tag for a workspace whose Lake inputs are unsupported or unresolvable.
+///
+/// `project_lake_inputs_tag`'s fallback emits a fresh PID/nanos nonce per call, which made two
+/// resolutions of the *same* failure disagree: the daemon's pre-resolved `execution_identity`
+/// never matched the identity it executed a moment later, and every `/eval` on such a workspace
+/// failed with HTTP 409 `eval execution identity changed`. Hashing `(dir, err)` instead keeps
+/// distinct failures distinct (no cross-workspace or cross-edit cache collision) while repeated
+/// resolutions of one failure agree, and the `uncacheable` flag still keeps every SHM, pool, and
+/// memo cache out of the picture.
+pub(super) fn unresolved_lake_inputs_tag(dir: &Path, err: &str) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(b"turbo-lean-unresolved-lake-inputs-v2:");
+    h.update(dir.to_string_lossy().as_bytes());
+    h.update(b"|");
+    h.update(err.as_bytes());
+    format!("\u{0}lake-inputs-uncacheable:{}", h.finalize().to_hex())
+}
+
+/// Digest of the declarative Lake file inputs of the caller's project, when its build directory
+/// is on the worker's search path.
 ///
 /// A zygote worker is reused on the strength of `olean_digest` and the pool key: the toolchain, the
 /// search path, and the content of the `.olean` files it imported. An `input_dir` file is none of
@@ -1718,12 +1865,16 @@ pub(super) fn collect_closure_snapshots(root: &Path, keep: &str) {
 /// three at once: the memo key contains it, `warm_imports` is compared against it before a worker
 /// is reused, and prefix reuse requires that same `warm_imports` match.
 ///
-/// Package roots are recovered from the search path, which is the only project location this
-/// function is given. `<pkg_root>/.lake/build/lib/lean` is only the *default* layout -- `buildDir`
-/// and `leanLibDir` are both Lake package fields -- so each entry is walked up to the nearest
-/// ancestor that carries a Lake config instead of counting a fixed four components. A package whose
-/// `buildDir` is custom would otherwise contribute no tag at all, and its `input_dir` edit would
-/// leave `olean_digest` unmoved: a warm worker answering from the old bytes.
+/// Only the caller's project root is resolved (`TURBO_LEAN_PROJECT_DIR`, else a `TURBO_LEAN_CALLER_CWD`
+/// carrying a Lake config, walked up to its nearest Lake root): every daemon `/eval` names its
+/// project that way, and re-resolving *every* dependency `LEAN_PATH` entry's own package root was
+/// O(dependencies) per resolution and let one dependency's unparseable lakefile destabilize this
+/// workspace's identity. Dependency inputs are compiled into their `.olean`s, which the search-path
+/// digest already covers. Without a caller workspace -- a plain CLI eval on a raw `LEAN_PATH` --
+/// each entry is walked up to the nearest ancestor that carries a Lake config instead of counting
+/// a fixed four components, because `<pkg_root>/.lake/build/lib/lean` is only the *default*
+/// layout: `buildDir` and `leanLibDir` are both Lake package fields, and a package whose `buildDir`
+/// is custom would otherwise contribute no tag at all.
 ///
 /// Empty -- and free, see `workspace_may_declare_lake_inputs` -- for every workspace that declares
 /// no inputs, including every toolchain entry on the path, which carries no Lake config.
@@ -1731,35 +1882,7 @@ pub(super) fn compute_lean_path_lake_inputs_digest(
     effective_lean_path: &str,
     env_vars: &std::collections::HashMap<String, String>,
 ) -> (String, bool) {
-    let mut tags: Vec<String> = Vec::new();
-    let mut uncacheable = false;
-    let mut record_workspace =
-        |dir: &Path| match crate::module_builder::try_project_lake_inputs_tag(dir) {
-            Ok(Some(tag)) => {
-                if !tags.contains(&tag) {
-                    tags.push(tag);
-                }
-            }
-            Ok(None) => {}
-            Err(_) => {
-                uncacheable = true;
-                if let Some(tag) = crate::module_builder::project_lake_inputs_tag(dir) {
-                    tags.push(tag);
-                }
-            }
-        };
-    for part in effective_lean_path.split(':').filter(|p| !p.is_empty()) {
-        // Walk every ancestor without an arbitrary depth cap so deeply nested custom
-        // `buildDir` / `leanLibDir` layouts still resolve their enclosing package root.
-        for anc in Path::new(part).ancestors() {
-            if !crate::lake_build::has_lake_config(anc) {
-                continue;
-            }
-            record_workspace(anc);
-            break;
-        }
-    }
-    if let Some(proj) = env_vars
+    let project_root = env_vars
         .get("TURBO_LEAN_PROJECT_DIR")
         .filter(|s| !s.is_empty())
         .map(Path::new)
@@ -1770,10 +1893,40 @@ pub(super) fn compute_lean_path_lake_inputs_digest(
                 .map(Path::new)
                 .filter(|p| crate::lake_build::has_lake_config(p))
         })
-    {
-        let root = crate::lake_build::find_project_root(proj);
-        if crate::lake_build::has_lake_config(&root) {
-            record_workspace(&root);
+        .map(crate::lake_build::find_project_root)
+        .filter(|root| crate::lake_build::has_lake_config(root));
+    let mut tags: Vec<String> = Vec::new();
+    let mut uncacheable = false;
+    let mut record_workspace =
+        |dir: &Path| match crate::module_builder::try_project_lake_inputs_tag(dir) {
+            Ok(Some(tag)) => {
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                uncacheable = true;
+                let tag = unresolved_lake_inputs_tag(dir, &e.to_string());
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+            }
+        };
+    match project_root {
+        Some(root) => record_workspace(&root),
+        None => {
+            for part in effective_lean_path.split(':').filter(|p| !p.is_empty()) {
+                // Walk every ancestor without an arbitrary depth cap so deeply nested custom
+                // `buildDir` / `leanLibDir` layouts still resolve their enclosing package root.
+                for anc in Path::new(part).ancestors() {
+                    if !crate::lake_build::has_lake_config(anc) {
+                        continue;
+                    }
+                    record_workspace(anc);
+                    break;
+                }
+            }
         }
     }
     tags.sort();
@@ -1858,3 +2011,179 @@ pub(super) fn hex_encode_bytes(bytes: &[u8]) -> String {
     unsafe { String::from_utf8_unchecked(out) }
 }
 
+
+#[cfg(all(test, unix))]
+mod snapshot_tests {
+    use super::*;
+
+    /// The unresolved-tag fallback must be deterministic: the daemon pre-resolves its execution
+    /// identity and compares it against the identity executed a moment later, so a per-call
+    /// nonce made every `/eval` on such a workspace fail with HTTP 409 `eval execution identity
+    /// changed`. Distinct failures (other dir, other error) must still resolve distinct tags.
+    #[test]
+    fn unresolved_lake_inputs_tag_is_deterministic_and_framed() {
+        let dir = std::env::temp_dir().join("turbo_unresolved_tag_dir");
+        let tag = unresolved_lake_inputs_tag(&dir, "unsupported filter");
+        assert_eq!(tag, unresolved_lake_inputs_tag(&dir, "unsupported filter"));
+        assert_eq!(
+            tag.len(),
+            "\u{0}lake-inputs-uncacheable:".len() + 64,
+            "unresolved tags keep the uncacheable sentinel shape: {tag}"
+        );
+        assert!(tag.starts_with("\u{0}lake-inputs-uncacheable:"));
+        assert_ne!(tag, unresolved_lake_inputs_tag(&dir, "other error"));
+        assert_ne!(
+            tag,
+            unresolved_lake_inputs_tag(&dir.join("other"), "unsupported filter")
+        );
+    }
+
+    /// With the caller workspace named (`TURBO_LEAN_PROJECT_DIR`, or a `TURBO_LEAN_CALLER_CWD`
+    /// carrying a Lake config), only the project root is resolved: dependency `LEAN_PATH`
+    /// entries must not add tags, so one dependency's unresolvable lakefile cannot destabilize
+    /// this workspace's identity and O(dependencies) resolution work disappears. Without a
+    /// caller workspace the legacy per-entry ancestor walk still applies.
+    #[test]
+    fn lake_inputs_digest_resolves_only_caller_project_root_when_known() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!(
+            "turbo_zcl_root_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let lakefile = "import Lake\nopen Lake DSL\npackage demo\ninput_dir smokeSources where\n  path := \"Data\"\n  filter := .extension \"sol\"\n@[default_target]\nlean_lib Smoke where\n  globs := #[.submodules `Smoke]\n  needs := #[smokeSources]\n";
+        for (name, sol) in [("proj", "contract A {}"), ("dep", "contract B {}")] {
+            let dir = base.join(name);
+            fs::create_dir_all(dir.join(".lake/build/lib/lean")).unwrap();
+            fs::create_dir_all(dir.join("Data")).unwrap();
+            fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+            fs::write(dir.join("lakefile.lean"), lakefile).unwrap();
+            fs::write(dir.join("Data/a.sol"), sol).unwrap();
+        }
+        let proj = base.join("proj");
+        let lp = format!(
+            "{}:{}",
+            proj.join(".lake/build/lib/lean").display(),
+            base.join("dep/.lake/build/lib/lean").display()
+        );
+        let digest = |lp: &str, env: &std::collections::HashMap<String, String>| {
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            compute_lean_path_lake_inputs_digest(lp, env)
+        };
+        let no_env = std::collections::HashMap::new();
+        let (both, uncacheable) = digest(&lp, &no_env);
+        assert!(!uncacheable, "supported inputs must stay cacheable");
+        let tags: Vec<&str> = both.split(',').collect();
+        assert_eq!(
+            tags.len(),
+            2,
+            "no caller workspace: every entry's own package root contributes: {both}"
+        );
+        let mut env_proj = std::collections::HashMap::new();
+        env_proj.insert(
+            "TURBO_LEAN_PROJECT_DIR".to_string(),
+            proj.to_string_lossy().to_string(),
+        );
+        let (proj_only, uncacheable) = digest(&lp, &env_proj);
+        assert!(!uncacheable);
+        assert_eq!(
+            proj_only.split(',').count(),
+            1,
+            "dependency roots must be skipped once the caller project is known: {proj_only}"
+        );
+        assert!(
+            tags.contains(&proj_only.as_str()),
+            "project tag unchanged between modes: {both} vs {proj_only}"
+        );
+        let mut env_cwd = std::collections::HashMap::new();
+        env_cwd.insert(
+            "TURBO_LEAN_CALLER_CWD".to_string(),
+            proj.to_string_lossy().to_string(),
+        );
+        let (cwd_only, _) = digest(&lp, &env_cwd);
+        assert_eq!(cwd_only, proj_only, "caller cwd fallback matches project dir");
+        let (empty_lp, _) = digest("", &env_proj);
+        assert_eq!(empty_lp, proj_only, "empty LEAN_PATH still names the project inputs");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// An active run's snapshot (shared flock lease on `<label>.lock`) must survive a concurrent
+    /// collection pass however idle its `.last-used` marker, becoming collectable again once
+    /// the lease is released; uncontended orphan lease files are collected, held ones kept.
+    #[test]
+    fn collect_closure_snapshots_honors_flock_leases_and_orphan_locks() {
+        let root = std::env::temp_dir().join(format!(
+            "turbo_snap_collect_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(root.join(CLOSURE_SNAPSHOT_USAGE_DIR)).unwrap();
+        let backdate = |path: &Path, secs: u64| {
+            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+            let f = fs::OpenOptions::new().append(true).open(path).unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(t).set_accessed(t))
+                .unwrap();
+        };
+        let stage = |label: &str, age_secs: u64| {
+            fs::create_dir_all(root.join(label)).unwrap();
+            fs::write(root.join(label).join("P.olean"), b"x").unwrap();
+            let marker = root.join(CLOSURE_SNAPSHOT_USAGE_DIR).join(label);
+            fs::write(&marker, b"").unwrap();
+            backdate(&marker, age_secs);
+        };
+        // 40 snapshots past the idle window; `leased` is the OLDEST of them all.
+        let mut labels: Vec<String> = (0..40).map(|i| format!("snap{i:03}")).collect();
+        labels.push("leased".to_string());
+        for label in &labels {
+            stage(label, if label == "leased" { 1900 } else { 900 });
+        }
+        let lease = acquire_closure_snapshot_lease(&root, "leased").expect("lease acquired");
+        assert!(closure_snapshot_lease_held(&root, "leased"));
+        fs::write(root.join("orph.lock"), b"").unwrap();
+        fs::write(root.join("orph2.lock"), b"").unwrap();
+        let held_orphan = acquire_closure_snapshot_lease(&root, "orph2").expect("orphan lease");
+        collect_closure_snapshots(&root, "");
+        assert!(
+            root.join("leased").is_dir(),
+            "a leased snapshot must survive collection even as the oldest candidate"
+        );
+        let remaining = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n != CLOSURE_SNAPSHOT_USAGE_DIR && !n.ends_with(LOCK_SUFFIX)
+            })
+            .count();
+        assert_eq!(
+            remaining, 32,
+            "collection must stop once back at the keep budget, lease included: {remaining}"
+        );
+        assert!(
+            !root.join("orph.lock").exists(),
+            "uncontended orphan lease file must be collected"
+        );
+        assert!(
+            root.join("orph2.lock").exists(),
+            "held orphan lease file must be kept"
+        );
+        // Release the lease: the snapshot is now the oldest collectable candidate again.
+        drop(lease);
+        drop(held_orphan);
+        for i in 40..49 {
+            stage(&format!("snap{i:03}"), 0);
+        }
+        collect_closure_snapshots(&root, "");
+        assert!(
+            !root.join("leased").exists(),
+            "a snapshot must be collectable once its lease is released"
+        );
+        assert!(
+            !root.join("orph2.lock").exists(),
+            "released orphan lease file must be collected"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+}

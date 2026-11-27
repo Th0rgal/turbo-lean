@@ -387,6 +387,131 @@ pub(crate) fn confirm_decl_identity_with_budget(
     })
 }
 
+/// Process-wide memo of coarse-keyed declaration identity results.
+///
+/// Keyed by [`splitter::declaration_identity_cache_key`] plus the per-process resolution
+/// context (project dir, filtered lean args, full probe env): identical probe prefixes in two
+/// different workspaces may still elaborate against different dependency bytes, so the
+/// in-process memo never conflates them. The key needs no walk of the transitive import
+/// closure, so a repeated `check --decl` that only edits inside a proof body resolves from
+/// this memo in microseconds instead of re-running the seconds-long stock-`lean` probe.
+fn decl_identity_coarse_memo() -> &'static std::sync::Mutex<HashMap<String, ConfirmedDeclIdentity>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<HashMap<String, ConfirmedDeclIdentity>>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Lookup handle for the coarse declaration-identity cache: where to memoize a fresh result
+/// and any identity already resolved for this key.
+struct DeclIdentityCoarseLookup {
+    memo_key: String,
+    disk_path: Option<PathBuf>,
+    disk_key: String,
+    cached: Option<ConfirmedDeclIdentity>,
+}
+
+/// Resolve the coarse cache for one stub-probe identity confirmation: the memory memo first,
+/// then the cross-invocation `coarse-<key>.json` entry under the verified private
+/// `decl_identities` staging dir. `None` when the coarse cache does not apply (untrusted
+/// probes and extra read-only `.olean` dirs always recompile; a toolchain or githash that
+/// cannot be resolved cannot be keyed).
+#[allow(clippy::too_many_arguments)]
+fn decl_identity_coarse_lookup(
+    project_dir: &Path,
+    coarse_prefix: &str,
+    expected: &str,
+    is_untrusted: bool,
+    extra_ro_olean_dirs: &[PathBuf],
+    lean_args: &[String],
+    env: Option<&HashMap<String, String>>,
+) -> Option<DeclIdentityCoarseLookup> {
+    if is_untrusted || !extra_ro_olean_dirs.is_empty() {
+        return None;
+    }
+    let toolchain = detect_toolchain(project_dir);
+    let (_, githash, _, _) =
+        crate::module_builder::resolve_toolchain_compiler(project_dir, &toolchain).ok()?;
+    let key =
+        splitter::declaration_identity_cache_key(coarse_prefix, expected, &toolchain, &githash);
+    // The memo is per-process, so it may safely pin the whole resolution context; every part
+    // is NUL-free (paths, argv, and env values cannot contain NUL on any supported host).
+    let mut env_pairs: Vec<(&String, &String)> =
+        env.map(|e| e.iter().collect()).unwrap_or_default();
+    env_pairs.sort();
+    let memo_key = format!(
+        "{key}\u{0}{}\u{0}{}\u{0}{}",
+        project_dir.display(),
+        crate::module_builder::filter_allowed_lean_args(lean_args).join("\u{0}"),
+        env_pairs
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("\u{0}"),
+    );
+    if let Ok(memo) = decl_identity_coarse_memo().lock() {
+        if let Some(att) = memo.get(&memo_key) {
+            return Some(DeclIdentityCoarseLookup {
+                memo_key,
+                disk_path: None,
+                disk_key: key,
+                cached: Some(att.clone()),
+            });
+        }
+    }
+    let root = crate::shm_cache::ensure_verified_private_staging_dir(Some("decl_identities"))?;
+    let path = root.join(format!("coarse-{key}.json"));
+    if let Some(att) = read_coarse_decl_identity_entry(&path, &key) {
+        if let Ok(mut memo) = decl_identity_coarse_memo().lock() {
+            memo.insert(memo_key.clone(), att.clone());
+        }
+        return Some(DeclIdentityCoarseLookup {
+            memo_key,
+            disk_path: None,
+            disk_key: key,
+            cached: Some(att),
+        });
+    }
+    Some(DeclIdentityCoarseLookup {
+        memo_key,
+        disk_path: Some(path),
+        disk_key: key,
+        cached: None,
+    })
+}
+
+/// Read and validate one coarse entry
+/// (`{"v":1,"key":...,"decl_name":...,"kernel_type_hash":...}`), opened fail-closed through
+/// `read_verified_isolated_artifact` and refused unless it echoes the key it was filed under.
+fn read_coarse_decl_identity_entry(path: &Path, key: &str) -> Option<ConfirmedDeclIdentity> {
+    let bytes = read_verified_isolated_artifact(path).ok()?;
+    let val: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    if val.get("v")?.as_u64()? != 1 || val.get("key")?.as_str()? != key {
+        return None;
+    }
+    Some(ConfirmedDeclIdentity {
+        decl_name: val.get("decl_name")?.as_str()?.to_string(),
+        kernel_type_hash: val.get("kernel_type_hash")?.as_str()?.to_string(),
+    })
+}
+
+/// Persist one confirmed identity under its coarse key (best-effort: a failed write only costs
+/// the next run its probe) and memoize it for the remainder of this process.
+fn store_coarse_decl_identity(lookup: &DeclIdentityCoarseLookup, att: &ConfirmedDeclIdentity) {
+    if let Ok(mut memo) = decl_identity_coarse_memo().lock() {
+        memo.insert(lookup.memo_key.clone(), att.clone());
+    }
+    if let Some(path) = &lookup.disk_path {
+        if let Ok(bytes) = serde_json::to_vec(&serde_json::json!({
+            "v": 1,
+            "key": lookup.disk_key,
+            "decl_name": att.decl_name,
+            "kernel_type_hash": att.kernel_type_hash,
+        })) {
+            let _ = crate::shm_cache::atomic_write_shm(path, &bytes);
+        }
+    }
+}
+
 pub(super) fn confirm_decl_identity_with_extra_dirs(
     src: &str,
     shard: &splitter::TheoremShard,
@@ -414,18 +539,40 @@ pub(super) fn confirm_decl_identity_with_extra_dirs(
     let stub_probe = format!("{before}{signature}\n:= by sorry\n");
     let (lean_args, env) =
         resolve_identity_probe_context(project_dir, file, is_untrusted, extra_ro_olean_dirs)?;
-    let stub_attempt = compile_and_read_probe_identities(
-        &stub_probe,
+    // Coarse cache: the probe prefix (header + suppression options + stubbed earlier
+    // declarations + this signature) is invariant under edits inside a proof body, so repeated
+    // confirmations of the same declaration under the same toolchain resolve from the memo or
+    // the cross-invocation coarse entry without compiling a fresh probe. Only stub successes
+    // are cached: the full-declaration fallback depends on the proof text.
+    let coarse = decl_identity_coarse_lookup(
         project_dir,
+        &format!("{before}{signature}"),
+        expected,
         is_untrusted,
+        extra_ro_olean_dirs,
         &lean_args,
         env.as_ref(),
-        extra_ro_olean_dirs,
-        probe_start_line,
-        stub_end_line,
-        probe_started,
-    )
-    .and_then(|decls| match_expected_decl_identity(expected, &decls, None));
+    );
+    let stub_attempt = match coarse.as_ref().and_then(|c| c.cached.clone()) {
+        Some(att) => Ok(att),
+        None => compile_and_read_probe_identities(
+            &stub_probe,
+            project_dir,
+            is_untrusted,
+            &lean_args,
+            env.as_ref(),
+            extra_ro_olean_dirs,
+            probe_start_line,
+            stub_end_line,
+            probe_started,
+        )
+        .and_then(|decls| match_expected_decl_identity(expected, &decls, None))
+        .inspect(|att| {
+            if let Some(c) = coarse.as_ref() {
+                store_coarse_decl_identity(c, att);
+            }
+        }),
+    };
     let result = match stub_attempt {
         Ok(att) => Ok(att),
         Err(stub_err) => {
@@ -1056,6 +1203,60 @@ pub(crate) fn read_single_isolated_olean(out_dir: &Path, module: &str) -> Result
 #[cfg(test)]
 mod memo_tests {
     use super::*;
+
+    /// The coarse cache must let a repeated confirmation of the same declaration resolve from
+    /// the memo without compiling a probe: this is the `check --decl` loop that edits inside a
+    /// proof body and re-runs the seconds-long stock-`lean` probe today. A sentinel identity is
+    /// seeded under exactly the lookup key the confirmation computes, so the probe could not
+    /// have run and still returned it.
+    #[test]
+    fn coarse_memo_serves_stub_identity_without_compiling() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_coarse_memo_{}",
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        let file = dir.join("M.lean");
+        let src = "theorem t1 : True := True.intro\ntheorem target : True := True.intro\n";
+        let split = splitter::split_lean_source(src, &[]);
+        let shard = &split.shards[1];
+        assert_eq!(shard.name, "target");
+        let prefix = splitter::declaration_identity_prefix(src, shard);
+        let header_info = crate::module_builder::parse_header_info(&prefix);
+        let (header, prefix_body) = prefix.split_at(header_info.body_byte_offset);
+        let (signature, _) = splitter::extract_shard_stmt_and_proof(src, shard);
+        let before = format!(
+            "{header}\nset_option warningAsError false\nset_option warn.sorry false\n{prefix_body}\nset_option warningAsError false\nset_option warn.sorry false\n"
+        );
+        let (lean_args, env) =
+            resolve_identity_probe_context(&dir, &file, false, &[]).expect("probe context");
+        let lookup = decl_identity_coarse_lookup(
+            &dir,
+            &format!("{before}{signature}"),
+            "target",
+            false,
+            &[],
+            &lean_args,
+            env.as_ref(),
+        )
+        .expect("coarse lookup");
+        assert!(lookup.cached.is_none(), "fresh key must miss");
+        let sentinel = ConfirmedDeclIdentity {
+            decl_name: "target".into(),
+            kernel_type_hash: "sentinel-coarse-hash".into(),
+        };
+        decl_identity_coarse_memo()
+            .lock()
+            .unwrap()
+            .insert(lookup.memo_key.clone(), sentinel.clone());
+        let attested = confirm_decl_identity(src, shard, &dir, &file).expect("confirmed");
+        assert_eq!(attested, sentinel, "memo hit must serve the seeded identity");
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn identity_memo_rejects_transitive_host_inputs() -> Result<()> {

@@ -137,30 +137,45 @@ pub(crate) fn rel_path_excluded(rel: &str) -> bool {
             .any(|p| exclude_pattern_matches_rel_path(p, rel))
 }
 
-/// Extra non-standard axiom patterns currently configured in `TURBO_LEAN_ALLOWED_AXIOMS`.
+/// Extra non-standard axiom patterns currently configured in `TURBO_LEAN_ALLOWED_AXIOMS`,
+/// trimmed, sorted, and deduplicated: execution identities are computed from this list, so a
+/// caller exporting the env var reordered (`a b`) or duplicated (`a a b`) must resolve to the
+/// same canonical list as the daemon's `resolve_request_axiom_policy`, or every pinned `/eval`
+/// fails with HTTP 409 `eval execution identity changed`. Order and duplicates are irrelevant
+/// to the glob match itself (`axiom_allowed_under` scans the list).
 pub fn extra_allowed_axiom_patterns() -> Vec<String> {
-    std::env::var(ALLOWED_AXIOMS_ENV)
+    let mut pats: Vec<String> = std::env::var(ALLOWED_AXIOMS_ENV)
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(String::from)
-        .collect()
+        .collect();
+    pats.sort();
+    pats.dedup();
+    pats
 }
 
 /// Build the full allowed-axioms list from an explicit list of extra patterns.
+///
+/// Extras are trimmed, sorted, and deduplicated (see `extra_allowed_axiom_patterns`): both
+/// the client that computes `context.identity` from the raw env var and the daemon that
+/// re-resolves from its own sorted `resolve_request_axiom_policy` CSV must produce identical
+/// lists for identical semantics, whatever order the caller listed the patterns in.
 pub fn allowed_axioms_with_extra(extra: &[String]) -> Vec<String> {
+    let mut pats: Vec<String> = extra
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    pats.sort();
+    pats.dedup();
     STANDARD_AXIOMS
         .iter()
         .copied()
         .map(String::from)
-        .chain(
-            extra
-                .iter()
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(String::from),
-        )
+        .chain(pats)
         .collect()
 }
 
@@ -5763,6 +5778,35 @@ pub(crate) fn declaration_identity_prefix(src: &str, shard: &TheoremShard) -> St
     prefix
 }
 
+/// Stable coarse cache key for declaration-identity probe results: `blake3` over a framed
+/// `(prefix, decl, toolchain, lean_githash)` tuple, where `prefix` is the probe source minus
+/// its trailing stub proof (`header` + suppression options + stubbed earlier declarations +
+/// the target's own signature).
+///
+/// Every byte of that prefix is invariant under edits *inside* a proof body -- of the target
+/// or of any earlier declaration -- so repeated `check --decl` runs that differ only in a
+/// proof body resolve to the same key and can reuse the previously confirmed
+/// `(decl_name, kernel_type_hash)` without re-running `lean` on a fresh probe.
+///
+/// The four parts are length-framed so no concatenation ambiguity can merge two distinct
+/// tuples into one key. Unlike the fine-grained declaration-identity cache this key needs no
+/// walk of the transitive import closure, which is exactly what makes it computable on
+/// workspaces whose dependency `.olean`s ship prebuilt with no readable sources.
+pub(crate) fn declaration_identity_cache_key(
+    prefix: &str,
+    decl: &str,
+    toolchain: &str,
+    lean_githash: &str,
+) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(b"turbo-lean-decl-identity-cache-key:v1:");
+    for part in [prefix, decl, toolchain, lean_githash] {
+        h.update(&(part.len() as u64).to_le_bytes());
+        h.update(part.as_bytes());
+    }
+    h.finalize().to_hex().to_string()
+}
+
 /// Build one full-file stubbed identity probe source (`:= sorry` with exact newline preservation)
 /// for batched per-file declaration identity confirmation, prepending warning-suppression options
 /// immediately after the module/import header and returning the line offset added before the body.
@@ -11325,6 +11369,99 @@ mod tests {
 
     use super::*;
     use std::collections::HashSet;
+
+    /// The coarse declaration-identity cache key must be invariant under proof-body edits --
+    /// of the target or of any earlier declaration -- and move exactly when the target's own
+    /// signature changes: that is the whole contract that lets a repeated `check --decl` after
+    /// editing inside a proof body reuse the previously confirmed identity.
+    #[test]
+    fn declaration_identity_cache_key_is_invariant_under_proof_body_edits() {
+        let key = |src: &str| {
+            let split = split_lean_source(src, &[]);
+            let shard = &split.shards[1];
+            assert_eq!(shard.name, "t2", "{src}");
+            let prefix = declaration_identity_prefix(src, shard);
+            let header_info = crate::module_builder::parse_header_info(&prefix);
+            let (header, prefix_body) = prefix.split_at(header_info.body_byte_offset);
+            let (signature, _) = extract_shard_stmt_and_proof(src, shard);
+            let before = format!(
+                "{header}\nset_option warningAsError false\nset_option warn.sorry false\n{prefix_body}\nset_option warningAsError false\nset_option warn.sorry false\n"
+            );
+            declaration_identity_cache_key(&format!("{before}{signature}"), "t2", "tc", "gh")
+        };
+        let v1 = "theorem t1 : 1 + 1 = 2 := by\n  rfl\ntheorem t2 : True := True.intro\n";
+        // An earlier declaration's proof changes: t2's prefix stubs it out, so the key holds.
+        let v2 = "theorem t1 : 1 + 1 = 2 := by\n  simp\ntheorem t2 : True := True.intro\n";
+        // The target's own proof changes: the signature is proof-free, so the key holds.
+        let v3 = "theorem t1 : 1 + 1 = 2 := by\n  rfl\ntheorem t2 : True := by\n  trivial\n";
+        // The target's signature changes: a different identity is being confirmed.
+        let v4 = "theorem t1 : 1 + 1 = 2 := by\n  rfl\ntheorem t2 : False := True.intro\n";
+        let k1 = key(v1);
+        assert_eq!(k1, key(v2), "earlier proof-body edit must not move the key");
+        assert_eq!(k1, key(v3), "target proof-body edit must not move the key");
+        assert_ne!(k1, key(v4), "target signature edit must move the key");
+    }
+
+    #[test]
+    fn declaration_identity_cache_key_frames_parts_unambiguously() {
+        assert_eq!(
+            declaration_identity_cache_key("a", "b", "c", "d"),
+            declaration_identity_cache_key("a", "b", "c", "d")
+        );
+        // Length framing: no split of one part can forge another tuple's key.
+        assert_ne!(
+            declaration_identity_cache_key("ab", "c", "d", "e"),
+            declaration_identity_cache_key("a", "bc", "d", "e")
+        );
+        assert_ne!(
+            declaration_identity_cache_key("a", "b", "cd", "e"),
+            declaration_identity_cache_key("a", "b", "c", "de")
+        );
+        assert_ne!(
+            declaration_identity_cache_key("a", "b", "c", "d"),
+            declaration_identity_cache_key("a", "b", "c", "d ")
+        );
+        assert_ne!(
+            declaration_identity_cache_key("a", "b", "c", "d"),
+            declaration_identity_cache_key("a", "b2", "c", "d")
+        );
+    }
+
+    /// Client-side extras (`TURBO_LEAN_ALLOWED_AXIOMS` read raw from the caller env) must
+    /// canonize to the same list the daemon's `resolve_request_axiom_policy` produces, whatever
+    /// order or duplication the caller exported, or every pinned `/eval` fails with HTTP 409
+    /// `eval execution identity changed`.
+    #[test]
+    fn allowed_axioms_with_extra_canonicalizes_extras() {
+        let canon = allowed_axioms_with_extra(&[
+            "Zed*".into(),
+            "Alpha".into(),
+            "Alpha".into(),
+            " beta ".into(),
+        ]);
+        assert_eq!(canon, allowed_axioms_with_extra(&[
+            "beta".into(),
+            "Alpha".into(),
+            "Zed*".into(),
+            "Alpha".into(),
+        ]));
+        for (i, s) in STANDARD_AXIOMS.iter().enumerate() {
+            assert_eq!(&canon[i], s, "standard axioms stay at the front");
+        }
+        assert_eq!(
+            &canon[STANDARD_AXIOMS.len()..],
+            ["Alpha", "Zed*", "beta"],
+            "extras must be trimmed, sorted, and deduplicated"
+        );
+        assert_eq!(
+            allowed_axioms_with_extra(&["Alpha".into(), "Zed*".into(), "beta".into()]),
+            canon
+        );
+        assert_eq!(
+            allowed_axioms_with_extra(&[]),
+            STANDARD_AXIOMS.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn test_indented_set_option_in_is_stripped_as_declaration_prefix() {

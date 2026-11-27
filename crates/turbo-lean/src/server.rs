@@ -1550,9 +1550,7 @@ pub fn serve_cas_http_with_auth(
                             let _ = write_json_response(
                                 &mut stream,
                                 409,
-                                &serde_json::json!({
-                                    "ok": false, "error": "eval execution identity changed"
-                                }),
+                                &eval_identity_mismatch_body(expected, &actual.identity),
                             );
                             return;
                         }
@@ -1586,9 +1584,7 @@ pub fn serve_cas_http_with_auth(
                                     let _ = write_json_response(
                                         &mut stream,
                                         409,
-                                        &serde_json::json!({
-                                            "ok": false, "error": "eval execution identity changed"
-                                        }),
+                                        &eval_identity_mismatch_body(expected, &executed_identity),
                                     );
                                     return;
                                 }
@@ -1746,6 +1742,19 @@ pub(crate) fn resolve_server_lean_env_and_bin(
 /// receipts written before canonical rooted target + server-computed content binding unreachable.
 fn server_receipt_key(shard_key: &str) -> String {
     format!("srv-v9:{}", shard_key)
+}
+
+/// Body of the HTTP 409 returned when the execution identity a `/eval` request pins no longer
+/// matches the one actually resolved (or executed). Both identities are included so callers can
+/// tell *what* changed -- a moved workspace, different declared Lake inputs, extra axioms,
+/// toolchain -- instead of guessing from the bare message; matching on `error` alone stays valid.
+pub(crate) fn eval_identity_mismatch_body(expected: &str, actual: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ok": false,
+        "error": "eval execution identity changed",
+        "expected_identity": expected,
+        "actual_identity": actual,
+    })
 }
 
 /// Pin the request's toolchain for an elan-proxied `lean` unless the environment already does.
@@ -3243,6 +3252,15 @@ fn write_http_response_with_headers(
 #[cfg(test)]
 mod bind_auth_tests {
     use super::*;
+
+    #[test]
+    fn eval_identity_mismatch_body_includes_both_identities() {
+        let body = eval_identity_mismatch_body("pre-resolved-identity", "executed-identity");
+        assert_eq!(body["ok"], serde_json::json!(false));
+        assert_eq!(body["error"], "eval execution identity changed");
+        assert_eq!(body["expected_identity"], "pre-resolved-identity");
+        assert_eq!(body["actual_identity"], "executed-identity");
+    }
 
     type BatchPublication = (String, String, Vec<(String, String, Vec<u8>, i64)>);
 
