@@ -1611,6 +1611,9 @@ pub(super) fn ensure_project_imports_fresh_inner(
 
     let mut stale_mods: HashSet<String> = HashSet::new();
     let mut tier_pin_exempt_mods: HashSet<String> = HashSet::new();
+    // #483.2 / #339 (P10): modules whose CAS-hardlinked `.olean` passed the fail-closed
+    // content-hash check (see `cas_hardlink_content_fresh_decision`).
+    let mut cas_content_fresh_mods: HashSet<String> = HashSet::new();
     for info in &ordered_imports {
         let dep_olean = &info.dep_olean;
         let olean_meta = fs::metadata(dep_olean).ok();
@@ -1772,12 +1775,25 @@ pub(super) fn ensure_project_imports_fresh_inner(
         // Under `--no-rebuild-upstream` a manifest entry that passes the content-hash checks
         // above (source BLAKE3 + artifact digest + dep `.olean` interface pins) counts as fresh
         // regardless of how its `mtime` compares to sources or sibling `.olean`s.
-        let cas_hardlink_content_fresh = crate::module_builder::no_rebuild_upstream_enabled()
-            && olean_meta.is_some()
-            && crate::module_builder::olean_installed_as_cas_hardlink(dep_olean)
-            && has_manifest_entry
-            && !identity_stale
-            && !manifest_stale;
+        // Fail closed: `manifest_stale` is `false` when `cur_hash` is `None` (symlinked `.lean`
+        // refused under `O_NOFOLLOW`, read error), so the source hash must be present AND match
+        // the manifest entry before mtime ordering may be bypassed.
+        let cas_hardlink_content_fresh = cas_hardlink_content_fresh_decision(
+            crate::module_builder::no_rebuild_upstream_enabled(),
+            olean_meta.is_some(),
+            olean_meta.is_some()
+                && crate::module_builder::olean_installed_as_cas_hardlink(dep_olean),
+            identity_stale,
+            manifest_stale,
+            cur_hash.as_deref(),
+            manifest_opt
+                .as_ref()
+                .and_then(|m| m.modules.get(&dep_rel))
+                .map(|e| e.src_blake3.as_str()),
+        );
+        if cas_hardlink_content_fresh {
+            cas_content_fresh_mods.insert(info.mod_name.clone());
+        }
         let mtime_stale = if cryptographically_verified || cas_hardlink_content_fresh {
             false
         } else {
@@ -1878,11 +1894,7 @@ pub(super) fn ensure_project_imports_fresh_inner(
                         && root_cfg
                             .as_ref()
                             .is_some_and(|cfg| !cfg.lean_bin.as_os_str().is_empty()))))
-                || (crate::module_builder::no_rebuild_upstream_enabled()
-                    && manifest_opt
-                        .as_ref()
-                        .is_some_and(|m| m.modules.contains_key(&dep_rel))
-                    && crate::module_builder::olean_installed_as_cas_hardlink(&info.dep_olean));
+                || cas_content_fresh_mods.contains(&info.mod_name);
             let self_om = fs::metadata(&info.dep_olean)
                 .and_then(|m| m.modified())
                 .ok();
@@ -1941,6 +1953,13 @@ pub(super) fn ensure_project_imports_fresh_inner(
             targets.join(" ")
         );
     }
+    // #483.2 / #339 (P10): a frozen-cone leaf worker fails fast naming every stale/missing
+    // upstream import instead of silently triggering a multi-hour upstream rebuild — and it never
+    // mutates the frozen cone either: stale non-target `.olean`s (and the Lake-less purge below)
+    // are left in place, even when no Lake target is stale.
+    if crate::module_builder::no_rebuild_upstream_enabled() {
+        anyhow::bail!("{}", frozen_cone_stale_upstream_error(&targets));
+    }
     if has_lake_config(canon_dir) {
         let (lake_targets, non_target_stale): (Vec<String>, Vec<String>) = if let Some(ref cfg) =
             root_cfg
@@ -1986,14 +2005,6 @@ pub(super) fn ensure_project_imports_fresh_inner(
         // standalone non-target `.olean`s left in `.lake/build/lib/lean`.
         let mut locally_rebuilt = None;
         if !lake_targets.is_empty() {
-            // #483.2 / #339 (P10): a frozen-cone leaf worker fails fast naming the stale/missing
-            // upstream imports instead of silently triggering a multi-hour upstream rebuild.
-            if crate::module_builder::no_rebuild_upstream_enabled() {
-                anyhow::bail!(
-                    "--no-rebuild-upstream (--frozen-cone): upstream import(s) stale or missing: {}; refusing to trigger an upstream rebuild. Materialize upstream `.olean`s from the CAS or build upstream first.",
-                    lake_targets.join(", ")
-                );
-            }
             let bypass_lake_cache = if let Some(ref cfg) = root_cfg {
                 crate::module_builder::purge_elab_host_effect_artifacts_in_closure(
                     cfg,
@@ -2618,20 +2629,71 @@ pub(super) fn standalone_recheck_compile_timeout(is_untrusted: bool) -> std::tim
 /// `.olean` on `LEAN_PATH`, so `.ir` files must be merged alongside the artifact-set suffixes or
 /// re-checked imports fail with `missing IR data file`.
 pub(super) fn standalone_olean_tree_rel_stem(rel: &str) -> Option<String> {
-    rel.strip_suffix(".olean.server")
-        .or_else(|| rel.strip_suffix(".olean.private"))
-        .or_else(|| rel.strip_suffix(".olean"))
-        .or_else(|| rel.strip_suffix(".ilean"))
-        .or_else(|| rel.strip_suffix(".ir"))
-        .map(String::from)
+    const SUFFIXES: [&str; 5] = [".olean.server", ".olean.private", ".olean", ".ilean", ".ir"];
+    // Only the final path component carries the extension; match it at a true extension
+    // boundary (the whole trailing suffix, e.g. `Base.ir.sig` is NOT a `.ir` artifact).
+    let (dir, file) = match rel.rfind(['/', '\\']) {
+        Some(i) => (&rel[..=i], &rel[i + 1..]),
+        None => ("", rel),
+    };
+    let stem = SUFFIXES.iter().find_map(|s| file.strip_suffix(s))?;
+    // A boundary needs a non-empty module stem (`Up/.ir` is a dotfile, not `Up`'s IR) that is not
+    // itself an artifact name (`Base.olean.ir` / `Base.ir.ir` are foreign files).
+    if stem.is_empty() || stem.ends_with('.') || SUFFIXES.iter().any(|s| stem.ends_with(s)) {
+        return None;
+    }
+    Some(format!("{dir}{stem}"))
 }
 
-/// #440: device id of `path` on unix (`None` when it cannot be determined).
+/// #483.2 / #339 (P10): error raised by a frozen-cone (`--no-rebuild-upstream`) leaf worker
+/// instead of rebuilding or deleting any stale upstream import.
+pub(super) fn frozen_cone_stale_upstream_error(stale: &[String]) -> String {
+    format!(
+        "--no-rebuild-upstream (--frozen-cone): upstream import(s) stale or missing: {}; refusing to trigger an upstream rebuild or delete upstream `.olean`s. Materialize upstream `.olean`s from the CAS or build upstream first.",
+        stale.join(", ")
+    )
+}
+
+/// #483.2 / #339 (P10): whether a CAS-installed hardlinked `.olean` may bypass mtime ordering
+/// under `--no-rebuild-upstream`. Fails closed unless the current source hash is known
+/// (`cur_hash` is `None` for a symlinked `.lean` refused under `O_NOFOLLOW` or on a read error,
+/// in which case `manifest_stale` is vacuously `false`) AND equals the manifest entry's hash.
+pub(super) fn cas_hardlink_content_fresh_decision(
+    no_rebuild_upstream: bool,
+    olean_present: bool,
+    olean_is_cas_hardlink: bool,
+    identity_stale: bool,
+    manifest_stale: bool,
+    cur_hash: Option<&str>,
+    manifest_src_hash: Option<&str>,
+) -> bool {
+    no_rebuild_upstream
+        && olean_present
+        && olean_is_cas_hardlink
+        && !identity_stale
+        && !manifest_stale
+        && match (cur_hash, manifest_src_hash) {
+            (Some(cur), Some(recorded)) => !cur.is_empty() && cur == recorded,
+            _ => false,
+        }
+}
+
+/// #440: device id of `path` on unix (`None` when it cannot be determined). A not-yet-created
+/// candidate directory reports the device of its nearest existing ancestor (where it would be
+/// created).
 pub(crate) fn fs_device_id(path: &Path) -> Option<u64> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        fs::metadata(path).ok().map(|m| m.dev())
+        let mut cur = Some(path);
+        while let Some(p) = cur {
+            match fs::metadata(p) {
+                Ok(m) => return Some(m.dev()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => cur = p.parent(),
+                Err(_) => return None,
+            }
+        }
+        None
     }
     #[cfg(not(unix))]
     {
@@ -2666,23 +2728,41 @@ pub(crate) fn choose_same_fs_staging_base_with(
         .unwrap_or_else(|| preferred.to_path_buf())
 }
 
+/// #440: ordered same-filesystem staging candidates for the standalone re-check. The turbo
+/// store's own `staging` dir comes first, then the system temp dir, then a private scratch dir
+/// under the root package's `.lake` — never inside `lib/lean` (it would shadow `LEAN_PATH`
+/// resolution) and only when `.lake` may be written (`lake_scratch` is `None` under
+/// `--no-auto-worktree-link` / preserved `.lake` snapshots). Each candidate is accepted by
+/// [`choose_same_fs_staging_base_with`] only when its `st_dev` matches the source `.olean` trees.
+pub(crate) fn same_fs_staging_candidates(
+    store_root: &Path,
+    lake_scratch: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut out = vec![store_root.join("staging"), std::env::temp_dir()];
+    out.extend(lake_scratch.map(Path::to_path_buf));
+    out
+}
+
 /// Filesystem-backed counterpart of [`choose_same_fs_staging_base_with`] used by the standalone
 /// re-check: an explicit `TURBO_LEAN_STAGING_DIR` is honored verbatim, otherwise the fast staging
-/// dir is kept only when it can hardlink the workspace `.olean` trees, else `/tmp` or the root
-/// package's own build dir (always on the sources' filesystem) is used.
+/// dir is kept only when it can hardlink the workspace `.olean` trees, else the first
+/// [`same_fs_staging_candidates`] entry sharing the sources' device is used; when none matches,
+/// the preferred base is kept (per-file copy fallback).
 pub(crate) fn choose_same_fs_staging_base(
     preferred: &Path,
     source_dirs: &[PathBuf],
-    root_pkg_build_dir: &Path,
+    store_root: &Path,
+    lake_scratch: Option<&Path>,
 ) -> PathBuf {
     if std::env::var_os("TURBO_LEAN_STAGING_DIR").is_some() {
         return preferred.to_path_buf();
     }
-    let fallbacks = vec![
-        std::env::temp_dir().clone(),
-        root_pkg_build_dir.to_path_buf(),
-    ];
-    choose_same_fs_staging_base_with(preferred, source_dirs, &fallbacks, &fs_device_id)
+    let fallbacks = same_fs_staging_candidates(store_root, lake_scratch);
+    // Only existing `.olean` trees define the source device (a missing dependency build dir
+    // would otherwise report its ancestor's device).
+    let existing_sources: Vec<PathBuf> =
+        source_dirs.iter().filter(|d| d.is_dir()).cloned().collect();
+    choose_same_fs_staging_base_with(preferred, &existing_sources, &fallbacks, &fs_device_id)
 }
 
 /// #483.2 / #339 (P10): workspace imports of `cfg` whose expected `.olean` artifact is missing on
@@ -2931,11 +3011,20 @@ pub(super) fn check_and_audit_standalone_modules(
         .iter()
         .map(|dp| dp.pkg_root.join(&dp.build_dir).join(&dp.lean_lib_dir))
         .collect();
-    merge_source_dirs.push(root_build_dir.clone());
+    // Root `.olean` tree first: it defines the workspace device the staging base must match.
+    merge_source_dirs.insert(0, root_build_dir.clone());
+    // Never stage inside `.lake` when it must stay untouched (`--no-auto-worktree-link`).
+    let lake_scratch = (!worktree_auto_link_disabled(canon_dir)).then(|| {
+        cfg.root_pkg
+            .pkg_root
+            .join(&cfg.root_pkg.build_dir)
+            .join("turbo_recheck_staging")
+    });
     let staging_base = choose_same_fs_staging_base(
         &store.fast_staging_dir(),
         &merge_source_dirs,
-        &root_build_dir,
+        &store.root,
+        lake_scratch.as_deref(),
     );
     fs::create_dir_all(&staging_base)?;
     let scratch = crate::check::PrivateScratchDir::create(&staging_base, "standalone_recheck")?;
@@ -5713,6 +5802,155 @@ mod tests {
     }
 
     #[test]
+    fn standalone_olean_tree_rel_stem_ir_only_at_extension_boundary() {
+        // `.ir` is stripped only as the whole trailing extension of the file name.
+        assert_eq!(standalone_olean_tree_rel_stem("Up/Base.ir.sig"), None);
+        assert_eq!(standalone_olean_tree_rel_stem("Up/Base.ir.bak"), None);
+        assert_eq!(standalone_olean_tree_rel_stem("Up/Base.irx"), None);
+        assert_eq!(standalone_olean_tree_rel_stem("Up/Base.olean.ir"), None);
+        assert_eq!(standalone_olean_tree_rel_stem("Up/Base.ir.ir"), None);
+        assert_eq!(standalone_olean_tree_rel_stem("Up/.ir"), None);
+        assert_eq!(standalone_olean_tree_rel_stem(".ir"), None);
+        assert_eq!(standalone_olean_tree_rel_stem("Up/Base..ir"), None);
+        // A directory named like an artifact never makes its children artifacts.
+        assert_eq!(standalone_olean_tree_rel_stem("Up.ir/Base.c"), None);
+        assert_eq!(
+            standalone_olean_tree_rel_stem("Up.ir/Base.ir").as_deref(),
+            Some("Up.ir/Base")
+        );
+        assert_eq!(
+            standalone_olean_tree_rel_stem("Up.ir").as_deref(),
+            Some("Up")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #483.2 / #339 (P10) review fix: CAS content-freshness fails closed.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cas_hardlink_content_fresh_requires_known_matching_source_hash() {
+        let h = "a".repeat(64);
+        let other = "b".repeat(64);
+        // Baseline: everything present and matching.
+        assert!(cas_hardlink_content_fresh_decision(
+            true,
+            true,
+            true,
+            false,
+            false,
+            Some(&h),
+            Some(&h)
+        ));
+        // `cur_hash = None` (symlinked `.lean` under O_NOFOLLOW / read error): `manifest_stale`
+        // is vacuously `false`, yet the bypass must fail closed.
+        assert!(!cas_hardlink_content_fresh_decision(
+            true,
+            true,
+            true,
+            false,
+            false,
+            None,
+            Some(&h)
+        ));
+        // Missing manifest entry / mismatched or empty hashes fail closed too.
+        assert!(!cas_hardlink_content_fresh_decision(
+            true,
+            true,
+            true,
+            false,
+            false,
+            Some(&h),
+            None
+        ));
+        assert!(!cas_hardlink_content_fresh_decision(
+            true,
+            true,
+            true,
+            false,
+            false,
+            Some(&h),
+            Some(&other)
+        ));
+        assert!(!cas_hardlink_content_fresh_decision(
+            true,
+            true,
+            true,
+            false,
+            false,
+            Some(""),
+            Some("")
+        ));
+        // Each remaining guard is required.
+        for (flag, present, cas, id_stale, man_stale) in [
+            (false, true, true, false, false),
+            (true, false, true, false, false),
+            (true, true, false, false, false),
+            (true, true, true, true, false),
+            (true, true, true, false, true),
+        ] {
+            assert!(!cas_hardlink_content_fresh_decision(
+                flag,
+                present,
+                cas,
+                id_stale,
+                man_stale,
+                Some(&h),
+                Some(&h)
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cas_hardlinked_olean_with_symlinked_source_is_not_content_fresh() -> Result<()> {
+        // End-to-end shape of the Opus finding: a symlinked `.lean` yields no source hash
+        // (`compute_cached_source_blake3` refuses symlinks), so the CAS bypass must not fire.
+        let dir = tmp_dir("cas_symlink_src");
+        fs::create_dir_all(&dir)?;
+        let real = dir.join("Real.lean");
+        fs::write(&real, "def x := 1\n")?;
+        let link = dir.join("Base.lean");
+        std::os::unix::fs::symlink(&real, &link)?;
+        let cur_hash = compute_cached_source_blake3(&link);
+        let recorded = blake3::hash(&fs::read(&real)?).to_hex().to_string();
+        assert!(
+            !cas_hardlink_content_fresh_decision(
+                true,
+                true,
+                true,
+                false,
+                false,
+                cur_hash.as_deref(),
+                Some(&recorded)
+            ),
+            "symlinked/unreadable source must fail closed (cur_hash = {cur_hash:?})"
+        );
+        let missing = compute_cached_source_blake3(&dir.join("Gone.lean"));
+        assert!(missing.is_none());
+        assert!(!cas_hardlink_content_fresh_decision(
+            true,
+            true,
+            true,
+            false,
+            false,
+            missing.as_deref(),
+            Some(&recorded)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn frozen_cone_stale_error_names_every_stale_import_and_refuses_deletion() {
+        let msg =
+            frozen_cone_stale_upstream_error(&["Dep.Prebuilt".to_string(), "Up.A".to_string()]);
+        assert!(msg.contains("--no-rebuild-upstream"));
+        assert!(msg.contains("Dep.Prebuilt") && msg.contains("Up.A"));
+        assert!(msg.contains("delete"));
+    }
+
+    #[test]
     fn merge_pkg_oleans_includes_ir_files_in_recheck_tree() -> Result<()> {
         let dir = tmp_dir("merge_ir");
         let pkg_root = dir.join("proj");
@@ -5869,6 +6107,93 @@ mod tests {
     }
 
     #[test]
+    fn choose_same_fs_staging_base_cross_device_skips_tmpfs_temp_dir() {
+        // Workspace `.olean` tree on disk (dev 2); `/dev/shm` and the system temp dir both on
+        // tmpfs (dev 1, as on many CI hosts): the tmpfs temp dir must never be picked, the
+        // store's same-device staging dir wins.
+        let store_root = Path::new("/store");
+        let tmp = std::env::temp_dir();
+        let tmp_s = tmp.to_string_lossy().into_owned();
+        let dev_of = |p: &Path| {
+            let s = p.to_string_lossy();
+            if s == "/dev/shm/stage" || s == tmp_s {
+                Some(1)
+            } else if s.starts_with("/store") || s.starts_with("/proj") {
+                Some(2)
+            } else {
+                None
+            }
+        };
+        let lake_scratch = Path::new("/proj/.lake/build/turbo_recheck_staging");
+        let candidates = same_fs_staging_candidates(store_root, Some(lake_scratch));
+        assert_eq!(
+            candidates,
+            vec![
+                store_root.join("staging"),
+                tmp.clone(),
+                lake_scratch.to_path_buf()
+            ]
+        );
+        assert!(
+            candidates.iter().all(|c| !c.ends_with("lib/lean")),
+            "never stage inside the `LEAN_PATH` `.olean` tree"
+        );
+        let src = [PathBuf::from("/proj/.lake/build/lib/lean")];
+        assert_eq!(
+            choose_same_fs_staging_base_with(
+                Path::new("/dev/shm/stage"),
+                &src,
+                &candidates,
+                &dev_of
+            ),
+            store_root.join("staging")
+        );
+
+        // Store also on tmpfs: only the `.lake` scratch shares the workspace device.
+        let dev_store_tmpfs = |p: &Path| {
+            let s = p.to_string_lossy();
+            if s.starts_with("/proj") {
+                Some(2)
+            } else {
+                Some(1)
+            }
+        };
+        assert_eq!(
+            choose_same_fs_staging_base_with(
+                Path::new("/dev/shm/stage"),
+                &src,
+                &candidates,
+                &dev_store_tmpfs
+            ),
+            lake_scratch.to_path_buf()
+        );
+        // ... and when `.lake` must stay untouched there is no same-device candidate: fall back
+        // cleanly to the preferred base (per-file copy), never to the cross-device temp dir.
+        let no_lake = same_fs_staging_candidates(store_root, None);
+        assert_eq!(no_lake.len(), 2);
+        assert_eq!(
+            choose_same_fs_staging_base_with(
+                Path::new("/dev/shm/stage"),
+                &src,
+                &no_lake,
+                &dev_store_tmpfs
+            ),
+            PathBuf::from("/dev/shm/stage")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_device_id_resolves_not_yet_created_candidates_via_ancestor() -> Result<()> {
+        let dir = tmp_dir("devid");
+        fs::create_dir_all(&dir)?;
+        let dev = fs_device_id(&dir).expect("existing dir has a device");
+        assert_eq!(fs_device_id(&dir.join("not/yet/created")), Some(dev));
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
     fn choose_same_fs_staging_base_real_fs_keeps_same_device_preferred() -> Result<()> {
         let dir = tmp_dir("stagefs");
         let src = dir.join("proj/.lake/build/lib/lean");
@@ -5878,7 +6203,7 @@ mod tests {
         // /dev/shm-style fast dir on the same filesystem (as in containers without a separate
         // shm mount): the preferred base must be kept.
         assert_eq!(
-            choose_same_fs_staging_base(&preferred, std::slice::from_ref(&src), &dir),
+            choose_same_fs_staging_base(&preferred, std::slice::from_ref(&src), &dir, None),
             preferred
         );
         // An explicit TURBO_LEAN_STAGING_DIR is honored verbatim.
@@ -5888,7 +6213,7 @@ mod tests {
         let saved = std::env::var("TURBO_LEAN_STAGING_DIR").ok();
         std::env::set_var("TURBO_LEAN_STAGING_DIR", &preferred);
         assert_eq!(
-            choose_same_fs_staging_base(&preferred, &[src], &dir),
+            choose_same_fs_staging_base(&preferred, &[src], &dir, None),
             preferred
         );
         match saved {
