@@ -1276,7 +1276,7 @@ pub(crate) fn lake_refresh_targets(canon_dir: &Path, modules: &[String]) -> Vec<
     lake_refresh_targets_inner(&cfg, modules, false)
 }
 
-/// The Lake-inputs closure sweep's variant (#434 / DA 449989b1 F3): dependency-package
+/// The Lake-inputs closure sweep's variant (#434): dependency-package
 /// lake targets are driven from the dependency's own workspace unless the project owns
 /// the package, so every dependency-shaped target — an input-bearing `<dep>/<lib>`, an
 /// `@<dep>/<exe>:exe`, a `+<Mod>` qualification — is emitted only for owned packages,
@@ -1285,7 +1285,7 @@ pub(crate) fn lake_refresh_targets(canon_dir: &Path, modules: &[String]) -> Vec<
 /// skip. Which modules the sweep considers at all is [`input_closure_sweep_mods`]'s
 /// job: a non-owned module must not pull its owned dependents into the closure
 /// either, or `lake build <dependent>` writes the stale non-owned module into the
-/// shared checkout's build dir (DA 47e88386 F4). Taking the resolved config the
+/// shared checkout's build dir. Taking the resolved config the
 /// caller already holds closes the fail-open the path-taking shape had (an
 /// unresolvable config returned the module list unfiltered) and drops the duplicate
 /// resolution. The unfiltered [`lake_refresh_targets`] stays the stale-import
@@ -1433,8 +1433,8 @@ pub(crate) fn record_stale_non_owned_warning(
 /// it, or its source uses `include_str`), plus every transitive OWNED dependent,
 /// each of which has to be re-checked once an input changes.
 ///
-/// Non-owned modules never enter the closure, as seed or as dependent (DA 47e88386
-/// F4): the explicit input-target seeds are already ownership-gated, and a non-owned
+/// Non-owned modules never enter the closure, as seed or as dependent: the explicit
+/// input-target seeds are already ownership-gated, and a non-owned
 /// seed here would pull its owned dependents in, whose emitted targets make
 /// `lake build <dependent>` rebuild the stale non-owned module inside the shared
 /// checkout's `.lake/build`, the #434 write the emission filter cannot catch. The

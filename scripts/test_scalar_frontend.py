@@ -1053,10 +1053,10 @@ def callNestedPair (x : UInt64) : UInt64 :=
                 self.assertFalse(output.exists(), f"{label} published an artifact despite failure")
 
     def test_unsupported_lcnf_paths_fail_closed(self):
-        # L1 r1 (review a094d3a9 F2): ported from the deleted BridgeM wrappers to the
+        # Ported from the deleted BridgeM wrappers to the
         # proved pure core (lowerRealLCNFCode / lowerLitValuePure / lowerImpureLetValuePure);
         # the pure-only cases (recursive local function, constructor payload pattern) went
-        # with the deleted pure lowering. L1 r2 (review 47512851 F3): the higher-order fvar
+        # with the deleted pure lowering. The higher-order fvar
         # case is NOT pure-only — LetValue .impure keeps `.fvar id args` — so it is ported
         # to lowerImpureLetValuePure below.
         source = '''import LeanNative.IR.Bridge

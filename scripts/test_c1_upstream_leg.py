@@ -53,7 +53,7 @@ class C1UpstreamClassificationTest(unittest.TestCase):
             )
 
     def test_mixed_output_disqualifiers_override_refusal_markers(self):
-        # F1 (round 2): a disqualifying fatal shape anywhere in stderr OR
+        # A disqualifying fatal shape anywhere in stderr OR
         # stdout makes the outcome frontend_error even when a deliberate
         # refusal marker is also present, and returncode >= 128 is a signal
         # death whatever the output says.
@@ -107,7 +107,7 @@ class C1UpstreamClassificationTest(unittest.TestCase):
 
 class C1ToolchainPinTest(unittest.TestCase):
     def test_mismatch_fails_only_the_opted_in_leg(self):
-        # F5 (round 2, re-pins the round-1 behavior): a C1_UPSTREAM_TOOLCHAIN
+        # A C1_UPSTREAM_TOOLCHAIN
         # drift no longer stops main() for unrelated tiers; the opted-in leg
         # fails closed with a named status, before any provisioning.
         with mock.patch.object(c1_corpus, "C1_UPSTREAM_TOOLCHAIN", "leanprover/lean4:v9.99.9"):

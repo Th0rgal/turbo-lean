@@ -3997,7 +3997,7 @@ fn kernel_witness_probe_theorems(
 /// itself. This is the fallback for audited sources whose verbatim embedding does not
 /// re-elaborate in the probe module because of its OWN elaboration errors; a pure
 /// header-import failure aborts as `imports_unresolved` and never reaches this
-/// fallback (A2 r3; review 29baa2ab F6): the witness replay needs the definitions a
+/// fallback: the witness replay needs the definitions a
 /// candidate text mentions, not the audited file's proofs or imports.
 pub(super) fn build_kernel_witness_minimal_probe_src(
     local_def_srcs: &[(String, String, bool)],
@@ -5329,7 +5329,7 @@ fn audit_spec_file_or_source_with_policy_inner(
         // reference, nothing else), gated then sides-only, for audited sources whose
         // verbatim embedding does not re-elaborate in the probe module because of its
         // OWN elaboration errors (a pure header-import failure aborts earlier as
-        // `imports_unresolved` and never reaches this fallback; review 29baa2ab F6).
+        // `imports_unresolved` and never reaches this fallback).
         // A batch that still rejects is retried candidate by candidate (one
         // non-replaying candidate must not poison the batch). A rejected probe
         // downgrades nothing: the eval-level labels simply stand.
@@ -7211,7 +7211,7 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
         assert_eq!(names, vec!["_turbo_audit_kw_neg_0".to_string()]);
     }
 
-    /// A2 r2 (#367): a def whose modifiers or attributes were stripped by extraction is
+    /// #367: a def whose modifiers or attributes were stripped by extraction is
     /// never re-emitted into a self-contained probe (a formerly-`partial` def would be
     /// transparent to `decide` there).
     #[test]
@@ -7236,7 +7236,7 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
         );
     }
 
-    /// A2 r2 (#367): sources that declare instances, notation, macros or custom syntax
+    /// #367: sources that declare instances, notation, macros or custom syntax
     /// disable the self-contained fallback for the whole file; plain defs and theorems
     /// do not.
     #[test]
@@ -7285,7 +7285,7 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
         }
     }
 
-    /// A2 r3 (#367): a def the extractor skipped (a `by`/`do`/`where` body) that the
+    /// #367: a def the extractor skipped (a `by`/`do`/`where` body) that the
     /// candidate texts reference disables the self-contained probe outright.
     #[test]
     fn audit_spec_kernel_witness_minimal_probe_refuses_skipped_def_references() {
@@ -7310,7 +7310,7 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
         );
     }
 
-    /// A2 r3 (#367): two extracted defs sharing a short name (`A.f` and `B.f`) flatten
+    /// #367: two extracted defs sharing a short name (`A.f` and `B.f`) flatten
     /// to one `_root_` name in the reconstructed probe, so re-emitting either silently
     /// rebinds the candidates' short-name references: the fallback is refused.
     #[test]
@@ -7351,7 +7351,7 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
         );
     }
 
-    /// A2 r3 (#367): attribute groups and `open`/`set_option … in` prefixes reach the
+    /// #367: attribute groups and `open`/`set_option … in` prefixes reach the
     /// command they modify, instance-making attributes are hostile by themselves, and
     /// an unterminated attribute group fails closed.
     #[test]
@@ -7400,7 +7400,7 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
         }
     }
 
-    /// A2 r3 (#367): the header recognizer covers the module-system import forms, so
+    /// #367: the header recognizer covers the module-system import forms, so
     /// the memo and the `imports_unresolved` classification see what the splitter sees.
     #[test]
     fn audit_spec_kernel_witness_header_import_lines_forms() {
@@ -7409,7 +7409,7 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
         assert!(lean_header_import_lines("def f : Nat := 0\n").is_empty());
     }
 
-    /// A2 r2+r3 (#367): error positions parse from Lean diagnostics so the probe
+    /// #367: error positions parse from Lean diagnostics so the probe
     /// ladder can tell an audited-block failure from a rejected witness theorem, and
     /// only the probe module's own scratch file counts.
     #[test]

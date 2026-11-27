@@ -1024,7 +1024,7 @@ def ensure_c1_upstream_corpus() -> dict[str, Any]:
         "tag": c1_corpus.C1_UPSTREAM_TAG,
         "path": str(dep_dir),
     }
-    # F2 (round 2): the stamp records the pile set beside the rev, so a
+    # The stamp records the pile set beside the rev, so a
     # CORPUS_PILES change re-provisions a warm sparse cache instead of
     # leaving it stuck without the new pile.
     want_stamp = rev + "\n" + ",".join(c1_corpus.CORPUS_PILES) + "\n"
@@ -1054,7 +1054,7 @@ def ensure_c1_upstream_corpus() -> dict[str, Any]:
             stamp.write_text(want_stamp, encoding="utf-8")
         missing_piles = [pile for pile in c1_corpus.CORPUS_PILES if not (dep_dir / pile).is_dir()]
         if missing_piles:
-            # F2 (round 2): a stamped cache can still lack a pile (an older
+            # A stamped cache can still lack a pile (an older
             # sparse cone, a partial cache restore); re-running the sparse
             # checkout is cheap and self-heals it instead of failing.
             subprocess.run(["git", "-C", str(dep_dir), "sparse-checkout", "set", *c1_corpus.CORPUS_PILES],
@@ -1089,7 +1089,7 @@ C1_UPSTREAM_REJECTION_MARKERS: tuple[str, ...] = (
     "[lean-native] Failed to extract any LCNF declarations",
     "[lean-native] Module contains no Stage 1B scalar functions",
 )
-# F1 (round 2): fatal shapes that DISQUALIFY a refusal classification even
+# Fatal shapes that DISQUALIFY a refusal classification even
 # when a refusal marker is also present (Lean can print a panic and keep
 # running, so a fatal line can sit beside per-declaration refusal notes).
 # Spellings read at their sources: "[lean-native] internal bridge error"
@@ -1154,7 +1154,7 @@ def run_c1_upstream_corpus(enabled: bool) -> dict[str, Any]:
                 "(one network fetch per cold cache) and fails closed on a missing dependency"
             ),
         }
-    # R2, relocated here by F5 (round 2): the corpus pin consistency check
+    # The corpus pin consistency check
     # lives in the opted-in leg, not suite startup, so a lean/lean-toolchain
     # bump cannot break tiers that never run this corpus. The leg still fails
     # closed, before any provisioning, with a named status.
@@ -1405,7 +1405,7 @@ def assert_toolchain_pins_consistent() -> None:
             "fixtures together."
         )
     # The R2 check on c1_corpus.C1_UPSTREAM_TOOLCHAIN moved into the opted-in
-    # upstream leg (F5, round 2): a repo toolchain bump must not break tiers
+    # upstream leg: a repo toolchain bump must not break tiers
     # that never run that corpus.
 
 

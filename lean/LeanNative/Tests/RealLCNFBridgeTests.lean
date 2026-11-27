@@ -151,21 +151,21 @@ private def recJpDecl : Decl .impure :=
 
 #guard (lowerRealLCNFDecl 32 { arch := .x86_64 } recJpDecl).isOk == false
 
-/-! ### L1 rounds 1-2 (reviews a094d3a9 F4, 47512851 F2): explicit requests fail closed
+/-! ### L1: explicit requests fail closed
 
 An explicitly requested declaration whose constant kind carries compiled code (a computable
 `defnInfo`/`opaqueInfo`) but that the Stage 1B ingest cannot lower raises a named
 `Unsupported` error instead of being dropped silently — the "imported declarations are
 outside" wording for an imported name, "no impure LCNF form" for a local one; a constant
 with no compiled code (here: a theorem) is skipped silently. Red evidence, both recorded in
-the w-l1 commit messages: on the pre-r1 tree `UInt64.add` was accepted as an EMPTY module;
+this branch's commit messages: on the pre-r1 tree `UInt64.add` was accepted as an EMPTY module;
 on the pre-r2 tree the LOCAL type-alias case below was accepted as an empty module too. -/
 
 private theorem l1NonCodeProbe : True := trivial
 
 /-- A local `def` with a compiled-code kind but no runtime code: `defnInfo`, computable,
     and the LCNF pipeline compiles no impure form for a `Type`-valued definition
-    (measured, w-l1 r2). -/
+    (measured on this branch). -/
 private def l1TypeAliasProbe : Type := UInt64
 
 private def expectIngestThrows (names : Array Lean.Name) (tag expected : String) :

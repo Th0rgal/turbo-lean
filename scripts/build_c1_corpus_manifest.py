@@ -218,7 +218,7 @@ TARGET_STATUS = {cid: status for cid, status, _p in TARGET_CONSTRUCT_SPEC}
 
 
 def detector_digest() -> str:
-    """F3 (round 2): sha256 over everything that shapes candidate enumeration
+    """Sha256 over everything that shapes candidate enumeration
     and selection (both spec tuples, the size bound, the import-free rule,
     the measured non-elaborating files, the pile set). Recorded in the manifest and re-checked by the
     manifest-only gate, so a detector edit without `--write` fails the PR
@@ -503,7 +503,7 @@ def verify_manifest(
         rec = manifest.get("emphasis", {}).get(name, {})
         actual = sum(1 for p in programs if name in p.get("emphasis", []))
         if rec.get("pattern") != pat:
-            # F3 (round 2): the recorded pattern is compared with the spec, so
+            # The recorded pattern is compared with the spec, so
             # a stale manifest cannot ride its own recorded detector text.
             reasons.append(f"emphasis {name!r}: recorded pattern differs from EMPHASIS_SPEC")
         elif rec.get("count") != actual:
@@ -675,7 +675,7 @@ class C1CorpusManifestSelfTest(unittest.TestCase):
             self.assertFalse(red["ok"])
             self.assertTrue(any("sha256" in r for r in red["reasons"]), red["reasons"])
 
-            # F3 (round 2): a detector edit without --write must fail the
+            # A detector edit without --write must fail the
             # manifest-only gate through the recorded detectorDigest...
             bad_digest = json.loads(json.dumps(manifest))
             bad_digest["detectorDigest"] = "0" * 64

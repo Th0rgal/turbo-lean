@@ -9,7 +9,7 @@ use std::process::Command;
 
 use super::*;
 
-    /// H2.3 r1 (finding 7): restore an env var on drop, so a failing assert cannot leak
+    /// H2.3: restore an env var on drop, so a failing assert cannot leak
     /// the override into later tests (the env lock's poison is ignored via `into_inner`).
     struct EnvVarGuard {
         key: &'static str,
@@ -159,7 +159,7 @@ use super::*;
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// H2.3 r1 (finding 2): a budgeted fan-out's workers carry a permanent RLIMIT_DATA
+    /// H2.3: a budgeted fan-out's workers carry a permanent RLIMIT_DATA
     /// share, so they pool under a cap-suffixed key, invisible to uncapped requests.
     #[test]
     #[cfg(unix)]
@@ -221,7 +221,7 @@ use super::*;
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// H2.3 r1 (finding 7): the fan-out's dispatching-thread crash retry at width > 4.
+    /// H2.3: the fan-out's dispatching-thread crash retry at width > 4.
     /// Poison the pooled workers a wide replay left warm, then replay a fresh wide body
     /// through them: the queue records crashes, the retry respawns per slice, and the
     /// combined reply is complete and ok.
@@ -2253,7 +2253,7 @@ use super::*;
             explicit_over_budget.effective_parallelism(64, 2048, || unreachable!()),
             2
         );
-        // #435 review (finding 2): `RLIMIT_DATA` meters writable private VIRTUAL mappings
+        // #435: `RLIMIT_DATA` meters writable private VIRTUAL mappings
         // (heap, malloc arenas, pthread stacks), not RSS, so the cap is the share FLOORED
         // at the worker RSS estimate, with x2 headroom. Review bb7c0f2f F2: the cap is
         // MONOTONE in the budget (no step from "no cap" to a 4096 MiB cap at a 2048 MiB
@@ -2377,7 +2377,7 @@ use super::*;
         // #437: the replay budget defaults to the audit budget ...
         assert_eq!(replay_timeout_ms(false), audit_timeout_ms(false));
         assert_eq!(replay_timeout_ms(true), audit_timeout_ms(true));
-        // #443 review (finding 3) + review bb7c0f2f F1: a literal `0` is explicitly
+        // A literal `0` is explicitly
         // unbounded on the TRUSTED side only; untrusted audits clamp to [15, 600] s like
         // untrusted replay and compile budgets (a PR-supplied `[audit] timeout_secs = 0`
         // must not hold a CI runner), and an EMPTY value (an empty CI export such as
@@ -2397,7 +2397,7 @@ use super::*;
         // ... and has its own knob (`[replay] timeout_secs` sets this environment key).
         std::env::set_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS", "3600");
         assert_eq!(replay_timeout_ms(false), 3_600_000);
-        // #443 review (finding 4): untrusted replay is clamped to [15, 600] s like
+        // #443: untrusted replay is clamped to [15, 600] s like
         // untrusted compile timeouts, so a PR-supplied `[replay] timeout_secs` cannot
         // hold a CI runner for hours.
         assert_eq!(replay_timeout_ms(true), 600_000);
@@ -2467,7 +2467,7 @@ use super::*;
 
     #[test]
     fn test_explicit_audit_timeout_parser_and_unbounded_threshold() {
-        // #443 review (finding 3): one shared parser decides what an explicit
+        // #443: one shared parser decides what an explicit
         // TURBO_LEAN_AUDIT_TIMEOUT_SECS means, and the shard auditor's unbounded-request
         // test is a threshold, so a derived budget (the sentinel minus elapsed time)
         // stays unbounded instead of silently falling back to the 300 s default.
@@ -2531,7 +2531,7 @@ use super::*;
     #[test]
     #[cfg(unix)]
     fn test_memory_cap_error_classification_for_scheduler_fallback() {
-        // #435 review (finding 1): the scheduler returns a capped replay's failure to its
+        // #435: the scheduler returns a capped replay's failure to its
         // caller (instead of silently redoing the work through the audit fallback) when
         // the error is a typed timeout or carries the memory-cap attribution; this pins
         // the classification helper against the exact phrases `memory_kill_note` writes.

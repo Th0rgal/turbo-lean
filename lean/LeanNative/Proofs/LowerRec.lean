@@ -4,7 +4,7 @@ import LeanNative.Proofs.RealLCNFBridgeProofs
 import LeanNative.Proofs.RealLCNFBridge.CallsF
 
 /-!
-## L3 contract (roadmap/HORIZONS.md, H1 rung L3 "Recursion and loops") — w-l3
+## L3 contract (roadmap/HORIZONS.md, H1 rung L3 "Recursion and loops")
 
 Authoritative row (`roadmap/HORIZONS.md`): "L3 Recursion and loops — Fuel-indexed calls;
 `LNIR` gets a join-point / loop construct that replaces inlining a join point at every jump.
@@ -20,7 +20,7 @@ leaf. Part II freezes the recursion-headline signatures H1.4 builds against; its
 are sequenced after the L2 lane's F-proofs merge (the reason is named there — it is a
 pipeline-sequencing fact at the bytes, not an unprovability).
 
-Status (gap-l3, 2026-11-26): Part I is PROVED at the end of this file — the 14 theorems
+Status (2026-11-26): Part I is PROVED at the end of this file — the 14 theorems
 with the statements below plus the four lemmas amendment 2 adds, registered in
 `AxiomAudit.lean` (874 → 892; L2's raise landed first), each depending only on `propext`,
 `Classical.choice` and `Quot.sound`; the executable guards are in
@@ -40,7 +40,7 @@ the per-case step mirrors (`Proofs/RealLCNFBridge/CallsF.lean`, imported here), 
 `CtxMapsEnv`, `DeclEnvLowers` and the proved headline `lowerRealLCNFDecl_soundF`
 (`Proofs/LowerCalls.lean`). L2 dropped its contract's `CodeRefinesF`, which had no
 consumer once the compression post-pass was removed (`LowerCalls.lean`'s definitions
-paragraph). Nothing here edits L2's files or proves L2's theorems. L1 fix round 1 removed
+paragraph). Nothing here edits L2's files or proves L2's theorems. L1 removed
 the post-pass (`applyValidatedCompression` is defined nowhere in the tree), so the
 driver-shaped soundness statement is `lowerRealLCNFDecl_sound` and this contract names no
 post-pass symbol. The sha-pinned files (`scripts/lcnf_coverage_results.json` pins
@@ -48,7 +48,7 @@ post-pass symbol. The sha-pinned files (`scripts/lcnf_coverage_results.json` pin
 `IR/BridgeHelpers*.lean`, `Proofs/RealLCNFBridgeProofs.lean`) are read, cited and proved
 ABOUT, never edited; every new definition goes in new files, as L2's layering prescribes.
 
-Amendment (2026-11-26, w-l3; names unchanged, entry/hypothesis shape only): environment
+Amendment (2026-11-26; names unchanged, entry/hypothesis shape only): environment
 ENTRIES carry their own context and lowering fuel. The driver builds a PER-DECLARATION
 `RealBridgeCtx` — `buildRealBridgeCtxM` derives `paramTypeMap`, `allowStage1DHeap`,
 `ctorLayouts` and `typeOverrides` from each declaration's own code
@@ -68,7 +68,7 @@ every Part II frozen name stays. The L2 lane applied the same-shape correction t
 `DeclEnv`/`DeclEnvLowers` (entries `Decl × RealBridgeCtx × Nat`), so the two lanes stay
 parallel and the fold meets one entry shape.
 
-Amendment 2 (gap-l3, 2026-11-26; devil's-advocate review 80ac7f68 of 7793bb37, five
+Amendment 2 (2026-11-26; a devil's-advocate review, five
 findings folded before the Part II statements freeze):
 
 - F1, coherence (the Part II statements were false as first frozen). The source rule
@@ -114,8 +114,8 @@ findings folded before the Part II statements freeze):
   contract text, the audit pin and the Part II sequencing text below describe the landed
   code.
 
-Amendment 3 (gap-l3, 2026-11-26; the lead's decision on the Part II status question, and
-review a2aa208f findings 1-2): the resolved local-call rule binds the call result at the
+Amendment 3 (2026-11-26; the Part II status decision, and
+review findings 1-2): the resolved local-call rule binds the call result at the
 caller's declared lowered type `rawTy`. Until this amendment it bound at
 `if isUnboxedScalarOrTuple rawTy then rawTy else .i64`, the unresolved `.fap` arm's
 fallback, while the lowering allocates the destination at `rawTy` itself
@@ -142,7 +142,7 @@ Rejected: keeping the `.i64` binding with a warning, which would have certified 
 rule that leaks objects on heap-typed local calls to keep a refutation of the headline
 standing.
 
-Amendment 4 (gap-l3, 2026-11-26; review de0391f1 of fcc0b33f, three rows):
+Amendment 4 (2026-11-26; a review, three rows):
 
 - `DeclEnvLowersPosR` drops its per-entry clause `ctx.findLocalCallee? sd.name = some
   ld.name` (each entry's own context knows its own name). No proof used it, the maps-to
@@ -655,11 +655,11 @@ stratified lookup on `DeclEnvLowersR` environments, whose names are duplicate-fr
 `Δ : DeclEnv` is L2's, entries `Decl × RealBridgeCtx × Nat`, so `declEnvR` applies to it
 unchanged. Reason 2 below refutes the remark.)
 
-#### Part II status (gap-l3, 2026-11-26): open; the semantic refutation is fixed
+#### Part II status (2026-11-26): open; the semantic refutation is fixed
 
 L2's F-stack has merged (`Proofs/LowerCalls.lean` proves `lowerRealLCNFDecl_soundF`), so
 the sequencing reason above no longer holds, and the statements above carry the coherence
-hypotheses review 80ac7f68 found missing (amendment 2, F1; `declEnvLowersR_lookup_align`
+hypotheses a review found missing (amendment 2, F1; `declEnvLowersR_lookup_align`
 proves them enough for the call case's lookup step). This section's first status refuted
 the headline over the landed `evalStepR`; amendment 3 fixed the step rule that refutation
 rested on. What stands, each point pinned by a committed guard of
@@ -728,7 +728,7 @@ The open work, for the fold owner:
   `lowerRealLCNFDecl_soundR` exists; the semantics and statement here already admit
   cyclic `Δ`. Recorded as a handoff to the matrix owner, as L2 recorded its
   reclassification.
-- E6 Driver-shaped R-forms: none stated. L1 fix round 1 removed the driver's compression
+- E6 Driver-shaped R-forms: none stated. L1 removed the driver's compression
   post-pass (a review proved it never changes any declaration), so the driver-shaped
   statement is `lowerRealLCNFDecl_sound`, whose R-form IS Part II's
   `lowerRealLCNFDecl_soundR`. One standing caution for consumers of

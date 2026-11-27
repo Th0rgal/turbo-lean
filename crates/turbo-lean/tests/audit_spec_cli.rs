@@ -1958,7 +1958,7 @@ fn audit_spec_kernel_witness_replay_certifies_or_reports_unavailable() {
     }
 }
 
-/// A2 r2 (#367): the self-contained fallback must never overrule the audited context.
+/// (#367): the self-contained fallback must never overrule the audited context.
 /// The audited file elaborates on its own (the hypothesis is `False` under its local
 /// `LE Nat` instance, so `nomatch h` closes the proof), the host evaluator still finds
 /// concrete witnesses under core `Nat` semantics, and the verbatim probe then fails
@@ -2002,7 +2002,7 @@ fn audit_spec_kernel_witness_fallback_never_overrules_audited_semantics() {
     );
 }
 
-/// A2 r2 (#367): an ambient `TURBO_LEAN_ALLOWED_AXIOMS` glob must never widen what a
+/// (#367): an ambient `TURBO_LEAN_ALLOWED_AXIOMS` glob must never widen what a
 /// `kernel_certified_*` label means: an audited source that rewrites `decide` into
 /// `native_decide` proves the appended theorems only through compiler-trust axioms,
 /// and the replay must refuse that whatever the environment says.
@@ -2052,7 +2052,7 @@ fn audit_spec_kernel_witness_axiom_globs_never_widen_certification() {
     );
 }
 
-/// A2 r3 (#367): an unresolved import is no kernel verdict at all. The audited file's
+/// (#367): an unresolved import is no kernel verdict at all. The audited file's
 /// semantic context is unknown (the sibling here changes what `≤` means on `Nat`), so
 /// replay must say `unavailable(imports_unresolved)` and never let a reconstructed
 /// Init-only context certify the witnesses. This fixture is byte-identical to the
@@ -2096,7 +2096,7 @@ fn audit_spec_kernel_witness_import_failure_is_unavailable_never_reconstructed()
     );
 }
 
-/// A2 r3 (#367): a `#exit` in the audited block stops Lean before the appended witness
+/// (#367): a `#exit` in the audited block stops Lean before the appended witness
 /// theorems, the probe compiles without them, and the runner's missing-theorem check
 /// fails closed as unavailability; the sentinel keeps the reconstructed fallback out.
 #[test]
@@ -2137,7 +2137,7 @@ fn audit_spec_kernel_witness_hash_exit_never_reconstructs() {
     );
 }
 
-/// A2 r3 (#367): the hostile-command scan is the SOLE defence here. The audited
+/// (#367): the hostile-command scan is the SOLE defence here. The audited
 /// block's column-0 tactic breaks in-block (the error-position gate would admit the
 /// fallback), the `notation` line never touches the candidates' semantics (a
 /// reconstructed probe would certify soundly), and the scan's deliberate file-global

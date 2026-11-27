@@ -18,7 +18,7 @@
   defined and proved in Lean: `routeKernelEngine`, `lean/TurboLean/PolicyGates.lean:113-118`.
 - Production routing: `auto` is routed by PolicyGates to con-leche when `conLecheSupported` is
   true (`routeKernelEngine`, `lean/TurboLean/PolicyGates.lean:113-118`), and since G1c the Rust
-  resolver probes support for `auto` too. Since G1c r2 the selection probe
+  resolver probes support for `auto` too. Since G1c the selection probe
   (`probe_con_leche_support_for_selection`) and every executing site (`ci-verify`, `pr-verify`
   head statements, `check --emit-olean`) share ONE discovery,
   `discover_con_leche_binary_for_selection_with_provenance` (`crates/turbo-lean/src/kernel.rs`),

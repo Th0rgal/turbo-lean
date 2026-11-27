@@ -437,7 +437,7 @@ pub(crate) fn run_check_command_inner(
         &toolchain,
         emit_olean.then_some(canon_dir.as_path()),
         // `check --emit-olean` runs in plain directories too; a tree without `.git` cannot
-        // have delivered the bridge binary (review 4f80161c U2).
+        // have delivered the bridge binary.
         crate::kernel::BridgeNoGitPolicy::PlainDirIsUntracked,
     )?;
 
@@ -902,7 +902,7 @@ pub(crate) fn run_check_command_inner(
                     let search_paths: Vec<PathBuf> = std::env::split_paths(&lp)
                         .filter(|p| !p.as_os_str().is_empty())
                         .collect();
-                    // G1c r2 + DA 388e906a F2: execution runs EXACTLY the binary selection
+                    // Execution runs EXACTLY the binary selection
                     // resolved and stored in the provenance. No second discovery after the
                     // build, which could otherwise pick up a binary created mid-flow.
                     let Some(resolved_binary) = kernel_prov.con_leche_binary.clone() else {

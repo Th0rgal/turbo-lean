@@ -8,12 +8,12 @@ open Lean
 open Lean.Compiler.LCNF
 
 /-!
-L1 (`roadmap/HORIZONS.md` rung L1, w-l1): the `BridgeM` lowering utilities that lived here
+L1 (`roadmap/HORIZONS.md` rung L1): the `BridgeM` lowering utilities that lived here
 (`lowerArg`, `toImpureParams`, `codeHasRecursiveJmp`, `codeReferencesFVar`,
 `substLNIRExprVars`, `freshenJoinPointCode`, `spliceJoinPointJmp`, `orderAlts`,
 `lowerLitValueM`, `lowerLitValue`, `internParams`, `lowerRefOp`, `inferImpureRhsType`,
 `lookupCtorIdx`) served only the deleted second lowering (`lowerPureCode`) and are deleted
-with it. Round 1 (review a094d3a9 F5/F8) also deleted the compression producer's state:
+with it. Round 1 also deleted the compression producer's state:
 the `jpMap`, `jpIndexMap`, `localFunMap`, `inJoinPointBody`, `activeCtor`, `fvarCtor`,
 `hasExtern`, `mangledSymbol` and `isSimpleGround` fields were read by nothing once the
 post-pass was removed. What stays: the slimmed `BridgeState`/`BridgeM` (the driver's

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 
 /// The schema this build writes, the ONE source for every site that spells it: the
 /// newer-store guard, the cold-create DDL, the final migration bump and the warm-template
-/// name (review b6409bc4 F5: hand-written copies let a future bump move the DDL and forget
+/// name (hand-written copies let a future bump move the DDL and forget
 /// the guard, making a build refuse the store it just created). A test asserts a fresh
 /// store reads exactly this version.
 pub(crate) const DB_SCHEMA_USER_VERSION: i64 = 9;
@@ -516,7 +516,7 @@ fn compute_kernel_audit_mac(
             + toolchain_hash.len()
             + policy_digest.len(),
     );
-    // G1a r2: domain v4 over the five remaining fields; the csimp posture digest left the
+    // G1a: domain v4 over the five remaining fields; the csimp posture digest left the
     // message (it keyed nothing, and (artifact, environment, policy) already binds every byte
     // it was derived from).
     msg.extend_from_slice(b"turbo-lean-verifier-audit-mac-v4\n");
@@ -666,7 +666,7 @@ fn template_shm_path() -> (PathBuf, u32) {
     let uid = unsafe { libc::geteuid() };
     (
         // The template name tracks the schema's `PRAGMA user_version` through the one
-        // shared const (review b6409bc4 F5). The embedded `build_epoch_short()` already
+        // shared const. The embedded `build_epoch_short()` already
         // separates templates per build, so a name an earlier build used with another
         // schema cannot be picked up by this one; the earlier "skip v10" caution is
         // thereby moot and the version follows the const.
@@ -833,7 +833,7 @@ impl TurboStore {
                 // NEWER build is refused rather than reinterpreted.
                 if uver > DB_SCHEMA_USER_VERSION {
                     anyhow::bail!(
-                        "state DB at {} has user_version {uver}, newer than this build's schema {DB_SCHEMA_USER_VERSION}; refusing to open it. A newer build migrated this store; to keep using this build, remove that file and its -wal/-shm siblings (the store is a re-derivable cache) or point the store root elsewhere (review b6409bc4 F3)",
+                        "state DB at {} has user_version {uver}, newer than this build's schema {DB_SCHEMA_USER_VERSION}; refusing to open it. A newer build migrated this store; to keep using this build, remove that file and its -wal/-shm siblings (the store is a re-derivable cache) or point the store root elsewhere",
                         db_path.display()
                     );
                 }
@@ -883,8 +883,7 @@ impl TurboStore {
                     // the v4 domain in `compute_kernel_audit_mac` dropped it)
                     // `csimp_posture_digest` column; audited rows are re-derivable, so the table
                     // is rebuilt rather than migrated in place. The DROP, CREATE and version
-                    // bump run in ONE transaction with the error propagated (review 22ae951a
-                    // F5): a DROP that failed (e.g. busy past the timeout) with a succeeding
+                    // bump run in ONE transaction with the error propagated: a DROP that failed (e.g. busy past the timeout) with a succeeding
                     // CREATE IF NOT EXISTS used to leave the old 8-column table at
                     // user_version 9, after which every audited-authority write failed hard on
                     // the missing column, permanently. A failed migration now leaves the store
@@ -3071,7 +3070,7 @@ impl TurboStore {
             // instead of depending on the DDL staying in sync. The column is NOT
             // covered by the audit MAC: `compute_kernel_audit_mac`'s v4 domain
             // dropped it (it keyed nothing, and (artifact, environment, policy)
-            // already binds every byte it was derived from; review b6409bc4 F4).
+            // already binds every byte it was derived from).
             "INSERT INTO kernel_audited_oleans_auth (
                 artifact_digest, environment_digest, replay_version, toolchain_hash, policy_digest, module_name, audit_mac, verified_at, csimp_posture_digest
              )
@@ -3130,7 +3129,7 @@ impl TurboStore {
         ) else {
             return false;
         };
-        // G1a r2: the MAC attests the five key fields (audit-mac-v4), so a tampered or
+        // G1a: the MAC attests the five key fields (audit-mac-v4), so a tampered or
         // legacy-domain row fails closed here.
         let expected_mac = compute_kernel_audit_mac(
             key,
@@ -9347,7 +9346,7 @@ mod tests {
         )?;
         assert!(!store.has_kernel_audited_olean_with_key(&key, "digA", "envA", 2, "tcA", "polA"));
 
-        // Key-diff at the MAC level (G1a r2, audit-mac-v4 over the five remaining fields): a
+        // Key-diff at the MAC level (G1a, audit-mac-v4 over the five remaining fields): a
         // changed policy digest changes the MAC; unchanged inputs do not.
         let mac_p = compute_kernel_audit_mac(&key, "d", "e", 2, "t", "p");
         let mac_p_again = compute_kernel_audit_mac(&key, "d", "e", 2, "t", "p");

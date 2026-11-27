@@ -297,8 +297,7 @@ fn resolve_identity_probe_context(
             .context("Failed to resolve Lean options for declaration identity")?;
         // Trusted mode parses with the dependency downgrade active (`is_root_pkg = false`),
         // which drops Lake-rejected `leanOptions` entries; refuse like
-        // `optional_package_config` instead of handing out args with entries silently gone
-        // (DA 3ff1014b finding 3).
+        // `optional_package_config` instead of handing out args with entries silently gone.
         crate::module_builder::refuse_lake_rejected_lean_options(&pkg)
             .context("Failed to resolve Lean options for declaration identity")?;
         crate::module_builder::resolve_file_lean_args_in_package(&pkg, file)
@@ -1233,7 +1232,7 @@ mod memo_tests {
         Ok(())
     }
 
-    /// DA 3ff1014b finding 3: the trusted identity path resolves the package config with
+    /// The trusted identity path resolves the package config with
     /// the dependency downgrade active (`is_root_pkg = false`), so a Lake-rejected
     /// `leanOptions` entry used to reach `resolve_file_lean_args_in_package` silently
     /// dropped. It must refuse like `optional_package_config` instead.

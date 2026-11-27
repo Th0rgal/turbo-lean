@@ -4,7 +4,7 @@ import LeanNative.Proofs.RealLCNFBridgeProofs
 import LeanNative.Proofs.RealLCNFBridge.CallsF
 
 /-!
-## L2 contract (roadmap/HORIZONS.md, H1 rung L2 "Calls") — w-l2
+## L2 contract (roadmap/HORIZONS.md, H1 rung L2 "Calls")
 
 Authoritative row (`roadmap/HORIZONS.md`): "L2 Calls — Both semantics take a function
 environment. Non-recursive calls between declarations are proved. | Without it the theorem
@@ -13,7 +13,7 @@ is empty for almost all real code." Leaf row: files `Semantics/Eval.lean`,
 
 Contract-first statement, in the same form as the L1 contract
 (`RealLCNFBridgeProofs.lean:10-125`). The contract commit of this leaf is 415256b1 (the
-doc-only form of this block); review e89404a9 (F1, F4, F5) reshaped the environments to
+doc-only form of this block); a review round reshaped the environments to
 per-declaration entries — the signatures below are the corrected ones L3 builds against.
 This leaf was pipelined on the L1 contract (fa715a8a) and folded onto the landed L1 merge
 (e8a4c1aa). Nothing here changes the arity of any existing evaluator — the function
@@ -35,7 +35,7 @@ calls a local helper (`scripts/lcnf_coverage.py` methodology:
 function environment to both semantics"). L2 adds that environment to both semantics and
 proves the lowering of non-recursive local calls sound end to end.
 
-### Per-declaration entries (review e89404a9 F1)
+### Per-declaration entries
 
 The driver builds a SEPARATE context and fuel for each declaration
 (`ingestImpureDeclViaReal`: `paramTypeMap` is keyed on the declaration's own parameter
@@ -109,7 +109,7 @@ and the generic transfer `CodeRefines → CodeRefinesF` is false. An interim rul
 call-free guard in the gate) was implemented, measured, and then superseded the same day:
 a review proved the compression post-pass never changes any declaration (straight-line
 early-returns; `ite` candidates are the rejected fresh-collapse shape; the tuple branch
-is unreachable), so L1 fix round 1 REMOVES `applyValidatedCompression` entirely — the
+is unreachable), so L1 REMOVES `applyValidatedCompression` entirely — the
 rung's "proved, validated by a proved checker, or removed" taken at "removed". The two
 restatements (`applyValidatedCompression_refinesF`, `lowerRealLCNFDecl_driver_soundF`)
 therefore cease to exist; `lowerRealLCNFDecl_soundF` below is the L2 headline. The
@@ -224,7 +224,7 @@ resolved local call with an erased or `type` argument goes through the zero-bind
 in the lowering but errors on the source side (`evalArgs` at
 `RealLCNFCallSemantics.lean:204` via `evalArg` at `RealLCNFSemantics.lean:317`), so the
 soundness theorem says nothing about such calls and they STAY `lowered_unproved`
-(review 6f812155 F1, option 2: recorded in the coverage handoff below rather than given
+(option 2: recorded in the coverage handoff below rather than given
 placeholder semantics, which would be a semantics change outside this unit).
 
 ### Acceptance (quoted) and gates
@@ -235,7 +235,7 @@ placeholder semantics, which would be a semantics change outside this unit).
 - "matrix moves": the semantics and proofs landed here are the condition
   `scripts/lcnf_coverage.py`'s methodology names for reclassifying
   `lowered_vacuous_local_call` rows out of `lowered_unproved` — for resolved calls whose
-  arguments are all `.fvar`. Coverage handoff (review 6f812155 F1): a resolved local
+  arguments are all `.fvar`. Coverage handoff: a resolved local
   call with an erased or `type` argument is NOT covered by the theorem (the source
   semantics errors on it, paragraph above), so such rows stay `lowered_unproved` and the
   matrix owner reclassifies only the all-`.fvar` rows. That script and its committed
@@ -284,7 +284,7 @@ def CtxMapsEnv (ctx : RealBridgeCtx) : DeclEnv → FuncEnv → Prop
   | _, _ => False
 
 /-- Pointwise "Δ lowers to Φ": positionally, each source declaration lowers UNDER ITS OWN
-    context and fuel (review e89404a9 F1 — the driver builds per-declaration contexts) to
+    context and fuel (the driver builds per-declaration contexts) to
     the corresponding LNIR declaration at the same fuel, mangled names are fresh
     (unreserved, not repeated later in `Φ`), the entry's own context maps the TAIL
     pairing (so the entry's nested call sites resolve), and the tails relate. A recursive

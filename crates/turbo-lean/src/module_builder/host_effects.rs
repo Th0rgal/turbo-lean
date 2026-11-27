@@ -146,7 +146,7 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
             // pin built, its digest does not change, and importers are pinned to that
             // digest by the verified-source stamps and Lake traces, so purging them
             // would rebuild identical artifacts while forcing the no-cache path on
-            // every refresh (DA 71add786 finding 3).
+            // every refresh.
         }
     }
     Ok(purged_any)
@@ -155,7 +155,7 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
 /// Whether `spec`'s own on-disk `.olean` is stale by the cheap mtime gates the
 /// dependency freshness check also applies: present but older than the module source,
 /// a package config file, or a resolved literal `include_str` target (a regenerated
-/// gitignored target goes stale with no source mtime change, DA 71add786 finding 1).
+/// gitignored target goes stale with no source mtime change).
 /// A missing artifact is NOT stale here — nothing is on disk for a later build to
 /// reuse, so a purge refusal would protect nothing. Beyond an mtime gate by design,
 /// and so undetected here: a `run_cmd` host read whose external input changed, and a
@@ -643,7 +643,7 @@ fn classify_clean_pinned_dep_source(
 /// Entries are `(window, tracked)` and a read accepts only the current window, so a
 /// git read that started before a reset cannot serve the new window a stale answer by
 /// inserting after it — the same shape as `CLEAN_GIT_PIN_MEMO` and
-/// `publish_lake_inputs_tag` (DA 71add786 finding 2). The reset also clears the map,
+/// `publish_lake_inputs_tag`. The reset also clears the map,
 /// bounding growth.
 pub(super) static TRACKED_INCLUDE_MEMO: std::sync::OnceLock<
     std::sync::Mutex<HashMap<(PathBuf, PathBuf), (u64, bool)>>,
@@ -658,7 +658,7 @@ pub(super) static TRACKED_INCLUDE_MEMO: std::sync::OnceLock<
 /// check, and the checkout is pinned for the memo window's lifetime.
 fn include_targets_tracked_at_pin(canon_pkg_root: &Path, rels: &[PathBuf]) -> bool {
     // Captured before any git runs: an insert stamped with this window is ignored by
-    // every reader whose window is newer (DA 71add786 finding 2).
+    // every reader whose window is newer.
     let window = current_memo_window();
     let memo = TRACKED_INCLUDE_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut pending: Vec<&PathBuf> = Vec::new();
@@ -932,8 +932,7 @@ pub(crate) fn dep_pkg_lake_targets_owned_by_project(
 ///   project-owned: its own workspace refreshes it from the pin (#434);
 /// * a root inside another package's `.lake/packages` is a nested checkout, never ours;
 /// * a canonical root inside the project root is project state;
-/// * an out-of-tree root is project state only with explicit evidence (DA 3ff1014b
-///   F1), one signal shared with the build gate's packages-dir proof (#436): a
+/// * an out-of-tree root is project state only with explicit evidence, one signal shared with the build gate's packages-dir proof (#436): a
 ///   `.turbo-lean-packages-owner` marker in the package root or the directory that
 ///   holds it, naming this project's canonical root, or residence in the project's
 ///   own git repository (one `.git` above both, the monorepo-sibling `require`
@@ -942,15 +941,15 @@ pub(crate) fn dep_pkg_lake_targets_owned_by_project(
 ///   skips returned), while a `.git`-less tarball or rsync copy behind a symlinked
 ///   `.lake/packages` entry stayed owned, exactly the #434 shared-checkout write;
 /// * a `path` manifest entry whose directory sits in no git repository stays editable
-///   scratch (finding 6) — whether or not the PROJECT is in git — when its DECLARED
+///   scratch — whether or not the PROJECT is in git — when its DECLARED
 ///   directory is relative, reaches the package without a symlink hop, and lies
-///   outside the project's own packagesDir slot (review a64324fd F4). An ABSOLUTE
+///   outside the project's own packagesDir slot. An ABSOLUTE
 ///   declared dir (`require mathlib from "/opt/mathlib"`: a tarball, container image
 ///   or store path shared across projects) and a symlinked entry carry no
 ///   editable-scratch evidence and need the owner marker. An out-of-tree GIT clone
 ///   behind a `path` entry with no marker (`require mathlib from "/abs/mathlib4"`,
 ///   one clone shared across projects) is refreshed by its own workspace, exactly
-///   the #434 class (DA 71add786 finding 4).
+///   the #434 class.
 fn pkg_root_owned_by_project(
     cfg: &ProjectConfig,
     pkg_name: &str,
@@ -1044,8 +1043,7 @@ fn pkg_root_owned_by_project(
 
 /// The manifest's `path`-dependency directories matching this package: the
 /// user-visible route to the package, which the resolved `pkg_root` cannot stand in
-/// for once the resolver hands back a symlink's canonical target (review a64324fd
-/// F3/F4). The manifest parser stores each `dir` joined onto the project root WITHOUT
+/// for once the resolver hands back a symlink's canonical target. The manifest parser stores each `dir` joined onto the project root WITHOUT
 /// normalizing (`project_dir.join(d)`), so a relative declaration keeps the project
 /// root as its prefix — `..` components and symlink names as spelled — while an
 /// absolute declaration replaces the root and keeps none of it. Matching mirrors the
@@ -1077,7 +1075,7 @@ fn declared_path_dep_dirs(
 }
 
 /// Whether a manifest `path` entry grants this git-less package editable-scratch
-/// ownership (review cf31dd1e F2, bounded by a64324fd F4). The entry must have been
+/// ownership. The entry must have been
 /// DECLARED RELATIVE (an absolute entry — `/opt/mathlib`, a store path — is a shared
 /// install carrying no scratch evidence), must reach the package without a symlink
 /// hop (a symlinked `../foo` reaches a shared directory; the walk runs on the
@@ -1119,7 +1117,7 @@ fn manifest_path_dep_grants_scratch_ownership(
 /// that does not exist counts as symlink-free (there is nothing to traverse), and the
 /// walk runs on the path AS SPELLED, with no `..` folding: a symlink component later
 /// cancelled by `..` still refuses, conservatively, because the kernel resolves the
-/// symlink before applying `..` while a lexical fold does not (review a64324fd F3).
+/// symlink before applying `..` while a lexical fold does not.
 fn components_symlink_free(path: &Path) -> bool {
     let mut cur = PathBuf::new();
     for comp in path.components() {
@@ -1133,7 +1131,7 @@ fn components_symlink_free(path: &Path) -> bool {
 
 /// Fold `.` and `..` components textually, touching no filesystem state: the comparison
 /// partner for `fs::canonicalize` when deciding whether a raw path reaches its target
-/// without a symlink hop (equal = symlink-free; review cf31dd1e F5).
+/// without a symlink hop (equal = symlink-free).
 fn lexical_normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
@@ -1181,8 +1179,7 @@ pub(crate) enum OwnerMarkerSite {
     /// The ownership walk's marker sites (package root or the directory holding it).
     /// `clean_git_pinned` says whether the package is a clean git-pinned checkout —
     /// `pkg_root_owned_by_project` refuses those BEFORE its marker check, so for them
-    /// no marker clears the refusal and the hint must not be shown (review bfa9d056
-    /// F3).
+    /// no marker clears the refusal and the hint must not be shown.
     PkgRootOrParent { clean_git_pinned: bool },
     PackagesDir(PathBuf),
 }
@@ -1191,7 +1188,7 @@ pub(crate) enum OwnerMarkerSite {
 /// where the package lives. An entry under the project's own tree is refreshed through
 /// the PROJECT's workspace (running `lake` inside `.lake/packages/<dep>` resolves the
 /// dependency's own manifest and can fetch a nested `.lake/packages` with different
-/// pins; DA 3ff1014b F5). An OUT-OF-TREE checkout is the opposite case: `lake build +X`
+/// pins). An OUT-OF-TREE checkout is the opposite case: `lake build +X`
 /// from this project would write into a checkout other projects may share — the very
 /// #434 write these refusals exist to stop — so the fix there is the checkout's own
 /// workspace, or the owner marker when the checkout really is this project's.
@@ -1271,7 +1268,7 @@ pub(crate) fn non_owned_dep_refresh_remedy(
 
 /// Whether this package is a clean git-pinned checkout — the shape
 /// `pkg_root_owned_by_project` refuses before its marker check, so no owner marker
-/// clears an ownership refusal for it (review bfa9d056 F3). A thin pub(crate) wrapper
+/// clears an ownership refusal for it. A thin pub(crate) wrapper
 /// so the lake_build sweep (outside this module tree) can feed
 /// `OwnerMarkerSite::PkgRootOrParent` honestly.
 pub(crate) fn pkg_is_clean_git_pinned(
@@ -2644,15 +2641,15 @@ pub(super) fn node_source_has_disallowed_elab_host_effects(
 }
 
 /// The TRANSITIVE spread verdict per (project config digest, package root, module),
-/// stamped with the memo window captured before its computation's reads (DA 71add786
-/// finding 5; the stamping is finding 2's `CLEAN_GIT_PIN_MEMO` shape). Within one
+/// stamped with the memo window captured before its computation's reads (the stamping is
+/// the `CLEAN_GIT_PIN_MEMO` shape). Within one
 /// window the closure is walked once; a new window (one per CLI command and per
 /// serve / MCP request) recomputes, which is how an edit below an unchanged importer
 /// still flips its verdict in a long-lived daemon. The verdict depends on the whole
 /// workspace configuration (root-first import resolution, the package set), so the key
 /// carries `ProjectConfig::canonical_config_digest`: two projects sharing one absolute
 /// `path` dependency never read each other's verdicts. A verdict whose computation
-/// read an in-progress cycle sentinel is never published here (DA 3ff1014b finding 2).
+/// read an in-progress cycle sentinel is never published here.
 /// One entry per module, overwritten per window; [`reset_lake_inputs_tag_memo`]
 /// clears it too.
 #[allow(clippy::type_complexity)]
@@ -2667,7 +2664,7 @@ pub(super) static SPREAD_TRANSITIVE_VERDICTS: std::sync::OnceLock<
 /// graphs are acyclic; a resolver cycle is cut by the in-progress memo entry (`None`),
 /// and a verdict whose computation read such a sentinel holds only under that call's
 /// assumption, so it stays in the per-call memo and is never published to
-/// [`SPREAD_TRANSITIVE_VERDICTS`] (DA 3ff1014b finding 2: publishing it served a
+/// [`SPREAD_TRANSITIVE_VERDICTS`] (publishing it served a
 /// wrong "does not spread" for the rest of the window). An unreadable source or
 /// broken header fails closed, as in the purge walk. Two cache layers: PER-FILE facts
 /// (the own-source spread verdict and the parsed header) keyed by source content, and
@@ -2923,7 +2920,7 @@ pub(super) fn run_audit_chunk_subprocess(
         extra_ro_binds,
         is_untrusted,
     )?;
-    // #435 review (finding 1): `--max-memory-mb` means the same thing on the audit path
+    // #435: `--max-memory-mb` means the same thing on the audit path
     // as on the replay path. Review bb7c0f2f F5: the cap is the share for the REAL
     // audit concurrency (the scheduler's audit pool size, threaded in by the caller),
     // not a hard-coded single-worker share that let each of several concurrent audits
@@ -3127,7 +3124,7 @@ pub(super) fn run_audit_or_replay_batch_worker_bound(
                 }
                 replay_sorted.clear();
             }
-            // #435/#437 review (finding 1): a capped replay that timed out or failed
+            // #435/#437: a capped replay that timed out or failed
             // under the per-worker memory cap carries diagnostics naming the knob to
             // raise (`[replay] timeout_secs`, `--max-memory-mb`). Return them to the
             // caller instead of silently redoing the whole replay through the
@@ -3140,8 +3137,7 @@ pub(super) fn run_audit_or_replay_batch_worker_bound(
             }
             // Any other failure falls through to the audit-chunk path below, whose
             // workers run under the same budget-derived rlimit; the per-dependency
-            // replay fallback further down runs capped under the replay timeout too
-            // (review bb7c0f2f F3).
+            // replay fallback further down runs capped under the replay timeout too.
             Err(_) => {}
         }
     } else if !is_untrusted && need_replay_dep.is_empty() && !replay_sorted.is_empty() {
@@ -3867,12 +3863,11 @@ mod host_effect_taint_tests {
         assert!(
             spec_artifacts_purgeable_from_project_root(&cfg, &spec),
             "an editable sibling path dependency is project state; its edited \
-             include_str targets are purged and rebuilt from here (finding 6)"
+             include_str targets are purged and rebuilt from here"
         );
         assert!(
             dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
-            "an editable sibling path dependency's targets are project-driven \
-             (finding 6)"
+            "an editable sibling path dependency's targets are project-driven"
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())
@@ -3934,12 +3929,12 @@ mod host_effect_taint_tests {
         assert!(
             spec_artifacts_purgeable_from_project_root(&cfg, &spec),
             "a plain-directory sibling path dependency stays project state when the \
-             project itself is a git checkout (review cf31dd1e F2)"
+             project itself is a git checkout"
         );
         assert!(
             dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
             "a plain-directory sibling's targets stay project-driven when the project \
-             is a git checkout (review cf31dd1e F2)"
+             is a git checkout"
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())
@@ -3948,7 +3943,7 @@ mod host_effect_taint_tests {
     /// A `path` entry pointing at an out-of-tree GIT clone is a shared checkout
     /// (`require mathlib from "/abs/mathlib4"` shares one clone across projects):
     /// deleting its artifacts or lake-building its targets from this project is the
-    /// #434 class, whatever the manifest entry type says (DA 71add786 finding 4). The
+    /// #434 class, whatever the manifest entry type says. The
     /// editable-sibling test above stays owned because that fixture is not itself a
     /// git checkout.
     #[test]
@@ -4011,11 +4006,11 @@ mod host_effect_taint_tests {
         Ok(())
     }
 
-    /// DA 3ff1014b F1: out-of-tree ownership rests on explicit evidence, the same
+    /// Out-of-tree ownership rests on explicit evidence, the same
     /// `.turbo-lean-packages-owner` proof the build gate uses for a relocated
     /// packages dir (#436). A standalone clone the project claims with a marker
-    /// naming the project's canonical root keeps the editable workflow (finding 6)
-    /// without re-admitting the unmarked shared clone (#434, DA 71add786 finding 4).
+    /// naming the project's canonical root keeps the editable workflow
+    /// without re-admitting the unmarked shared clone (#434).
     #[test]
     fn host_effects_owner_marked_out_of_tree_clone_is_project_owned() -> Result<()> {
         let dir = temp_dir("marked_clone_path");
@@ -4080,7 +4075,7 @@ mod host_effect_taint_tests {
         Ok(())
     }
 
-    /// DA 3ff1014b F1: a `.git`-less copy (a tarball extract, an rsync copy, a
+    /// A `.git`-less copy (a tarball extract, an rsync copy, a
     /// foreign monorepo subdirectory) behind a symlinked `.lake/packages` entry
     /// canonicalizes outside the project checkout and carries no ownership evidence,
     /// so it stays a shared checkout (#434) even though no `.git` sits inside it.
@@ -4213,13 +4208,12 @@ mod host_effect_taint_tests {
         assert!(
             !spec_artifacts_purgeable_from_project_root(&cfg, &spec),
             "a nested symlinked entry under a marker-owned relocated slot points at a \
-             shared checkout: the marker must not be inherited through the raw parent \
-             (review cf31dd1e F1)"
+             shared checkout: the marker must not be inherited through the raw parent"
         );
         assert!(
             !dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
             "a shared checkout behind a marker-owned relocated slot is never \
-             lake-built from this project (review cf31dd1e F1)"
+             lake-built from this project"
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())
@@ -4282,16 +4276,15 @@ mod host_effect_taint_tests {
         assert!(
             !dep_pkg_lake_targets_owned_by_project(&cfg, dep_pkg),
             "a package reached through a symlink must not inherit ownership from the \
-             enclosing repository (review cf31dd1e F5)"
+             enclosing repository"
         );
         // The resolver may hand back the symlink's canonical target as the package
-        // root; the declared-dir walk must refuse that form too (review a64324fd F3:
-        // on it, `lexical_normalize(pkg_root) == canon` is vacuously true).
+        // root; the declared-dir walk must refuse that form too
+        // (on it, `lexical_normalize(pkg_root) == canon` is vacuously true).
         let shared_canon = fs::canonicalize(&shared)?;
         assert!(
             !pkg_root_owned_by_project(&cfg, "lintlib", "", &shared_canon),
-            "the canonical symlink target must not read as same-repo owned \
-             (review a64324fd F3)"
+            "the canonical symlink target must not read as same-repo owned"
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())
@@ -4416,7 +4409,7 @@ mod host_effect_taint_tests {
     /// A path dependency in the SAME repository as the project (a monorepo sibling,
     /// `require lintlib from "../libs/lintlib"` with one `.git` above both) is the
     /// project's own state wherever the package root sits relative to the project
-    /// root (DA 3ff1014b F1).
+    /// root.
     #[test]
     fn host_effects_same_repo_monorepo_path_dep_is_project_owned() -> Result<()> {
         let dir = temp_dir("monorepo_path");
@@ -4480,7 +4473,7 @@ mod host_effect_taint_tests {
     /// A pinned module whose gitignored `include_str` target is regenerated goes
     /// stale with no change to its source or lakefile mtimes: the resolved targets
     /// are part of the artifact's input set, so the staleness gate reads them too
-    /// (DA 71add786 finding 1). With the target untouched the walk completes and
+    /// With the target untouched the walk completes and
     /// leaves everything in place.
     #[test]
     fn host_effects_regenerated_include_str_target_makes_pinned_artifact_stale() -> Result<()> {
@@ -5035,7 +5028,7 @@ mod host_effect_taint_tests {
 
     /// The window-scoped transitive spread cache never serves a superseded window: a
     /// planted wrong verdict stamped with an old window is ignored and the clean
-    /// closure recomputes (DA 71add786 finding 5's cache, finding 2's stamping).
+    /// closure recomputes.
     #[test]
     fn transitive_spread_cache_ignores_entries_from_a_superseded_window() -> Result<()> {
         let (dir, cfg, spec) = dep_fixture_with(
@@ -5068,7 +5061,7 @@ mod host_effect_taint_tests {
         Ok(())
     }
 
-    /// DA 3ff1014b finding 2: an intermediate verdict computed through a cycle cut (it
+    /// An intermediate verdict computed through a cycle cut (it
     /// read an ancestor's in-progress entry) is only valid inside that call. Published
     /// to the cross-call cache it serves a wrong "does not spread" answer for the rest
     /// of the window: A imports B and a spreading C, B imports A back; querying A first
@@ -5128,7 +5121,7 @@ mod host_effect_taint_tests {
         Ok(())
     }
 
-    /// DA 3ff1014b finding 2 (key): the cross-call cache key carries the project
+    /// The cross-call cache key carries the project
     /// configuration identity, so a verdict computed under another configuration for
     /// the same (package root, module) is never served.
     #[test]

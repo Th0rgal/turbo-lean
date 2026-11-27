@@ -12,7 +12,7 @@ export LeanNative.IR.RealLCNFBridge (
 )
 
 /-!
-L1 (`roadmap/HORIZONS.md` rung L1, w-l1): the `BridgeM` constructor/heap lowering that lived
+L1 (`roadmap/HORIZONS.md` rung L1): the `BridgeM` constructor/heap lowering that lived
 here (`lowerTupleOrEnumCtor`, `lowerTupleProj`, `lowerTuplePatternAlt`, `lowerOsetInstr`,
 `withActiveCtor`, `withActiveCtor?`, `heapCtorLayoutOfM`, `lowerScalarProjM`,
 `lowerRcCtorWithScalarsM`, `lowerScalarSetM`, `lowerSetTagM`, `lowerDelM`) was the deleted

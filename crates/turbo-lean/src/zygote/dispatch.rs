@@ -1044,7 +1044,7 @@ pub(super) fn eval_with_zygote_pool_attempt(
         worker_rss_limit_mb.max(2048)
     };
     let budget = WorkerBudget::from_env();
-    // H2.3 r1 (finding 6): an explicit `--jobs` widens idle-pool residency only under an
+    // H2.3: an explicit `--jobs` widens idle-pool residency only under an
     // explicit memory budget, where `effective_parallelism` caps it by each worker's
     // share; `--jobs` alone must not override the governor's memory-derived clamp.
     // `TURBO_LEAN_MAX_IDLE_ZYGOTES` stays the explicit override.
@@ -1316,7 +1316,7 @@ pub(super) fn eval_with_zygote_pool_attempt(
             drop(w);
             return;
         }
-        // H2.3 r1 (finding 2): a permanently RLIMIT_DATA-capped worker may pool only
+        // H2.3: a permanently RLIMIT_DATA-capped worker may pool only
         // under a key naming its cap; any other key would hand it to requests that
         // expect no cap and fail allocations with no `memory_kill_note`.
         if let Some(mb) = w.rlimit_mb {
@@ -1406,7 +1406,7 @@ pub(super) fn eval_with_zygote_pool_attempt(
             // in block order whatever the completion order. Before H2.3 this path took at
             // most 4 blocks, one dedicated worker each regardless of the budget, and a
             // wider replay fell back to one serial whole-body request.
-            // H2.3 r1 (finding 3): with no explicit budget the width is the governor's
+            // H2.3: with no explicit budget the width is the governor's
             // memory-derived recommendation (already core-capped), never bare core
             // count: a 64-block replay must not start 64 cold Lean workers on a 64-core
             // host whose memory cannot back them. Width bounds compose per CALL, not per
@@ -1430,7 +1430,7 @@ pub(super) fn eval_with_zygote_pool_attempt(
             } else {
                 None
             };
-            // H2.3 r1 (finding 2): capped workers live under their own pool key, so an
+            // H2.3: capped workers live under their own pool key, so an
             // uncapped request never reuses a permanently RLIMIT_DATA-capped worker and
             // a later fan-out with the same share gets them back warm.
             let fanout_pool_key = match pool_rlimit_mb {
@@ -1511,7 +1511,7 @@ pub(super) fn eval_with_zygote_pool_attempt(
             while workers.len() < needed {
                 match acquire_worker(pool_rlimit_mb) {
                     Ok(w) => workers.push(w),
-                    // H2.3 r1 (finding 5): one failed spawn (a process or memory limit)
+                    // H2.3: one failed spawn (a process or memory limit)
                     // does not abort the batch once a worker is held; the queue runs at
                     // the reduced width and the warm workers already taken stay in use.
                     // The per-worker share was sized for the full width, so the smaller
@@ -1540,7 +1540,7 @@ pub(super) fn eval_with_zygote_pool_attempt(
                 .collect::<Result<Vec<_>>>()?;
 
             let req_id_ref = request_identity.as_str();
-            // H2.3 r1 (finding 1): one pool-eligibility predicate for both paths — the
+            // H2.3: one pool-eligibility predicate for both paths — the
             // serial arm's `unusable` check (RUNTIME_PANIC_ERR or "importsCsv changed")
             // retires the worker here too; the reply itself still reaches the combine.
             let worker_fate = |res: &WorkerReqOutcome| match res {
@@ -1560,7 +1560,7 @@ pub(super) fn eval_with_zygote_pool_attempt(
                 run_request_queue_over_workers(
                     workers,
                     req_lines_ref.len(),
-                    // H2.3 r1 (finding 4): a timeout aborts the run, and so does a sick
+                    // H2.3: a timeout aborts the run, and so does a sick
                     // REPLY (failed import, runtime panic): the run is already a failure
                     // and scheduling more slices against the same closure would only
                     // reproduce it. A crash carries no verdict, so it is not fatal: the
@@ -1664,7 +1664,7 @@ pub(super) fn eval_with_zygote_pool_attempt(
                     None => {}
                 }
             }
-            // H2.3 r1 (finding 1): a crash reads exactly as the serial arm reports it —
+            // H2.3: a crash reads exactly as the serial arm reports it —
             // the structured reply keeps `crashed`, `peak_rss_mb` and `stderr_tail`, and
             // a crash discovered past the deadline reads as the timeout it is.
             if let Some(diag) = first_crash {
@@ -1688,7 +1688,7 @@ pub(super) fn eval_with_zygote_pool_attempt(
                     executed_identity,
                 ));
             }
-            // H2.3 r1 (finding 4): a fatal-reply stop leaves unscheduled slots, and the
+            // H2.3: a fatal-reply stop leaves unscheduled slots, and the
             // collected replies already carry the real failure — surface them through
             // the combine instead of a generic lost-slices error. A shortfall with every
             // collected reply healthy still fails closed.

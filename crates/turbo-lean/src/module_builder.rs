@@ -3678,7 +3678,7 @@ lean_lib Smoke where
         let cfg = resolve_project_config(&proj)?;
         // 1. `build <Lib>` (trusted, no prebuilt adoption) fails closed instead of scheduling a
         //    native compile that would publish into the other checkout. The remedy named by the
-        //    refusal is decided on CANONICAL paths (review a64324fd F2, after the #436 follow-up
+        //    refusal is decided on CANONICAL paths (after the #436 follow-up
         //    canonicalized the gate's compare): this entry is a SYMLINK to the other checkout, so
         //    running `lake build +DepPin` from the project root would write through the symlink —
         //    the very publish this gate stops — and the message must instead point at the
@@ -3872,7 +3872,7 @@ lean_lib Smoke where
         let cfg2 = resolve_project_config(&proj)?;
         let dag = build_module_dag(&cfg2, &["App".to_string()])?;
         assert!(dag.nodes["Shared.M"].is_root_pkg);
-        // #299 round 2: a dependency that OWNS the module with a MISSING source counts toward
+        // #299: a dependency that OWNS the module with a MISSING source counts toward
         // the ambiguity check. Lake's `findSomeRev?` may pick it and fail, so one Found sibling
         // must not resolve silently when another dependency owns the name without its source.
         fs::remove_file(proj.join("Shared/M.lean"))?;
@@ -4196,7 +4196,7 @@ lean_lib Smoke where
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// L299 round 2 (#299): root directories are also parsed with `is_root_pkg = false`
+    /// L299 (#299): root directories are also parsed with `is_root_pkg = false`
     /// (pr-verify's working-tree resolve, `try_resolve_lean_args_for_path`), so the dependency
     /// downgrade for Lake-rejected `leanOptions` entry forms must not let those paths hand out
     /// args with entries silently dropped: `optional_package_config` fails like the root parse.
@@ -4222,7 +4222,7 @@ lean_lib Smoke where
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// DA 3ff1014b finding 3: the Lake-rejected `leanOptions` downgrade is recorded in its
+    /// The Lake-rejected `leanOptions` downgrade is recorded in its
     /// own right, not found by scanning the shared `unsupported` reason slot afterwards. An
     /// earlier unsupported construct in the same target occupies that slot first
     /// (`unsupported_lake_field` keeps the first reason), and the refusal must still fire.

@@ -8,17 +8,17 @@ open LeanNative.IR.RealLCNFSemantics
 open LeanNative.Semantics
 
 /-!
-## L1 contract (roadmap/HORIZONS.md, H1 rung L1 "Single path") — w-l1, updated w-l1 r1
+## L1 contract (roadmap/HORIZONS.md, H1 rung L1 "Single path")
 
 Authoritative row (`roadmap/HORIZONS.md`): "L1 Single path — The pure lowering and dead
 helpers are gone. The theorem is stated for the context the driver builds, with no unproved
 post-pass (each one is proved, validated by a proved checker, or removed)." Accept:
 "one lowering callee; `ΔLOC < 0`".
 
-State after round 1 (fix round, review a094d3a9, F5 ruling): the per-declaration driver
+Current state: the per-declaration driver
 (`ingestImpureDeclViaReal`) applies NO post-pass to the lowered body at all — the rung's
 "or removed" option. The MODULE path (`ingestModuleDecls`) is narrower than that and OPEN:
-see `normalizeAndInlineLocalDefs` under Named exclusions (round 2, review 47512851 F1).
+see `normalizeAndInlineLocalDefs` under Named exclusions below.
 Round 0 had gated a
 `compressScalarCode` candidate behind the kernel-proved `runSymbolicValidatedDecl` checker;
 the review showed the producer's candidates provably never pass that gate (straight-line
@@ -56,12 +56,12 @@ post-pass.
 1. Round 0: the second, unproved lowering (`lowerPureCode` and its `BridgeM` helper
    cascade), the mono ingest arm, and the `BridgeM` heap path, deleted from
    `lean/LeanNative/IR/Bridge.lean` and the helper split.
-2. Round 1 (review a094d3a9 F5/F8): the compression post-pass — `applyValidatedCompression`,
+2. Round 1: the compression post-pass — `applyValidatedCompression`,
    `compressedBodyRetTy`, the producer file `ScalarDagAndJoinPoints.lean`
    (`compressScalarCode`, `gateCodeWithSymbolicTV` and their collectors), the dead state
    converters (`bridgeStateToRealM`, `syncRealToBridgeStateM`), and the `BridgeState`
    fields only those read. Zero-reference sweeps with planted positive controls are in
-   the w-l1 commit messages; `lean/LeanNative/Tests/BridgeHelpersSplitPin.lean` pins the
+   this branch's commit messages; `lean/LeanNative/Tests/BridgeHelpersSplitPin.lean` pins the
    surviving inventory.
 3. A declaration explicitly requested with compiled code fails closed by name instead of
    being dropped silently; a constant with no compiled code is skipped. Round 2 (review
@@ -70,7 +70,7 @@ post-pass.
    own message — `ingestModuleDeclsWith` throws
    `[lean-native] Unsupported declaration ...: no impure LCNF form` for a local name and
    `...: imported declarations are outside the Stage 1B ingest ...` for an imported one
-   (reviews a094d3a9 F4 and 47512851 F2, each red-first; regressions in
+   (each fixed red-first, with regressions in
    `Tests/RealLCNFBridgeTests.lean`).
 4. The axiom audit keeps `lowerRealLCNFCode_sound` / `lowerRealLCNFDecl_sound` /
    `lowerRealLCNFDecl_driver_sound` in its required set
@@ -92,7 +92,7 @@ does not infer coverage:
 - `attachBaseDeclFactsM` — attaches `retainedFacts` metadata to the emitted declaration,
   matching base-declaration parameters to LNIR parameters by position; it changes neither
   `body` nor `params`, but downstream Transform passes may consume the facts.
-- `normalizeAndInlineLocalDefs` — OPEN (round 2, review 47512851 F1): an unproved
+- `normalizeAndInlineLocalDefs` — OPEN: an unproved
   LNIR-level inlining rewrite that `ingestModuleDeclsWith` applies to every lowered body on
   the module path, so `lowerRealLCNFDecl_driver_sound` covers `ingestImpureDeclViaReal`
   output, not `ingestModuleDecls` output. It has already had one shadowing bug (the test-6
@@ -615,7 +615,7 @@ theorem lowerRealLCNFDecl_sound (fuel : Nat) (ctx : RealBridgeCtx)
           hlc h_eval
 
 
-/-- L1 (`roadmap/HORIZONS.md` rung L1, round 1): the driver-named soundness statement.
+/-- L1 (`roadmap/HORIZONS.md` rung L1): the driver-named soundness statement.
     `ingestImpureDeclViaReal` calls exactly one lowering function and applies no body
     transformation afterwards (the round-0 checker-gated compression was removed — review
     a094d3a9 F5: its candidates provably never passed the kernel-proved gate), so the

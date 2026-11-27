@@ -4228,7 +4228,7 @@ pub fn run_ci_verify_command(
         &toolchain,
         Some(&canon_dir),
         // `ci-verify` measures a git checkout; a missing `.git` fails the bridge-binary
-        // tracked-check closed (review 4f80161c U2).
+        // tracked-check closed.
         crate::kernel::BridgeNoGitPolicy::PlainDirFailsClosed,
     )?;
 
@@ -4485,7 +4485,7 @@ pub fn run_ci_verify_command(
         let search_paths: Vec<PathBuf> = std::env::split_paths(&lp)
             .filter(|p| !p.as_os_str().is_empty())
             .collect();
-        // G1c r2 + DA 388e906a F2 + review b08785bc F3: execution runs EXACTLY the binary
+        // Execution runs EXACTLY the binary
         // selection resolved and stored in the provenance, byte-pinned at selection and
         // re-verified by the runner before the spawn.
         let Some(resolved) = kernel_prov.con_leche_binary.clone() else {
@@ -7815,7 +7815,7 @@ fn certify_head_statement_modules_and_replay(
     overlay_lib_dir: Option<&Path>,
     overlay_rebuilt_hint: Option<&std::collections::HashSet<String>>,
     pre_resolved_cfg: Option<&crate::module_builder::ProjectConfig>,
-    // DA b08785bc F1: the kernel provenance (and its byte-pinned con-leche binary) is resolved
+    // The kernel provenance (and its byte-pinned con-leche binary) is resolved
     // by the CALLER before the head build, so nothing the build writes can swap into execution.
     head_kernel_prov: &crate::kernel::KernelProvenance,
 ) -> Result<(
@@ -7967,7 +7967,7 @@ fn certify_head_statement_modules_and_replay(
 
     let verify_head_snap_with_con_leche =
         |snap_opt: &Option<crate::zygote::ClosureSnapshot>| -> Result<()> {
-            // DA b08785bc F1: the provenance was resolved by the caller BEFORE the head build;
+            // The provenance was resolved by the caller BEFORE the head build;
             // this closure performs no discovery of its own.
             let prov = head_kernel_prov;
             if !matches!(
@@ -7988,7 +7988,7 @@ fn certify_head_statement_modules_and_replay(
             let search_paths: Vec<PathBuf> = std::env::split_paths(&search_path_str)
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect();
-            // G1c r2 + DA 388e906a F2 + review b08785bc F1/F3: execution runs EXACTLY the
+            // Execution runs EXACTLY the
             // binary the caller resolved before the head build, byte-pinned at selection and
             // re-verified by the runner before the spawn.
             let Some(resolved) = prov.con_leche_binary.clone() else {
@@ -8893,7 +8893,7 @@ fn kernel_statement_changes_with_trust(
     // Test-only wrapper: resolve the kernel engine the way the command path does. Every tree
     // that reaches the statement function passes `resolve_git_toplevel`, so `.git` always
     // exists here and the PRODUCTION fail-closed policy costs nothing — using it keeps the
-    // tests on the same path `pr-verify` runs (review b6409bc4 F7).
+    // tests on the same path `pr-verify` runs.
     let head_kernel_prov = crate::kernel::resolve_kernel_engine_in_workspace(
         crate::kernel::resolve_kernel_selection_from_env(None)?,
         &detect_toolchain(project),
@@ -9389,7 +9389,7 @@ fn kernel_statement_changes_and_csimp_with_trust(
             .ok()?;
             let mut rebuilt_hint: std::collections::HashSet<String> =
                 dirty_mods.iter().cloned().collect();
-            // DA b08785bc F1 + review 4f80161c U1: the con-leche binary was resolved ONCE at
+            // The con-leche binary was resolved ONCE at
             // command level against the live checkout, before any head source was compiled
             // (lean elaboration can run IO), so nothing the compiles write can swap into
             // execution and no discovery ever runs here.
@@ -9635,7 +9635,7 @@ fn kernel_statement_changes_and_csimp_with_trust(
         } else {
             head_project
         };
-        // DA b08785bc F1 + review 4f80161c U1: the con-leche binary was resolved ONCE at
+        // The con-leche binary was resolved ONCE at
         // command level against the live checkout, before the head build, so a file the build
         // writes at the bridge path cannot swap into execution and no discovery ever runs
         // against a materialized snapshot.
@@ -9776,7 +9776,7 @@ pub fn run_pr_verify_command(
         &toolchain,
         Some(&canon_dir),
         // `pr-verify` measures a git checkout; a missing `.git` fails the bridge-binary
-        // tracked-check closed (review 4f80161c U2).
+        // tracked-check closed.
         crate::kernel::BridgeNoGitPolicy::PlainDirFailsClosed,
     )?;
     let is_untrusted = mode == "untrusted";
@@ -19784,7 +19784,7 @@ end ParityNs
             crate::module_builder::module_compile_timeout_secs_from(None, false),
             1800
         );
-        // #437 review (finding 5): the history-based trusted default is floored at the
+        // #437: the history-based trusted default is floored at the
         // no-history default — max(1800, 3x last) — so a recorded duration never makes
         // the budget stricter than having no history at all.
         assert_eq!(

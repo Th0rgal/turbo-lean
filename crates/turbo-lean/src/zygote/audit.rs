@@ -810,7 +810,7 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
                 .iter()
                 .all(|m| snap.entries.get(m).and_then(|e| e.as_ref()).is_some())
     };
-    // #435 review (finding 1): thread the budget-derived hard cap to the audit workers.
+    // #435: thread the budget-derived hard cap to the audit workers.
     // The sequential branches run one audit subprocess at a time, so their per-process
     // backstop is the budget's single-worker share.
     let solo_audit_rlimit_mb = if is_untrusted {
@@ -863,7 +863,7 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
             }
         },
     );
-    // #435 review (finding 1): each fan-out worker's hard cap is its share of the budget.
+    // #435: each fan-out worker's hard cap is its share of the budget.
     let audit_rlimit_mb = WorkerBudget::from_env().per_worker_rlimit_mb(parallelism);
     if parallelism <= 1 {
         for chunk in chunks {
@@ -1039,7 +1039,7 @@ pub(crate) fn replay_and_audit_modules_with_zygote_snapshot(
                     .unwrap_or(4)
             },
         );
-        // #435 review (finding 1): each fan-out worker's hard cap is its budget share.
+        // #435: each fan-out worker's hard cap is its budget share.
         let audit_rlimit_mb = WorkerBudget::from_env().per_worker_rlimit_mb(parallelism);
         if parallelism <= 1 {
             for chunk in chunks {
@@ -1719,7 +1719,7 @@ pub(super) fn audit_compiled_module_batch_exec_pinned(
     }
     let (mut cmd, timeout) =
         kernel_reader_command(store_root, cfg, lean_path_env, extra_ro_binds, is_untrusted)?;
-    // #435 review (finding 1): the budget-derived hard cap reaches `--audit-modules`
+    // #435: the budget-derived hard cap reaches `--audit-modules`
     // workers too, so `--max-memory-mb` means the same thing on the audit path as on the
     // replay path. Untrusted audits keep the sandbox's own fixed RLIMIT_DATA instead.
     if !is_untrusted {
@@ -2395,7 +2395,7 @@ pub(crate) fn run_audited_lean_shard_at_with_full_report(
     } else {
         std::time::Duration::from_millis(audit_timeout_ms(false))
     };
-    // #443 review (finding 3): when the remaining request budget is the binding limit,
+    // #443: when the remaining request budget is the binding limit,
     // the timeout error names the request knob, not `[audit] timeout_secs`.
     let mut request_budget_bound = false;
     if let Some(left) = budget_left("the shard audit")? {

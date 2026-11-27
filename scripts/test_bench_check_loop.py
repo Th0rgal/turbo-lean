@@ -1338,7 +1338,7 @@ class EndToEnd(unittest.TestCase):
             # with a constant makes the verdicts deterministic. This replaced
             # the previous version, which compared two measured runs and
             # failed on loaded machines when the second run drifted past the
-            # noise band (reviewer's flaky failure).
+            # noise band (flaky under load).
             def base_with_fixed_medians(median):
                 base = json.loads(out.read_text())
                 base["turbo_lean_commit"] = "1" * 40

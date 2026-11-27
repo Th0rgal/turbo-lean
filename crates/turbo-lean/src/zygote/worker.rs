@@ -45,7 +45,7 @@ pub(super) const ZYGOTE_EMBEDDED_MODULES: &[EmbeddedZygoteModule] = &[
         emit_olean: true,
         c_opt: "-O3",
     },
-    // S3b-M revised decomposition (review 9f6cb6dc): only the shim-free public-only
+    // S3b-M revised decomposition: only the shim-free public-only
     // ranges live in submodules (`Env`, `Wire`, `KernelAudit`). The shim block (whose
     // private `formatReducibilityStatus` is consumed by the root signature-audit code),
     // the replay/compiler/signature/hotspot ranges and root `main` stay in the
@@ -524,7 +524,7 @@ pub struct ZygoteWorkerProcess {
     pub(super) cold_import_us: Option<u64>,
     pub(super) is_master: bool,
     pub(super) _master: Option<std::sync::Arc<ZygoteMasterEntry>>,
-    /// H2.3 r1 (finding 2): the RLIMIT_DATA share this worker was spawned with, if any.
+    /// H2.3: the RLIMIT_DATA share this worker was spawned with, if any.
     /// `apply_worker_rlimit` lowers `rlim_max` too, so the cap is permanent; a capped
     /// worker may pool only under a key that names its cap, or an uncapped request would
     /// reuse it and fail allocations with no `memory_kill_note`.
@@ -2203,7 +2203,7 @@ mod pool_queue_tests {
             max_live.load(Ordering::SeqCst) <= 3,
             "more concurrent requests than workers"
         );
-        // H2.3 r1 (finding 7): the concurrency counter is the proof; a wall-time bound
+        // H2.3: the concurrency counter is the proof; a wall-time bound
         // flakes on a loaded runner and was removed.
         assert!(
             max_live.load(Ordering::SeqCst) >= 2,

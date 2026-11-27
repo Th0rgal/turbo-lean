@@ -751,7 +751,7 @@ use super::*;
     #[test]
     fn test_lake_refresh_targets_substitutes_the_input_bearing_library() -> Result<()> {
         // Every fixture tree is removed on ANY exit, a failed assertion included
-        // (DA 47e88386 F5: the test used to leak its temp dirs on panic).
+        // (the test used to leak its temp dirs on panic).
         struct RmDirs(Vec<PathBuf>);
         impl Drop for RmDirs {
             fn drop(&mut self) {
@@ -840,7 +840,7 @@ use super::*;
             "a dependency module without input-bearing libs must be qualified with `+` so Lake builds it"
         );
 
-        // DA 47e88386 F5: the positive side of the input-closure filter. An OWNED
+        // The positive side of the input-closure filter. An OWNED
         // dependency keeps its targets: the `owned_dep` key (`pkg_target_base_name`)
         // and the `<depBase>/` prefix that `input_bearing_libs_for_module` /
         // `exe_targets_for_module` emit agree at the bytes, or owned dependencies
@@ -899,7 +899,7 @@ use super::*;
              library and the @<pkg>/<exe>:exe target"
         );
 
-        // DA 449989b1 F3: a dependency reached through a SYMLINKED `.lake/packages`
+        // A dependency reached through a SYMLINKED `.lake/packages`
         // entry canonicalizes outside the project root (a shared checkout, the #434
         // class) and must emit NO lake target from here, whatever it carries: not
         // its input-bearing library, not a `+` module qualification. Its own
@@ -935,7 +935,7 @@ use super::*;
         ] {
             // CI requires the trusted Git; a local host without Git >= 2.46 (and no
             // TURBO_LEAN_GIT) SKIPS the shared-checkout leg with a message instead of
-            // failing (DA 47e88386 F5), the trusted_tools runtime-test shape.
+            // failing, the trusted_tools runtime-test shape.
             let mut git = match crate::trusted_tools::git(&shared) {
                 Ok(git) => git,
                 Err(err) => {
@@ -967,7 +967,7 @@ use super::*;
             "name = \"p2\"\n[[lean_lib]]\nname = \"P2\"\nglobs = [\"P2.+\"]\n",
         )?;
         fs::write(proj2.join("P2.lean"), "def p2 : Nat := 1\n")?;
-        // The discriminating owned module (DA 47e88386 F5): it EXISTS on disk, so it
+        // The discriminating owned module: it EXISTS on disk, so it
         // resolves through the ROOT package rather than the no-package fallback, and
         // it IMPORTS the non-owned module. The earlier P2.A named a module that did
         // neither, so it passed for either result.
@@ -984,7 +984,7 @@ use super::*;
             lake_refresh_targets_for_input_closure(&cfg2, &["SharedDep.D".to_string()]),
             Vec::<String>::new(),
             "the input-closure sweep emits no lake target for a non-owned dependency \
-             module: its own workspace refreshes it (DA 449989b1 F3, #434)"
+             module: its own workspace refreshes it (#434)"
         );
         assert_eq!(
             lake_refresh_targets_for_input_closure(
@@ -994,7 +994,7 @@ use super::*;
             vec!["P2.A".to_string()],
             "an owned root module that exists on disk and imports the non-owned \
              module keeps its target while the non-owned dependency module drops \
-             out of the closure sweep (DA 449989b1 F3)"
+             out of the closure sweep"
         );
         assert_eq!(
             lake_refresh_targets(&proj2, &["SharedDep.D".to_string()]),
@@ -1005,7 +1005,7 @@ use super::*;
         Ok(())
     }
 
-    /// DA 47e88386 F4: the input-closure sweep must not let a NON-OWNED input-bearing
+    /// The input-closure sweep must not let a NON-OWNED input-bearing
     /// module pull its owned dependents into the closure. Emitting those dependents
     /// makes `lake build <dependent>` rebuild the stale non-owned module inside the
     /// shared checkout's `.lake/build`, the very write #434 forbids; the emission
@@ -1130,7 +1130,7 @@ use super::*;
             !closure.contains("P2.A"),
             "an owned module whose only path into the closure is a non-owned module \
              stays out: emitting it would make lake rebuild the stale non-owned \
-             module inside the shared checkout (DA 47e88386 F4): {closure:?}"
+             module inside the shared checkout: {closure:?}"
         );
         let emitted = lake_refresh_targets_for_input_closure(
             &cfg,

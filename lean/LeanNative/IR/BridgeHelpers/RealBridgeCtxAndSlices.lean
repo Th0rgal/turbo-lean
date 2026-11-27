@@ -478,7 +478,7 @@ def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
         callees paramTypeMap knownCtors.toList
       let fuel := codeAstFuel c + decl.params.size + 64
       match RealLCNFBridge.lowerRealLCNFDecl fuel ctx decl metaInfo.mangledSymbol with
-      -- L1 r1: one lowering callee and no body post-pass (review a094d3a9 F5 — the
+      -- L1: one lowering callee and no body post-pass (the
       -- round-0 checker-gated compression provably never fired and was removed).
       | .ok d => attachBaseDeclFactsM decl.name d
       | .error msg => Lean.throwError msg

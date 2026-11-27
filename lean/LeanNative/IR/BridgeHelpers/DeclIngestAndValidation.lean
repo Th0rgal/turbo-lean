@@ -146,7 +146,7 @@ def expandCompilerAuxDecls (declNames : Array Lean.Name) : Lean.CoreM (Array Lea
   for name in declNames do
     let red := Lean.Name.str name "_redArg"
     if !out.contains red then
-      -- L1 r1 (review a094d3a9 F8): mono-only `_redArg` forms fed the deleted mono arm.
+      -- L1: mono-only `_redArg` forms fed the deleted mono arm.
       if (← Lean.Compiler.LCNF.getLocalImpureDecl? red).isSome then
         out := out.push red
   return out
@@ -167,7 +167,7 @@ def ingestModuleDeclsWith (ingestImpure : Lean.Compiler.LCNF.Decl .impure → Ar
       decls := decls ++ [d]
       rawPairs := rawPairs ++ [(name, d.name)]
     else
-      -- L1 r1 (review a094d3a9 F4, red-first) + r2 (review 47512851 F2): an explicitly
+      -- L1: an explicitly
       -- requested declaration whose constant kind carries compiled code (a computable
       -- def or opaque) fails closed by name instead of being dropped silently. The kind
       -- check replaces the earlier base/mono LCNF lookups: those also see IMPORTED

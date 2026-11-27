@@ -354,7 +354,7 @@ fn pr_and_ci_verify_base_policy_isolation_and_receipt_verification() {
     let ci_json: Value = serde_json::from_slice(&ci_out.stdout).unwrap();
     assert_eq!(ci_json["kernel_requested"], "auto");
     assert_eq!(ci_json["lean_toolchain"], toolchain);
-    // Host-honest resolved-engine assertion (G1c r2; DA 388e906a F7): computed by the REAL
+    // Host-honest resolved-engine assertion: computed by the REAL
     // selection probe through the #[path]-included kernel module, under the same environment
     // the CLI child sees (`ELAN_HOME`, `HOME` and `TURBO_CON_LECHE_BIN` reach both), so this
     // test cannot drift from the resolver the way a hand-rolled copy did. A capable bundled
@@ -363,7 +363,7 @@ fn pr_and_ci_verify_base_policy_isolation_and_receipt_verification() {
         kernel::KernelEngineSelection::Auto,
         toolchain,
         Some(&repo),
-        // Mirrors `ci-verify`'s policy (review 4f80161c U2), so this host-honest probe keeps
+        // Mirrors `ci-verify`'s policy, so this host-honest probe keeps
         // computing the same answer as the resolver inside the CLI child.
         kernel::BridgeNoGitPolicy::PlainDirFailsClosed,
     ) {

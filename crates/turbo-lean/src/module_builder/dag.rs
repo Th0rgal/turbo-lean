@@ -244,7 +244,7 @@ pub struct PackageConfig {
     /// Why the dependency downgrade dropped Lake-rejected `leanOptions` entries from this
     /// package or one of its targets. Recorded in its own slot, never found by scanning the
     /// shared `unsupported` reason, which keeps only its first reason and can be occupied
-    /// by an earlier construct (#299 round 2; DA 3ff1014b finding 3). Callers that hand out
+    /// by an earlier construct (#299). Callers that hand out
     /// file args from a root-as-dependency parse refuse on it.
     #[serde(default)]
     pub lake_rejected_lean_options: Option<String>,
@@ -5426,7 +5426,7 @@ pub(super) fn parse_lean_path_literal(field: &str, expr: &str) -> Result<PathBuf
 /// resolution error keeps failing closed for every package. A downgrade returns
 /// `Ok(Some(why))` so the caller records it in `PackageConfig::lake_rejected_lean_options`
 /// explicitly: the shared `unsupported` slot keeps only its first reason, so scanning its
-/// text afterwards misses a downgrade an earlier construct masked (DA 3ff1014b finding 3).
+/// text afterwards misses a downgrade an earlier construct masked.
 pub(super) fn extend_lean_options_or_record(
     target: &mut LeanOptionsMap,
     slot: &mut Option<String>,
@@ -6862,7 +6862,7 @@ pub(crate) fn optional_package_config(project_dir: &Path) -> Result<Option<Packa
             project_dir.display()
         )
     })?;
-    // #299 round 2: this is the root-as-dependency parse (pr-verify's working-tree resolve,
+    // #299: this is the root-as-dependency parse (pr-verify's working-tree resolve,
     // `try_resolve_lean_args_for_path`). The dependency downgrade for Lake-rejected
     // `leanOptions` entry forms must not let a ROOT lakefile parse `Ok` here with entries
     // silently dropped from the args these callers hand out; only the workspace dependency
@@ -6875,7 +6875,7 @@ pub(crate) fn optional_package_config(project_dir: &Path) -> Result<Option<Packa
 /// that hands out file args from a root-as-dependency parse (`optional_package_config`, the
 /// trusted declaration-identity resolve) fails like the root parse instead of serving args
 /// with entries silently gone. Reads the dedicated record, never the shared `unsupported`
-/// reason text, which an earlier construct can occupy first (DA 3ff1014b finding 3).
+/// reason text, which an earlier construct can occupy first.
 pub(crate) fn refuse_lake_rejected_lean_options(pkg: &PackageConfig) -> Result<()> {
     if let Some(why) = &pkg.lake_rejected_lean_options {
         anyhow::bail!("{why}");
@@ -10169,7 +10169,7 @@ pub(super) fn build_module_dag_inner(
         )?;
     }
     let mut dep_closure_memo = DepClosureMemo::new(cfg);
-    // #299 round 2: per-import memo of dependencies that OWN the name with a MISSING source
+    // #299: per-import memo of dependencies that OWN the name with a MISSING source
     // file; they count toward the ambiguity check and stop resolution, while
     // `resolve_dep_pkg_matches` memoizes only Found results.
     let mut owned_missing_memo: std::collections::HashMap<String, Vec<(String, String, PathBuf)>> =

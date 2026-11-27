@@ -89,7 +89,7 @@ private def selfL : LNIRDecl :=
 
 #guard (runCodeF [(selfL, 32)] selfL.body (.u64 5)).isOk == false
 
--- 4b. Stratified self-call, depth-1 STOP (review 6f812155 F3): the branch the unrolled
+-- 4b. Stratified self-call, depth-1 STOP: the branch the unrolled
 --     body takes under the strict suffix carries no call (`x = 0` lands in the `else`
 --     arm), so the ONE resolution suffices and the run is ok — this distinguishes
 --     depth-1 unrolling from an immediate miss, which guard 4's `.isOk == false` alone
@@ -217,7 +217,7 @@ private def boxSpec : RcCtorLayoutSpec :=
   { ctorName := `l2_box, cidx := 0, objSlots := 1, usizeSlots := 1, scalarSlots := [] }
 
 /-- `l2_u o y`: write `y` into `o`'s usize slot (logical index 1), read it back. The
-object parameter is typed `ImpureType.tobject` (review 6f812155 F4), so the fixture is a
+object parameter is typed `ImpureType.tobject`, so the fixture is a
 program the driver could produce — `.objPtr` is passed where an object is declared. -/
 private def calleeU : Decl .impure :=
   let u64 := ImpureType.uint64

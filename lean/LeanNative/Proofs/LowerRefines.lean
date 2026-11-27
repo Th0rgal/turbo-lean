@@ -13,7 +13,7 @@ open LeanNative.IR.RealLCNFSemantics
 open LeanNative.Semantics
 
 /-!
-## H1.4 — Mutant kill matrix for the proved lowering path (roadmap/HORIZONS.md) — w-h14
+## H1.4 — Mutant kill matrix for the proved lowering path (roadmap/HORIZONS.md)
 
 Authoritative row (`roadmap/HORIZONS.md`): "H1.4 Mutant kill matrix; coverage number
 published | `Proofs/LowerRefines.lean` | L3 | mutants in CI | M". This file is the matrix's
@@ -89,7 +89,7 @@ each: four KILLED by this file's pins, the budget mutant SURVIVED 3/3):
   failure, so a mutant that several modules kill is credited to whichever elaborates
   first.
 
-  RE-MEASURED at commit da40658f (gap-l3, 2026-11-26), after L2's
+  RE-MEASURED on 2026-11-26, after L2's
   `Tests/RealLCNFCallTests.lean` and L3's `Tests/RealLCNFRecTests.lean` joined the
   closure (both are absent at 88324526): 59/60 again, every mutant's outcome identical
   to the 88324526 run, the same survivor. The results JSON now records this run. In it

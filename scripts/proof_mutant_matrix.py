@@ -9,7 +9,7 @@ cache. The kill signal is a failed `lake build LeanNative` of the proofs/Tests
 closure (theorem elaboration failure or a failed `#guard` executable guard),
 never a hand-judged verdict.
 
-Honesty rules this harness enforces (round 1 of the harness review folded in):
+Honesty rules this harness enforces:
   * The committed originals are never touched: mutations happen only in a
     scratch worktree under `.h14-mutants/` inside the repository root, created
     with `git worktree add --detach` and removed with `git worktree remove`

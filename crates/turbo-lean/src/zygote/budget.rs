@@ -233,7 +233,7 @@ impl WorkerBudget {
     /// would fail workers whose resident use fits the budget. The cap is therefore the
     /// share FLOORED at the worker RSS estimate (`REPLAY_WORKER_EST_RSS_MB`), with
     /// `RLIMIT_DATA_HEADROOM_MULT` headroom: monotone in the budget, so RAISING
-    /// `--max-memory-mb` can never newly fail a worker (review bb7c0f2f F2: the old
+    /// `--max-memory-mb` can never newly fail a worker (the old
     /// shape applied NO cap below a 2048 MiB share and a 4096 MiB cap at it, so a
     /// 5 GiB-footprint worker passed at share 2000 and failed at share 2048, and the
     /// kill note's "raise the budget" advice pointed the wrong way). A tighter budget
@@ -283,7 +283,7 @@ impl WorkerBudget {
     /// resident memory fits. `TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER=<n>` opts into
     /// `RLIMIT_AS = n ×` the `rlimit_mb` passed here — the HEADROOM-APPLIED
     /// `RLIMIT_DATA` cap from `per_worker_rlimit_mb`, not the raw budget share, so an
-    /// operator's `=4` means 4 × (2 × share-or-floor) (review bb7c0f2f F7: the base is
+    /// operator's `=4` means 4 × (2 × share-or-floor) (the base is
     /// stated so existing settings are re-checked, not silently rescaled). Fail-open
     /// inside the child: a worker that cannot lower
     /// its limits still runs, and the machine-wide LRU governor remains the backstop.
@@ -334,7 +334,7 @@ impl WorkerBudget {
     /// non-definite and keeps the bisection that isolates the module. Empty when no
     /// cap was applied or nothing points at memory.
     ///
-    /// Both notes state the one real condition (review bfa9d056 F7): the cap is
+    /// Both notes state the one real condition: the cap is
     /// `RLIMIT_DATA_HEADROOM_MULT x max(budget / workers, REPLAY_WORKER_EST_RSS_MB)`,
     /// so raising `--max-memory-mb` and lowering the worker count move the SAME
     /// quotient, and neither moves the cap until that quotient exceeds the floor.
@@ -408,7 +408,7 @@ impl WorkerBudget {
     /// SIGSEGV or SIGKILL with no allocation signature still gets the bisection that
     /// isolates the failing module. An abort DELIVERING an allocation failure (SIGABRT
     /// with `bad_alloc` on stderr) is definite: `memory_kill_note` checks the stderr
-    /// signature before the signal (review bfa9d056 F2).
+    /// signature before the signal.
     pub fn error_names_definite_memory_cap(err: &anyhow::Error) -> bool {
         format!("{err:#}").contains("per-worker memory cap of")
     }
@@ -585,7 +585,7 @@ pub(crate) fn invocation_timeout_ms() -> Option<u64> {
 /// check, so every spelling of `TURBO_LEAN_AUDIT_TIMEOUT_SECS` means the same thing on
 /// both paths. `None`: not configured (unset, an EMPTY value, or an unparsable value,
 /// which is no configuration at all — an empty export such as `VAR=${UNSET}` in CI must
-/// not silently mean "no timeout"; review bb7c0f2f F1). `Some(UNBOUNDED_TIMEOUT_MS)`:
+/// not silently mean "no timeout"). `Some(UNBOUNDED_TIMEOUT_MS)`:
 /// explicitly unbounded (a literal `0`, matching `eval --timeout-ms 0`). Otherwise the
 /// configured budget.
 pub(crate) fn explicit_audit_timeout_ms() -> Option<u64> {
@@ -614,7 +614,7 @@ pub(crate) fn is_unbounded_timeout_ms(ms: u64) -> bool {
 /// `[audit] timeout_secs` in turbo-lean.toml; defaulting to 120 s in untrusted mode and
 /// 300 s in trusted mode). A literal `0` is explicitly unbounded (#443); an empty or
 /// unparsable value is ignored like an unset one. In untrusted mode the result is clamped
-/// to [15, 600] s like the replay and compile budgets (review bb7c0f2f F1), so a
+/// to [15, 600] s like the replay and compile budgets, so a
 /// PR-supplied `[audit] timeout_secs = 0` cannot hold a CI runner; the explicitly
 /// unbounded spelling still reaches the shard auditor's OWN check through
 /// `explicit_audit_timeout_ms`, which is trusted-side only.
