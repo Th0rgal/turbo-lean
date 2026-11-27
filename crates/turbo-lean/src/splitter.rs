@@ -1977,7 +1977,7 @@ fn contains_admit_tactic(line: &str) -> bool {
                     })
                 });
         let rest = line[end..].trim_start();
-        prev_ok && (rest.is_empty() || rest.starts_with([';', '<', '|', ')']))
+        prev_ok && (rest.is_empty() || rest.starts_with([';', '<', '|', ')', ']', '}', '⟩', ',']))
     })
 }
 
@@ -11305,6 +11305,9 @@ mod tests {
             "by any_goals admit",
             "by focus admit",
             "by trivial <;> admit",
+            "⟨by admit, by trivial⟩",
+            "[by admit]",
+            "{ x := by admit }",
         ] {
             assert!(flags(&format!("theorem t : False := {src}")), "{src}");
         }
