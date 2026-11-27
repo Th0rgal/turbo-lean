@@ -9186,7 +9186,7 @@ mod tests {
 
     #[test]
     fn test_fresh_store_user_version_matches_schema_const() -> Result<()> {
-        // Review b6409bc4 F5: the cold-create DDL and the schema const are written in one
+        // The cold-create DDL and the schema const are written in one
         // place now; this pins that a store THIS build creates reads back exactly the
         // version the newer-store guard compares against, so a future bump cannot move one
         // without the other.

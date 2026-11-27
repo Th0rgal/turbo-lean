@@ -722,7 +722,7 @@ def mslAtomicResult : MSLRes :=
 theorem msl_multi_group_atomic_add_kernel_checked :
     mslReadU32? mslAtomicResult 0 0 = some 16#32 := rfl
 
-/-! ## 13. Round-2 PTX coverage: `regDecls` checks, `atom.cas`, and atomic vs non-atomic epoch races -/
+/-! ## 13. Additional PTX coverage: `regDecls` checks, `atom.cas`, and atomic vs non-atomic epoch races -/
 
 def ptxUndeclRegKernel : PTXKernel where
   name := "ptx_undecl_reg"
@@ -827,7 +827,7 @@ def ptxAtomVsStoreRaceResult : PTXRes :=
 theorem ptx_atom_vs_nonatomic_store_race_checked :
     ptxAtomVsStoreRaceResult = .dataRace .global 0 := rfl
 
-/-! ## 14. Round-2 Metal coverage: multi-lane vectors/structs, single-pass simd,
+/-! ## 14. Additional Metal coverage: multi-lane vectors/structs, single-pass simd,
     depth-8 calls, arrays, short-circuit, pointer atomics & rank promotion -/
 
 def mslUlong2Kernel : MSLKernelDecl where

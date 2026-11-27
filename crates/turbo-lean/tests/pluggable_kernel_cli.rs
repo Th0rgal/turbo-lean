@@ -640,9 +640,9 @@ fn compile_real_olean_module(dir: &Path, module: &str) -> Option<PathBuf> {
     {
         Ok(v) if v.status.success() => {}
         _ => {
-            // Review bb7c0f2f F6: a silent skip would let CI report this G1b evidence
+            // A silent skip would let CI report this G1b evidence
             // test as passing on a host (or network outage) where Lean never ran.
-            // Review a64324fd F8: the gate keys ONLY on TURBO_LEAN_REQUIRE_LEAN — the
+            // The gate keys ONLY on TURBO_LEAN_REQUIRE_LEAN — the
             // workflow sets it on the jobs that install Lean — never on the generic
             // `CI`, which any CI job running `cargo test` without elan would trip.
             assert!(

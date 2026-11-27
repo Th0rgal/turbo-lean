@@ -1097,7 +1097,7 @@ use super::*;
             "{\"version\":\"1.1.0\",\"packagesDir\":\".lake/packages\",\"packages\":[{\"type\":\"path\",\"name\":\"shareddep\",\"dir\":\".lake/packages/shareddep\"}]}\n",
         )?;
         let projc = projc.canonicalize()?;
-        // Review cf31dd1e F7 / 29baa2ab F7: no silent skip — a fixture that stops
+        // No silent skip — a fixture that stops
         // resolving must FAIL this test (it is the only coverage for the
         // closure-exclusion fix), never return Ok(()) with nothing asserted.
         let cfg = crate::module_builder::resolve_project_config(&projc)?;
@@ -5228,7 +5228,7 @@ impl Drop for OwnershipFixture {
     }
 }
 
-/// Review f9807eb0 F8 fixtures: a project `P3` (owned lib `P3.A` importing `D.D`) whose
+/// Fixtures: a project `P3` (owned lib `P3.A` importing `D.D`) whose
 /// single dependency `dep` carries a Lake file input. `tag` makes the temp dir name
 /// unique, `dep_rel` is the dependency checkout's path (relative to the project root
 /// when `dep_in_project`, else relative to the fixture root, declared to Lake by its

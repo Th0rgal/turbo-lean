@@ -972,7 +972,7 @@ fn pkg_root_owned_by_project(
     let Ok(root) = root_canon else {
         return false;
     };
-    // Review cf31dd1e F1: the marker is checked on the CANONICAL package root, the same
+    // The marker is checked on the CANONICAL package root, the same
     // form the #436 build gate canonicalizes, never the raw path. On the raw path,
     // `pkg_root.parent()` is the project's `.lake/packages` SLOT: when that slot is a
     // symlink to a relocated, marker-owned packages dir, a nested symlinked entry
@@ -986,11 +986,11 @@ fn pkg_root_owned_by_project(
     {
         return true;
     }
-    // Review cf31dd1e F5: the same-repository grant covers the LEXICAL monorepo-sibling
+    // The same-repository grant covers the LEXICAL monorepo-sibling
     // `require … from "../libs/x"` shape only. A package reached THROUGH A SYMLINK (the
     // #434 shape) must not inherit ownership from an enclosing repository, and an
     // unrelated enclosing checkout (a dotfiles repository at `$HOME`) would otherwise
-    // make every git-less neighbor under it count as owned. Review a64324fd F3: the
+    // make every git-less neighbor under it count as owned. The
     // symlink-hop test runs on the manifest's DECLARED directory, never on `pkg_root`
     // alone — the resolver may hand back the symlink's canonical target, on which
     // `lexical_normalize(pkg_root) == canon` is vacuously true and sees nothing. With
@@ -998,7 +998,7 @@ fn pkg_root_owned_by_project(
     // `pkg_root`'s own components are walked instead, which catches a symlinked
     // packages slot the lexical test also caught. A symlink anywhere on the declared
     // route loses this grant conservatively; the owner marker is the way back.
-    // Review bfa9d056 F6: the declared manifest dirs are computed ONCE (the grant arm
+    // The declared manifest dirs are computed ONCE (the grant arm
     // reuses them), and the symlink walk is LAZY — only the same-repository arm needs
     // it, and this function runs once per dependency module in the purge walk, so an
     // eager per-entry canonicalize+lstat here is the same per-module I/O the sweep's
@@ -1022,7 +1022,7 @@ fn pkg_root_owned_by_project(
                 .is_some_and(|canon| raw_symlink_free(canon))
                 && pkg_repo == root_repo
         }
-        // Review cf31dd1e F2: a plain-directory `path` dependency (`require foo from
+        // A plain-directory `path` dependency (`require foo from
         // "../foo"`, no `.git` anywhere above it) is editable scratch — finding 6's
         // shape — whether or not the PROJECT is a git checkout; the previous
         // `(None, Some(_)) => false` arm silently dropped it from the closure sweep
@@ -1102,7 +1102,7 @@ fn manifest_path_dep_grants_scratch_ownership(
         dir.starts_with(&cfg.root_pkg.pkg_root)
             && components_symlink_free(dir)
             && !lexical_normalize(dir).starts_with(&slot)
-            // Review bfa9d056 F6: the entry must canonicalize to THIS package's root —
+            // The entry must canonicalize to THIS package's root —
             // an entry matched only by the target base name must not grant ownership
             // to a different package that happens to share it.
             && fs::canonicalize(dir)
@@ -1184,7 +1184,7 @@ pub(crate) enum OwnerMarkerSite {
     PackagesDir(PathBuf),
 }
 
-/// The remedy the non-owned-checkout refusal names. Review cf31dd1e F3: it depends on
+/// The remedy the non-owned-checkout refusal names. It depends on
 /// where the package lives. An entry under the project's own tree is refreshed through
 /// the PROJECT's workspace (running `lake` inside `.lake/packages/<dep>` resolves the
 /// dependency's own manifest and can fetch a nested `.lake/packages` with different
@@ -1193,7 +1193,7 @@ pub(crate) enum OwnerMarkerSite {
 /// #434 write these refusals exist to stop — so the fix there is the checkout's own
 /// workspace, or the owner marker when the checkout really is this project's.
 ///
-/// Review a64324fd F2: the branch is decided on CANONICAL paths, and the message
+/// The branch is decided on CANONICAL paths, and the message
 /// prints them. The raw root of a symlinked `.lake/packages/<dep>` entry is lexically
 /// under the project, so a raw `starts_with` would send the user to `lake build +X`
 /// from the project root — a write through the symlink into the shared checkout, the
@@ -1201,7 +1201,7 @@ pub(crate) enum OwnerMarkerSite {
 /// `owner_marker_names_project` and the #436 gate compare marker CONTENT against, so
 /// the marker hint prints that form too.
 ///
-/// Review bfa9d056 F3: a marker hint is shown only when the marker would actually
+/// A marker hint is shown only when the marker would actually
 /// clear the CALLER's gate. The #436 build-scope gate honors a marker only in the
 /// project's canonical packages dir, and only a packages dir OUTSIDE the root needs
 /// one (an in-tree packages dir already counts), so the `PackagesDir` hint appears
@@ -2921,7 +2921,7 @@ pub(super) fn run_audit_chunk_subprocess(
         is_untrusted,
     )?;
     // #435: `--max-memory-mb` means the same thing on the audit path
-    // as on the replay path. Review bb7c0f2f F5: the cap is the share for the REAL
+    // as on the replay path. The cap is the share for the REAL
     // audit concurrency (the scheduler's audit pool size, threaded in by the caller),
     // not a hard-coded single-worker share that let each of several concurrent audits
     // grow to a multiple of the whole budget; untrusted audits keep the sandbox's own
@@ -2947,7 +2947,7 @@ pub(super) fn run_audit_chunk_subprocess(
     let out =
         run_command_with_timeout_pinned_fd(&mut cmd, timeout, is_untrusted, pinned_dir_raw_fd);
     record_scheduler_test_event("audit_subprocess_end", mod_names);
-    // Review bb7c0f2f F4: an allocation failure under the worker cap names the knob (so
+    // An allocation failure under the worker cap names the knob (so
     // `error_names_memory_cap` can classify it), and a memory-capped failure is never
     // bisected — the halving would redo full-closure loads under the same cap. Review
     // a64324fd F5: only the DEFINITE allocation signature skips bisection; the "may
@@ -3205,7 +3205,7 @@ pub(super) fn run_audit_or_replay_batch_worker_bound(
                     per_mod.insert(chunk[0].clone(), (Err(chunk_err), None));
                 } else if crate::zygote::WorkerBudget::error_names_definite_memory_cap(&chunk_err)
                 {
-                    // Review a64324fd F5, reshaped by bfa9d056 F1: a chunk that
+                    // A chunk that
                     // provably hit the per-worker memory cap is neither retried
                     // module-by-module (up to a chunk's worth of full-closure loads
                     // under the same cap, the cost the no-bisect rule exists to avoid)
@@ -3422,7 +3422,7 @@ pub(super) fn run_audit_or_replay_batch_worker_bound(
             let _ = crate::zygote::ensure_bound_audit_closure(snap, "sched_replay_before_single")?;
             let (mut cmd, _audit_timeout) =
                 crate::zygote::kernel_reader_command(store_root, cfg, &snap_lp, &[], false)?;
-            // Review bb7c0f2f F3: this per-dependency fallback redoes the union replay's
+            // This per-dependency fallback redoes the union replay's
             // work, so it runs under the same budget-derived rlimit, the REPLAY timeout
             // knob (not the audit one), and its failure carries the memory-cap note —
             // this was the one path that still ran uncapped after #435.
@@ -3873,7 +3873,7 @@ mod host_effect_taint_tests {
         Ok(())
     }
 
-    /// Review cf31dd1e F2: the editable-sibling grant must not depend on whether the
+    /// The editable-sibling grant must not depend on whether the
     /// PROJECT is a git checkout. The previous `(None, Some(_)) => false` arm silently
     /// un-owned a plain-directory sibling the moment the project was in git — the
     /// ordinary finding-6 layout — so this is the sibling test again with
@@ -4142,7 +4142,7 @@ mod host_effect_taint_tests {
         Ok(())
     }
 
-    /// Review cf31dd1e F1, pinned by a64324fd F9: the owner marker is honored on the
+    /// The owner marker is honored on the
     /// CANONICAL package root. When the project's whole packagesDir is a symlink to a
     /// relocated, marker-owned directory, a nested symlinked entry under it pointing
     /// at a SHARED checkout must not inherit the marker through its raw parent (the
@@ -4219,7 +4219,7 @@ mod host_effect_taint_tests {
         Ok(())
     }
 
-    /// Review cf31dd1e F5, pinned by a64324fd F3/F9: a package reached THROUGH A
+    /// A package reached THROUGH A
     /// SYMLINK must not inherit same-repository ownership from an enclosing checkout
     /// (a dotfiles repository above both would otherwise own every symlinked
     /// neighbor). The symlink-hop test runs on the manifest's DECLARED directory, so
@@ -4290,7 +4290,7 @@ mod host_effect_taint_tests {
         Ok(())
     }
 
-    /// Review a64324fd F2/F9: the refusal remedy is decided on CANONICAL paths and
+    /// The refusal remedy is decided on CANONICAL paths and
     /// names them, and its marker hint names the site the CALLER honors.
     #[cfg(unix)]
     #[test]
@@ -4331,7 +4331,7 @@ mod host_effect_taint_tests {
             msg.contains(".turbo-lean-packages-owner"),
             "a non-pinned out-of-tree checkout gets the ownership-walk marker hint: {msg}"
         );
-        // Review bfa9d056 F3: a CLEAN GIT-PINNED checkout is refused before the
+        // A CLEAN GIT-PINNED checkout is refused before the
         // ownership walk's marker check, so no marker clears it and the hint must not
         // be shown.
         let msg_pinned = non_owned_dep_refresh_remedy(
@@ -4362,7 +4362,7 @@ mod host_effect_taint_tests {
             msg2.contains("run `lake build +Real` from the project root"),
             "in-tree entry keeps the project-workspace remedy: {msg2}"
         );
-        // Review bfa9d056 F3: for the usual #434 shape — an IN-TREE packages dir with
+        // For the usual #434 shape — an IN-TREE packages dir with
         // one entry symlinked to a shared checkout — the #436 gate already counts the
         // packages dir without any marker, and the package's canonical home is not
         // under it, so a packages-dir marker cannot clear that gate and the hint is

@@ -1111,7 +1111,7 @@ C1_UPSTREAM_CANARY = ROOT / "scripts" / "fixtures" / "c1_upstream_canary.lean"
 
 
 def classify_c1_upstream_rejection(returncode: int, stderr: str, stdout: str = "") -> str:
-    """R1 + round-2 F1: a nonzero `emit-lnir` exit counts as
+    """A nonzero `emit-lnir` exit counts as
     rejected_fail_closed only when stderr carries a deliberate refusal
     diagnostic AND no fatal shape appears in stderr or stdout. A negative
     returncode, or one >= 128 (a shell-encoded signal death), is

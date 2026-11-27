@@ -1451,7 +1451,7 @@ pub(crate) fn input_closure_sweep_mods(
     cfg: &crate::module_builder::ProjectConfig,
     dag: &crate::module_builder::ModuleDag,
 ) -> std::collections::BTreeSet<String> {
-    // Review cf31dd1e F4 (elevating 29baa2ab F3): ownership is keyed on the package
+    // Ownership is keyed on the package
     // ROOT — an identity — never on name strings. A non-owned package whose origName
     // collides with an owned package's name must not ride into the closure, and an
     // owned package whose node spells the other name form must not silently drop out
@@ -1475,7 +1475,7 @@ pub(crate) fn input_closure_sweep_mods(
         .nodes
         .iter()
         .filter_map(|(m, n)| {
-            // Review a64324fd F6 (reshaping cf31dd1e F6): ownership is decided FIRST.
+            // Ownership is decided FIRST.
             // A non-owned node runs the module resolvers and the artifact staleness
             // check (mtime stats) so a stale one can be warned about; the config walk
             // and the per-module SOURCE reads run only for nodes that came out stale.
@@ -1484,7 +1484,7 @@ pub(crate) fn input_closure_sweep_mods(
                 // cf31dd1e F6: an EXCLUDED non-owned input-bearing seed used to fail
                 // the freshness check loudly; now that the sweep skips it, a stale one
                 // must not go silent while the purge path fails closed on the same
-                // state. Review bfa9d056 F4 orders the work by cost: the artifact
+                // state. This orders the work by cost: the artifact
                 // STALENESS check (resolver + mtimes) runs first, and the per-module
                 // SOURCE reads that decide `include_str` input-bearing run only for
                 // nodes that came out stale — so a fresh Mathlib import still costs no
@@ -1501,7 +1501,7 @@ pub(crate) fn input_closure_sweep_mods(
                 let stale = spec
                     .as_ref()
                     .is_some_and(crate::module_builder::spec_own_artifact_stale_on_disk);
-                // Review bfa9d056 F5: the dedupe key carries the package root (two
+                // The dedupe key carries the package root (two
                 // packages may share a module name), and a node seen FRESH clears its
                 // entry, so a module the user refreshes and later lets go stale again
                 // is warned about again, even in a long-lived daemon.

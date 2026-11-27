@@ -1759,7 +1759,7 @@ pub(super) fn audit_compiled_module_batch_exec_pinned(
         is_untrusted,
         pinned_dir_raw_fd,
     );
-    // Review bb7c0f2f F4: an allocation failure under the worker cap names the knob (so
+    // An allocation failure under the worker cap names the knob (so
     // `error_names_memory_cap` can classify it), and a memory-capped failure is never
     // bisected — the recursive halving below would redo full-closure loads under the
     // same cap and end in the same unhelpful error.

@@ -49,7 +49,8 @@ theorem evalCodeF_letBind (Φ : FuncEnv) (fuel : Nat) (env : VarEnv) (st : HeapS
   -- `unfold` would rewrite them too and the fold-back pattern never matches).
   rw [evalCodeF.eq_def]
   try simp only []
-  split <;> rename_i heq <;> simp only [heq] <;> try rfl
+  split <;> rename_i heq <;>
+    simp only [heq] <;> try rfl
 
 /-- The non-call instance of `evalCodeF_letBind`: with the environment lookup a miss the
     arm is `evalCode`'s byte for byte (modulo the recursive occurrence). -/

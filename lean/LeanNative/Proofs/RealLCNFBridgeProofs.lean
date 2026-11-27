@@ -19,7 +19,7 @@ Current state: the per-declaration driver
 (`ingestImpureDeclViaReal`) applies NO post-pass to the lowered body at all — the rung's
 "or removed" option. The MODULE path (`ingestModuleDecls`) is narrower than that and OPEN:
 see `normalizeAndInlineLocalDefs` under Named exclusions below.
-Round 0 had gated a
+An earlier version had gated a
 `compressScalarCode` candidate behind the kernel-proved `runSymbolicValidatedDecl` checker;
 the review showed the producer's candidates provably never pass that gate (straight-line
 candidates are byte-identical and early-return; `ite` candidates return a fresh variable,
@@ -48,15 +48,15 @@ theorem lowerRealLCNFDecl_driver_sound (fuel : Nat) (ctx : RealBridgeCtx)
 the statement to the context the driver builds (`buildRealBridgeCtxM` output). The shape
 is forward simulation on successful runs, HORIZONS's honest H1 shape. The L2 lane (calls)
 builds against these names: L2 adds a function environment to both semantics and restates
-them with that one extra binder. The round-0 `cand : LNIRCode` binder is gone with the
+them with that one extra binder. The earlier `cand : LNIRCode` binder is gone with the
 post-pass.
 
 ### Removals (the other half of the rung)
 
-1. Round 0: the second, unproved lowering (`lowerPureCode` and its `BridgeM` helper
+1. The second, unproved lowering (`lowerPureCode` and its `BridgeM` helper
    cascade), the mono ingest arm, and the `BridgeM` heap path, deleted from
    `lean/LeanNative/IR/Bridge.lean` and the helper split.
-2. Round 1: the compression post-pass — `applyValidatedCompression`,
+2. The compression post-pass — `applyValidatedCompression`,
    `compressedBodyRetTy`, the producer file `ScalarDagAndJoinPoints.lean`
    (`compressScalarCode`, `gateCodeWithSymbolicTV` and their collectors), the dead state
    converters (`bridgeStateToRealM`, `syncRealToBridgeStateM`), and the `BridgeState`
@@ -64,8 +64,8 @@ post-pass.
    this branch's commit messages; `lean/LeanNative/Tests/BridgeHelpersSplitPin.lean` pins the
    surviving inventory.
 3. A declaration explicitly requested with compiled code fails closed by name instead of
-   being dropped silently; a constant with no compiled code is skipped. Round 2 (review
-   47512851 F2): "has compiled code" is the constant kind (a computable
+   being dropped silently; a constant with no compiled code is skipped. Specifically,
+   "has compiled code" is the constant kind (a computable
    `defnInfo`/`opaqueInfo`), not base/mono LCNF visibility, and an imported name gets its
    own message — `ingestModuleDeclsWith` throws
    `[lean-native] Unsupported declaration ...: no impure LCNF form` for a local name and
@@ -617,10 +617,10 @@ theorem lowerRealLCNFDecl_sound (fuel : Nat) (ctx : RealBridgeCtx)
 
 /-- L1 (`roadmap/HORIZONS.md` rung L1): the driver-named soundness statement.
     `ingestImpureDeclViaReal` calls exactly one lowering function and applies no body
-    transformation afterwards (the round-0 checker-gated compression was removed — review
-    a094d3a9 F5: its candidates provably never passed the kernel-proved gate), so the
+    transformation afterwards (the checker-gated compression was removed: its
+    candidates provably never passed the kernel-proved gate), so the
     driver pipeline's statement is `lowerRealLCNFDecl_sound` itself, restated under the
-    name the L1 contract exports to the L2 lane. -/
+    name the L1 contract exports to the L2 layer. -/
 theorem lowerRealLCNFDecl_driver_sound (fuel : Nat) (ctx : RealBridgeCtx)
     (decl : Lean.Compiler.LCNF.Decl .impure) (args : List Val) (hst hst' : HeapState)
     (v : Val) (d : LNIRDecl) (mangled : String)

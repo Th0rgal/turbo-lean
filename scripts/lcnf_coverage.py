@@ -4460,7 +4460,7 @@ class TestLcnfCoverage(unittest.TestCase):
             self.assertFalse(json.loads(out.getvalue())["ok"])
 
     def test_write_results_refuses_dirty_tracked_bridge_files(self) -> None:
-        # Round-1 F4 + round-2 F5: `--write-results` must refuse when a
+        # `--write-results` must refuse when a
         # measurement input has uncommitted changes, and the test must pin the
         # exact git command line, not just the canned outcome: the guard runs
         # `git status --porcelain --` over MEASUREMENT_INPUT_PATHS (which
@@ -4502,10 +4502,10 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertIn("classifier_source_sha256", str(ctx.exception))
 
     def test_write_results_refuses_untracked_bridge_stray(self) -> None:
-        # Round-2 F1, real temp git repo: an UNTRACKED `*.lean` directly under
+        # Real temp git repo: an UNTRACKED `*.lean` directly under
         # a tracked bridge dir is a measurement input HEAD does not contain;
         # the dirty guard must refuse (`?? ...` in porcelain), where the
-        # round-1 guard's digest-only pathspec let it through silently.
+        # earlier guard's digest-only pathspec let it through silently.
         with tempfile.TemporaryDirectory(prefix="lcnf-stray-") as tmp:
             root = Path(tmp)
             helpers = root / TRACKED_BRIDGE_DIRS[0]
@@ -4534,7 +4534,7 @@ class TestLcnfCoverage(unittest.TestCase):
             self.assertIn("StrayScratch.lean", str(ctx2.exception))
 
     def test_write_results_dirty_guard_runs_before_measurement(self) -> None:
-        # Round-2 F2 (cheap half): under `--write-results` the dirty guard runs
+        # Under `--write-results` the dirty guard runs
         # at the start of main, before the minutes-long audit, and a refusal is
         # a named [ERROR] + exit 1, not a traceback after the build.
         import contextlib
@@ -4559,7 +4559,7 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertIn("refusing to write results", err.getvalue())
 
     def test_json_mode_errors_when_results_file_missing(self) -> None:
-        # Round-2 F3: outside --check, a MISSING committed results file must be
+        # Outside --check, a MISSING committed results file must be
         # a named error (ok=false), not a silent skip of the digest gate —
         # `--json` is the H1.0 acceptance command. `--write-results` is the
         # bootstrap path and keeps compare_results_digests off.
@@ -4585,7 +4585,7 @@ class TestLcnfCoverage(unittest.TestCase):
             )
 
     def test_tracked_bridge_paths_git_enumeration_edges(self) -> None:
-        # Round-2 F4, real temp git repos: `-z` keeps a quotable (non-ASCII)
+        # Real temp git repos: `-z` keeps a quotable (non-ASCII)
         # tracked path in the set; an untracked stray never joins it inside a
         # work tree, even when NOTHING is tracked under the dir (no silent
         # glob fallback there); the glob fallback applies only outside a git
@@ -5442,7 +5442,7 @@ unsafe def main (_args : List String) : IO Unit := do
             "def aux_fold (x : UInt64) : UInt64 := (List.range 3).foldl (fun a _ => helper a) x\n",
             mod_name="AuxClosureFixture",
         )
-        # Round-2 F5: pin the exact measured values on the pinned toolchain
+        # Pin the exact measured values on the pinned toolchain
         # (the sum assertion that stood here was a tautology of auditMods).
         # total == 4, NOT 2: the 2 authored decls plus 2 compiler-generated
         # fold specializations that `isCompilerGeneratedAuxDecl` does NOT
@@ -5462,7 +5462,7 @@ unsafe def main (_args : List String) : IO Unit := do
         )
 
     def test_con_leche_unmapped_pinned_revision_is_named_error(self) -> None:
-        # Round-2 Point 1 (case 1): pinned con-leche revision missing from
+        # Case 1: pinned con-leche revision missing from
         # CON_LECHE_PINNED_MODULE_COUNTS -> named error and non-zero exit.
         import unittest.mock as mock
 
@@ -5484,7 +5484,7 @@ unsafe def main (_args : List String) : IO Unit := do
         )
 
     def test_con_leche_full_tree_module_count_mismatch_is_named_error(self) -> None:
-        # Round-2 Point 1 (case 2): a full built tree at the pinned revision whose
+        # Case 2: a full built tree at the pinned revision whose
         # module count differs from CON_LECHE_PINNED_MODULE_COUNTS[rev] -> named error, non-zero exit.
         import unittest.mock as mock
 
@@ -5526,7 +5526,7 @@ unsafe def main (_args : List String) : IO Unit := do
         )
 
     def test_con_leche_absent_or_partial_tree_stays_not_measured(self) -> None:
-        # Round-2 Point 1 (case 3): an absent or partial tree stays `not_measured` (exit 0)
+        # Case 3: an absent or partial tree stays `not_measured` (exit 0)
         # while CON_LECHE_PINNED_MODULE_COUNTS maps the pinned revision.
         import unittest.mock as mock
 
@@ -5562,7 +5562,7 @@ unsafe def main (_args : List String) : IO Unit := do
             self.assertTrue(chk["ok"], chk["errors"])
 
     def test_results_file_records_measured_source_commit_and_documents_it(self) -> None:
-        # Round-2 Point 2: `scripts/lcnf_coverage_results.json` records `measured_source_commit`
+        # `scripts/lcnf_coverage_results.json` records `measured_source_commit`
         # (not `commit` / `generating_commit`), states in the file and in `--help` that it is
         # the commit of the tree the measurement was taken from, and `--check` does not
         # require it to match `HEAD`.
@@ -5589,7 +5589,7 @@ unsafe def main (_args : List String) : IO Unit := do
         self.assertTrue(chk["ok"], chk["errors"])
 
     def test_rejected_not_lowered_mutual_cycle_reported_in_json_and_check_output(self) -> None:
-        # Round-2 Point 3: declarations in mutual cycles stay counted in `rejected`,
+        # Declarations in mutual cycles stay counted in `rejected`,
         # and both JSON and `--check` output report per corpus how many of `rejected`
         # were not lowered (`rejected_not_lowered`) and why (`mutual_cycle`).
         mut = measure_fixture_corpus(

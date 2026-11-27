@@ -2721,7 +2721,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // Review 4f80161c U2: the no-`.git` outcome is the CALLER's policy, exercised on the real
+    // The no-`.git` outcome is the CALLER's policy, exercised on the real
     // tracked-check function, not an injected closure.
     #[test]
     fn bridge_tracked_check_policy_decides_plain_dirs() {
@@ -2745,7 +2745,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // Review 4f80161c U3: the digest is taken from the opened handle and the runner executes
+    // The digest is taken from the opened handle and the runner executes
     // those bytes, so a swap between selection and execution, or a symlink planted at the
     // pinned path, is refused.
     #[test]
@@ -2772,7 +2772,7 @@ mod tests {
                 .contains("changed between selection and execution"),
             "a swapped binary must be refused: {err:#}"
         );
-        // Review b6409bc4 F1/F6: the verified handle runs the HASHED bytes even when the
+        // The verified handle runs the HASHED bytes even when the
         // path's inode is rewritten in place AND a different file is renamed over the path
         // after verification — the sealed in-memory copy is immune to both.
         #[cfg(target_os = "linux")]
@@ -2818,7 +2818,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // Review 4f80161c U5: the REAL tracked gate (a real git index, the real `git ls-files`
+    // The REAL tracked gate (a real git index, the real `git ls-files`
     // check wired by `discover_con_leche_binary_for_selection_with_provenance`) refuses a
     // tree-delivered bridge binary, and that discovery cause reaches the explicit-selection
     // bail.

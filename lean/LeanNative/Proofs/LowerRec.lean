@@ -17,7 +17,7 @@ loops, in the L1/L2 form (`RealLCNFBridgeProofs.lean:13-127`, `LowerCalls.lean:1
 doc-block contract rather than `sorry` skeletons, because the repo gates hold `0 sorryAx`
 on every commit. Part I lands proved, verbatim, in the follow-up commits of this same
 leaf. Part II freezes the recursion-headline signatures H1.4 builds against; its proofs
-are sequenced after the L2 lane's F-proofs merge (the reason is named there — it is a
+are sequenced after L2's F-proofs merge (the reason is named there — it is a
 pipeline-sequencing fact at the bytes, not an unprovability).
 
 Status (2026-11-26): Part I is PROVED at the end of this file — the 14 theorems
@@ -64,8 +64,8 @@ governing only the caller's own clauses; the EVALUATION fuel stays the single st
 — distinct from the per-entry LOWERING fuel, never per-entry. `CodeRefinesR` (the LNIR
 side carries no `RealBridgeCtx`) and `lowerRealLCNFDecl_soundR_base` (already one
 declaration with its own context and the pointwise freshness hypothesis) are unchanged;
-every Part II frozen name stays. The L2 lane applied the same-shape correction to its
-`DeclEnv`/`DeclEnvLowers` (entries `Decl × RealBridgeCtx × Nat`), so the two lanes stay
+every Part II frozen name stays. L2 applied the same-shape correction to its
+`DeclEnv`/`DeclEnvLowers` (entries `Decl × RealBridgeCtx × Nat`), so the two layers stay
 parallel and the fold meets one entry shape.
 
 Amendment 2 (2026-11-26; a devil's-advocate review, five

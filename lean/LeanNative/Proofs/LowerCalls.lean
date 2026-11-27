@@ -113,8 +113,8 @@ is unreachable), so L1 REMOVES `applyValidatedCompression` entirely — the
 rung's "proved, validated by a proved checker, or removed" taken at "removed". The two
 restatements (`applyValidatedCompression_refinesF`, `lowerRealLCNFDecl_driver_soundF`)
 therefore cease to exist; `lowerRealLCNFDecl_soundF` below is the L2 headline. The
-guard's record (edits, red measurement, repin fixtures) is preserved for the L1 lane in
-`l2-probes/guard-b.patch` and `l2-probes/red-gate.lean`.
+guard's record (edits, red measurement, repin fixtures) is preserved in this branch's
+history.
 
 ### Theorems proved by this leaf (the L2 contract L3 builds against)
 

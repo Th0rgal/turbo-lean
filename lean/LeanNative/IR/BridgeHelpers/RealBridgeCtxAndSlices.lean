@@ -479,7 +479,7 @@ def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
       let fuel := codeAstFuel c + decl.params.size + 64
       match RealLCNFBridge.lowerRealLCNFDecl fuel ctx decl metaInfo.mangledSymbol with
       -- L1: one lowering callee and no body post-pass (the
-      -- round-0 checker-gated compression provably never fired and was removed).
+      -- checker-gated compression provably never fired and was removed).
       | .ok d => attachBaseDeclFactsM decl.name d
       | .error msg => Lean.throwError msg
   Prod.fst <$> action.run initSt

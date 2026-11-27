@@ -2255,7 +2255,7 @@ use super::*;
         );
         // #435: `RLIMIT_DATA` meters writable private VIRTUAL mappings
         // (heap, malloc arenas, pthread stacks), not RSS, so the cap is the share FLOORED
-        // at the worker RSS estimate, with x2 headroom. Review bb7c0f2f F2: the cap is
+        // at the worker RSS estimate, with x2 headroom. The cap is
         // MONOTONE in the budget (no step from "no cap" to a 4096 MiB cap at a 2048 MiB
         // share), so raising --max-memory-mb can never newly fail a worker; a
         // sub-estimate share gets the generous 4096 MiB floor cap instead of none.
@@ -2385,7 +2385,7 @@ use super::*;
         std::env::set_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "0");
         assert_eq!(audit_timeout_ms(false), UNBOUNDED_TIMEOUT_MS);
         assert_eq!(audit_timeout_ms(true), 600_000);
-        // Review bb7c0f2f F7: the untrusted replay default over an explicitly unbounded
+        // The untrusted replay default over an explicitly unbounded
         // audit budget clamps the same way.
         assert_eq!(replay_timeout_ms(true), 600_000);
         std::env::set_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "");
@@ -2408,7 +2408,7 @@ use super::*;
 
     #[test]
     fn test_memory_cap_error_classification_distinguishes_definite_from_signal() {
-        // Review a64324fd F5/F9: the broad predicate matches BOTH kill-note texts (the
+        // The broad predicate matches BOTH kill-note texts (the
         // union-replay early return wants either attribution surfaced); the definite
         // predicate matches only the allocation-failure note, so a SIGSEGV/SIGABRT
         // ("may have been" out of memory) keeps the bisection that isolates the
@@ -2430,7 +2430,7 @@ use super::*;
                 "a signal death with no allocation signature is never a DEFINITE cap \
                  hit: {note}"
             );
-            // Review bfa9d056 F2: an ABORT that delivers an allocation failure (an
+            // An ABORT that delivers an allocation failure (an
             // uncaught `std::bad_alloc` reaches `std::terminate` and dies SIGABRT with
             // the signature on stderr) is a DEFINITE cap hit — the stderr check runs
             // before the signal check, so the abort does not mask it.
@@ -2483,7 +2483,7 @@ use super::*;
             assert_eq!(explicit_audit_timeout_ms(), Some(UNBOUNDED_TIMEOUT_MS));
         }
         {
-            // Review a64324fd F1 (pinning bb7c0f2f F1): an empty or whitespace-only
+            // An empty or whitespace-only
             // value is NO configuration — an empty export such as `VAR=${UNSET}` in CI
             // must not silently mean "no timeout". Only a literal `0` is unbounded.
             let _empty = EnvVarGuard::set("TURBO_LEAN_AUDIT_TIMEOUT_SECS", "  ");

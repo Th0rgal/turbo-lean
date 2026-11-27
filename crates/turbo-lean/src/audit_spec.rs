@@ -6255,7 +6255,7 @@ mod lexer_tests {
         );
     }
 
-    /// Review f9807eb0 F1: `def liftU.{u} (n : Nat) ...` must not record the universe
+    /// `def liftU.{u} (n : Nat) ...` must not record the universe
     /// name `u` as a parameter, and the def must unfold with its one real argument.
     #[test]
     fn extractor_skips_universe_block_after_def_name() {
@@ -6277,7 +6277,7 @@ mod lexer_tests {
         assert!(unfolded.contains('3') && !unfolded.contains("liftU"), "got {unfolded}");
     }
 
-    /// Review f9807eb0 F3: a blank line followed by a non-def command start such as
+    /// A blank line followed by a non-def command start such as
     /// `example` keeps the preceding def re-emittable, and `example` does not get
     /// absorbed into a def body with no blank line before it.
     #[test]
@@ -6341,7 +6341,7 @@ mod lexer_tests {
         assert!(!h.2, "a following command start is not a continuation");
     }
 
-    /// Review 4de545db F3: a def directly followed (no blank line) by `attribute`,
+    /// A def directly followed (no blank line) by `attribute`,
     /// `instance` and the other hostile commands is not extended over them, and a body
     /// continuing on an indented term-level `set_option … in` line is kept whole.
     #[test]
@@ -6386,7 +6386,7 @@ mod lexer_tests {
         );
     }
 
-    /// Review 9dfada6c F1: indented declaration starts still end a gather, so an
+    /// Indented declaration starts still end a gather, so an
     /// indented namespace body or `mutual` block extracts every def under its own name.
     #[test]
     fn extractor_gather_breaks_at_indented_declarations() {
@@ -6426,7 +6426,7 @@ mod lexer_tests {
         assert!(defs.iter().find(|d| d.0 == "arr").unwrap().2.contains("#[1, 2]"));
     }
 
-    /// Review 9dfada6c F1 (flag): a body that kept an indented term-level `set_option …
+    /// Flag: a body that kept an indented term-level `set_option …
     /// in` continuation is truncation-suspect, and the flag blocks re-emission of the def
     /// into a self-contained probe.
     #[test]
@@ -6450,7 +6450,7 @@ mod lexer_tests {
         );
     }
 
-    /// Review 9dfada6c F2: code-running tokens anywhere on a line are probe-hostile.
+    /// Code-running tokens anywhere on a line are probe-hostile.
     #[test]
     fn hostile_scan_matches_code_running_tokens_anywhere() {
         for src in [
@@ -7248,11 +7248,11 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
             "attribute [instance] foo\n",
             "elab \"go\" : tactic => pure ()\n",
             "scoped infixl:65 \" +. \" => g\n",
-            // Review 29baa2ab F4 residual, pinned by a64324fd F9: `@[tactic k]`
+            // `@[tactic k]`
             // registers a tactic elaborator without the `instance`/`macro`/`elab`
             // attribute substrings.
             "@[tactic fooElab] def f : Nat := 0\n",
-            // Review f9807eb0 F2/F4: elaboration-time commands and exact attribute families.
+            // Elaboration-time commands and exact attribute families.
             "run_cmd logInfo \"x\"\n",
             "run_elab pure ()\n",
             "run_meta pure ()\n",
@@ -7362,14 +7362,14 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
             "@[default_instance] def d : Nat := 0\n",
             "open Foo in instance : LE Nat := ⟨fun _ _ => False⟩\n",
             "set_option pp.all true in notation \"!!\" => f\n",
-            // Review 4de545db F2: other `<command> … in` combinators reach the command.
+            // Other `<command> … in` combinators reach the command.
             "#guard_msgs in run_cmd logInfo \"x\"\n",
             "#guard_msgs (drop info) in #eval 1\n",
             "#guard_msgs in instance : LE Nat := ⟨fun _ _ => False⟩\n",
             "variable (x : Nat) in instance : Inhabited Nat := ⟨x⟩\n",
             "omit [Foo] in attribute [simp] f\n",
             "include h in macro \"m\" : term => `(1)\n",
-            // Review 4de545db F1: any `#eval` line is hostile, with no `ElabM` on it.
+            // Any `#eval` line is hostile, with no `ElabM` on it.
             "def evil : Lean.Elab.Command.CommandElabM Unit := pure ()\n#eval evil\n",
             "#eval show MetaM Unit from pure ()\n",
             "#eval! IO.FS.readFile \"x\"\n",

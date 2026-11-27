@@ -8919,7 +8919,7 @@ fn kernel_statement_changes_and_csimp_with_trust(
     scope: Option<&Path>,
     untrusted_cfg: Option<&crate::module_builder::ProjectConfig>,
     proof_only_project_rel_files: &[String],
-    // Review 4f80161c U1: the ONE command-level kernel resolution, taken against the LIVE
+    // The ONE command-level kernel resolution, taken against the LIVE
     // checkout before any build; the head-statement paths below reuse it and never run
     // discovery inside a materialized snapshot.
     head_kernel_prov: &crate::kernel::KernelProvenance,
@@ -15709,7 +15709,7 @@ allow = [
         Ok(())
     }
 
-    /// Round-4 regression suite covering:
+    /// Regression suite covering:
     /// - Finding 1: `evaluate_agent_step_value` (`agent-step` / `turbo_agent_step`) refreshes stale
     ///   imported `.olean`s after a matched `input_dir` edit and invalidates `st_*.json` SHM splits.
     /// - Finding 2: `git_head_tree` (`pr-verify` + `check` fast-prefix split) invalidates when a
@@ -16103,7 +16103,7 @@ allow = [
         res
     }
 
-    /// Round-5 regression suite covering:
+    /// Regression suite covering:
     /// - Finding 1 ([P0]): `try_stateless_remote_check` refreshes stale imported `.olean`s on
     ///   Lake `input_dir` edits and fails closed (`Err`) on unsupported/missing Lake inputs.
     /// - Finding 2 ([P1]): `check` refreshes reverse dependents (`Downstream` `.olean`) after
@@ -16461,7 +16461,7 @@ allow = [
         res
     }
 
-    /// Round 6 regression suite for `lean_exe` targets with `input_dir` / `needs` and downstream
+    /// Regression suite for `lean_exe` targets with `input_dir` / `needs` and downstream
     /// executable linking:
     /// 1. Direct `needs` on `lean_exe` (`lean_exe «my-driver» where root := `Main; needs := #[smokeSources]`):
     ///    - `turbo-lean build` + `lake build` links `.lake/build/bin/custom-driver` (`exeName`),
