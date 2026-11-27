@@ -5361,8 +5361,10 @@ mod freshness_ownership_tests {
         };
         let warned = warned_stale_non_owned();
         warned.lock().unwrap().remove(&key);
-        // Emissions are counted process-wide (these tests run single-threaded), so the
-        // assertions read the change since the test started.
+        // Emissions are counted process-wide, and nothing in the test enforces serial
+        // execution: the repo's CI runs with RUST_TEST_THREADS=1, and under a parallel
+        // local run the global counter is shared with other tests. The assertions read
+        // the change since the test started, which is only exact under that contract.
         let emitted_counter = &crate::lake_build::freshness::STALE_NON_OWNED_WARNINGS_EMITTED;
         let emitted_base = emitted_counter.load(std::sync::atomic::Ordering::SeqCst);
         let emitted = || emitted_counter.load(std::sync::atomic::Ordering::SeqCst) - emitted_base;

@@ -832,6 +832,9 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
             .unwrap_or(src.len());
         let mut combined = src[kw_end..first_line_end].trim().to_string();
         let mut truncation_suspect = false;
+        // Set only when an unknown indented `#`-led line cut the gather; the body is
+        // then unreliable for `defs` as well as for `def_srcs`.
+        let mut hash_break_truncated = false;
         line_no = cur_ln + usize::from(first_line_end < src.len());
         let mut next_ls = if first_line_end < src.len() {
             first_line_end + 1
@@ -890,13 +893,26 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
                 // so absorbing one would lose it and corrupt this body. Only forms
                 // with real term-level versions stay in the body: `set_option … in`,
                 // `open … in`, and `#[` array literals.
-                let term_level = next_trim.starts_with("set_option ")
-                    || next_trim.starts_with("open ")
-                    || next_trim.starts_with("#[");
-                if !term_level {
+                // `open`/`set_option` stay in the body only with a whole-word `in` on the
+                // line (a bare indented `open X` is a command); `#v[…]` style vector
+                // literals (`#` + identifier + `[`) stay intact and are not suspect.
+                if is_hash_ident_bracket_literal(next_trim) {
+                    // Part of the body, nothing was cut.
+                } else if ((next_trim.starts_with("set_option ") || next_trim.starts_with("open "))
+                    && line_has_whole_word_in(next_trim))
+                    || next_trim.starts_with("#[")
+                {
+                    truncation_suspect = true;
+                } else {
+                    if next_trim.starts_with('#') {
+                        // An unknown indented `#`-led line ends the gather while the real
+                        // body may continue past it: the text is suspect, and `defs`
+                        // must not carry the possibly truncated body either.
+                        truncation_suspect = true;
+                        hash_break_truncated = true;
+                    }
                     break;
                 }
-                truncation_suspect = true;
             }
             combined.push(' ');
             combined.push_str(next_trim);
@@ -1059,6 +1075,15 @@ pub(super) fn extract_local_def_unfoldings_and_sources(
             format!("{kw} {combined}"),
             semantics_changing_prefix || truncation_suspect,
         ));
+        if hash_break_truncated {
+            // Do not unfold a body the gather may have cut short; record the def as
+            // skipped under its short name, like the other unextractable defs.
+            let short = raw_def_name.rsplit('.').next().unwrap_or(raw_def_name);
+            if !short.is_empty() {
+                skipped_def_names.push(short.to_string());
+            }
+            continue;
+        }
         defs.push((def_name, params, body.to_string(), type_dependencies));
     }
     (defs, def_srcs, skipped_def_names)
@@ -4263,8 +4288,9 @@ pub(super) fn run_kernel_witness_probe(
 /// disables the fallback when it sees: a command start from `HOSTILE_COMMAND_KEYWORDS`
 /// (after attribute, `open`/`set_option`/`#guard_msgs`/`variable`/`omit`/`include`
 /// prefixes), an instance-making attribute group, or, as a whole token ANYWHERE on a
-/// line, `#eval`, `#guard`, `run_tac`, `native_decide`, `decide +native` or
-/// `implemented_by`. Code reached only through imported files is outside the scan.
+/// line, `#eval`, `#guard`, `run_tac`, `native_decide`, `implemented_by`, `extern`,
+/// `ofReduceBool`, `reduceBool`, or `decide` followed on the same command by a
+/// whole-word `native` (see `line_has_code_running_token`). Code reached only through imported files is outside the scan.
 fn sentinel_present(diagnostics: &str, derived_marker: &str) -> bool {
     diagnostics.contains(derived_marker)
 }
@@ -4392,6 +4418,27 @@ fn starts_with_command_keyword(t: &str, kw: &str) -> bool {
     })
 }
 
+/// Whether `t` holds `in` as a whole word (the `open X in` / `set_option k v in` form).
+fn line_has_whole_word_in(t: &str) -> bool {
+    t.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '\'' || c == '.'))
+        .any(|w| w == "in")
+}
+
+/// Whether `t` starts a core vector literal such as `#v[1, 2]`: `#`, an identifier,
+/// then `[`.
+fn is_hash_ident_bracket_literal(t: &str) -> bool {
+    let Some(rest) = t.strip_prefix('#') else {
+        return false;
+    };
+    if !rest.chars().next().is_some_and(is_ident_start) {
+        return false;
+    }
+    let end = rest
+        .find(|c: char| !is_ident_continue(c))
+        .unwrap_or(rest.len());
+    rest[end..].starts_with('[')
+}
+
 /// Whether `line` (untrimmed, so only a column-0 start counts) begins a new top-level
 /// command and therefore ends a def-body gather.
 fn is_gather_break_command(line: &str) -> bool {
@@ -4478,8 +4525,11 @@ fn audited_src_declares_probe_hostile_commands(clean_src: &str) -> bool {
 }
 
 /// Whether `line` holds, as a whole token anywhere on it, one of: `#eval` (also
-/// `#eval!`), `#guard` (not `#guard_msgs`), `run_tac`, `native_decide`, `decide +native`
-/// (also `decide  +native`), or `implemented_by`. Each runs compiled code (or code at
+/// `#eval!`), `#guard` (not `#guard_msgs`), `run_tac`, `native_decide`, `implemented_by`,
+/// `extern`, `ofReduceBool` or `reduceBool` (the last two also when qualified, as in
+/// `Lean.reduceBool`), or a `decide` token followed, before the line end, a `;` or a
+/// `<;>`, by a whole-word `native` (`decide +native`, `decide +zetaReduce +native`,
+/// `decide (native := true)`, `decide (config := { native := true })`). Each runs compiled code (or code at
 /// elaboration time) that can read the probe file, and `run_tac`/`native_decide`
 /// usually sit mid-line (`:= by run_tac ...`). Over-matching is the safe side: a false
 /// positive only disables the optional self-contained fallback.
@@ -4494,15 +4544,43 @@ fn line_has_code_running_token(line: &str) -> bool {
             before_ok && after_ok
         })
     };
-    // `decide +native`: the config flag may follow after any whitespace.
+    // Like `has_token`, but a `.` qualifier may precede the token (`Lean.reduceBool`).
+    let has_qualified_token = |tok: &str| {
+        line.match_indices(tok).any(|(i, _)| {
+            let before_ok = !line[..i]
+                .chars()
+                .next_back()
+                .is_some_and(|c| ident_char(c) && c != '.');
+            let after_ok = !line[i + tok.len()..].chars().next().is_some_and(ident_char);
+            before_ok && after_ok
+        })
+    };
+    // `decide` with a whole-word `native` anywhere after it on the same command
+    // segment (up to the line end, `;` or `<;>`): `decide +native`,
+    // `decide +zetaReduce +native`, `decide (native := true)`,
+    // `decide (config := { native := true })`.
     let decide_native = line.match_indices("decide").any(|(i, _)| {
         let before_ok = !line[..i].chars().next_back().is_some_and(ident_char);
-        let rest = &line[i + "decide".len()..];
-        before_ok && rest.starts_with(char::is_whitespace) && rest.trim_start().starts_with("+native")
+        let after = &line[i + "decide".len()..];
+        if !before_ok || after.chars().next().is_some_and(ident_char) {
+            return false;
+        }
+        let segment = after.split(';').next().unwrap_or(after);
+        segment.match_indices("native").any(|(j, _)| {
+            let b_ok = !segment[..j].chars().next_back().is_some_and(ident_char);
+            let a_ok = !segment[j + "native".len()..]
+                .chars()
+                .next()
+                .is_some_and(ident_char);
+            b_ok && a_ok
+        })
     });
-    ["#eval", "#guard", "run_tac", "native_decide", "implemented_by"]
+    ["#eval", "#guard", "run_tac", "native_decide", "implemented_by", "extern"]
         .iter()
         .any(|tok| has_token(tok))
+        || ["ofReduceBool", "reduceBool"]
+            .iter()
+            .any(|tok| has_qualified_token(tok))
         || decide_native
 }
 
@@ -6448,6 +6526,90 @@ mod lexer_tests {
             build_kernel_witness_minimal_probe_src(&def_srcs, &[], &[(0, cand)], true).is_none(),
             "a suspect def must not be re-emitted"
         );
+    }
+
+    /// A bare indented `open X` is a command and ends the gather; it must not be
+    /// absorbed into the previous def's body.
+    #[test]
+    fn gather_breaks_at_indented_bare_open_command() {
+        let (defs, def_srcs, _) = extract_local_def_unfoldings_and_sources(
+            "namespace Foo\n  def a := 1\n  open List\n  def b := 2\nend Foo\n",
+        );
+        let body = |n: &str| {
+            defs.iter()
+                .find(|d| d.0 == n)
+                .unwrap_or_else(|| panic!("{n} must be extracted: {defs:?}"))
+                .2
+                .clone()
+        };
+        assert_eq!(body("Foo.a"), "1");
+        assert_eq!(body("Foo.b"), "2");
+        assert!(def_srcs.iter().all(|s| !s.2), "neither def is suspect: {def_srcs:?}");
+    }
+
+    /// `open X in` on an indented line stays term-level: it is absorbed into the body.
+    #[test]
+    fn gather_keeps_indented_open_in_term_level() {
+        let (defs, _, _) = extract_local_def_unfoldings_and_sources(
+            "namespace Foo\n  def a (n : Nat) : Nat :=\n    n +\n    open List in\n  def b := 2\nend Foo\n",
+        );
+        let a = defs.iter().find(|d| d.0 == "Foo.a").expect("Foo.a extracted");
+        assert!(a.2.contains("open List in"), "open … in must stay in the body: {}", a.2);
+        assert!(defs.iter().any(|d| d.0 == "Foo.b"), "Foo.b stays separate: {defs:?}");
+    }
+
+    /// A core `#v[…]` vector literal is part of the body, intact and not suspect.
+    #[test]
+    fn gather_keeps_hash_ident_vector_literal_intact() {
+        let (defs, def_srcs, _) = extract_local_def_unfoldings_and_sources(
+            "def v : Vector Nat 2 :=\n  #v[1, 2]\n",
+        );
+        let v = defs.iter().find(|d| d.0 == "v").expect("v extracted");
+        assert!(v.2.contains("#v[1, 2]"), "vector literal kept: {}", v.2);
+        assert!(!def_srcs.iter().find(|s| s.0 == "v").unwrap().2, "v is not suspect");
+    }
+
+    /// An unknown indented `#foo` line ends the gather and marks the def suspect; the
+    /// possibly truncated body is not carried in `defs`.
+    #[test]
+    fn gather_unknown_indented_hash_line_sets_truncation_suspect() {
+        let (defs, def_srcs, skipped) = extract_local_def_unfoldings_and_sources(
+            "def g (n : Nat) : Nat :=\n  n +\n  #foo bar\n  1\n",
+        );
+        assert!(def_srcs.iter().find(|s| s.0 == "g").unwrap().2, "g must be suspect");
+        assert!(defs.iter().all(|d| d.0 != "g"), "g must not be unfolded: {defs:?}");
+        assert!(skipped.iter().any(|n| n == "g"), "g is skipped: {skipped:?}");
+    }
+
+    /// Widened hostile forms: `decide` with `native` anywhere after it, and the
+    /// `ofReduceBool` / `reduceBool` / `extern` tokens.
+    #[test]
+    fn hostile_scan_matches_widened_native_forms() {
+        for src in [
+            "theorem t : 2 + 2 = 4 := by decide +zetaReduce +native\n",
+            "theorem t : 2 + 2 = 4 := by decide (native := true)\n",
+            "theorem t : 2 + 2 = 4 := by decide (config := { native := true })\n",
+            "theorem t : 2 + 2 = 4 := Lean.ofReduceBool _ _ rfl\n",
+            "def b : Bool := Lean.reduceBool x\n",
+            "theorem t : x = y := ofReduceBool _ _ rfl\n",
+            "@[extern \"c_fn\"] def leak : Nat := 0\n",
+        ] {
+            assert!(
+                audited_src_declares_probe_hostile_commands(src),
+                "must be probe-hostile: {src}"
+            );
+        }
+        for src in [
+            "theorem t : True := by decide\n",
+            "theorem t : True := by decide; exact native_free\n",
+            "theorem t : True := by decide <;> simp\n",
+            "theorem externality : True := trivial\n",
+        ] {
+            assert!(
+                !audited_src_declares_probe_hostile_commands(src),
+                "must not be flagged: {src}"
+            );
+        }
     }
 
     /// Code-running tokens anywhere on a line are probe-hostile.

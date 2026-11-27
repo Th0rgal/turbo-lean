@@ -9869,10 +9869,11 @@ pub fn run_pr_verify_command(
         );
     }
 
-    // Only a theorem whose proof body alone changed is a local edit (proof irrelevance). Anything
-    // else (statement, definition, instance, attribute, option, import, added or deleted file)
-    // can break other modules: re-check them and their dependents before per-theorem checks
-    // count. In `--mode untrusted`, never invoke unsandboxed `lake build` or `[lake] build_command`;
+    // A theorem whose proof body alone changed is not an interface change (proof irrelevance), but
+    // it is no longer treated as a purely local edit either: every proof edit with importers gets
+    // the dependent recheck described below. Anything else (statement, definition, instance,
+    // attribute, option, import, added or deleted file) can break other modules too: re-check them
+    // and their dependents before per-theorem checks count. In `--mode untrusted`, never invoke unsandboxed `lake build` or `[lake] build_command`;
     // compile inside `bwrap` with Stage 1C `--audit-modules` instead.
     let lake_t0 = Instant::now();
     let mut lake_rechecked_modules = 0usize;
@@ -11284,7 +11285,7 @@ pub fn run_pr_verify_command(
 
     if let Some(e) = deferred_import_graph_error {
         return Err(e.context(
-            "a proof-only edit of a non-`module` file needs its importers re-checked, but the project's import graph cannot be resolved",
+            "a proof edit needs its importers re-checked (every proof edit with importers is rechecked, `module` files included), but the project's import graph cannot be resolved",
         ));
     }
     let mut ver_receipt =

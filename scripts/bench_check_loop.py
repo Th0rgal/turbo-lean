@@ -720,9 +720,15 @@ def settings_match(base, res) -> bool:
 
     Both sides are read in committed form (recorded_setting), so a raw path in an
     older artifact and the digest of the same path compare equal on this host. An
-    older artifact's unkeyed `<sha256:` digest equals the raw path it came from;
-    against a keyed digest it cannot be checked and reads as different. A `<set>`
-    mark (no machine-id) equals any set path and nothing unset."""
+    older artifact's unkeyed `<sha256:` digest equals the raw path it came from.
+    Compared with a keyed digest directly, it cannot be checked and reads as
+    different, unless the live environment decides it: for a path-valued setting,
+    when this run's recorded value is what the live `os.environ` value records as
+    (or is that raw value), the baseline is compared with the live raw value instead
+    (`_live_setting_equal`). So the unkeyed-versus-keyed result depends on
+    `os.environ` at call time: it reads as equal only while the live value is set and
+    is the path both digests came from, and as different otherwise. A `<set>` mark
+    (no machine-id) equals any set path and nothing unset."""
     bs, rs = base.get("settings") or {}, res.get("settings") or {}
     return all(_live_setting_equal(v, bs.get(v), rs.get(v)) for v in RECORDED_ENV_VARS)
 
