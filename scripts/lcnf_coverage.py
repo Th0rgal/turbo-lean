@@ -3597,19 +3597,17 @@ class TestLcnfCoverage(unittest.TestCase):
                 else:
                     self.assertEqual(json.loads(results.read_text(encoding="utf-8")), committed)
 
-    def test_write_results_refuses_a_corrupt_committed_results_file(self) -> None:
+    def test_write_results_refuses_a_corrupt_committed_file_before_measuring(self) -> None:
         # Only a missing file means a first baseline. A committed file that
         # exists but does not parse (merge-conflict markers after a rebase)
-        # read as missing, so the drop guard let the write replace it.
+        # read as missing, so the drop guard let the write replace it. The
+        # check before the measurement reads the same file and refuses first.
         import contextlib
         import io
         import unittest.mock as mock
 
         m = sys.modules[__name__]
         committed = self._v_committed_baseline()
-        partial = json.loads(json.dumps(committed))
-        del partial["corpora"]["external_batteries"]
-        report = {"corpora": {"external_batteries": {"measurement_source": "not_measured", "reason": "no tree"}}}
         with tempfile.TemporaryDirectory(prefix="lcnf-corrupt-results-") as tmp:
             root = Path(tmp)
             (root / "scripts").mkdir()
@@ -3620,17 +3618,34 @@ class TestLcnfCoverage(unittest.TestCase):
             err = io.StringIO()
             with mock.patch.object(m, "ROOT_DIR", root), mock.patch.object(
                 m, "RESULTS_FILE", results
-            ), mock.patch.object(m, "_refuse_dirty_measurement_inputs"), mock.patch.dict(
-                os.environ, {BATTERIES_OLEANS_ENV: str(root)}
-            ), mock.patch.object(
-                m, "check_coverage_report", return_value={"ok": True, "errors": [], "report": report}
-            ), mock.patch.object(m, "results_document", return_value=partial), mock.patch.object(
+            ), mock.patch.object(m, "_refuse_dirty_measurement_inputs"), mock.patch.object(
+                m, "check_coverage_report", return_value={"ok": True, "errors": [], "report": {"corpora": {}}}
+            ) as measured, mock.patch.object(
                 sys, "argv", ["lcnf_coverage.py", "--write-results"]
             ), contextlib.redirect_stderr(err):
                 rc = m.main()
             self.assertEqual(rc, 1, err.getvalue())
+            measured.assert_not_called()
             self.assertEqual(results.read_text(encoding="utf-8"), corrupt)
             self.assertIn("not valid JSON", err.getvalue())
+
+    def test_drop_guard_refuses_a_corrupt_committed_file(self) -> None:
+        # The guard after the measurement reads the committed file again, so a
+        # file that went corrupt after the first check is refused there too. A
+        # missing file is the first-baseline case and passes.
+        committed = self._v_committed_baseline()
+        report: dict[str, Any] = {"corpora": {}}
+        doc: dict[str, Any] = {"corpora": {}}
+        with tempfile.TemporaryDirectory(prefix="lcnf-drop-guard-corrupt-") as tmp:
+            results = Path(tmp) / "lcnf_coverage_results.json"
+            self.assertIsNone(_refuse_dropped_corpora(report, doc, results))
+            text = json.dumps(committed, indent=2, sort_keys=True) + "\n"
+            results.write_text(
+                "<<<<<<< HEAD\n" + text + "=======\n" + text + ">>>>>>> other\n", encoding="utf-8"
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                _refuse_dropped_corpora(report, doc, results)
+            self.assertIn("not valid JSON", str(ctx.exception))
 
     def test_write_results_fails_before_measuring_without_a_committed_external_tree(self) -> None:
         # The drop guard runs after the minutes-long measurement. With no tree
