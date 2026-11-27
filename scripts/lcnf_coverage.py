@@ -2272,6 +2272,18 @@ def _committed_measured_corpora(results_path: Path) -> set[str] | None:
     }
 
 
+def _external_tree_finders() -> dict[str, tuple[Any, str]]:
+    """How each pinned external corpus's `.olean` tree is found: (finder, its env var).
+
+    It names the same corpora as PINNED_EXTERNAL_REVISIONS (a self-test holds
+    the two equal), so a third external corpus cannot be added to one alone.
+    """
+    return {
+        "external_batteries": (_batteries_olean_root, BATTERIES_OLEANS_ENV),
+        "con_leche_h3_benchmark": (_con_leche_olean_root, CON_LECHE_OLEANS_ENV),
+    }
+
+
 def _refuse_missing_external_trees(results_path: Path, root_dir: Path = ROOT_DIR) -> None:
     """Fail in seconds when `--write-results` has no tree for a committed external corpus.
 
@@ -2281,13 +2293,9 @@ def _refuse_missing_external_trees(results_path: Path, root_dir: Path = ROOT_DIR
     base = _committed_measured_corpora(results_path)
     if base is None:
         return
-    trees = {
-        "external_batteries": (_batteries_olean_root, BATTERIES_OLEANS_ENV),
-        "con_leche_h3_benchmark": (_con_leche_olean_root, CON_LECHE_OLEANS_ENV),
-    }
     missing = [
         (cname, env)
-        for cname, (find_root, env) in sorted(trees.items())
+        for cname, (find_root, env) in sorted(_external_tree_finders().items())
         if cname in base and find_root(root_dir) is None
     ]
     if missing:
@@ -3540,6 +3548,18 @@ class TestLcnfCoverage(unittest.TestCase):
             self.assertEqual(results.read_text(encoding="utf-8"), before)
             self.assertIn("`external_batteries`", err.getvalue())
             self.assertIn(BATTERIES_OLEANS_ENV, err.getvalue())
+
+    def test_every_pinned_external_corpus_has_a_tree_finder(self) -> None:
+        # The no-tree check before the measurement skips a corpus it has no
+        # finder for, so a third external corpus added to
+        # PINNED_EXTERNAL_REVISIONS alone would be refused only after the full
+        # audit. The two tables name the same corpora.
+        import unittest.mock as mock
+
+        self.assertEqual(set(_external_tree_finders()), set(PINNED_EXTERNAL_REVISIONS))
+        # Control: a corpus pinned without a finder breaks the equality.
+        with mock.patch.dict(PINNED_EXTERNAL_REVISIONS, {"third_external": "0" * 40}):
+            self.assertNotEqual(set(_external_tree_finders()), set(PINNED_EXTERNAL_REVISIONS))
 
     def test_write_results_reports_a_results_document_refusal_as_an_error(self) -> None:
         # results_document's refusals (a dirty tree, a missing digest, an
