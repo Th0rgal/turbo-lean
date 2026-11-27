@@ -3481,7 +3481,7 @@ pub(crate) fn recheck_dependents_if_nonlocal_for_check(
                                 || spec_has_include_str
                                 || fs::read_to_string(&n.src_path)
                                     .map(|s| crate::module_builder::source_uses_include_str(&s))
-                                    .unwrap_or(false)
+                                    .unwrap_or(true)
                             {
                                 Some(m.clone())
                             } else {
@@ -3526,9 +3526,14 @@ pub(crate) fn recheck_dependents_if_nonlocal_for_check(
                             if !has_target_needs
                                 && fs::read_to_string(&spec.src_path)
                                     .map(|s| crate::module_builder::source_uses_include_str(&s))
-                                    .unwrap_or(false)
+                                    .unwrap_or(true)
                             {
-                                remove_spec_build_artifacts_checked(&spec)?;
+                                // External package `.olean`s are never deleted; a stale external
+                                // `include_str` module is never trusted either: Lake rebuilds it
+                                // with its artifact cache bypassed.
+                                if crate::module_builder::spec_in_project(&cfg, &spec) {
+                                    remove_spec_build_artifacts_checked(&spec)?;
+                                }
                                 bypass_lake_cache = true;
                             }
                         }

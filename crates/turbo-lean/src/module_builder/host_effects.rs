@@ -49,11 +49,20 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
     }
     let mut tainted: HashSet<(PathBuf, String)> = HashSet::new();
     let mut purged_any = false;
+    // External package `.olean`s (`.lake/packages/*`, out-of-tree path deps) are never deleted: a
+    // tainted external module still taints its importers and forces `bypass_lake_cache`, but its
+    // artifacts belong to the dependency checkout.
+    let mut purge = |spec: &DiscoveredModuleSpec| -> Result<()> {
+        if spec_in_project(cfg, spec) {
+            crate::lake_build::remove_spec_build_artifacts_checked(spec)?;
+        }
+        purged_any = true;
+        Ok(())
+    };
     for spec in postorder {
         let Ok(src_raw) = fs::read_to_string(&spec.src_path) else {
             tainted.insert((spec.pkg_root.clone(), spec.module_name.clone()));
-            crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
-            purged_any = true;
+            purge(&spec)?;
             continue;
         };
         let hdr = parse_header_info(&src_raw);
@@ -72,8 +81,7 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
             });
         if imp_tainted || spec_source_has_disallowed_elab_host_effects(cfg, &spec, &src_raw) {
             tainted.insert((spec.pkg_root.clone(), spec.module_name.clone()));
-            crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
-            purged_any = true;
+            purge(&spec)?;
         }
     }
     Ok(purged_any)
@@ -89,13 +97,81 @@ pub(crate) fn source_ineligible_for_stamp_reuse(
     let Ok(pkg_root) = fs::canonicalize(pkg_root) else {
         return true;
     };
-    crate::splitter::source_may_read_host_state(src_raw)
+    let reads_host = if pkg_root_is_clean_git_pinned_dep(cfg, &pkg_root) {
+        crate::splitter::pinned_dep_source_may_read_host_state(src_raw)
+    } else {
+        crate::splitter::source_may_read_host_state(src_raw)
+    };
+    reads_host
         || !std::iter::once(&cfg.root_pkg)
             .chain(cfg.dep_pkgs.iter())
             .find(|pkg| fs::canonicalize(&pkg.pkg_root).is_ok_and(|root| root == pkg_root))
             .is_some_and(|pkg| {
                 module_includes_all_covered_by_lake_inputs(pkg, module_name, src_path, src_raw)
             })
+}
+
+/// `canon_pkg_root` (already canonical) is a non-root dependency whose checkout is a clean Git
+/// checkout of the exact revision pinned in `lake-manifest.json`. Fails closed (`false`).
+pub(crate) fn pkg_root_is_clean_git_pinned_dep(cfg: &ProjectConfig, canon_pkg_root: &Path) -> bool {
+    if fs::canonicalize(&cfg.root_pkg.pkg_root).is_ok_and(|r| r == canon_pkg_root) {
+        return false;
+    }
+    let Some(pkg) = cfg
+        .dep_pkgs
+        .iter()
+        .find(|p| fs::canonicalize(&p.pkg_root).is_ok_and(|r| r == canon_pkg_root))
+    else {
+        return false;
+    };
+    is_clean_git_pinned_pkg(cfg, false, &pkg.name, &pkg.base_name, canon_pkg_root)
+}
+
+/// True iff `path` lies inside the root project's own tree and outside every dependency package
+/// checkout (e.g. `.lake/packages/*`). Only such artifacts may be deleted or reseeded by turbo-lean;
+/// external package `.olean`s belong to their (git-pinned) checkouts and are never touched.
+/// Fails closed (`false`) when either path cannot be canonicalized.
+pub(crate) fn path_in_project(root: &Path, path: &Path) -> bool {
+    let Ok(canon_root) = fs::canonicalize(root) else {
+        return false;
+    };
+    // The path may not exist yet (e.g. a build dir); canonicalize its nearest existing ancestor.
+    let mut existing = path;
+    let mut suffix = Vec::new();
+    let canon_path = loop {
+        match fs::canonicalize(existing) {
+            Ok(c) => break suffix.iter().rev().fold(c, |acc: PathBuf, s| acc.join(s)),
+            Err(_) => match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    if name == ".." {
+                        return false;
+                    }
+                    suffix.push(name.to_os_string());
+                    existing = parent;
+                }
+                _ => return false,
+            },
+        }
+    };
+    if !canon_path.starts_with(&canon_root) {
+        return false;
+    }
+    let rel = canon_path.strip_prefix(&canon_root).unwrap_or(Path::new(""));
+    !rel.starts_with(".lake/packages")
+}
+
+/// [`path_in_project`] for a module spec: the spec's package root must be the root project itself
+/// (not a dependency checkout nested under it).
+pub(crate) fn spec_in_project(cfg: &ProjectConfig, spec: &DiscoveredModuleSpec) -> bool {
+    let root = &cfg.root_pkg.pkg_root;
+    path_in_project(root, &spec.pkg_root)
+        && path_in_project(root, &spec.build_lib_lean_dir)
+        && !cfg.dep_pkgs.iter().any(|dp| {
+            fs::canonicalize(&dp.pkg_root)
+                .ok()
+                .zip(fs::canonicalize(&spec.pkg_root).ok())
+                .is_some_and(|(d, s)| d == s)
+        })
 }
 
 pub(super) fn source_has_disallowed_elab_host_effects_for_module(

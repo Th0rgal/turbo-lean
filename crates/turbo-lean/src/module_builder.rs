@@ -56,6 +56,189 @@ mod tests {
         fs::create_dir_all(&dir).expect("create temp test dir");
         dir
     }
+    /// Build `proj` requiring a clean git-pinned dependency `dep_lint` whose `DepLint/*.lean` files
+    /// are `files`. Returns `(proj, dep_checkout)`.
+    fn make_git_pinned_lint_dep_project(
+        dir: &Path,
+        files: &[(&str, &str)],
+    ) -> Result<(PathBuf, PathBuf)> {
+        let dep_origin = dir.join("dep_origin");
+        let proj = dir.join("proj");
+        let dep = proj.join(".lake/packages/dep_lint");
+        fs::create_dir_all(dep_origin.join("DepLint"))?;
+        fs::create_dir_all(proj.join("App"))?;
+        let tc = "leanprover/lean4:v4.35.0\n";
+        fs::write(dep_origin.join("lean-toolchain"), tc)?;
+        fs::write(proj.join("lean-toolchain"), tc)?;
+        fs::write(
+            dep_origin.join("lakefile.toml"),
+            "name = \"dep_lint\"\ndefaultTargets = [\"DepLint\"]\n[[lean_lib]]\nname = \"DepLint\"\n",
+        )?;
+        let mut root_imports = String::new();
+        for (name, body) in files {
+            fs::write(dep_origin.join(format!("DepLint/{name}.lean")), body)?;
+            root_imports.push_str(&format!("import DepLint.{name}\n"));
+        }
+        fs::write(dep_origin.join("DepLint.lean"), &root_imports)?;
+        let git_bin = std::env::var_os("TURBO_LEAN_GIT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("git"));
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.email", "t@e.com"],
+            vec!["config", "user.name", "T"],
+            vec!["add", "."],
+            vec!["commit", "--quiet", "-m", "init"],
+        ] {
+            let st = Command::new(&git_bin)
+                .args(&args)
+                .current_dir(&dep_origin)
+                .status()?;
+            anyhow::ensure!(st.success(), "git {args:?} failed");
+        }
+        let rev_out = Command::new(&git_bin)
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&dep_origin)
+            .output()?;
+        let rev = String::from_utf8(rev_out.stdout)?.trim().to_string();
+        // A `.git`-less trusted snapshot of the pinned revision (the production path for verified
+        // snapshots): clean-pin status then does not depend on the host Git version.
+        for entry in WalkDir::new(&dep_origin).into_iter().filter_map(|e| e.ok()) {
+            let rel = entry.path().strip_prefix(&dep_origin)?;
+            if rel.starts_with(".git") {
+                continue;
+            }
+            let out = dep.join(rel);
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(&out)?;
+            } else {
+                fs::copy(entry.path(), &out)?;
+            }
+        }
+        mark_trusted_snapshot_git_pinned_dir(&dep, &rev);
+        fs::write(
+            proj.join("lakefile.toml"),
+            format!(
+                "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep_lint\"\ngit = {:?}\nrev = {:?}\n[[lean_lib]]\nname = \"App\"\n",
+                dep_origin.to_string_lossy(),
+                rev
+            ),
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [{
+                    "type": "git", "scope": "", "name": "dep_lint",
+                    "manifestFile": "lake-manifest.json", "rev": rev, "inherited": false,
+                    "configFile": "lakefile.toml", "inputRev": rev,
+                    "url": dep_origin.to_string_lossy()
+                }]
+            })
+            .to_string(),
+        )?;
+        Ok((proj, dep))
+    }
+
+    fn dep_spec(cfg: &ProjectConfig, module: &str) -> DiscoveredModuleSpec {
+        match resolve_import_site(cfg, module) {
+            ImportSite::Module(s) => *s,
+            _ => panic!("`{module}` must resolve to the git-pinned dependency source"),
+        }
+    }
+
+    /// Mathlib `Linter.Header` shape: the host read lives in a `def` the linter calls, and the only
+    /// import-time code is `initialize <ref> ← Mutex.new` plus `initialize addLinter`.
+    const HEADER_LIKE_LINTER: &str = "import Lean\nopen Lean Elab Command Linter\n\nnamespace DepLint\n\n/-- Reads the library root. -/\ndef isInLibraryRoot (modName : Name) : IO Bool := do\n  let rootPath := (modName.getRoot.toString : System.FilePath).addExtension \"lean\"\n  if ← rootPath.pathExists then\n    let res ← IO.FS.readFile rootPath\n    return res.length > 0\n  else return false\n\ninitialize inLibraryRootMutex : IO.Ref (Option Bool) ← IO.mkRef none\n\ndef headerLinter : Linter where run := fun _stx => do\n  let v ← isInLibraryRoot `DepLint\n  if v then logInfo \"in root\"\n\ninitialize addLinter headerLinter\n\nend DepLint\n";
+
+    #[test]
+    fn test_host_effects_git_pinned_linter_only_dep_does_not_taint_and_external_oleans_untouched(
+    ) -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("host_effects_pinned_linter");
+        let (proj, dep) =
+            make_git_pinned_lint_dep_project(&dir, &[("Header", HEADER_LIKE_LINTER)])?;
+        fs::write(proj.join("App/Use.lean"), "import DepLint.Header\ndef x : Nat := 1\n")?;
+        let cfg = resolve_project_config(&proj)?;
+        let spec = dep_spec(&cfg, "DepLint.Header");
+        assert!(
+            is_git_pinned_manifest_package(&cfg, &spec),
+            "fixture must be a clean git-pinned dependency"
+        );
+        assert!(
+            !spec_source_has_disallowed_elab_host_effects(&cfg, &spec, HEADER_LIKE_LINTER),
+            "a linter-only host read in a clean git-pinned dep must not taint importers"
+        );
+        // External `.olean`s of the dependency are never deleted by the purge.
+        let ext_olean = spec.build_lib_lean_dir.join("DepLint/Header.olean");
+        fs::create_dir_all(ext_olean.parent().unwrap())?;
+        fs::write(&ext_olean, b"olean")?;
+        let root_olean = proj.join(".lake/build/lib/lean/App/Use.olean");
+        fs::create_dir_all(root_olean.parent().unwrap())?;
+        fs::write(&root_olean, b"olean")?;
+        let purged = purge_elab_host_effect_artifacts_in_closure(&cfg, &[String::from("App.Use")])?;
+        assert!(!purged, "nothing in a linter-only closure may force a cache bypass");
+        assert!(ext_olean.exists() && root_olean.exists());
+        assert!(!path_in_project(&proj, &ext_olean));
+        assert!(!spec_in_project(&cfg, &spec));
+        assert!(path_in_project(&proj, &root_olean));
+        assert!(dep.exists());
+        unmark_trusted_snapshot_root(&dir);
+        crate::zygote::purge_snapshot_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_host_effects_git_pinned_initialize_read_still_taints_and_keeps_external_oleans(
+    ) -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("host_effects_pinned_init_read");
+        // An `elab` elsewhere in the file must not mask the `initialize` host read (Gap 1).
+        let bad = "import Lean\nopen Lean Elab Term\n\nelab \"pure_term\" : term => return mkNatLit 0\n\ninitialize shadow : String ← IO.FS.readFile \"/etc/shadow\"\n";
+        let (proj, _dep) = make_git_pinned_lint_dep_project(
+            &dir,
+            &[("Header", HEADER_LIKE_LINTER), ("Bad", bad)],
+        )?;
+        fs::write(proj.join("App/Use.lean"), "import DepLint.Bad\ndef x : Nat := 1\n")?;
+        let cfg = resolve_project_config(&proj)?;
+        let spec = dep_spec(&cfg, "DepLint.Bad");
+        assert!(is_git_pinned_manifest_package(&cfg, &spec));
+        assert!(
+            spec_source_has_disallowed_elab_host_effects(&cfg, &spec, bad),
+            "`initialize ... ← IO.FS.readFile` must taint even beside an `elab`"
+        );
+        let ext_olean = spec.build_lib_lean_dir.join("DepLint/Bad.olean");
+        fs::create_dir_all(ext_olean.parent().unwrap())?;
+        fs::write(&ext_olean, b"olean")?;
+        let root_olean = proj.join(".lake/build/lib/lean/App/Use.olean");
+        fs::create_dir_all(root_olean.parent().unwrap())?;
+        fs::write(&root_olean, b"olean")?;
+        let purged = purge_elab_host_effect_artifacts_in_closure(&cfg, &[String::from("App.Use")])?;
+        assert!(purged, "a tainted closure must force `bypass_lake_cache`");
+        assert!(ext_olean.exists(), "external package `.olean`s must never be deleted");
+        assert!(!root_olean.exists(), "the tainted importer's own `.olean` must be purged");
+        // An unreadable dependency source stays tainted (fail closed, Gap 2).
+        fs::write(&root_olean, b"olean")?;
+        let header = dep_spec(&cfg, "DepLint.Header");
+        fs::write(proj.join("App/Use.lean"), "import DepLint.Header\ndef x : Nat := 1\n")?;
+        let saved = fs::read(&header.src_path)?;
+        let header_ext_olean = header.build_lib_lean_dir.join("DepLint/Header.olean");
+        fs::write(&header_ext_olean, b"olean")?;
+        // Invalid UTF-8: the file still resolves, but `read_to_string` fails.
+        fs::write(&header.src_path, b"\xff\xfe import Lean\n")?;
+        let purged = purge_elab_host_effect_artifacts_in_closure(&cfg, &[String::from("App.Use")])?;
+        fs::write(&header.src_path, &saved)?;
+        assert!(purged, "an unreadable source must taint its closure");
+        assert!(!root_olean.exists(), "importers of an unreadable source are purged");
+        assert!(header_ext_olean.exists(), "external `.olean`s stay untouched");
+        unmark_trusted_snapshot_root(&dir);
+        crate::zygote::purge_snapshot_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_stamp_eligibility_canonical_package_root() -> Result<()> {
