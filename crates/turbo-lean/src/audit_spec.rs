@@ -7434,7 +7434,7 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
         for src in [
             "def chk (p q : Bool) : Bool := p && !q\ntheorem t : True := trivial\n",
             "def infixes (n : Nat) : Nat := n\n",
-            // A benign attribute must not be flagged (a64324fd F9 control case).
+            // A benign attribute must not be flagged (the must-not-flag control case).
             "@[simp] theorem s : True := trivial\n",
             "@[macro_inline] def mi (n : Nat) : Nat := n\n",
             "@[elab_as_elim] theorem ee : True := trivial\n",
