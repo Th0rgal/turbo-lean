@@ -194,6 +194,28 @@ impl KernelProvenance {
             );
         }
     }
+
+    /// Kernel-audit digest bound into theorem-shard cache keys (roadmap G1a).
+    ///
+    /// `None` for the standard kernel, which is the domain Lake-seeded and replayed shards are
+    /// recorded under. Any other engine binds its name and pinned `con-leche` revision, so a
+    /// verdict checked by one kernel configuration is never served as a hit to another. The
+    /// `csimp`/`unsafe`/`implemented_by`/FFI allowlists are bound by the shard key itself.
+    pub fn shard_cache_digest(&self) -> Option<String> {
+        if self.kernel_engine == ResolvedKernelEngine::Standard {
+            return None;
+        }
+        let mut h = blake3::Hasher::new();
+        h.update(b"turbo-lean-kernel-audit-v1\n");
+        for field in [
+            self.kernel_engine.as_str(),
+            self.con_leche_rev.as_deref().unwrap_or(""),
+        ] {
+            h.update(&(field.len() as u64).to_le_bytes());
+            h.update(field.as_bytes());
+        }
+        Some(h.finalize().to_hex().to_string())
+    }
 }
 
 pub fn normalize_lean_toolchain(raw_toolchain: &str) -> String {
@@ -839,6 +861,132 @@ pub fn compute_transitive_csimp_posture_digest(
     h.finalize().to_hex().to_string()
 }
 
+/// The zero-config `csimp` import-policy decision over one transitive compiled-import posture,
+/// resolved before any expensive audit/build work (`#411`/`#412`, roadmap P9).
+///
+/// Lean and Lake trust proven `@[csimp]` theorems from imported modules (they only redirect
+/// compiled code, and the kernel audit still covers the compiled result), so entries owned by a
+/// dependency module are auto-allowed without any manual flag. Entries owned by the project
+/// itself keep the manual gate: they must be covered by the configured `[csimp] allow`
+/// allowlist or the policy fails closed before expensive work.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CsimpImportPolicyDecision {
+    /// `@[csimp]` theorems auto-allowed because their owner module is an imported dependency
+    /// module (not project-owned), sorted and de-duplicated.
+    pub imported_allow: Vec<String>,
+    /// `(owner module, theorem)` pairs owned by project modules that the configured allowlist
+    /// does not cover, sorted and de-duplicated.
+    pub requires_explicit_allow: Vec<(String, String)>,
+}
+
+impl CsimpImportPolicyDecision {
+    /// Whether the zero-config default plus the configured allowlist already satisfy the policy,
+    /// so the run can proceed without a manual `[csimp] allow` entry.
+    pub fn is_zero_config_satisfied(&self) -> bool {
+        self.requires_explicit_allow.is_empty()
+    }
+}
+
+/// Strip Lean's `_private.<module>.<idx>.` prefix to obtain the user-facing declaration name,
+/// mirroring `Lean.privateToUserName` in `ZygoteWorker.lean`.
+fn private_csimp_user_name(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("_private.")?;
+    let mut offset = 0usize;
+    for seg in rest.split('.') {
+        let next_offset = offset + seg.len();
+        if !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()) {
+            if next_offset < rest.len() {
+                return Some(&rest[next_offset + 1..]);
+            }
+            return None;
+        }
+        offset = next_offset + 1;
+    }
+    None
+}
+
+/// Whether a configured `[csimp] allow` pattern admits `theorem`, with the same `*`-glob
+/// semantics as the zygote worker's `nameMatchesPolicy` (matching either the raw kernel name or
+/// `Lean.privateToUserName`).
+pub fn csimp_pattern_allows(configured_allow: &[String], theorem: &str) -> bool {
+    let user_name = private_csimp_user_name(theorem);
+    configured_allow.iter().any(|p| {
+        let pat = p.trim();
+        crate::splitter::glob_match(pat, theorem)
+            || user_name.is_some_and(|u| crate::splitter::glob_match(pat, u))
+    })
+}
+
+/// Decide the zero-config `csimp` import policy for `entries` — `(owner module, theorem name)`
+/// pairs observed in a module's transitive compiled-import cone.
+///
+/// An entry whose owner module is not in `owned_modules` (the project's own module names) is
+/// auto-allowed; an entry owned by a project module must already be admitted by
+/// `configured_allow` to keep the manual gate for the project's own replacements.
+pub fn decide_csimp_import_policy(
+    owned_modules: &BTreeSet<String>,
+    entries: &[(String, String)],
+    configured_allow: &[String],
+) -> CsimpImportPolicyDecision {
+    let mut imported: BTreeSet<String> = BTreeSet::new();
+    let mut requires: BTreeSet<(String, String)> = BTreeSet::new();
+    for (owner, theorem) in entries {
+        let theorem = theorem.trim();
+        if theorem.is_empty() {
+            continue;
+        }
+        if owned_modules.contains(owner.trim()) {
+            if !csimp_pattern_allows(configured_allow, theorem) {
+                requires.insert((owner.trim().to_string(), theorem.to_string()));
+            }
+        } else {
+            imported.insert(theorem.to_string());
+        }
+    }
+    CsimpImportPolicyDecision {
+        imported_allow: imported.into_iter().collect(),
+        requires_explicit_allow: requires.into_iter().collect(),
+    }
+}
+
+/// Fail-closed effective `csimp` allowlist: the configured patterns plus the zero-config
+/// auto-allowed imported entries, sorted and de-duplicated.
+///
+/// Errors before any expensive work when a project-owned `@[csimp]` theorem is not covered by
+/// the configured allowlist, naming the offending entries and how to allow them.
+pub fn effective_csimp_policy_allowlist(
+    owned_modules: &BTreeSet<String>,
+    entries: &[(String, String)],
+    configured_allow: &[String],
+) -> Result<Vec<String>> {
+    let decision = decide_csimp_import_policy(owned_modules, entries, configured_allow);
+    if !decision.is_zero_config_satisfied() {
+        let listed = decision
+            .requires_explicit_allow
+            .iter()
+            .map(|(m, t)| format!("`{t}` (module `{m}`)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "[TurboLean.KernelGate] csimp import policy decided before expensive work: \
+             project-owned `@[csimp]` theorem(s) {listed} are not covered by the configured \
+             allowlist; add them under `[csimp] allow = [\"...\"]` in `turbo-lean.toml` (or set \
+             `TURBO_LEAN_ALLOWED_CSIMP`), or drop the `@[csimp]` attribute. Imported \
+             dependency-module replacements are auto-allowed; project-owned replacements keep \
+             the manual gate"
+        );
+    }
+    let mut effective: Vec<String> = configured_allow
+        .iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    effective.extend(decision.imported_allow);
+    effective.sort();
+    effective.dedup();
+    Ok(effective)
+}
+
 /// Canonical module name of one `exported_imports` token.
 ///
 /// ZygoteWorker records each import as `Module:e=<bool>:m=<bool>:a=<bool>`. A bare module name
@@ -949,6 +1097,20 @@ pub fn parse_public_signature_csimp_entry(raw: &str) -> Result<CompiledCsimpObse
         to: to.to_string(),
         scope: scope.map(str::to_string),
     })
+}
+
+/// Parse a batch of public-signature `csimp` entry tokens, failing closed with the offending
+/// index in the error context so a malformed entry can never be silently dropped.
+pub fn parse_public_signature_csimp_entries(
+    raws: &[String],
+) -> Result<Vec<CompiledCsimpObservation>> {
+    raws.iter()
+        .enumerate()
+        .map(|(idx, raw)| {
+            parse_public_signature_csimp_entry(raw)
+                .with_context(|| format!("csimp entry #{idx} of the public signature"))
+        })
+        .collect()
 }
 
 /// Split a public-signature `csimp_entries` field on top-level `:` separators, ignoring separators
@@ -1487,4 +1649,201 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_csimp_pattern_allows_wildcard_and_exact() {
+        assert!(csimp_pattern_allows(&["Foo.fast_eq".into()], "Foo.fast_eq"));
+        assert!(!csimp_pattern_allows(&["Foo.fast_eq".into()], "Foo.other_eq"));
+        assert!(csimp_pattern_allows(&["*".into()], "Anything.At.All"));
+        assert!(csimp_pattern_allows(
+            &["Foo.*".into()],
+            "Foo.Bar.fast_eq"
+        ));
+        assert!(!csimp_pattern_allows(&["Foo.*".into()], "Batteries.Fast.eq"));
+        // Patterns are trimmed before matching; no `?` or `[]` semantics.
+        assert!(csimp_pattern_allows(
+            &[" Foo.fast_eq ".to_string()],
+            "Foo.fast_eq"
+        ));
+        assert!(!csimp_pattern_allows(&["Foo.fast_?q".into()], "Foo.fast_eq"));
+        // Private declarations match both exact module-scoped private names and user names,
+        // while a different module's private name never matches.
+        assert!(csimp_pattern_allows(
+            &["_private.MyProj.Own.0.Foo.fast_eq".into()],
+            "_private.MyProj.Own.0.Foo.fast_eq"
+        ));
+        assert!(csimp_pattern_allows(
+            &["Foo.fast_eq".into()],
+            "_private.MyProj.Own.0.Foo.fast_eq"
+        ));
+        assert!(!csimp_pattern_allows(
+            &["_private.Batteries.Fast.0.Foo.fast_eq".into()],
+            "_private.MyProj.Own.0.Foo.fast_eq"
+        ));
+    }
+
+    #[test]
+    fn test_decide_csimp_import_policy_zero_config_and_manual_gate() {
+        let mut owned = BTreeSet::new();
+        owned.insert("Verity.Target".to_string());
+        owned.insert("Verity.Own".to_string());
+        let entries = vec![
+            ("Batteries.Fast".to_string(), "Batteries.scan_eq".to_string()),
+            ("Verity.Own".to_string(), "Verity.slow_eq_fast".to_string()),
+        ];
+
+        // Empty config: imported dependency entries auto-allowed, project-owned entry gated.
+        let decision = decide_csimp_import_policy(&owned, &entries, &[]);
+        assert_eq!(decision.imported_allow, vec!["Batteries.scan_eq"]);
+        assert_eq!(
+            decision.requires_explicit_allow,
+            vec![("Verity.Own".to_string(), "Verity.slow_eq_fast".to_string())]
+        );
+        assert!(!decision.is_zero_config_satisfied());
+
+        // Covered config: zero-config satisfied.
+        let decision =
+            decide_csimp_import_policy(&owned, &entries, &["Verity.slow_eq_fast".to_string()]);
+        assert!(decision.requires_explicit_allow.is_empty());
+        assert!(decision.is_zero_config_satisfied());
+
+        // Deterministic: same inputs, same decision.
+        assert_eq!(
+            decide_csimp_import_policy(&owned, &entries, &[]),
+            decide_csimp_import_policy(&owned, &entries, &[])
+        );
+
+        // Blank theorem names are ignored, not surfaced as gate failures.
+        let decision = decide_csimp_import_policy(
+            &owned,
+            &[("Verity.Own".to_string(), "   ".to_string())],
+            &[],
+        );
+        assert!(decision.is_zero_config_satisfied());
+    }
+
+    #[test]
+    fn test_effective_csimp_policy_allowlist_sorted_dedup_and_fail_closed() {
+        let mut owned = BTreeSet::new();
+        owned.insert("Verity.Own".to_string());
+        let entries = vec![
+            ("Batteries.Fast".to_string(), "b_eq".to_string()),
+            ("Other.Dep".to_string(), "a_eq".to_string()),
+            ("Other.Dep".to_string(), "a_eq".to_string()),
+        ];
+
+        let effective = effective_csimp_policy_allowlist(&owned, &entries, &[]).unwrap();
+        assert_eq!(effective, vec!["a_eq", "b_eq"]);
+
+        // Configured patterns are preserved (trimmed) and merged, still sorted + deduped.
+        let effective = effective_csimp_policy_allowlist(
+            &owned,
+            &entries,
+            &[" z_eq ".to_string(), "a_eq".to_string()],
+        )
+        .unwrap();
+        assert_eq!(effective, vec!["a_eq", "b_eq", "z_eq"]);
+
+        // Uncovered owned entries fail closed with the actionable fix.
+        let mut owned2 = BTreeSet::new();
+        owned2.insert("Verity.Own".to_string());
+        let err = effective_csimp_policy_allowlist(
+            &owned2,
+            &[("Verity.Own".to_string(), "slow_eq_fast".to_string())],
+            &[],
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("slow_eq_fast"), "error must name the theorem: {msg}");
+        assert!(msg.contains("[csimp] allow"), "error must name the fix: {msg}");
+        assert!(msg.contains("turbo-lean.toml"), "error must name the file: {msg}");
+    }
+
+    #[test]
+    fn test_parse_public_signature_csimp_entries_batch_and_fail_closed() {
+        let parsed = parse_public_signature_csimp_entries(&[
+            "global:slow->fast:slow_eq".to_string(),
+            "scoped:Ns:a->b:a_eq".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].theorem, "slow_eq");
+        assert_eq!(parsed[0].scope, None);
+        assert_eq!(parsed[1].scope.as_deref(), Some("Ns"));
+
+        // Malformed entries fail closed with the offending index.
+        let err = parse_public_signature_csimp_entries(&[
+            "global:slow->fast:ok".to_string(),
+            "garbage".to_string(),
+        ])
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("1"), "error must name the offending index: {msg}");
+    }
+
+    #[test]
+    fn test_transitive_csimp_posture_digest_moves_with_imported_entry_change() {
+        // root imports A, A imports B: the scanner's closure of `root` covers A and B.
+        let posture = |b_theorem: &str| {
+            let mut modules = BTreeMap::new();
+            modules.insert("A".to_string(), Vec::new());
+            modules.insert(
+                "B".to_string(),
+                vec![CompiledCsimpObservation {
+                    theorem: b_theorem.to_string(),
+                    from: "slow".to_string(),
+                    to: "fast".to_string(),
+                    scope: None,
+                }],
+            );
+            compute_transitive_csimp_posture_digest("root", &modules)
+        };
+        let d1 = posture("slow_eq");
+        // Changing the entry in the transitively-imported module moves the digest.
+        let d2 = posture("slow_eq_renamed");
+        assert_ne!(d1, d2);
+        // A module entering or leaving the scanned closure moves the digest (the scanner owns
+        // reachability; the digest binds exactly the closure it is handed).
+        let mut wider = BTreeMap::new();
+        wider.insert("A".to_string(), Vec::new());
+        wider.insert(
+            "B".to_string(),
+            vec![CompiledCsimpObservation {
+                theorem: "slow_eq".to_string(),
+                from: "slow".to_string(),
+                to: "fast".to_string(),
+                scope: None,
+            }],
+        );
+        wider.insert("C".to_string(), Vec::new());
+        assert_ne!(
+            d1,
+            compute_transitive_csimp_posture_digest("root", &wider)
+        );
+        // Deterministic: same closure, same digest.
+        assert_eq!(d1, posture("slow_eq"));
+        // Insertion order and duplicate observations never move the digest.
+        let mut reordered = BTreeMap::new();
+        reordered.insert(
+            "B".to_string(),
+            vec![
+                CompiledCsimpObservation {
+                    theorem: "slow_eq".to_string(),
+                    from: "slow".to_string(),
+                    to: "fast".to_string(),
+                    scope: None,
+                },
+                CompiledCsimpObservation {
+                    theorem: "slow_eq".to_string(),
+                    from: "slow".to_string(),
+                    to: "fast".to_string(),
+                    scope: None,
+                },
+            ],
+        );
+        reordered.insert("A".to_string(), Vec::new());
+        assert_eq!(
+            d1,
+            compute_transitive_csimp_posture_digest("root", &reordered)
+        );
+    }
 }

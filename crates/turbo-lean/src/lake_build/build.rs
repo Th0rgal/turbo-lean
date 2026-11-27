@@ -49,7 +49,7 @@ pub(crate) fn seed_project_theorem_shards_from_splits(
                 continue;
             }
             file_had_clean_shard = true;
-            let shard_key = compute_shard_key_with_args(toolchain, shard, &file_lean_args);
+            let shard_key = compute_shard_key_with_args(toolchain, shard, &file_lean_args, None);
             batch_items.push((shard_key, shard.name.clone(), shared_receipt.clone(), 1i64));
         }
         if file_had_clean_shard {
@@ -974,7 +974,7 @@ pub fn replay_project_cas_expr_shards(
             {
                 continue;
             }
-            let shard_key = compute_shard_key_with_args(toolchain, shard, &file_lean_args);
+            let shard_key = compute_shard_key_with_args(toolchain, shard, &file_lean_args, None);
             let entries = store
                 .get_cached_action_no_hit_bump(&shard_key, trust_domain)?
                 .ok_or_else(|| {

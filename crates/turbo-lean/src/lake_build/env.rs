@@ -770,19 +770,22 @@ pub(crate) fn resolve_remote_lean_path(
 
 #[cfg(test)]
 pub(crate) fn compute_shard_key(toolchain: &str, shard: &splitter::TheoremShard) -> String {
-    compute_shard_key_with_args(toolchain, shard, &[])
+    compute_shard_key_with_args(toolchain, shard, &[], None)
 }
 
 pub(crate) fn compute_shard_key_with_args(
     toolchain: &str,
     shard: &splitter::TheoremShard,
     lean_args: &[String],
+    kernel_audit_digest: Option<&str>,
 ) -> String {
     let mut key_hasher = blake3::Hasher::new();
-    // v8: replay-audited verdicts + 3-byte `/--` and `/-!` docstring/module-doc opener fix.
+    // v10: the non-standard kernel-audit digest is bound into the key (roadmap G1a), so a verdict
+    // from one kernel engine is never served to a run that selected another; the bump retires
+    // rows a con-leche-only run cached under the standard-kernel domain.
     // The verifier provenance versions are bound too, so pre-replay receipts never match
     // and any later scanner/replay bump retires every older receipt.
-    key_hasher.update(b"theorem-shard-v9:");
+    key_hasher.update(b"theorem-shard-v10:");
     key_hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
     key_hasher.update(b":");
     key_hasher.update(&crate::zygote::ZYGOTE_SCANNER_VERSION.to_le_bytes());
@@ -794,6 +797,10 @@ pub(crate) fn compute_shard_key_with_args(
     key_hasher.update(shard.stmt_hash.as_bytes());
     key_hasher.update(b":");
     key_hasher.update(shard.proof_hash.as_bytes());
+    if let Some(d) = kernel_audit_digest {
+        key_hasher.update(b":kernel_audit:");
+        key_hasher.update(d.as_bytes());
+    }
     // A shard accepted under a wider axiom allowlist is no cache hit under the default one.
     let allowed = splitter::allowed_axioms();
     if allowed.len() > splitter::STANDARD_AXIOMS.len() {

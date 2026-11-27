@@ -11,7 +11,6 @@ use crate::splitter::split_lean_source;
 
 use super::*;
 
-
     #[cfg(unix)]
     #[test]
     fn cached_lake_environments_cannot_supply_verifier_executables() -> Result<()> {
@@ -4626,4 +4625,329 @@ public def api := by
             as fn(&mut TurboStore, bool, Vec<String>, PathBuf, String, i64, bool, bool) -> Result<()>;
         let _ = crate::lake_build::run_hydrate_traces_command as fn(bool, PathBuf) -> Result<()>;
         assert!(!crate::validate_lnir_expr_v1_blob(b""));
+    }
+
+    #[test]
+    fn test_p9_freshness_preflight_fails_closed_on_uncovered_project_owned_csimp(
+    ) -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct RestoreEnv(&'static str, Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match self.1 {
+                    Some(ref v) => std::env::set_var(self.0, v),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let key = "TURBO_LEAN_ALLOWED_CSIMP";
+        let restore = RestoreEnv(key, std::env::var_os(key));
+
+        let dir = std::env::temp_dir().join(format!(
+            "tl_p9_fail_closed_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        fs::create_dir_all(&proj)?;
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"p9-fixture\"\ndefaultTargets = [\"Main\"]\n[[lean_lib]]\nname = \"Main\"\n",
+        )?;
+        fs::write(
+            proj.join("Main.lean"),
+            "def slow (n : Nat) : Nat := n + 1\ndef fast (n : Nat) : Nat := n.succ\n@[csimp] theorem slow_eq_fast : @slow = @fast := rfl\n",
+        )?;
+        let canon = fs::canonicalize(&proj)?;
+        let target = canon.join("Main.lean");
+        crate::module_builder::reset_lake_inputs_tag_memo();
+
+        // Empty policy: the project-owned `@[csimp]` theorem fails closed before expensive work
+        // (before any Lake invocation or olean manifest read), with the actionable fix named.
+        std::env::remove_var(key);
+        let err = ensure_project_imports_fresh(
+            &canon,
+            std::slice::from_ref(&target),
+            Some("leanprover/lean4:v4.35.0"),
+            true,
+        )
+        .expect_err("uncovered project-owned csimp entry must fail closed before expensive work");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("slow_eq_fast") && msg.contains("[csimp] allow"),
+            "actionable error must name the theorem and the fix: {msg}"
+        );
+        assert!(
+            !proj.join(".lake/build").exists(),
+            "preflight must decide before any Lake build work"
+        );
+
+        // Covered policy: the same gate passes and the no-import gate short-circuits cleanly.
+        std::env::set_var(key, "slow_eq_fast");
+        crate::module_builder::reset_lake_inputs_tag_memo();
+        ensure_project_imports_fresh(
+            &canon,
+            std::slice::from_ref(&target),
+            Some("leanprover/lean4:v4.35.0"),
+            true,
+        )?;
+
+        // Wildcard policy also covers the owned entry.
+        std::env::set_var(key, "*");
+        crate::module_builder::reset_lake_inputs_tag_memo();
+        ensure_project_imports_fresh(
+            &canon,
+            std::slice::from_ref(&target),
+            Some("leanprover/lean4:v4.35.0"),
+            true,
+        )?;
+
+        drop(restore);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_p9_preflight_zero_config_autoallows_dependency_package_csimp() -> Result<()> {
+        // The CLI-side preflight (`AllDependencyPackages`, `apply_env = true`) must extend the
+        // effective allowlist with `@[csimp]` theorems scraped from dependency sources, while a
+        // project without dependency csimp leaves the env untouched.
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct RestoreEnv(&'static str, Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match self.1 {
+                    Some(ref v) => std::env::set_var(self.0, v),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let key = "TURBO_LEAN_ALLOWED_CSIMP";
+        let restore = RestoreEnv(key, std::env::var_os(key));
+
+        let dir = std::env::temp_dir().join(format!(
+            "tl_p9_autoallow_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        let bat_dir = proj.join(".lake/packages/batteries");
+        fs::create_dir_all(bat_dir.join("Batteries"))?;
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(bat_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"p9-auto\"\ndefaultTargets = [\"Main\"]\n[[lean_lib]]\nname = \"Main\"\n",
+        )?;
+        fs::write(
+            bat_dir.join("lakefile.toml"),
+            "name = \"batteries\"\ndefaultTargets = [\"Batteries\"]\n[[lean_lib]]\nname = \"Batteries\"\n",
+        )?;
+        fs::write(
+            bat_dir.join("Batteries/Fast.lean"),
+            "@[csimp] theorem scan_eq : @slowSpec = @fastSpec := rfl\n",
+        )?;
+        fs::write(bat_dir.join("Batteries.lean"), "import Batteries.Fast\n")?;
+        // Manual lake-manifest-style dep wiring via symlinked packages dir is what
+        // `resolve_project_config` reads; a plain manifest entry suffices here.
+        fs::write(
+            proj.join("lake-manifest.json"),
+            serde_json::to_string(&serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [
+                    {
+                        "type": "path",
+                        "name": "batteries",
+                        "inherited": false,
+                        "configFile": "lakefile.toml"
+                    }
+                ]
+            }))?,
+        )?;
+        let canon = fs::canonicalize(&proj)?;
+        crate::module_builder::reset_lake_inputs_tag_memo();
+
+        std::env::set_var(key, "from_config");
+        crate::lake_build::preflight_zero_config_csimp_import_policy(
+            &canon,
+            crate::lake_build::CsimpPreflightScope::AllDependencyPackages,
+            true,
+        )?;
+        let extended = std::env::var(key).unwrap_or_default();
+        assert!(
+            extended.contains("scan_eq") && extended.contains("from_config"),
+            "preflight must merge configured policy with scraped dependency csimp entries: {extended}"
+        );
+        let parts: Vec<&str> = extended.split(',').collect();
+        assert_eq!(
+            parts,
+            ["from_config", "scan_eq"],
+            "effective allowlist must be sorted and de-duplicated: {extended}"
+        );
+
+        // Read-only mode never mutates the env.
+        std::env::set_var(key, "from_config");
+        crate::lake_build::preflight_zero_config_csimp_import_policy(
+            &canon,
+            crate::lake_build::CsimpPreflightScope::AllDependencyPackages,
+            false,
+        )?;
+        assert_eq!(
+            std::env::var(key).unwrap_or_default(),
+            "from_config",
+            "apply_env = false must leave the environment untouched"
+        );
+
+        drop(restore);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_p9_dep_autoallow_does_not_bypass_nested_or_colliding_project_csimp() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct RestoreEnv(&'static str, Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match self.1 {
+                    Some(ref v) => std::env::set_var(self.0, v),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let key = "TURBO_LEAN_ALLOWED_CSIMP";
+        let restore = RestoreEnv(key, std::env::var_os(key));
+
+        let dir = std::env::temp_dir().join(format!(
+            "tl_p9_adversarial_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        let bat_dir = proj.join(".lake/packages/batteries");
+        fs::create_dir_all(proj.join("MyProj"))?;
+        fs::create_dir_all(bat_dir.join("Batteries"))?;
+        fs::create_dir_all(bat_dir.join(".lake/build/ir"))?;
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(bat_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"p9-adv\"\ndefaultTargets = [\"MyProj\"]\n[[lean_lib]]\nname = \"MyProj\"\n",
+        )?;
+        fs::write(
+            bat_dir.join("lakefile.toml"),
+            "name = \"batteries\"\ndefaultTargets = [\"Batteries\"]\n[[lean_lib]]\nname = \"Batteries\"\n",
+        )?;
+        // Noise inside dependency `.lake/` and root `lakefile.lean` must not be scraped.
+        fs::write(
+            bat_dir.join(".lake/build/ir/Noise.lean"),
+            "@[csimp] theorem should_not_scrape : True = True := rfl\n",
+        )?;
+        fs::write(
+            bat_dir.join("lakefile.lean"),
+            "@[csimp] theorem lakefile_noise : True = True := rfl\n",
+        )?;
+        fs::write(
+            bat_dir.join("Batteries/Fast.lean"),
+            "namespace List\n@[csimp] theorem scan_eq : @slowSpec = @fastSpec := rfl\n@[csimp] private theorem helper_eq : @a = @b := rfl\nend List\n",
+        )?;
+        fs::write(bat_dir.join("Batteries.lean"), "import Batteries.Fast\n")?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            serde_json::to_string(&serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [
+                    {
+                        "type": "path",
+                        "name": "batteries",
+                        "inherited": false,
+                        "configFile": "lakefile.toml"
+                    }
+                ]
+            }))?,
+        )?;
+        // Nested project-owned files attempting name collision (public & private) and Lean 4.35 modifiers.
+        let collide_pub = proj.join("MyProj/CollidePub.lean");
+        fs::write(
+            &collide_pub,
+            "namespace List\n@[csimp] theorem scan_eq : @a = @b := rfl\nend List\n",
+        )?;
+        let collide_priv = proj.join("MyProj/CollidePriv.lean");
+        fs::write(
+            &collide_priv,
+            "namespace List\n@[csimp] private theorem helper_eq : @a = @b := rfl\nend List\n",
+        )?;
+        let pub_mod = proj.join("MyProj/PubMod.lean");
+        fs::write(
+            &pub_mod,
+            "@[csimp] public theorem pub_own_eq : @a = @b := rfl\n",
+        )?;
+        let clean = proj.join("MyProj/Clean.lean");
+        fs::write(&clean, "import Batteries.Fast\ntheorem ok : True := trivial\n")?;
+
+        let canon = fs::canonicalize(&proj)?;
+        crate::module_builder::reset_lake_inputs_tag_memo();
+
+        // Simulate CLI startup: empty configured policy + AllDependencyPackages auto-allow.
+        std::env::remove_var(key);
+        crate::lake_build::preflight_zero_config_csimp_import_policy(
+            &canon,
+            crate::lake_build::CsimpPreflightScope::AllDependencyPackages,
+            true,
+        )?;
+        let exported = std::env::var(key).unwrap_or_default();
+        assert_eq!(
+            exported, "List.scan_eq,_private.Batteries.Fast.0.List.helper_eq",
+            "dep auto-allow must scope private theorems to their declaring module and skip .lake/lakefile.lean: {exported}"
+        );
+
+        // 1) Project-owned public theorem colliding with dep's `List.scan_eq` MUST STILL FAIL CLOSED.
+        let err_pub = crate::lake_build::preflight_zero_config_csimp_import_policy(
+            &canon,
+            crate::lake_build::CsimpPreflightScope::Targets(vec![fs::canonicalize(&collide_pub)?]),
+            false,
+        )
+        .expect_err("project-owned csimp colliding with dep theorem name must still fail closed");
+        assert!(format!("{err_pub:#}").contains("List.scan_eq"));
+
+        // 2) Project-owned private theorem colliding with dep's `List.helper_eq` MUST STILL FAIL CLOSED.
+        let err_priv = crate::lake_build::preflight_zero_config_csimp_import_policy(
+            &canon,
+            crate::lake_build::CsimpPreflightScope::Targets(vec![fs::canonicalize(&collide_priv)?]),
+            false,
+        )
+        .expect_err("project-owned private csimp colliding with dep private theorem must fail closed");
+        assert!(format!("{err_priv:#}").contains("_private.MyProj.CollidePriv.0.List.helper_eq"));
+
+        // 3) Nested project-owned Lean 4.35 `public theorem` MUST FAIL CLOSED.
+        let err_mod = crate::lake_build::preflight_zero_config_csimp_import_policy(
+            &canon,
+            crate::lake_build::CsimpPreflightScope::Targets(vec![fs::canonicalize(&pub_mod)?]),
+            false,
+        )
+        .expect_err("nested project-owned `public theorem` csimp must fail closed");
+        assert!(format!("{err_mod:#}").contains("pub_own_eq"));
+
+        // 4) Clean project file importing Batteries.Fast passes zero-config preflight.
+        crate::lake_build::preflight_zero_config_csimp_import_policy(
+            &canon,
+            crate::lake_build::CsimpPreflightScope::Targets(vec![fs::canonicalize(&clean)?]),
+            false,
+        )?;
+
+        drop(restore);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }

@@ -32,6 +32,22 @@ mod shm_cache {
     pub(crate) fn record_child_exit_status(_: std::process::ExitStatus) {}
 }
 
+mod splitter {
+    /// `*`-glob match (`*` matches any, possibly empty, run of characters); mirrors
+    /// `crate::splitter::glob_match` and the zygote's `globMatch`.
+    pub(crate) fn glob_match(pat: &str, s: &str) -> bool {
+        match pat.split_once('*') {
+            None => pat == s,
+            Some((head, rest)) => {
+                s.starts_with(head)
+                    && (0..=s.len() - head.len())
+                        .filter(|i| s.is_char_boundary(head.len() + i))
+                        .any(|i| glob_match(rest, &s[head.len() + i..]))
+            }
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[path = "../src/kernel.rs"]
 mod kernel;

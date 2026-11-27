@@ -1270,6 +1270,22 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
     }
+    // Zero-config `csimp` import policy (`#411`/`#412`, roadmap P9), CLI side: for interactive
+    // `check`/`build` runs, `@[csimp]` theorems declared by dependency packages are auto-allowed
+    // so imported batteries-style replacements get a verdict without a manual `[csimp] allow`
+    // flag. The effective allowlist is exported here (single-threaded startup, so the env write
+    // is race-free) before any worker spawns; project-owned entries stay gated by the
+    // freshness-preflight fail-closed check. `pr-verify`/`ci-verify` keep their pinned-revision
+    // policy machinery and do not opt in.
+    if matches!(&cli.command, Commands::Check { .. } | Commands::Build { .. }) {
+        if let Some(ref dir) = dir {
+            lake_build::preflight_zero_config_csimp_import_policy(
+                std::path::Path::new(dir),
+                lake_build::CsimpPreflightScope::AllDependencyPackages,
+                true,
+            )?;
+        }
+    }
     if matches!(
         &cli.command,
         Commands::Check { .. } | Commands::CiVerify { .. } | Commands::PrVerify { .. }
