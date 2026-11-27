@@ -1539,45 +1539,95 @@ pub const CGROUP_V2_ROOT: &str = "/sys/fs/cgroup";
 
 /// Extract the cgroup v2 relative path (`0::<rel>`) from `/proc/self/cgroup` contents.
 pub fn parse_proc_self_cgroup_v2_path(text: &str) -> Option<String> {
-    let _ = text;
-    None
+    let rel = text
+        .lines()
+        .find_map(|line| line.trim_end().strip_prefix("0::"))?
+        .trim();
+    if !rel.starts_with('/') || rel.split('/').any(|seg| seg == ".." || seg == ".") {
+        return None;
+    }
+    Some(rel.to_string())
 }
 
 /// Parse a cgroup `memory.max` / `memory.limit_in_bytes` value: `max` (or absurd sentinel
 /// values) means unlimited (`None`); otherwise a positive byte count.
 pub fn parse_cgroup_memory_max_bytes(raw: &str) -> Option<u64> {
-    let _ = raw;
-    None
+    let trimmed = raw.trim();
+    if trimmed == "max" {
+        return None;
+    }
+    trimmed
+        .parse::<u64>()
+        .ok()
+        .filter(|&bytes| bytes > 0 && bytes < (1u64 << 50))
+}
+
+/// Ancestor cgroup directories of `rel` under `cgroup_root`, leaf first, mount root last.
+fn cgroup_v2_ancestor_dirs(cgroup_root: &Path, rel: &str) -> Vec<PathBuf> {
+    let segs: Vec<&str> = rel
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .collect();
+    (0..=segs.len())
+        .rev()
+        .map(|n| {
+            segs[..n]
+                .iter()
+                .fold(cgroup_root.to_path_buf(), |p, s| p.join(s))
+        })
+        .collect()
 }
 
 /// Walk `<root><rel>/memory.max` up through every ancestor to `<root>/memory.max`, returning the
 /// tightest (minimum) numeric limit, or `None` when every level is `max` / unreadable.
 pub fn resolve_cgroup_v2_memory_max_bytes_at(cgroup_root: &Path, rel: &str) -> Option<u64> {
-    let _ = (cgroup_root, rel);
-    None
+    cgroup_v2_ancestor_dirs(cgroup_root, rel)
+        .into_iter()
+        .filter_map(|dir| fs::read_to_string(dir.join("memory.max")).ok())
+        .filter_map(|raw| parse_cgroup_memory_max_bytes(&raw))
+        .min()
+}
+
+fn current_cgroup_v2_rel_path() -> Option<String> {
+    parse_proc_self_cgroup_v2_path(&fs::read_to_string("/proc/self/cgroup").ok()?)
 }
 
 /// Effective cgroup memory limit in bytes for this process (cgroup v2 ancestor walk, then the
 /// cgroup v1 `memory.limit_in_bytes` fallback).
 pub fn effective_cgroup_memory_max_bytes() -> Option<u64> {
-    None
+    let root = Path::new(CGROUP_V2_ROOT);
+    let v2 = resolve_cgroup_v2_memory_max_bytes_at(
+        root,
+        current_cgroup_v2_rel_path().as_deref().unwrap_or("/"),
+    );
+    v2.or_else(|| {
+        fs::read_to_string(root.join("memory/memory.limit_in_bytes"))
+            .ok()
+            .and_then(|raw| parse_cgroup_memory_max_bytes(&raw))
+    })
 }
 
 /// Parse the `oom_kill` counter from a cgroup v2 `memory.events` file.
 pub fn parse_cgroup_memory_events_oom_kill(text: &str) -> Option<u64> {
-    let _ = text;
-    None
+    text.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == "oom_kill")
+            .then(|| fields.next()?.parse::<u64>().ok())
+            .flatten()
+    })
 }
 
 /// Read `<root><rel>/memory.events` `oom_kill` count.
 pub fn read_cgroup_oom_kill_count_at(cgroup_root: &Path, rel: &str) -> Option<u64> {
-    let _ = (cgroup_root, rel);
-    None
+    let dir = cgroup_v2_ancestor_dirs(cgroup_root, rel)
+        .into_iter()
+        .next()?;
+    parse_cgroup_memory_events_oom_kill(&fs::read_to_string(dir.join("memory.events")).ok()?)
 }
 
 /// `oom_kill` count of this process' own cgroup v2 (`None` when unavailable).
 pub fn current_cgroup_oom_kill_count() -> Option<u64> {
-    None
+    read_cgroup_oom_kill_count_at(Path::new(CGROUP_V2_ROOT), &current_cgroup_v2_rel_path()?)
 }
 
 /// Pre-flight memory guard: fail fast with an actionable diagnostic when the recorded historical
@@ -1589,7 +1639,22 @@ pub fn preflight_memory_guard(
     max_memory_mb: Option<u64>,
     cgroup_max_bytes: Option<u64>,
 ) -> anyhow::Result<()> {
-    let _ = (what, historical_peak_rss_mb, max_memory_mb, cgroup_max_bytes);
+    let Some(limit_bytes) = cgroup_max_bytes else {
+        return Ok(());
+    };
+    let limit_mb = limit_bytes / (1024 * 1024);
+    if let Some(peak_mb) = historical_peak_rss_mb.filter(|&mb| mb > limit_mb) {
+        anyhow::bail!(
+            "[turbo-lean] pre-flight memory guard: `{what}` previously peaked at {peak_mb} MiB RSS but the effective cgroup `memory.max` is only {limit_mb} MiB; it would be OOM-killed. Run it under a larger cgroup (e.g. `systemd-run --user -p MemoryMax={}M`) or a bigger machine, reduce parallelism (`--jobs 1`), or set `TURBO_LEAN_SKIP_MEMORY_PREFLIGHT=1` to bypass (`--max-memory-mb` cannot raise a cgroup limit)",
+            peak_mb.saturating_add(peak_mb / 4)
+        );
+    }
+    if let Some(budget_mb) = max_memory_mb.filter(|&mb| mb > limit_mb) {
+        anyhow::bail!(
+            "[turbo-lean] pre-flight memory guard: `--max-memory-mb {budget_mb}` (`TURBO_LEAN_MAX_MEMORY_MB`) for `{what}` exceeds the effective cgroup `memory.max` of {limit_mb} MiB; the kernel would OOM-kill before the budget is reached. Pass `--max-memory-mb {}` or less, or raise the cgroup `MemoryMax`",
+            (limit_mb.saturating_mul(9) / 10).max(1)
+        );
+    }
     Ok(())
 }
 
@@ -1639,31 +1704,89 @@ impl BuildReceipt {
         cgroup_oom_kill: Option<u64>,
         olean: Option<&Path>,
     ) -> Self {
-        let _ = (status, elapsed, peak_rss_kib, cgroup_oom_kill, olean);
-        Self::default()
+        #[cfg(unix)]
+        let signal = {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal()
+        };
+        #[cfg(not(unix))]
+        let signal: Option<i32> = None;
+        #[cfg(unix)]
+        let killed = signal == Some(libc::SIGKILL);
+        #[cfg(not(unix))]
+        let killed = false;
+        Self {
+            exit_code: status.code(),
+            signal,
+            peak_rss_kib,
+            cgroup_oom_kill,
+            elapsed_s: elapsed.as_secs_f64(),
+            olean_sha256: olean
+                .filter(|p| p.is_file())
+                .and_then(|p| sha256_file_hex(p).ok()),
+            oom_suspected: killed || cgroup_oom_kill.is_some_and(|n| n > 0),
+        }
     }
 }
 
 /// Lowercase hex SHA-256 of the file at `path`.
 pub fn sha256_file_hex(path: &Path) -> std::io::Result<String> {
-    let _ = path;
-    Ok(String::new())
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    std::io::copy(&mut fs::File::open(path)?, &mut hasher)?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+#[cfg(unix)]
+fn getrusage_maxrss_kib(who: libc::c_int) -> Option<u64> {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(who, &mut usage) } != 0 {
+        return None;
+    }
+    let raw = u64::try_from(usage.ru_maxrss).ok()?;
+    // macOS reports bytes, Linux KiB.
+    Some(if cfg!(target_os = "macos") {
+        raw / 1024
+    } else {
+        raw
+    })
 }
 
 /// Peak RSS in KiB over all waited-for children of this process (`getrusage(RUSAGE_CHILDREN)`).
 pub fn children_peak_rss_kib() -> Option<u64> {
-    None
+    #[cfg(unix)]
+    {
+        getrusage_maxrss_kib(libc::RUSAGE_CHILDREN)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 /// Peak RSS in KiB of this process itself (`getrusage(RUSAGE_SELF)`).
 pub fn self_peak_rss_kib() -> Option<u64> {
-    None
+    #[cfg(unix)]
+    {
+        getrusage_maxrss_kib(libc::RUSAGE_SELF)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 /// Atomically (write-then-rename) persist `receipt` as pretty JSON at `path`.
 pub fn write_build_receipt_atomic(path: &Path, receipt: &BuildReceipt) -> std::io::Result<()> {
-    let _ = (path, receipt);
-    Ok(())
+    let bytes = serde_json::to_vec_pretty(receipt).map_err(std::io::Error::other)?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    atomic_write_shm(path, &bytes)
 }
 
 /// Spawn `cmd`, wait for it (whatever signal kills it), and atomically emit a `BuildReceipt` at
@@ -1673,8 +1796,21 @@ pub fn run_command_with_receipt(
     receipt_path: &Path,
     olean: Option<&Path>,
 ) -> std::io::Result<(std::process::Output, BuildReceipt)> {
-    let _ = (cmd, receipt_path, olean);
-    Err(std::io::Error::other("unimplemented"))
+    let oom_before = current_cgroup_oom_kill_count();
+    let started = std::time::Instant::now();
+    let output = cmd.output()?;
+    let elapsed = started.elapsed();
+    let cgroup_oom_kill = current_cgroup_oom_kill_count()
+        .map(|after| after.saturating_sub(oom_before.unwrap_or(after)));
+    let receipt = BuildReceipt::from_exit_status(
+        &output.status,
+        elapsed,
+        children_peak_rss_kib(),
+        cgroup_oom_kill,
+        olean,
+    );
+    write_build_receipt_atomic(receipt_path, &receipt)?;
+    Ok((output, receipt))
 }
 
 fn parse_cgroup_memory_limit_mb() -> Option<u64> {

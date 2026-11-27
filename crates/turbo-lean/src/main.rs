@@ -609,7 +609,53 @@ fn main() -> Result<()> {
         Some(zygote::OneShotGuard::new(cli.no_daemon)?)
     };
     phase_timing::record_active_span_since("cli_startup", process_t0);
-    run(cli)
+    let receipt_path = std::env::var_os("TURBO_LEAN_BUILD_RECEIPT").map(PathBuf::from);
+    let oom_before = receipt_path
+        .as_ref()
+        .and_then(|_| shm_cache::current_cgroup_oom_kill_count());
+    let res = run(cli).map_err(zygote::with_timeout_knob_hint);
+    if let Some(path) = receipt_path {
+        write_invocation_receipt(&path, res.is_ok(), process_t0, oom_before);
+    }
+    res
+}
+
+/// `TURBO_LEAN_BUILD_RECEIPT=<path>`: atomically emit a structured JSON receipt for this
+/// invocation (children killed by `SIGKILL`/`SIGABRT` still contribute their peak RSS and any
+/// cgroup `oom_kill` delta).
+fn write_invocation_receipt(
+    path: &std::path::Path,
+    ok: bool,
+    started: std::time::Instant,
+    oom_before: Option<u64>,
+) {
+    let cgroup_oom_kill = shm_cache::current_cgroup_oom_kill_count()
+        .map(|after| after.saturating_sub(oom_before.unwrap_or(after)));
+    let peak_rss_kib = match (
+        shm_cache::self_peak_rss_kib(),
+        shm_cache::children_peak_rss_kib(),
+    ) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    let receipt = shm_cache::BuildReceipt {
+        exit_code: Some(if ok { 0 } else { 1 }),
+        signal: None,
+        peak_rss_kib,
+        cgroup_oom_kill,
+        elapsed_s: started.elapsed().as_secs_f64(),
+        olean_sha256: std::env::var_os("TURBO_LEAN_BUILD_RECEIPT_OLEAN")
+            .map(PathBuf::from)
+            .filter(|p| p.is_file())
+            .and_then(|p| shm_cache::sha256_file_hex(&p).ok()),
+        oom_suspected: cgroup_oom_kill.is_some_and(|n| n > 0),
+    };
+    if let Err(e) = shm_cache::write_build_receipt_atomic(path, &receipt) {
+        eprintln!(
+            "[turbo-lean] failed to write build receipt {}: {e}",
+            path.display()
+        );
+    }
 }
 
 pub(crate) fn apply_global_cli_env(cli: &Cli) {
@@ -624,6 +670,24 @@ pub(crate) fn apply_global_cli_env(cli: &Cli) {
 fn run(cli: Cli) -> Result<()> {
     let run_setup_started = std::time::Instant::now();
     apply_global_cli_env(&cli);
+    if matches!(
+        &cli.command,
+        Commands::Build { .. }
+            | Commands::Check { .. }
+            | Commands::SeedOleans { .. }
+            | Commands::CiVerify { .. }
+            | Commands::PrVerify { .. }
+    ) {
+        if cli.max_memory_mb.is_some() {
+            shm_cache::preflight_memory_guard_live("turbo-lean", None)?;
+        }
+        let cli_jobs = match &cli.command {
+            Commands::Check { jobs, .. } => *jobs,
+            Commands::SeedOleans { jobs, .. } => Some(*jobs).filter(|&j| j > 0),
+            _ => None,
+        };
+        zygote::export_replay_worker_budget(cli_jobs);
+    }
     if let Commands::Daemon {
         command: DaemonCommands::Stop,
     } = &cli.command
@@ -2124,7 +2188,7 @@ fn run(cli: Cli) -> Result<()> {
                     &source,
                     &file_audit,
                     &file_lean_args,
-                    Some(timeout_ms),
+                    zygote::eval_request_timeout_ms(timeout_ms),
                 )?;
                 std::io::stdout().write_all(&out.stdout)?;
                 std::io::stderr().write_all(&out.stderr)?;
@@ -2169,11 +2233,7 @@ fn run(cli: Cli) -> Result<()> {
                     false,
                     true,
                     Some(&file_display),
-                    if timeout_ms > 0 {
-                        Some(timeout_ms)
-                    } else {
-                        None
-                    },
+                    zygote::eval_request_timeout_ms(timeout_ms),
                     &filtered_file_lean_args,
                 )?,
                 Err(e) => return Err(e),
@@ -2225,7 +2285,7 @@ fn run(cli: Cli) -> Result<()> {
                     &source,
                     &file_audit,
                     &file_lean_args,
-                    Some(timeout_ms),
+                    zygote::eval_request_timeout_ms(timeout_ms),
                 )?;
                 let lean_ok = lean_out.status.success();
                 if reply.ok != lean_ok
