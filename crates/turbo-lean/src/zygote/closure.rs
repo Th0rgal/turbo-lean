@@ -1138,7 +1138,7 @@ pub(super) fn acquire_closure_snapshot_lease(
 /// Whether snapshot `label` in `root` is currently leased by an active run: opens `<label>.lock`
 /// without `O_CREAT` (never creating stray `.lock` files on a read-only probe) and checks
 /// whether a non-blocking exclusive `flock` is contended on the currently linked inode.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub(super) fn closure_snapshot_lease_held(root: &Path, label: &str) -> bool {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;

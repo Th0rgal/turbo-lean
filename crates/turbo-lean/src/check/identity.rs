@@ -218,6 +218,35 @@ impl IdentityElaborationContext {
         let toolchain = detect_toolchain(project_dir);
         let (compiler, githash, tc_lib, _) =
             crate::module_builder::resolve_toolchain_compiler(project_dir, &toolchain).ok()?;
+        Self::compute_with_toolchain(
+            probe_source,
+            project_dir,
+            lean_args,
+            env,
+            toolchain,
+            compiler,
+            githash,
+            &tc_lib,
+        )
+    }
+
+    /// [`Self::compute`] against an already-resolved toolchain. Only the canonical toolchain
+    /// artifact `tc_lib/<rel>.olean` (winning search root canonicalizes to `tc_lib`, header
+    /// githash verified) is left unpinned; every other resolved `.olean` — including an
+    /// `Init`/`Std`/`Lean`/`Lake` tree shadowing the toolchain from an earlier `LEAN_PATH`
+    /// entry, even one nested under `tc_lib` with a matching githash — is pinned by source and
+    /// artifact digest (or fails closed when its source is missing).
+    #[allow(clippy::too_many_arguments)]
+    fn compute_with_toolchain(
+        probe_source: &str,
+        project_dir: &Path,
+        lean_args: &[String],
+        env: &HashMap<String, String>,
+        toolchain: String,
+        compiler: PathBuf,
+        githash: String,
+        tc_lib: &Path,
+    ) -> Option<Self> {
         let header = crate::module_builder::parse_header_info(probe_source);
         if header.header_error.is_some()
             || splitter::source_may_read_host_state(probe_source)
@@ -230,7 +259,8 @@ impl IdentityElaborationContext {
             .filter(|p| !p.as_os_str().is_empty())
             .map(|p| project_dir.join(p))
             .collect();
-        dirs.push(tc_lib.clone());
+        dirs.push(tc_lib.to_path_buf());
+        let canon_tc_lib = tc_lib.canonicalize().ok();
         let search_dirs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
         let cfg = crate::module_builder::resolve_project_config(project_dir).ok();
         let mut pending = header.imports;
@@ -242,11 +272,13 @@ impl IdentityElaborationContext {
             }
             let path =
                 crate::module_builder::resolve_olean_along_search_dirs(&search_dirs, &import)?;
-            if crate::module_builder::is_verified_toolchain_olean_file(
-                &tc_lib,
-                Some(&githash),
-                &path,
-            ) {
+            if is_canonical_toolchain_olean(tc_lib, canon_tc_lib.as_deref(), &import, &path)
+                && crate::module_builder::is_verified_toolchain_olean_file(
+                    tc_lib,
+                    Some(&githash),
+                    &path,
+                )
+            {
                 continue;
             }
             let src_path = cfg
@@ -310,6 +342,35 @@ impl IdentityElaborationContext {
         .ok()?;
         Some(blake3::hash(&bytes).to_hex().to_string())
     }
+}
+
+/// Whether `path` (resolved for `import` along the search dirs) is exactly the toolchain's own
+/// `tc_lib/<rel>.olean`, i.e. the winning search root is `tc_lib` itself (modulo symlinks).
+/// A same-githash `Init`/`Std`/`Lean` tree in an earlier `LEAN_PATH` entry nested anywhere
+/// under `tc_lib` (e.g. `tc_lib/shadow/Init.olean`) is NOT canonical and must be pinned.
+fn is_canonical_toolchain_olean(
+    tc_lib: &Path,
+    canon_tc_lib: Option<&Path>,
+    import: &str,
+    path: &Path,
+) -> bool {
+    let rel = format!(
+        "{}.olean",
+        crate::module_builder::module_name_to_rel_slash(import)
+    );
+    if path == tc_lib.join(&rel) {
+        return true;
+    }
+    let Some(canon_tc) = canon_tc_lib else {
+        return false;
+    };
+    let Some(parent) = path.parent().and_then(|p| p.canonicalize().ok()) else {
+        return false;
+    };
+    let Some(file_name) = path.file_name() else {
+        return false;
+    };
+    parent.join(file_name) == canon_tc.join(&rel)
 }
 
 fn identity_cache_path(
@@ -1495,6 +1556,102 @@ mod memo_tests {
         if let Some(p) = base.disk_path {
             let _ = fs::remove_file(p);
         }
+        Ok(())
+    }
+
+    /// A same-githash `Init` tree shadowing the toolchain from an earlier `LEAN_PATH` entry
+    /// (here nested under `tc_lib`, so `is_verified_toolchain_olean_file` alone accepts it) must
+    /// be pinned: mutating the shadowed `Init.olean` must change the coarse cache key.
+    #[test]
+    fn coarse_key_pins_shadowed_toolchain_init_on_lean_path() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let scratch = PrivateScratchDir::create(
+            &verified_private_temp_scratch_base()?,
+            "identity_shadow_init",
+        )?;
+        let root = scratch.path.clone();
+        let project = root.join("proj");
+        let tc_lib = root.join("tc/lib/lean");
+        let shadow = tc_lib.join("shadow");
+        fs::create_dir_all(&project)?;
+        fs::create_dir_all(&shadow)?;
+        fs::write(project.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        let init_src = "prelude\n";
+        for dir in [&tc_lib, &shadow] {
+            fs::write(dir.join("Init.lean"), init_src)?;
+            let output = Command::new("lean")
+                .args(["-o", "Init.olean", "Init.lean"])
+                .current_dir(dir)
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let (_, githash) = crate::module_builder::read_olean_header_version_and_githash(
+            &tc_lib.join("Init.olean"),
+        )
+        .expect("compiled Init.olean header");
+        let shadow_olean = shadow.join("Init.olean");
+        assert!(
+            crate::module_builder::is_verified_toolchain_olean_file(
+                &tc_lib,
+                Some(&githash),
+                &shadow_olean
+            ),
+            "precondition: nested same-githash shadow passes the toolchain-file check"
+        );
+        let probe = "theorem target : True";
+        let key_for = |env: &HashMap<String, String>| -> (Vec<PathBuf>, String) {
+            let ctx = IdentityElaborationContext::compute_with_toolchain(
+                probe,
+                &project,
+                &[],
+                env,
+                "leanprover/lean4:v4.35.0".into(),
+                PathBuf::from("/nonexistent/lean"),
+                githash.clone(),
+                &tc_lib,
+            )
+            .expect("pure prelude-only context");
+            let fp = ctx.fingerprint(&project).expect("fingerprint");
+            let key = splitter::declaration_identity_cache_key(
+                probe,
+                "target",
+                &ctx.toolchain,
+                &ctx.githash,
+                &fp,
+            );
+            (ctx.pins.iter().map(|p| p.1.clone()).collect(), key)
+        };
+
+        // Canonical toolchain `Init` stays unpinned.
+        let (pins, _) = key_for(&HashMap::new());
+        assert!(
+            pins.is_empty(),
+            "canonical toolchain Init must not be pinned: {pins:?}"
+        );
+
+        // Shadowed `Init` earlier on `LEAN_PATH` is pinned and its bytes drive the key.
+        let env = HashMap::from([("LEAN_PATH".into(), shadow.to_string_lossy().into_owned())]);
+        let (pins, before) = key_for(&env);
+        assert_eq!(
+            pins,
+            vec![shadow_olean.clone()],
+            "shadowed Init must be pinned"
+        );
+        let mut bytes = fs::read(&shadow_olean)?;
+        bytes.push(0);
+        fs::write(&shadow_olean, bytes)?;
+        let (_, after) = key_for(&env);
+        assert_ne!(
+            before, after,
+            "mutating a shadowed Init.olean on LEAN_PATH must invalidate the coarse key"
+        );
+        scratch.remove()?;
         Ok(())
     }
 
