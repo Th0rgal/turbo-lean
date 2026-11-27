@@ -283,11 +283,13 @@ def validate_baseline(base):
     if "turbo_lean_dirty" not in base:
         errs.append("baseline_missing_turbo_lean_dirty: turbo_lean_dirty missing "
                     "(provenance requires the marker, exactly boolean false)")
-    elif not isinstance(base["turbo_lean_dirty"], bool):
-        errs.append(f"baseline_invalid_turbo_lean_dirty: turbo_lean_dirty must be exactly "
-                    f"boolean false, got {base['turbo_lean_dirty']!r}")
-    elif base["turbo_lean_dirty"]:
-        errs.append("baseline_dirty_tree: turbo_lean_dirty is true")
+    else:
+        dirty_val = base["turbo_lean_dirty"]
+        if not isinstance(dirty_val, bool):
+            errs.append(f"baseline_invalid_turbo_lean_dirty: turbo_lean_dirty must be exactly "
+                        f"boolean false, got {dirty_val!r}")
+        elif dirty_val is not False:
+            errs.append("baseline_dirty_tree: turbo_lean_dirty is true")
     commit = base.get("turbo_lean_commit")
     if not isinstance(commit, str) or not commit or commit == "not_a_git_checkout":
         errs.append("baseline_missing_turbo_lean_commit: turbo_lean_commit missing, null, or not a git commit")
@@ -1292,14 +1294,14 @@ def main(argv=None):
             data = json.loads(Path(args.validate_only).read_text())
         except (OSError, json.JSONDecodeError) as e:
             print(f"INVALID: cannot read {args.validate_only}: {e}")
-            return 1
+            return 4
         errs = validate_baseline(data)
         for e in errs:
             print(f"INVALID: {e}")
         if not errs:
             print(f"OK: {data.get('kind')} at {args.validate_only} is schema-valid "
                   f"({data.get('turbo_lean_commit')}, host {data.get('host', {}).get('hostname')})")
-        return 0 if not errs else 1
+        return 0 if not errs else 4
     if not args.batteries_dir or not args.pfr_dir:
         ap.error("--batteries-dir and --pfr-dir are required (unless --validate-only); "
                  "the environment needs TURBO_LEAN_GIT (git >= 2.46) and "

@@ -1185,7 +1185,11 @@ class ComparabilityAndProvenance(unittest.TestCase):
             for name, mutate, fragment in (
                     ("string_true", lambda b: b.__setitem__("turbo_lean_dirty", "true"),
                      "baseline_invalid_turbo_lean_dirty"),
+                    ("string_false", lambda b: b.__setitem__("turbo_lean_dirty", "false"),
+                     "baseline_invalid_turbo_lean_dirty"),
                     ("null", lambda b: b.__setitem__("turbo_lean_dirty", None),
+                     "baseline_invalid_turbo_lean_dirty"),
+                    ("zero", lambda b: b.__setitem__("turbo_lean_dirty", 0),
                      "baseline_invalid_turbo_lean_dirty"),
                     ("number", lambda b: b.__setitem__("turbo_lean_dirty", 1),
                      "baseline_invalid_turbo_lean_dirty"),
@@ -1194,7 +1198,7 @@ class ComparabilityAndProvenance(unittest.TestCase):
                     ("bool_true", lambda b: b.__setitem__("turbo_lean_dirty", True),
                      "baseline_dirty_tree")):
                 r = cli(name, mutate)
-                self.assertNotEqual(r.returncode, 0, (name, r.stdout + r.stderr))
+                self.assertEqual(r.returncode, 4, (name, r.stdout + r.stderr))
                 self.assertIn(fragment, r.stdout + r.stderr, name)
 
             valid_false = cli("valid_false", lambda b: b.__setitem__("turbo_lean_dirty", False))
