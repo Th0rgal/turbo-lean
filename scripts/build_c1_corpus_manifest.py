@@ -40,25 +40,36 @@ Honesty rules (matching `scripts/lcnf_coverage.py`)
 - `LetValue.fap.gf_simd` is excluded from the coverage targets: the matrix
   row itself records 0 hits across every measured corpus (Std/Init+C2, C1,
   con-leche), and the intrinsic whitelist has no syntactic surface in
-  upstream test files. The exclusion is recorded in the manifest.
+  upstream test files. `LetValue.proj` and `LetValue.const` are excluded as
+  well: they are pure-phase constructs that `toImpure` rewrites before the
+  lowerer runs, so no program can exercise the `rejected` status their rows
+  carry. The exclusions and their reasons are recorded in the manifest.
 - The selection is deterministic (sorted enumeration, fixed quotas, greedy
-  rounds); re-running `--write` against the pinned checkout reproduces the
-  committed manifest byte for byte.
+  rounds). Re-running `--write` against the pinned checkout reproduces the
+  committed manifest byte for byte given the same committed coverage
+  results: `--write` also records their `measured_source_commit` (below), so
+  after a results refresh it rewrites that one field.
 - Only import-free (self-contained) pile files are candidates: the suite leg
   elaborates each program standalone, and import-bearing files fail
   elaboration outright at the pin (measured 2026-11-26: the five
   tests/elab/bv_*.lean importing Std.Tactic.BVDecide), which the hardened leg
-  records as `frontend_error`, never as an expected rejection.
+  records as `frontend_error`, never as an expected rejection. Import-free
+  files that a leg run measured failing elaboration all the same are listed
+  in `NONELABORATING_PROGRAMS` with that run (`tests/elab/linterCoe.lean`,
+  2026-11-27), and `detectorDigest` covers the list.
 - `matrixSource.measuredSourceCommit` is read from the committed results when
   `--write` runs, never typed by hand (a hand-copied value went stale through
   two re-measurements). It names the measurement that was committed when the
-  manifest was written. The selection depends only on the matrix rows'
-  statuses, which `detectorDigest` and the matrix self-test pin, so a later
-  re-measure that leaves those rows alone does not invalidate the manifest:
-  the gate checks the field's shape, not its equality with the current
-  results, and the value can trail the newest results until the next
-  `--write`. Requiring equality would force a pinned lean4 checkout on every
-  results refresh for a field the selection never reads.
+  manifest was written. The selection reads neither the measurement nor a
+  row's status: `select_programs` uses the target rows' ids, detectors and
+  order and the emphasis specs. `detectorDigest` hashes the target rows in
+  full, statuses included, and the self-test pins those statuses to the
+  coverage matrix, so a status edit still needs `--write`, while a re-measure
+  does not invalidate the manifest. The gate checks this field's shape, not
+  its equality with the current results, and the value can trail the newest
+  results until the next `--write`. Requiring equality would force a pinned
+  lean4 checkout on every results refresh for a field the selection never
+  reads.
 """
 from __future__ import annotations
 
@@ -109,7 +120,7 @@ CATEGORIES_NOTE = (
 
 # Coverage targets: every `lowered_unproved` and `rejected` row of
 # LCNF_CONSTRUCTOR_MATRIX_SPEC (scripts/lcnf_coverage.py), except the recorded
-# exclusion below. (id, matrix status, syntactic detector).
+# exclusions below. (id, matrix status, syntactic detector).
 _MULTI_DEF = "__multi_def__"  # sentinel: >= 2 top-level `def`s (local user call sites)
 TARGET_CONSTRUCT_SPEC: tuple[tuple[str, str, str], ...] = (
     ("DeclValue.extern", "rejected", r"@\[extern"),
@@ -136,11 +147,6 @@ TARGET_CONSTRUCT_SPEC: tuple[tuple[str, str, str], ...] = (
     # R5: the width suffix is required; bare `Int` (arbitrary precision) is not
     # a signed fixed-width scalar and must not satisfy this detector.
     ("Type.signed_scalars", "rejected", r"\b(?:Int(?:8|16|32|64)|ISize)\b"),
-    # L1 (81986e6a) deleted the pure-phase lowering these two rows named; the
-    # matrix re-bins them as rejected (no impure LCNF form fails closed). Status
-    # only: the detectors and their order, which drive selection, are unchanged.
-    ("LetValue.proj", "rejected", r"\.(?:fst|snd|[12])\b"),
-    ("LetValue.const", "rejected", r"\b[A-Z][A-Za-z0-9]*\.[a-z][A-Za-z0-9_!?']*"),
     ("LetValue.fap.local_call", "lowered_unproved", _MULTI_DEF),
 )
 EXCLUDED_TARGETS: dict[str, str] = {
@@ -148,6 +154,18 @@ EXCLUDED_TARGETS: dict[str, str] = {
         "GF(2^128)/BabyBear/Goldilocks SIMD intrinsic whitelist has no syntactic surface "
         "in upstream test files; the matrix row records 0 hits across Std/Init+C2, C1, "
         "and con-leche corpora."
+    ),
+    "LetValue.proj": (
+        "Pure-phase construct: toImpure rewrites it into the LetValue.oproj / uproj / sproj "
+        "forms before the lowerer runs, so no declaration is refused because of it. The "
+        "matrix row records rejected because L1 (81986e6a) deleted the pure-phase lowering; a "
+        "program selected for `.fst` / `.snd` would exercise no rejected path."
+    ),
+    "LetValue.const": (
+        "Pure-phase construct: toImpure rewrites it into the LetValue.fap / pap forms before "
+        "the lowerer runs, so no declaration is refused because of it. The matrix row records "
+        "rejected because L1 (81986e6a) deleted the pure-phase lowering; a program selected for "
+        "a `Foo.bar` reference would exercise no rejected path."
     ),
 }
 
@@ -162,6 +180,16 @@ EMPHASIS_SPEC: tuple[tuple[str, str, int], ...] = (
     ("array_bytearray_sharing", r"\b(?:Array|ByteArray)\b", 30),
     ("signed_int_scalars", r"\b(?:Int(?:8|16|32|64)|ISize)\b", 30),
 )
+
+# Import-free pile files that still fail to elaborate standalone at the pin, so
+# the C1 leg would record each as frontend_error and fail. Each entry names the
+# leg run that measured it; add one only from such a run. (path -> reason)
+NONELABORATING_PROGRAMS: dict[str, str] = {
+    "tests/elab/linterCoe.lean": (
+        "emit-lnir --wire exits 1 with 'Elaboration failed' (C1 upstream leg at the pin, "
+        "2026-11-27, after the proj/const exclusion re-selected it)"
+    ),
+}
 
 _IMPORT_RE = re.compile(r"^\s*(?:public\s+)?import\s", re.M)
 _DEF_RE = re.compile(
@@ -185,7 +213,7 @@ TARGET_STATUS = {cid: status for cid, status, _p in TARGET_CONSTRUCT_SPEC}
 def detector_digest() -> str:
     """F3 (round 2): sha256 over everything that shapes candidate enumeration
     and selection (both spec tuples, the size bound, the import-free rule,
-    the pile set). Recorded in the manifest and re-checked by the
+    the measured non-elaborating files, the pile set). Recorded in the manifest and re-checked by the
     manifest-only gate, so a detector edit without `--write` fails the PR
     gate instead of only failing at nightly runtime."""
     payload = json.dumps(
@@ -195,6 +223,7 @@ def detector_digest() -> str:
             "maxProgramBytes": MAX_PROGRAM_BYTES,
             "importRe": _IMPORT_RE.pattern,
             "corpusPiles": list(CORPUS_PILES),
+            "nonelaboratingPrograms": sorted(NONELABORATING_PROGRAMS),
         },
         sort_keys=True,
     )
@@ -241,6 +270,8 @@ def enumerate_candidates(corpus_root: Path) -> list[dict[str, Any]]:
                 # tests/elab/bv_*.lean importing Std.Tactic.BVDecide) fail
                 # elaboration outright, which the hardened leg records as
                 # frontend_error, not as an expected rejection.
+                continue
+            if f"{pile}/{fp.name}" in NONELABORATING_PROGRAMS:
                 continue
             cands.append(
                 {
@@ -581,6 +612,11 @@ class C1CorpusManifestSelfTest(unittest.TestCase):
         self.assertNotIn("DeclValue.extern", matrix_constructs("def f := 1\n"))
         self.assertIn("LetValue.fap.local_call", matrix_constructs("def a := 1\ndef b := a\n"))
         self.assertNotIn("LetValue.fap.local_call", matrix_constructs("def a := 1\n"))
+        # The pure-phase rows are excluded: `toImpure` rewrites `.fst` and a
+        # constant reference before the lowerer runs, so a program carrying
+        # them exercises no rejected path and is not selected for them.
+        self.assertEqual(matrix_constructs("def pr := (1, 2).fst\n"), [])
+        self.assertEqual(matrix_constructs("def one : Nat := Nat.succ 0\n"), [])
 
     def test_target_rows_match_lcnf_coverage_matrix(self):
         src = (ROOT / "scripts" / "lcnf_coverage.py").read_text(encoding="utf-8")
@@ -590,8 +626,16 @@ class C1CorpusManifestSelfTest(unittest.TestCase):
         by_id = {row["id"]: row["status"] for row in spec}
         for cid, status in TARGET_STATUS.items():
             self.assertEqual(by_id.get(cid), status, f"matrix drift on {cid}")
-        for cid in EXCLUDED_TARGETS:
-            self.assertEqual(by_id.get(cid), "lowered_unproved", f"exclusion drift on {cid}")
+        # Each exclusion pins the matrix status its recorded reason was written
+        # against, so a status change re-opens the exclusion.
+        excluded_status = {
+            "LetValue.fap.gf_simd": "lowered_unproved",
+            "LetValue.proj": "rejected",
+            "LetValue.const": "rejected",
+        }
+        self.assertEqual(set(EXCLUDED_TARGETS), set(excluded_status))
+        for cid, status in excluded_status.items():
+            self.assertEqual(by_id.get(cid), status, f"exclusion drift on {cid}")
         unproved_or_rejected = {
             rid for rid, st in by_id.items() if st in ("lowered_unproved", "rejected")
         }
@@ -670,6 +714,24 @@ class C1CorpusManifestSelfTest(unittest.TestCase):
             paths = [c["path"] for c in enumerate_candidates(root)]
             self.assertNotIn("tests/elab/synth_imports.lean", paths)
             self.assertIn("tests/elab/synth_scalar.lean", paths)
+
+    def test_measured_nonelaborating_files_are_not_candidates(self):
+        # An import-free file can still fail to elaborate standalone at the
+        # pin: the C1 leg measured tests/elab/linterCoe.lean as frontend_error
+        # once a re-selection picked it. A listed path never enters the
+        # candidate set, and the list shapes the selection, so it is part of
+        # detectorDigest.
+        import tempfile
+
+        self.assertIn("tests/elab/linterCoe.lean", NONELABORATING_PROGRAMS)
+        with tempfile.TemporaryDirectory(prefix="c1x_nonelab_") as tmp:
+            root = self._synth_corpus(Path(tmp))
+            (root / "tests/elab/linterCoe.lean").write_text(
+                "def lc (f : Nat → Nat) := f 1\n", encoding="utf-8"
+            )
+            paths = [c["path"] for c in enumerate_candidates(root)]
+            self.assertNotIn("tests/elab/linterCoe.lean", paths)
+            self.assertIn("tests/elab/synth_hof.lean", paths)
 
     def test_fill_step_skips_constructless_candidates(self):
         # R6: the fill step never pads the corpus with a candidate carrying no
