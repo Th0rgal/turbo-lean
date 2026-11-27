@@ -998,7 +998,7 @@ def self_test() -> int:
     # the published number (review F9, r2 F5): current schema, each file's
     # hash against its OWN pin (not merely any pin), a full 40-hex measured
     # commit, and summary.coverage equal to the published figure, so a stale
-    # stale artifact whose environmental kills the record disavows can never
+    # artifact whose environmental kills the record disavows can never
     # pass this check again.
     if RESULTS_PATH.exists():
         doc = json.loads(RESULTS_PATH.read_text(encoding="utf-8"))

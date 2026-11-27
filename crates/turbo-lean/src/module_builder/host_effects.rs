@@ -1026,7 +1026,7 @@ fn pkg_root_owned_by_project(
         // "../foo"`, no `.git` anywhere above it) is editable scratch —
         // whether or not the PROJECT is a git checkout; the previous
         // `(None, Some(_)) => false` arm silently dropped it from the closure sweep
-        // and made the purge refuse as soon as the project was in git. Review
+        // and made the purge refuse as soon as the project was in git.
         // The grant is bounded: only a RELATIVE, symlink-free declared dir
         // outside the project's own packagesDir SLOT counts. An absolute entry
         // (`/opt/mathlib`, a store path) is a shared install, a symlinked `../foo`
