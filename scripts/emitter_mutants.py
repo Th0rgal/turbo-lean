@@ -687,32 +687,18 @@ def run_suite(
     return report
 
 
-def run_fixtures(logs: Path, full_checks: bool = False, checkpoint_path: Path | None = None) -> dict:
-    """Run all 4 mechanical self-test fixtures from spec v4 against the real emitter.
-
-    With --full-fixtures (used in CI), F2/F4 run full C1..C7; locally without
-    --full-fixtures, F2/F4 omit C3 (which has an unrelated 50ms wall-clock
-    python plugin budget test that flakes under heavy shared-host CPU load) and
-    C4 (covered by the CI suite) while still running C1, C2, C5, C6, C7.
-
-    Progress is checkpointed per baseline check and fixture case; an interrupted
-    run stays explicitly INCOMPLETE in the checkpoint and can never report
-    fixture PASS.
-    """
-    spec = load_spec()
-    checkpoint_path = checkpoint_path or checkpoint_sibling(logs)
+def build_fixtures(full_checks: bool = False) -> list[tuple[str, dict, tuple[str, ...], str]]:
     comment_subset = CHECK_ORDER if full_checks else ("C1", "C2", "C5", "C6", "C7")
     c5_runtime_subset = CHECK_ORDER if full_checks else ("C1", "C2", "C5", "C6", "C7")
-
-    fixtures = [
+    return [
         (
             "build_breaking",
             {
                 "id": "F1_build_breaking",
                 "backend": "llvm",
                 "file": "lean/LeanNative/Backend/LLVM.lean",
-                "search": "emitLine s!\"  {res} = sub{fl} {tyStr} {lVal}, {rVal}\"; return res",
-                "replace": "emitLine (__B0_FIXTURE_BUILD_BREAK__); return res",
+                "search": "| .sub    => emit (.sub \u00b7 fl w lVal rVal)",
+                "replace": "| .sub    => emit (__B0_FIXTURE_BUILD_BREAK__)",
                 "expected_match_count": 1,
             },
             ("C1",),
@@ -724,8 +710,8 @@ def run_fixtures(logs: Path, full_checks: bool = False, checkpoint_path: Path | 
                 "id": "F2_comment_only",
                 "backend": "llvm",
                 "file": "lean/LeanNative/Backend/LLVM.lean",
-                "search": "emitLine s!\"  {res} = sub{fl} {tyStr} {lVal}, {rVal}\"; return res",
-                "replace": "emitLine s!\"  {res} = sub{fl} {tyStr} {lVal}, {rVal}\"; return res -- B0 comment-only fixture",
+                "search": "| .sub    => emit (.sub \u00b7 fl w lVal rVal)",
+                "replace": "| .sub    => emit (.sub \u00b7 fl w lVal rVal) -- B0 comment-only fixture",
                 "expected_match_count": 1,
             },
             comment_subset,
@@ -750,14 +736,31 @@ def run_fixtures(logs: Path, full_checks: bool = False, checkpoint_path: Path | 
                 "id": "F4_runtime_only_c5",
                 "backend": "llvm",
                 "file": "lean/LeanNative/Backend/LLVM.lean",
-                "search": "| .shl    => emitShift \"shl\" \"sh\"\n    | .shr    => emitShift \"lshr\" \"sh\"",
-                "replace": "| .shl    => emitShift \"lshr\" \"sh\"\n    | .shr    => emitShift \"shl\" \"sh\"",
+                "search": "| .shl    => emitShift .shl\n    | .shr    => emitShift .shr",
+                "replace": "| .shl    => emitShift .shr\n    | .shr    => emitShift .shl",
                 "expected_match_count": 1,
             },
             c5_runtime_subset,
             "KILLED",
         ),
     ]
+
+
+def run_fixtures(logs: Path, full_checks: bool = False, checkpoint_path: Path | None = None) -> dict:
+    """Run all 4 mechanical self-test fixtures from spec v4 against the real emitter.
+
+    With --full-fixtures (used in CI), F2/F4 run full C1..C7; locally without
+    --full-fixtures, F2/F4 omit C3 (which has an unrelated 50ms wall-clock
+    python plugin budget test that flakes under heavy shared-host CPU load) and
+    C4 (covered by the CI suite) while still running C1, C2, C5, C6, C7.
+
+    Progress is checkpointed per baseline check and fixture case; an interrupted
+    run stays explicitly INCOMPLETE in the checkpoint and can never report
+    fixture PASS.
+    """
+    spec = load_spec()
+    checkpoint_path = checkpoint_path or checkpoint_sibling(logs)
+    fixtures = build_fixtures(full_checks=full_checks)
 
     checkpoint = Checkpoint(checkpoint_path, {
         "schema": CHECKPOINT_SCHEMA,
@@ -916,6 +919,11 @@ def run_unit_tests() -> bool:
                     self.assertEqual(target.read_text(encoding="utf-8"),
                         before.replace(mutation["search"], mutation["replace"], 1))
                     self.assertNotEqual(target.read_text(encoding="utf-8"), before)
+            for name, mutation, _, expected in build_fixtures():
+                with self.subTest(fixture=name):
+                    before = (ROOT / mutation["file"]).read_text(encoding="utf-8")
+                    want = 0 if expected == "APPLY_FAILED" else mutation["expected_match_count"]
+                    self.assertEqual(before.count(mutation["search"]), want)
 
         def test_stage_b_universe_is_live_applicable_mutants(self):
             # G5 Stage B (roadmap/GOALS.md): comparison_universe is exactly the

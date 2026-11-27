@@ -232,28 +232,27 @@ theorem emitDivRem_exec
   by_cases hbz : b = 0
   · subst hbz
     cases isRem
-    · simp [emitDivRem, execInstrsWith, stepInstrWith, evalOperand, evalTypedOperand,
-        lookupReg, icmpEval, w64, c64, IntWidth.bits, bindReg, hdr, hdl1, divOrRem,
+    · simp [emitDivRem, cW, execInstrsWith, stepInstrWith, evalOperand, evalTypedOperand,
+        lookupReg, icmpEval, IntWidth.bits, bindReg, hdr, hdl1, divOrRem,
         hz2, zBit, safeB, rawV, resV]
       congr 1
       exact BitVec.udiv_one
-    · simp [emitDivRem, execInstrsWith, stepInstrWith, evalOperand, evalTypedOperand,
-        lookupReg, icmpEval, w64, c64, IntWidth.bits, bindReg, hdr, hdl1, hdl2, divOrRem,
+    · simp [emitDivRem, cW, execInstrsWith, stepInstrWith, evalOperand, evalTypedOperand,
+        lookupReg, icmpEval, IntWidth.bits, bindReg, hdr, hdl1, hdl2, divOrRem,
         hz2, zBit, safeB, rawV, resV]
       congr 1
       exact BitVec.umod_one
   · have hbnz64 : (b.toBitVec == 0#64) = false :=
       Bool.eq_false_iff.mpr (fun h => hbz (UInt64.eq_of_toBitVec_eq (eq_of_beq h)))
-    have hbnzi1 : (@BEq.beq (BitVec IntWidth.i64.bits) _ b.toBitVec (0#64 : BitVec 64)) = false := hbnz64
     have hbnzi2 : (@BEq.beq (BitVec IntWidth.i64.bits) _ b.toBitVec 0#IntWidth.i64.bits) = false := hbnz64
     cases isRem
-    · simp [emitDivRem, execInstrsWith, stepInstrWith, evalOperand, evalTypedOperand,
-        lookupReg, icmpEval, w64, c64, bindReg, hdr, hdr0, hdl1, divOrRem,
-        hz2, zBit, safeB, rawV, resV, hbnz64, hbnzi1, hbnzi2, h01]
+    · simp [emitDivRem, cW, execInstrsWith, stepInstrWith, evalOperand, evalTypedOperand,
+        lookupReg, icmpEval, bindReg, hdr, hdr0, hdl1, divOrRem,
+        hz2, zBit, safeB, rawV, resV, hbnz64, hbnzi2, h01]
       rfl
-    · simp [emitDivRem, execInstrsWith, stepInstrWith, evalOperand, evalTypedOperand,
-        lookupReg, icmpEval, w64, c64, bindReg, hdr, hdr0, hdl1, divOrRem,
-        hz2, zBit, safeB, rawV, resV, hbnz64, hbnzi1, hbnzi2, h01]
+    · simp [emitDivRem, cW, execInstrsWith, stepInstrWith, evalOperand, evalTypedOperand,
+        lookupReg, icmpEval, bindReg, hdr, hdr0, hdl1, divOrRem,
+        hz2, zBit, safeB, rawV, resV, hbnz64, hbnzi2, h01]
       rfl
 
 theorem emitShift_exec
@@ -284,6 +283,7 @@ theorem emitShift_exec
     change ¬(64 ≤ (b.toBitVec &&& 63#64).toNat)
     omega
   dsimp only [mBit] at hnle
+  have hmask : BitVec.ofNat IntWidth.i64.bits (IntWidth.i64.bits - 1) = (63#64 : BitVec IntWidth.i64.bits) := rfl
   let resV : BitVec 64 := match op with
     | .shr => (a >>> b).toBitVec
     | .sar => (lnirSar64 a b).toBitVec
@@ -292,15 +292,15 @@ theorem emitShift_exec
     ?_, rfl, rfl, rfl, lookup_cons_self _ _ _,
     fun q hq => by repeat (rw [lookup_cons_ne _ _ _ _ (hq _ (by omega) (by omega))])⟩
   rcases hop with rfl | rfl | rfl
-  · simp [emitShift, execInstrsWith, stepInstrWith, evalOperand, lookupReg, c64, mBit, resV,
+  · simp [emitShift, cW, shiftInstr, hmask, execInstrsWith, stepInstrWith, evalOperand, lookupReg, mBit, resV,
       binResult, shiftResult, flagsOverflow, bindReg, hdr, hdl0, hnle]
     congr 1
     exact u64_shl_masked_bv a b
-  · simp [emitShift, execInstrsWith, stepInstrWith, evalOperand, lookupReg, c64, mBit, resV,
+  · simp [emitShift, cW, shiftInstr, hmask, execInstrsWith, stepInstrWith, evalOperand, lookupReg, mBit, resV,
       binResult, shiftResult, flagsOverflow, bindReg, hdr, hdl0, hnle]
     congr 1
     exact u64_shr_masked_bv a b
-  · simp [emitShift, execInstrsWith, stepInstrWith, evalOperand, lookupReg, c64, mBit, resV,
+  · simp [emitShift, cW, shiftInstr, hmask, execInstrsWith, stepInstrWith, evalOperand, lookupReg, mBit, resV,
       binResult, shiftResult, flagsOverflow, bindReg, hdr, hdl0, hnle]
     congr 1
     exact u64_ashr_masked_bv a b
@@ -321,7 +321,7 @@ theorem emitCmp_exec
   refine ⟨{ st with regs := (tmpReg (k + 1), .bits .i64 resV) :: (tmpReg k, .bits .i1 cBit) :: st.regs },
     ?_, rfl, rfl, rfl, lookup_cons_self _ _ _,
     fun q hq => by repeat (rw [lookup_cons_ne _ _ _ _ (hq _ (by omega) (by omega))])⟩
-  simp [emitCmp, execInstrsWith, stepInstrWith, evalOperand, lookupReg, w64, IntWidth.bits, bindReg,
+  simp [emitCmp, execInstrsWith, stepInstrWith, evalOperand, lookupReg, IntWidth.bits, bindReg,
     hdl, hdr, cBit, resV, zext_i1_to_i64]
 
 theorem finishScalarTail

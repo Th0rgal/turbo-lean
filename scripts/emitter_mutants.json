@@ -120,24 +120,24 @@
       "id": "M1",
       "backend": "llvm",
       "file": "lean/LeanNative/Backend/LLVM.lean",
-      "search": "emitLine s!\"  {res} = sub{fl} {tyStr} {lVal}, {rVal}\"; return res",
-      "replace": "emitLine s!\"  {res} = sub{fl} {tyStr} {rVal}, {lVal}\"; return res",
+      "search": "| .sub    => emit (.sub \u00b7 fl w lVal rVal)",
+      "replace": "| .sub    => emit (.sub \u00b7 fl w rVal lVal)",
       "expected_match_count": 1
     },
     {
       "id": "M2",
       "backend": "llvm",
       "file": "lean/LeanNative/Backend/LLVM.lean",
-      "search": "| .shl    => emitShift \"shl\" \"sh\"\n    | .shr    => emitShift \"lshr\" \"sh\"",
-      "replace": "| .shl    => emitShift \"lshr\" \"sh\"\n    | .shr    => emitShift \"shl\" \"sh\"",
+      "search": "| .shl    => emitShift .shl\n    | .shr    => emitShift .shr",
+      "replace": "| .shl    => emitShift .shr\n    | .shr    => emitShift .shl",
       "expected_match_count": 1
     },
     {
       "id": "M3",
       "backend": "llvm",
       "file": "lean/LeanNative/Backend/LLVM.lean",
-      "search": "| .lt     => emitCmp \"ult\" \"lt\"",
-      "replace": "| .lt     => emitCmp \"ule\" \"lt\"",
+      "search": "| .lt     => emitCmp .ult",
+      "replace": "| .lt     => emitCmp .ule",
       "expected_match_count": 1
     },
     {
@@ -152,8 +152,8 @@
       "id": "M5",
       "backend": "llvm",
       "file": "lean/LeanNative/Backend/LLVM.lean",
-      "search": "let emitDivRem (llvmOp pfx : String) (isMod : Bool) : EmitM String := do\n      match is256, rhs with\n      | false, .constU64 d =>\n        if d != 0 then emitLine s!\"  {res} = {llvmOp} i64 {lVal}, {rVal}\"\n        else if isMod then emitLine s!\"  {res} = add i64 {lVal}, 0\"\n        else emitLine s!\"  {res} = add i64 0, 0\"\n        return res\n      | _, _ =>\n        let safeR \u2190 freshTmp (pfx ++ sfx ++ \"_rhs\")\n        let isZero \u2190 freshTmp (pfx ++ sfx ++ \"_z\")\n        let rawRes \u2190 freshTmp (pfx ++ sfx ++ \"_raw\")\n        let zeroVal := if isMod then lVal else \"0\"\n        emitLine s!\"  {isZero} = icmp eq {tyStr} {rVal}, 0\"\n        emitLine s!\"  {safeR} = select i1 {isZero}, {tyStr} 1, {tyStr} {rVal}\"\n        emitLine s!\"  {rawRes} = {llvmOp} {tyStr} {lVal}, {safeR}\"\n        emitLine s!\"  {res} = select i1 {isZero}, {tyStr} {zeroVal}, {tyStr} {rawRes}\"\n        return res",
-      "replace": "let emitDivRem (llvmOp _pfx : String) (_isMod : Bool) : EmitM String := do\n      emitLine s!\"  {res} = {llvmOp} {tyStr} {lVal}, {rVal}\"\n      return res",
+      "search": "let emitDivRem (isMod : Bool) : EmitM Operand :=\n      match is256, rhs with\n      | false, .constU64 d =>\n        emit fun r => if d == 0 then .add r .none w (if isMod then lVal else cw 0) (cw 0)\n          else if isMod then .urem r w lVal rVal else .udiv r false w lVal rVal\n      | _, _ => emitBuilt (LLVMLower.emitDivRem \u00b7 isMod lVal rVal w)",
+      "replace": "let emitDivRem (isMod : Bool) : EmitM Operand :=\n      emit fun r => if isMod then .urem r w lVal rVal else .udiv r false w lVal rVal",
       "expected_match_count": 1
     },
     {
