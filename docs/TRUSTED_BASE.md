@@ -129,8 +129,16 @@
    on v4.35.0); the file-level SHA-256 is recorded in the freezing commit.
 3. The generated coverage matrix is a measurement, not a proof (`H1.0`): `scripts/lcnf_coverage.py`
    runs the real lowerer over its corpora, the committed results (`scripts/lcnf_coverage_results.json`,
-   measured at `138b287`) pin the bridge-source digests and the digest of the script's own audit
-   drivers and classifier, and CI's `verify` job emits the JSON. A declaration counts as `proved`
+   measured at `138b287`) pin three things: the digests of 23 Lean sources, the digest of the
+   script's own audit drivers and classifier, and the revision the `Batteries` counts were measured
+   at. The 23 sources are the bridge with its `BridgeHelpers/` split, `RealLCNFShared.lean`, the
+   two semantics files, and the bridge proofs with their `Proofs/RealLCNFBridge/` split and
+   `Proofs/LowerCalls.lean`. CI's `verify` job emits the JSON and gates all three. The rest of
+   `LeanNative.IR.Bridge`'s import cone is not pinned: 28 of its 37 modules, namely the IR data
+   types and codec, `Semantics/`, `Transform/`, `Backend/`, `Frontend/ProofRetention.lean` and the
+   SymbolicTV, loop-opt and peephole proofs. An edit there reaches the committed counts only
+   through `--check`'s live re-measure, because CI does not compare the in-repo counts. A
+   declaration counts as `proved`
    when the proved path lowers it with no local call, so `lowerRealLCNFDecl_sound` applies to it, or
    when `lowerRealLCNFDecl_soundF` (§4) applies to its local calls: everything it reaches lowers,
    sits on no call cycle, makes no self-call, and passes only `.fvar` arguments, and their lowered
