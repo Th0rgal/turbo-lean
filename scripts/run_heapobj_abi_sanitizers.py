@@ -151,21 +151,22 @@ def find_host_clangxx() -> str | None:
 
 
 def find_host_clang() -> str | None:
-    for cand in (
-        os.environ.get("CLANG"),
-        "/usr/bin/clang",
-        "/usr/bin/clang-18",
-        shutil.which("clang"),
-        shutil.which("clang-18"),
-    ):
-        if not cand:
-            continue
-        if ".elan" in cand or "caches/elan" in cand:
-            continue
+    """Resolve the clang that compiles the core binary's emitted LLVM IR.
+
+    The pinned toolchain emits LLVM 16+ `memory(...)` attribute groups, so a
+    bare "first clang on the PATH" pick breaks on clang 15 hosts with
+    "unterminated attribute group". `fuzz_san.find_clang_binary` already
+    solves exactly this for the target-IR fuzzer (banner major >= 16 fast
+    path, a functional `memory(none)` IR probe otherwise, then the pinned
+    toolchain's bundled clang as the fallback), so this leg reuses it. A
+    `CLANG` override keeps winning, used as given."""
+    cand = os.environ.get("CLANG")
+    if cand:
         p = Path(cand)
         if p.is_file() and os.access(p, os.X_OK):
             return str(p)
-    return None
+        return None
+    return fuzz_san.find_clang_binary()
 
 
 def lean_runtime_link_flags(lean_prefix: Path) -> list[str]:
