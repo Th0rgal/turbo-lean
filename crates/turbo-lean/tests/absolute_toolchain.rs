@@ -219,17 +219,26 @@ write_flush
 while read_pkt; do
   [ "$bodylen" -lt 0 ] && continue
   dd bs=1 count="$bodylen" of="$tmp" 2>/dev/null
-  case "$(cat "$tmp" 2>/dev/null)" in
-    capability=*)
-      while read_pkt; do
-        [ "$bodylen" -lt 0 ] && break
-        dd bs=1 count="$bodylen" of=/dev/null 2>/dev/null
-      done
-      write_pkt '
+      case "$(cat "$tmp" 2>/dev/null)" in
+        capability=clean|capability=smudge)
+          while read_pkt; do
+            [ "$bodylen" -lt 0 ] && break
+            dd bs=1 count="$bodylen" of=/dev/null 2>/dev/null
+          done
+          write_pkt 'status=success
 '
-      write_flush
-      ;;
-    command=*)
+          write_flush
+          ;;
+        capability=*)
+          while read_pkt; do
+            [ "$bodylen" -lt 0 ] && break
+            dd bs=1 count="$bodylen" of=/dev/null 2>/dev/null
+          done
+          write_pkt 'status=error
+'
+          write_flush
+          ;;
+        command=*)
       while read_pkt; do
         [ "$bodylen" -lt 0 ] && break
         dd bs=1 count="$bodylen" of=/dev/null 2>/dev/null

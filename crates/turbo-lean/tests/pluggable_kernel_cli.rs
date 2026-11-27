@@ -1100,3 +1100,76 @@ fn real_con_leche_binary_verifies_valid_and_rejects_adversarial_olean_if_built()
         "CLI --kernel con-leche remains fail-closed even when binary exists",
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn auto_kernel_routes_to_con_leche_when_pinned_toolchain_binary_is_provisioned() {
+    let f = KernelTestFixture::new("auto_kernel_g1c");
+    let proj = f.root.join("proj_v435");
+    fs::create_dir_all(&proj).unwrap();
+    let fake_bin = f.root.join("external-con-leche.sh");
+    write_executable_script(
+        &fake_bin,
+        "#!/usr/bin/env bash\nif [ \"${1:-}\" = \"--version\" ]; then echo 'con-leche 0.1.0'; exit 0; fi\nexit 0\n",
+    );
+
+    let prev = std::env::var_os(kernel::CON_LECHE_BIN_ENV);
+    std::env::set_var(kernel::CON_LECHE_BIN_ENV, &fake_bin);
+    let auto_v435 = kernel::resolve_kernel_engine_in_workspace(
+        kernel::KernelEngineSelection::Auto,
+        kernel::PINNED_CON_LECHE_TOOLCHAIN,
+        Some(&proj),
+    );
+    let auto_other = kernel::resolve_kernel_engine_in_workspace(
+        kernel::KernelEngineSelection::Auto,
+        "leanprover/lean4:v4.15.0",
+        Some(&proj),
+    );
+    let auto_no_ws = kernel::resolve_kernel_engine_in_workspace(
+        kernel::KernelEngineSelection::Auto,
+        kernel::PINNED_CON_LECHE_TOOLCHAIN,
+        None,
+    );
+    let explicit_std = kernel::resolve_kernel_engine_in_workspace(
+        kernel::KernelEngineSelection::Standard,
+        kernel::PINNED_CON_LECHE_TOOLCHAIN,
+        Some(&proj),
+    );
+    match prev {
+        Some(v) => std::env::set_var(kernel::CON_LECHE_BIN_ENV, v),
+        None => std::env::remove_var(kernel::CON_LECHE_BIN_ENV),
+    }
+
+    let auto_v435 = auto_v435.unwrap();
+    assert_eq!(auto_v435.requested_engine, kernel::KernelEngineSelection::Auto);
+    assert_eq!(
+        auto_v435.kernel_engine,
+        kernel::ResolvedKernelEngine::ConLeche
+    );
+    assert_eq!(
+        auto_v435.con_leche_rev.as_deref(),
+        Some(kernel::PINNED_CON_LECHE_REV)
+    );
+    assert_eq!(auto_v435.fallback_reason, None);
+
+    let auto_other = auto_other.unwrap();
+    assert_eq!(
+        auto_other.kernel_engine,
+        kernel::ResolvedKernelEngine::Standard
+    );
+    assert!(auto_other.fallback_reason.is_some());
+
+    let auto_no_ws = auto_no_ws.unwrap();
+    assert_eq!(
+        auto_no_ws.kernel_engine,
+        kernel::ResolvedKernelEngine::Standard
+    );
+    assert!(auto_no_ws.fallback_reason.is_some());
+
+    let explicit_std = explicit_std.unwrap();
+    assert_eq!(
+        explicit_std.kernel_engine,
+        kernel::ResolvedKernelEngine::Standard
+    );
+    assert_eq!(explicit_std.con_leche_rev, None);
+}
