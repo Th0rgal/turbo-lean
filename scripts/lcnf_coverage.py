@@ -65,6 +65,7 @@ import argparse
 import concurrent.futures
 import datetime
 import hashlib
+import inspect
 import json
 import os
 import subprocess
@@ -134,7 +135,9 @@ _BATTERIES_CACHE: dict[str, dict[str, Any]] = {}
 # by `--check`). The script itself carries no hard-coded digest: editing a
 # tracked file fails `--check` against the committed results until the
 # measurement is regenerated, and L1-L3 bridge PRs regenerate the JSON instead
-# of hand-editing this script.
+# of hand-editing this script. The same file pins `classifier_source_sha256`,
+# the digest of this script's own audit drivers and facts path
+# (`classifier_source_digest`), which `--json` gates too.
 TRACKED_BRIDGE_FILES: tuple[str, ...] = (
     "lean/LeanNative/IR/Bridge.lean",
     "lean/LeanNative/IR/RealLCNFBridge.lean",
@@ -161,7 +164,7 @@ MEASUREMENT_INPUT_PATHS: tuple[str, ...] = (
     "scripts/fuzz_lcnf_conformance.py",
     "verification/c2-lake-packages",
 )
-RESULTS_SCHEMA_VERSION = "turbo-lean-lcnf-coverage-results-v3"
+RESULTS_SCHEMA_VERSION = "turbo-lean-lcnf-coverage-results-v4"
 MEASURED_SOURCE_COMMIT_NOTE = (
     "`measured_source_commit` is the commit of the tree the measurement was taken from "
     "(recorded when `--write-results` ran, i.e. the parent of the commit that updates this file)."
@@ -2045,6 +2048,55 @@ def build_live_corpora(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     return corpora
 
 
+def _classifier_source_texts() -> list[str]:
+    """The source of everything in this script that decides a declaration's class.
+
+    The bridge-file digests pin only the Lean sources, so without this an edit
+    to the audit drivers or to the Python facts path would pass `--json`
+    against committed counts the edited code never produced; CI builds no
+    `Batteries` tree and cannot re-measure. Covered: the two Lean drivers and
+    the per-module driver builder, the AUDIT_RESULT parser and runner, the
+    shard facts driver, parser and name decoder, the classifier, the merger,
+    the sharded runner, and the `Batteries` module discovery and measurement.
+    """
+    funcs = (
+        _lean_audit_driver_for_modules,
+        _parse_audit_result,
+        _run_audit_driver,
+        _lean_shard_facts_driver,
+        _collect_shard_facts,
+        _unescape_facts_name,
+        _reserved_runtime_name,
+        _classify_decl_facts,
+        _merge_batteries_shard_facts,
+        _run_sharded_batteries_audit,
+        _batteries_modules,
+        measure_external_batteries,
+    )
+    return [
+        _LEAN_AUDIT_DRIVER_HEAD,
+        _LEAN_AUDIT_DRIVER_SRC,
+        json.dumps(_FACTS_NAME_ESCAPES, sort_keys=True),
+        REJECTED_NOT_LOWERED_REASON,
+        *(inspect.getsource(fn) for fn in funcs),
+    ]
+
+
+def classifier_source_digest() -> str:
+    """sha256 over `_classifier_source_texts()`, each text length-prefixed.
+
+    `--write-results` records it as `classifier_source_sha256`; `--check` and
+    `--json` refuse a live digest that differs from the committed one, so any
+    edit to the covered source (a comment included) needs a re-measure.
+    """
+    h = hashlib.sha256()
+    for text in _classifier_source_texts():
+        data = text.encode("utf-8")
+        h.update(len(data).to_bytes(8, "big"))
+        h.update(data)
+    return h.hexdigest()
+
+
 def build_coverage_report(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     file_digests = _bridge_digests(root_dir)
 
@@ -2060,6 +2112,7 @@ def build_coverage_report(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
         "leaf_id": "H1.0",
         "toolchain": PINNED_TOOLCHAIN,
         "bridge_source_digests": file_digests,
+        "classifier_source_sha256": classifier_source_digest(),
         "lcnf_constructor_matrix": {
             "summary": {
                 "total": len(rows),
@@ -2107,6 +2160,11 @@ def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[
     # Defense in depth: main() runs this before the measurement; a direct
     # results_document caller gets the same refusal here.
     _refuse_dirty_measurement_inputs(root_dir)
+    classifier = report.get("classifier_source_sha256")
+    if not _is_hex_digest(classifier, 64):
+        raise RuntimeError(
+            f"refusing to write results: the live report's classifier_source_sha256 is {classifier!r}"
+        )
     corpora: dict[str, Any] = {}
     for cname, corp in report.get("corpora", {}).items():
         if corp.get("status") == "unknown" or corp.get("measurement_source") != "live_invocation":
@@ -2133,6 +2191,7 @@ def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[
         "measured_source_commit": head,
         "measured_source_commit_note": MEASURED_SOURCE_COMMIT_NOTE,
         "bridge_file_sha256": digests,
+        "classifier_source_sha256": classifier,
         "corpora": corpora,
     }
 
@@ -2246,6 +2305,7 @@ def validate_results_document(doc: Any) -> list[str]:
         "measured_source_commit",
         "measured_source_commit_note",
         "bridge_file_sha256",
+        "classifier_source_sha256",
         "corpora",
     )
     unknown_top = sorted(set(doc) - set(required_top))
@@ -2291,6 +2351,11 @@ def validate_results_document(doc: Any) -> list[str]:
                 errors.append(
                     f"Results file `bridge_file_sha256[{rel}]` must be a 64-hex sha256, got {sha!r}"
                 )
+    if "classifier_source_sha256" in doc and not _is_hex_digest(doc["classifier_source_sha256"], 64):
+        errors.append(
+            "Results file `classifier_source_sha256` must be a 64-hex sha256, got "
+            f"{doc['classifier_source_sha256']!r}"
+        )
     corpora = doc.get("corpora", {})
     if not isinstance(corpora, dict):
         errors.append("Results file `corpora` must be a JSON object")
@@ -2357,6 +2422,24 @@ def _compare_committed_digests(
                 f"File `{rel}` is pinned in scripts/lcnf_coverage_results.json "
                 f"`bridge_file_sha256` but is not tracked by the live report"
             )
+
+
+def _compare_committed_classifier(rep: dict[str, Any], committed: Any, errors: list[str]) -> None:
+    """Refuse committed counts measured with classifier source other than the live one."""
+    pinned = committed.get("classifier_source_sha256") if isinstance(committed, dict) else None
+    live = rep.get("classifier_source_sha256")
+    if not _is_hex_digest(pinned, 64):
+        errors.append(
+            "scripts/lcnf_coverage_results.json carries no valid `classifier_source_sha256`, "
+            "so the classifier source its counts were measured with cannot be gated "
+            "(re-run --write-results)"
+        )
+    elif live != pinned:
+        errors.append(
+            f"Classifier source digest mismatch: committed={pinned} live={live}; the "
+            "committed counts were measured with other audit-driver or classifier code "
+            "(re-run --write-results)"
+        )
 
 
 def check_coverage_report(
@@ -2498,6 +2581,7 @@ def check_coverage_report(
         if not isinstance(base_digests, dict):
             base_digests = {}  # already named by validate_results_document
         _compare_committed_digests(rep, base_digests, errors)
+        _compare_committed_classifier(rep, baseline_doc, errors)
         base_corpora = baseline_doc.get("corpora", {}) if isinstance(baseline_doc, dict) else {}
         if not isinstance(base_corpora, dict):
             base_corpora = {}
@@ -2638,6 +2722,7 @@ def check_coverage_report(
                     )
                 else:
                     _compare_committed_digests(rep, base_digests, errors)
+                _compare_committed_classifier(rep, committed, errors)
         else:
             errors.append(
                 "Missing committed results file scripts/lcnf_coverage_results.json: "
@@ -2866,6 +2951,42 @@ class TestLcnfCoverage(unittest.TestCase):
             chk["errors"],
         )
 
+    def test_check_and_json_refuse_classifier_source_drift(self) -> None:
+        # The bridge-file digests pin only Lean sources, so an edit to the audit
+        # drivers or the Python facts path in this script passed `--json`
+        # against committed counts the edited code never produced (CI builds no
+        # Batteries tree to re-measure). The committed results pin
+        # `classifier_source_sha256`: a drifted or a missing pin fails both the
+        # `--check` path (`results=`) and the `--json` digest path.
+        self.assertIn(inspect.getsource(_classify_decl_facts), _classifier_source_texts())
+        self.assertIn(_LEAN_AUDIT_DRIVER_HEAD, _classifier_source_texts())
+        self.assertEqual(classifier_source_digest(), classifier_source_digest())
+        rep = self._v_fake_live_report()
+        baseline = self._v_committed_baseline()
+        baseline["schemaVersion"] = RESULTS_SCHEMA_VERSION
+        baseline["classifier_source_sha256"] = classifier_source_digest()
+        drifted = json.loads(json.dumps(baseline))
+        drifted["classifier_source_sha256"] = "0" * 64
+        dropped = json.loads(json.dumps(baseline))
+        del dropped["classifier_source_sha256"]
+
+        def gate_errors(errors: list[str]) -> list[str]:
+            return [e for e in errors if "classifier_source_sha256" in e or "Classifier source" in e]
+
+        self.assertEqual(gate_errors(check_coverage_report(ROOT_DIR, rep, results=baseline)["errors"]), [])
+        for doc in (drifted, dropped):
+            chk = check_coverage_report(ROOT_DIR, rep, results=doc)
+            self.assertFalse(chk["ok"])
+            self.assertTrue(gate_errors(chk["errors"]), chk["errors"])
+        with tempfile.TemporaryDirectory(prefix="lcnf-classifier-gate-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            committed = root / "scripts" / "lcnf_coverage_results.json"
+            for doc, want_gate_error in ((baseline, False), (drifted, True), (dropped, True)):
+                committed.write_text(json.dumps(doc), encoding="utf-8")
+                chk = check_coverage_report(root, rep, compare_results_digests=True)
+                self.assertEqual(bool(gate_errors(chk["errors"])), want_gate_error, chk["errors"])
+
     def test_executes_live_lean_lowerer_on_corpora(self) -> None:
         live = execute_live_lean_audit(ROOT_DIR)
         self.assertTrue(live["executed"], live)
@@ -3037,6 +3158,7 @@ class TestLcnfCoverage(unittest.TestCase):
         }
         return {
             "bridge_source_digests": _bridge_digests(ROOT_DIR),
+            "classifier_source_sha256": classifier_source_digest(),
             "lcnf_constructor_matrix": {
                 "rows": [],
                 "summary": {"total": 0, "proved": 0, "lowered_unproved": 0, "rejected": 0},
@@ -3609,7 +3731,11 @@ class TestLcnfCoverage(unittest.TestCase):
 
         m = sys.modules[__name__]
         rel = "lean/LeanNative/IR/Bridge.lean"
-        report = {"bridge_source_digests": {rel: {"actual_sha256": "0" * 64}}, "corpora": {}}
+        report = {
+            "bridge_source_digests": {rel: {"actual_sha256": "0" * 64}},
+            "classifier_source_sha256": "1" * 64,
+            "corpora": {},
+        }
         with mock.patch.object(m, "_git_head", return_value="a" * 40), mock.patch.object(
             m.subprocess, "run"
         ) as run:
@@ -3629,7 +3755,13 @@ class TestLcnfCoverage(unittest.TestCase):
         ) as run:
             run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
             doc = results_document(report, ROOT_DIR)
+            # A clean tree still refuses a report without the classifier digest.
+            unpinned = {k: v for k, v in report.items() if k != "classifier_source_sha256"}
+            with self.assertRaises(RuntimeError) as ctx:
+                results_document(unpinned, ROOT_DIR)
         self.assertEqual(doc["bridge_file_sha256"], {rel: "0" * 64})
+        self.assertEqual(doc["classifier_source_sha256"], "1" * 64)
+        self.assertIn("classifier_source_sha256", str(ctx.exception))
 
     def test_write_results_refuses_untracked_bridge_stray(self) -> None:
         # Round-2 F1, real temp git repo: an UNTRACKED `*.lean` directly under
