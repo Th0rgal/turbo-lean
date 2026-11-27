@@ -8,23 +8,38 @@
     "lean/LeanNative/IR/BridgeHelpers/StateAndIntrinsics.lean": "b0dcc03cf2c9b375ab51616a6526dea162bd607a8847df46b5a9637d3d4b7529",
     "lean/LeanNative/IR/BridgeHelpers/TypesAndSigs.lean": "1e6d6f4c07d6684435c11a64a672f89dc7a0c781271e5a04b45c8250828a2223",
     "lean/LeanNative/IR/RealLCNFBridge.lean": "cc32468508d6aa1bd2d907b0a2b5a3f1818082000729e38e551b37943d001848",
+    "lean/LeanNative/IR/RealLCNFCallSemantics.lean": "249d9abaf9f7826b0fbbc7eba1c9cb19fc88ce6039754caf23e0e419bc44104f",
     "lean/LeanNative/IR/RealLCNFSemantics.lean": "82bc8345586d1ecd333a778d7a25091b8938c69dacdffef53a9ff47c61e32c3e",
+    "lean/LeanNative/IR/RealLCNFShared.lean": "d00987d486ad389b209205ef63866cddb1c134235bf5eae2c96057c2cac4436e",
+    "lean/LeanNative/Proofs/LowerCalls.lean": "b2b84820ab7f369a48c3d9c5cb322efa87d03b94ddb8d12f7b6bc992fc4a9039",
+    "lean/LeanNative/Proofs/RealLCNFBridge/CallsF.lean": "95711b90b55b8aaacf40823b4a50ac095017a68d60569d69e1b22b3a7bd720ca",
+    "lean/LeanNative/Proofs/RealLCNFBridge/CtorIntrinsic.lean": "df7693a7c0d0dbc9f52b472b49a676bccbb8928fe36a4977b897ece60cd71876",
+    "lean/LeanNative/Proofs/RealLCNFBridge/CtorScalarCall.lean": "e8551c73ddb8b7d25411448f0361b0342c068400e1d0329c9d6e181091939d90",
+    "lean/LeanNative/Proofs/RealLCNFBridge/JpTag.lean": "20760222945e992cff8e7fdfddc57bf60435fc93d9fcec7933732b872f8b0aaf",
+    "lean/LeanNative/Proofs/RealLCNFBridge/LetValue.lean": "7c611157d0a664a6a060c7b8eb5a580a09b0586eaf02a94c2e566738386edd45",
+    "lean/LeanNative/Proofs/RealLCNFBridge/Scalar.lean": "5be25694dbcee0acd98ebeaf24e031d039ecb40f4989969a3420e151201a1d54",
+    "lean/LeanNative/Proofs/RealLCNFBridge/StateInv.lean": "a7463f07ddc459de94daf4dd1cba4f9015c4342d6dc0f3830a5d37ed8c790584",
+    "lean/LeanNative/Proofs/RealLCNFBridge/StepCases.lean": "2d88c3c0e835b24700f69f4cf1060e1bf76d5185dc2b388d7b1c6cd72553b41d",
+    "lean/LeanNative/Proofs/RealLCNFBridge/StepMono.lean": "100de2408f76c9fdda3bd1f15e0f38137d7b77b2c2efcd8b497b3bb8cf167386",
+    "lean/LeanNative/Proofs/RealLCNFBridge/UnaryCast.lean": "54d7db4cadfd202c0a823ba490a5f77d8de8801769bbc8b510b4e3387a1276c6",
     "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean": "3f0627ba90ef74acb3093cf4703ee18abf9380ba3752f01b5f9266b846f1bc4b"
   },
+  "classifier_source_sha256": "08e4fde1a4106f753b3b6379b5f118ad625608bf016929b50e071e3163a0bac4",
   "corpora": {
     "c1_corpus": {
       "compiler_aux_decls_excluded": 925,
-      "lowered_unproved": 98,
-      "proved": 782,
+      "lowered_unproved": 0,
+      "proved": 880,
       "rejected": 22,
       "rejected_not_lowered": 2,
       "rejected_not_lowered_reason": "mutual_cycle",
       "total_declarations": 902
     },
     "external_batteries": {
+      "commit_sha": "66e469188fe07963e5cf666c7d4433f45b8131c5",
       "compiler_aux_decls_excluded": 3472,
-      "lowered_unproved": 1060,
-      "proved": 59,
+      "lowered_unproved": 1066,
+      "proved": 53,
       "rejected": 9539,
       "rejected_not_lowered": 211,
       "rejected_not_lowered_reason": "mutual_cycle",
@@ -32,16 +47,16 @@
     },
     "std_init_and_c2": {
       "compiler_aux_decls_excluded": 817,
-      "lowered_unproved": 84,
-      "proved": 29,
+      "lowered_unproved": 65,
+      "proved": 48,
       "rejected": 1692,
       "rejected_not_lowered": 0,
       "rejected_not_lowered_reason": "mutual_cycle",
       "subcorpora": {
         "c2_lake_packages": {
           "compiler_aux_decls_excluded": 61,
-          "lowered_unproved": 19,
-          "proved": 13,
+          "lowered_unproved": 0,
+          "proved": 32,
           "rejected": 0,
           "rejected_not_lowered": 0,
           "rejected_not_lowered_reason": "mutual_cycle",
@@ -60,8 +75,8 @@
       "total_declarations": 1805
     }
   },
-  "measured_source_commit": "19ae99cd36c4dbe30f71a776f933e9258372081d",
-  "measured_source_commit_note": "`measured_source_commit` is the commit of the tree the measurement was taken from (recorded when `--write-results` ran, i.e. the parent of the commit that updates this file).",
-  "schemaVersion": "turbo-lean-lcnf-coverage-results-v3",
+  "measured_source_commit": "138b287609bc2785e34cfd630b8cdfbd58a09790",
+  "measured_source_commit_note": "`measured_source_commit` is the commit of the tree the measurement was taken from, recorded when `--write-results` ran.",
+  "schemaVersion": "turbo-lean-lcnf-coverage-results-v4",
   "toolchain": "leanprover/lean4:v4.35.0"
 }

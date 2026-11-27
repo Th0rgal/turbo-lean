@@ -1,14 +1,14 @@
 {
   "categoriesNote": "matrixConstructs/emphasis are syntactic selection markers (regexes over program source), chosen to exercise the lowered_unproved and rejected rows of the LCNF coverage matrix; they are not executed-lowering measurements. The executed classification is recorded per program by run_conformance_suite.py --tier C1.",
-  "detectorDigest": "abe7905f887e02546ede230580f4bc2cfa0e0688aff01ede87113d8a10248711",
+  "detectorDigest": "0620775227098bef9e91246412845b8094941415f47cd2aef7d1aa1b53c60c65",
   "emphasis": {
     "array_bytearray_sharing": {
-      "count": 67,
+      "count": 68,
       "pattern": "\\b(?:Array|ByteArray)\\b",
       "required": 30
     },
     "closures": {
-      "count": 171,
+      "count": 174,
       "pattern": "(?:\\bfun\\b|\u03bb)",
       "required": 40
     },
@@ -29,11 +29,13 @@
     }
   },
   "excludedTargets": {
-    "LetValue.fap.gf_simd": "GF(2^128)/BabyBear/Goldilocks SIMD intrinsic whitelist has no syntactic surface in upstream test files; the matrix row records 0 hits across Std/Init+C2, C1, and con-leche corpora."
+    "LetValue.const": "Pure-phase construct: toImpure rewrites it into the LetValue.fap / pap forms before the lowerer runs, so no declaration is refused because of it. The matrix row records rejected because L1 (81986e6a) deleted the pure-phase lowering; a program selected for a `Foo.bar` reference would exercise no rejected path.",
+    "LetValue.fap.gf_simd": "GF(2^128)/BabyBear/Goldilocks SIMD intrinsic whitelist has no syntactic surface in upstream test files; the matrix row records 0 hits across Std/Init+C2, C1, and con-leche corpora.",
+    "LetValue.proj": "Pure-phase construct: toImpure rewrites it into the LetValue.oproj / uproj / sproj forms before the lowerer runs, so no declaration is refused because of it. The matrix row records rejected because L1 (81986e6a) deleted the pure-phase lowering; a program selected for `.fst` / `.snd` would exercise no rejected path."
   },
   "matrixSource": {
     "committedResults": "scripts/lcnf_coverage_results.json",
-    "measuredSourceCommit": "19ae99cd36c4dbe30f71a776f933e9258372081d",
+    "measuredSourceCommit": "138b287609bc2785e34cfd630b8cdfbd58a09790",
     "spec": "scripts/lcnf_coverage.py"
   },
   "originNote": "roadmap names lean4/tests/lean/run; at the pinned rev (tag v4.35.0) upstream has reorganized the suite into test piles (tests/README.md), and the successor piles for the self-contained run tests are tests/elab and tests/compile. Paths are recorded as they exist at the pin.",
@@ -56,7 +58,6 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/compile/534.lean",
@@ -71,7 +72,6 @@
       "matrixConstructs": [
         "Code.fun",
         "LetValue.fap.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/compile/StackOverflowTask.lean",
@@ -91,8 +91,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/compile/arity_bug1.lean",
@@ -112,7 +110,6 @@
         "LetValue.ctor.general",
         "LetValue.pap",
         "LetValue.reset_reuse",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/compile/arrayMapIdxInPlace.lean",
@@ -127,7 +124,6 @@
       "matrixConstructs": [
         "LetValue.lit.str",
         "LetValue.ctor.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/compile/arrayMk.lean",
@@ -146,7 +142,6 @@
         "LetValue.ctor.general",
         "LetValue.pap",
         "LetValue.reset_reuse",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/compile/array_test.lean",
@@ -164,7 +159,6 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/compile/array_test2.lean",
@@ -178,147 +172,10 @@
       "importFree": true,
       "matrixConstructs": [
         "LetValue.ctor.general",
-        "LetValue.reset_reuse",
-        "LetValue.const"
+        "LetValue.reset_reuse"
       ],
       "path": "tests/compile/bytearray_bug.lean",
       "sha256": "a1c1618e9cd80412f703d6d0ff8bac56b63fe8182b70005fa8c152481aa621c6"
-    },
-    {
-      "bytes": 545,
-      "emphasis": [
-        "closures"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/compile/closure_bug1.lean",
-      "sha256": "cb4fd2b7fc146f7e62943abf6845b9465dca41ff9abc5c18746a8209d38b5e7b"
-    },
-    {
-      "bytes": 539,
-      "emphasis": [
-        "closures"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/compile/closure_bug2.lean",
-      "sha256": "187b66395a5a0748ca89a6a80e37946b99eb2537378eeb5dd1ff848702e7efb4"
-    },
-    {
-      "bytes": 534,
-      "emphasis": [
-        "closures"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/compile/closure_bug3.lean",
-      "sha256": "f4d06bc8ee7dde48cd92e8a8c54ce0b35a49d1c6271163dd4fb8a577b1e24b94"
-    },
-    {
-      "bytes": 529,
-      "emphasis": [
-        "closures"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/compile/closure_bug4.lean",
-      "sha256": "ec3f89b85967b77fe265ae2bd2c71222c6fbdd613309ab8b9f14b45582e1200d"
-    },
-    {
-      "bytes": 541,
-      "emphasis": [
-        "closures"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/compile/closure_bug5.lean",
-      "sha256": "1b5458608e9ef2f814b8dae7ebfc0c01aa2583b43eead71fd579080b88cca3c1"
-    },
-    {
-      "bytes": 512,
-      "emphasis": [
-        "closures"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/compile/closure_bug6.lean",
-      "sha256": "024ddc06586bd07ded5ce8654ea8c3f59a8d9803984865f169d3029608a45d75"
-    },
-    {
-      "bytes": 508,
-      "emphasis": [
-        "closures"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/compile/closure_bug7.lean",
-      "sha256": "678d7543d2f609bb6b1384b52597c443bc1c5f95a5de21eef9f3aa1c899650f3"
-    },
-    {
-      "bytes": 504,
-      "emphasis": [
-        "closures"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/compile/closure_bug8.lean",
-      "sha256": "6c278e83e260f998c0121cb0bac88b8e81cea092ff1969b8cd69f8f906eaf759"
     },
     {
       "bytes": 418,
@@ -331,7 +188,6 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.fap.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/compile/extractClosedMutualBlock.lean",
@@ -350,8 +206,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/compile/float.lean",
@@ -368,8 +222,6 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.fap.general",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/compile/float_cases_bug.lean",
@@ -387,7 +239,6 @@
         "LetValue.ctor.general",
         "LetValue.pap",
         "LetValue.reset_reuse",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/compile/init.lean",
@@ -407,7 +258,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/compile/lazylist.lean",
@@ -424,7 +274,6 @@
         "Code.fun",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/compile/map_big.lean",
@@ -442,8 +291,6 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.reset_reuse",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/compile/overflow1.lean",
@@ -461,46 +308,10 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.reset_reuse",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/compile/overflow2.lean",
       "sha256": "b6d4f3cc27e9204baf3a0f6c2379c0b77b8871b3fbf6614efaee35d059d454d2"
-    },
-    {
-      "bytes": 450,
-      "emphasis": [
-        "array_bytearray_sharing"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "LetValue.reset_reuse",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/compile/overflow3.lean",
-      "sha256": "7c48d5941faf69709b4f4cef4cbfc2f96afd33ed6048b2e7e5bdc7d084fd7ddd"
-    },
-    {
-      "bytes": 533,
-      "emphasis": [
-        "closures"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/compile/reduceArity_overapp.lean",
-      "sha256": "a3296fecbdec1dd8d41d8606bed4e6a70f2d62c7ef093b5d4706e05930ff0c8c"
     },
     {
       "bytes": 3474,
@@ -514,7 +325,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.fap.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/compile/t4.lean",
@@ -531,7 +341,6 @@
         "Code.fun",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/compile/thunk.lean",
@@ -546,7 +355,6 @@
       "matrixConstructs": [
         "Code.jp.recursive",
         "LetValue.ctor.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/1020.lean",
@@ -574,8 +382,7 @@
       "importFree": true,
       "matrixConstructs": [
         "LetValue.ctor.general",
-        "LetValue.pap",
-        "LetValue.const"
+        "LetValue.pap"
       ],
       "path": "tests/elab/11778.lean",
       "sha256": "e8fccdec2a0384565dc6effe887259a63f564bdccb070114c299562e0152b2bf"
@@ -593,7 +400,6 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/125.lean",
@@ -607,8 +413,7 @@
       "importFree": true,
       "matrixConstructs": [
         "Code.fun",
-        "LetValue.ctor.general",
-        "LetValue.const"
+        "LetValue.ctor.general"
       ],
       "path": "tests/elab/12676.lean",
       "sha256": "ed4db3660dfdffed31312c639359e12c584cac5d99a3fd24b1f58adc35c3dcae"
@@ -628,7 +433,6 @@
         "LetValue.ctor.general",
         "LetValue.pap",
         "LetValue.reset_reuse",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/1293.lean",
@@ -669,7 +473,6 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.fap.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/1650.lean",
@@ -684,8 +487,7 @@
       "matrixConstructs": [
         "Code.fun",
         "LetValue.fvar.app",
-        "LetValue.ctor.general",
-        "LetValue.const"
+        "LetValue.ctor.general"
       ],
       "path": "tests/elab/1674.lean",
       "sha256": "ee2ee897756fe57de74e8e019f4159eb166971b7c0714bdd44cb0b6a377cd1d3"
@@ -713,7 +515,6 @@
         "LetValue.lit.str",
         "LetValue.fvar.app",
         "LetValue.ctor.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/1725.lean",
@@ -740,28 +541,10 @@
       "importFree": true,
       "matrixConstructs": [
         "LetValue.ctor.general",
-        "LetValue.pap",
-        "LetValue.const"
+        "LetValue.pap"
       ],
       "path": "tests/elab/1812.lean",
       "sha256": "8ea4fa3d6400950337b36a2d6f24871161afae488a2f92521a7f953796e7e83f"
-    },
-    {
-      "bytes": 825,
-      "emphasis": [
-        "closures"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.lit.str",
-        "LetValue.fvar.app",
-        "LetValue.ctor.general",
-        "LetValue.proj",
-        "LetValue.const"
-      ],
-      "path": "tests/elab/1856.lean",
-      "sha256": "a55238551b7872fe3708af73b17af21acb09803dbc96544abee9608566840f26"
     },
     {
       "bytes": 239,
@@ -788,7 +571,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/2461.lean",
@@ -808,8 +590,6 @@
         "Code.fun",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/2670.lean",
@@ -826,7 +606,6 @@
         "LetValue.lit.str",
         "LetValue.fvar.app",
         "LetValue.ctor.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/28.lean",
@@ -841,11 +620,26 @@
       "matrixConstructs": [
         "LetValue.fvar.app",
         "LetValue.ctor.general",
-        "LetValue.pap",
-        "LetValue.const"
+        "LetValue.pap"
       ],
       "path": "tests/elab/281.lean",
       "sha256": "63f88c3501b6e2eeb7dd6e500711339783a404f460e6e5694cb1017aafc9f6d5"
+    },
+    {
+      "bytes": 2702,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.lit.str",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/3031.lean",
+      "sha256": "e434a14261519bc1db8234ae92657a91fa3d02f216a2cdc552f4d2cd7bc15e63"
     },
     {
       "bytes": 555,
@@ -873,50 +667,10 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/3965.lean",
       "sha256": "ea98261383a3d1e9627f8e654aa0f08026b483c0827e9b788fe3982a300454da"
-    },
-    {
-      "bytes": 721,
-      "emphasis": [
-        "closures",
-        "pap_partial_application",
-        "array_bytearray_sharing"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.ctor.general",
-        "LetValue.fap.general",
-        "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const"
-      ],
-      "path": "tests/elab/4051.lean",
-      "sha256": "f34963151917c2914634c703a9cbd7fabe5f7624f48ddf8ded9e55271d6aebb9"
-    },
-    {
-      "bytes": 19585,
-      "emphasis": [
-        "closures",
-        "pap_partial_application"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/elab/4171.lean",
-      "sha256": "97d13f95f8b83f674cbe859b390898b9c32b674a4b856d6653693b22248e1c46"
     },
     {
       "bytes": 840,
@@ -929,7 +683,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.fap.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/4320.lean",
@@ -942,30 +695,10 @@
       ],
       "importFree": true,
       "matrixConstructs": [
-        "Code.fun",
-        "LetValue.const"
+        "Code.fun"
       ],
       "path": "tests/elab/4375.lean",
       "sha256": "fadf7f103fb69dc51df3a8f22dccf93c2e6062cdde0c29f017d2b16cc0c4c6fb"
-    },
-    {
-      "bytes": 8677,
-      "emphasis": [
-        "closures",
-        "pap_partial_application"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/elab/4595_slowdown.lean",
-      "sha256": "0998dd1c1df487fc5d8a8aaba52ad2f3abe238c4701fb1c2b0b3e378ef092ed4"
     },
     {
       "bytes": 165,
@@ -1007,7 +740,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/6123_cat_adjunction.lean",
@@ -1026,7 +758,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/6123_mod_cast.lean",
@@ -1058,8 +789,6 @@
         "LetValue.lit.str",
         "LetValue.fvar.app",
         "LetValue.ctor.general",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/633.lean",
@@ -1079,8 +808,6 @@
         "LetValue.ctor.general",
         "LetValue.pap",
         "LetValue.reset_reuse",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/6332.lean",
@@ -1101,7 +828,6 @@
         "LetValue.ctor.general",
         "LetValue.pap",
         "LetValue.reset_reuse",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/646.lean",
@@ -1117,7 +843,6 @@
         "Code.jp.recursive",
         "LetValue.ctor.general",
         "LetValue.fap.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/6694.lean",
@@ -1158,8 +883,7 @@
       ],
       "importFree": true,
       "matrixConstructs": [
-        "Code.jp.recursive",
-        "LetValue.const"
+        "Code.jp.recursive"
       ],
       "path": "tests/elab/7073.lean",
       "sha256": "9ad23b72dfa4795c060d7d3411c4259040edf2e80041190be8d6929bf4edf0ec"
@@ -1172,8 +896,7 @@
       "importFree": true,
       "matrixConstructs": [
         "Code.fun",
-        "LetValue.ctor.general",
-        "LetValue.const"
+        "LetValue.ctor.general"
       ],
       "path": "tests/elab/753.lean",
       "sha256": "70e2b333852ec4c210f2ed88cfcfc4a7a225f1902e947bfb76e4e11482d5e3db"
@@ -1188,7 +911,6 @@
         "Code.jp.recursive",
         "LetValue.ctor.general",
         "LetValue.fap.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/860.lean",
@@ -1201,9 +923,7 @@
       ],
       "importFree": true,
       "matrixConstructs": [
-        "Code.fun",
-        "LetValue.proj",
-        "LetValue.const"
+        "Code.fun"
       ],
       "path": "tests/elab/9089.lean",
       "sha256": "fb0404f3c15c96921fe890ead6d8f1ddb712d7e4b8875f9f8c7057ebb8253171"
@@ -1220,8 +940,6 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/946.lean",
@@ -1235,11 +953,28 @@
       "importFree": true,
       "matrixConstructs": [
         "Code.fun",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/9806.lean",
       "sha256": "43cef5f6451ecac6e817f2382844dbe5a5e4d4cd96ed31cef6143b3c87657767"
+    },
+    {
+      "bytes": 487,
+      "emphasis": [
+        "closures",
+        "pap_partial_application",
+        "array_bytearray_sharing"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.pap",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/Daniel1.lean",
+      "sha256": "c1c597f33db74aadd2f31dd995fa8b25eaa06e56a4e1b19288b6bb9302830b98"
     },
     {
       "bytes": 690,
@@ -1253,7 +988,6 @@
         "LetValue.lit.str",
         "LetValue.fvar.app",
         "LetValue.ctor.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/IRbug.lean",
@@ -1270,11 +1004,26 @@
         "LetValue.lit.str",
         "LetValue.fvar.app",
         "LetValue.ctor.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/MonadControl_tutorial.lean",
       "sha256": "caad7e927c89c9814c40d795a32afeb323208accd18d572fbafb91acdba48d95"
+    },
+    {
+      "bytes": 689,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.pap",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/Reid1.lean",
+      "sha256": "562b2014c3005f0659a10d2a3539eb35b71fcd96f0caa9d1351540d0e1b9bfff"
     },
     {
       "bytes": 10384,
@@ -1289,8 +1038,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/aStructPerfIssue.lean",
@@ -1310,7 +1057,6 @@
         "LetValue.ctor.general",
         "LetValue.pap",
         "LetValue.reset_reuse",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/array1.lean",
@@ -1325,8 +1071,7 @@
       "importFree": true,
       "matrixConstructs": [
         "LetValue.ctor.general",
-        "LetValue.pap",
-        "LetValue.const"
+        "LetValue.pap"
       ],
       "path": "tests/elab/array_map_module.lean",
       "sha256": "031cd4a78d117070a5bae73098c7761b4dbd947e55046d129de078d0a86323a3"
@@ -1340,8 +1085,7 @@
       "importFree": true,
       "matrixConstructs": [
         "Code.fun",
-        "LetValue.ctor.general",
-        "LetValue.const"
+        "LetValue.ctor.general"
       ],
       "path": "tests/elab/array_offn_module.lean",
       "sha256": "6a26ac4621b049904b552fc91b6518be5fd7c6dab280cf629aecec59847e0de7"
@@ -1372,6 +1116,22 @@
       "sha256": "7231d2f96a4fc0594a7b0ca3990f1b9752b1d2bcb3894d28c5a446ac4c04f4d2"
     },
     {
+      "bytes": 1825,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.fap.general",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/binrec.lean",
+      "sha256": "c74af17b3ecd06ece08c37f17bb0aadf97f6272d011008daa48bd07b1e73290f"
+    },
+    {
       "bytes": 441,
       "emphasis": [
         "closures",
@@ -1384,12 +1144,26 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.reset_reuse",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/binsearch.lean",
       "sha256": "aa19a201c247fd99734d107ca2970c94adbeea5283d193f11a7345aee837b974"
+    },
+    {
+      "bytes": 1823,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.pap",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/bintreeGoal.lean",
+      "sha256": "7bd5e4ed4dfe05db90bb7c372ab9740b851e88331c73edfb3ff6e23173aebd46"
     },
     {
       "bytes": 200,
@@ -1398,8 +1172,7 @@
       ],
       "importFree": true,
       "matrixConstructs": [
-        "Code.fun",
-        "LetValue.const"
+        "Code.fun"
       ],
       "path": "tests/elab/casesOnAcc.lean",
       "sha256": "db1b63388b7eb624f9b0912e28c1274fb2c0a1dc5bf6f33f0a7755602daa0c1e"
@@ -1417,8 +1190,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/cdotTests.lean",
@@ -1445,8 +1216,7 @@
       "importFree": true,
       "matrixConstructs": [
         "Code.jp.recursive",
-        "Code.fun",
-        "LetValue.const"
+        "Code.fun"
       ],
       "path": "tests/elab/checkAssignmentIssue.lean",
       "sha256": "a0705d9302a06334122c3ea465e33baac2a7ca5b703608bd70b00567b1024729"
@@ -1494,7 +1264,6 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/coeIssue3.lean",
@@ -1513,7 +1282,6 @@
         "LetValue.ctor.general",
         "LetValue.pap",
         "LetValue.reset_reuse",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/coeIssues4.lean",
@@ -1529,7 +1297,6 @@
       "matrixConstructs": [
         "Code.fun",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/coeSort1.lean",
@@ -1551,24 +1318,6 @@
       "sha256": "ed046789b43c59916fe472023bc59a7d7b13ceab1844d840f615f149b0371670"
     },
     {
-      "bytes": 6137,
-      "emphasis": [
-        "closures"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.fvar.app",
-        "LetValue.ctor.general",
-        "LetValue.fap.general",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/elab/coinductive_predicates.lean",
-      "sha256": "40daf98c212913028a93033b5c7c77196e5e36994fe17ca689281101cf37bcc4"
-    },
-    {
       "bytes": 8105,
       "emphasis": [
         "closures"
@@ -1580,8 +1329,7 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.fap.general",
-        "LetValue.reset_reuse",
-        "LetValue.const"
+        "LetValue.reset_reuse"
       ],
       "path": "tests/elab/coinductive_syntax.lean",
       "sha256": "cd166e6cf6c9362966bfc079e5711ecb782e1a8b58c5ad6f1e210429c11b2793"
@@ -1599,7 +1347,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/combinatorsAndWF.lean",
@@ -1616,8 +1363,6 @@
         "LetValue.lit.str",
         "LetValue.fvar.app",
         "LetValue.ctor.general",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/compatibleTypesEtaIssue.lean",
@@ -1648,7 +1393,6 @@
         "LetValue.lit.str",
         "LetValue.fvar.app",
         "LetValue.ctor.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/concatElim.lean",
@@ -1667,8 +1411,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/constProp.lean",
@@ -1685,6 +1427,22 @@
       ],
       "path": "tests/elab/convPatternMatchIssue.lean",
       "sha256": "cd133a8243d1a872214234f52841101e15de680ebcfdacf1d4842fec018bf0c5"
+    },
+    {
+      "bytes": 1892,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.lit.str",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/deBruijn.lean",
+      "sha256": "c5aa8342f27e2806aef548a539d71c762a3530dbcc4aa97ffca9d66c3be0d85a"
     },
     {
       "bytes": 105,
@@ -1725,7 +1483,6 @@
       "matrixConstructs": [
         "Code.jp.recursive",
         "LetValue.fap.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/defaultEliminator.lean",
@@ -1743,8 +1500,7 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.fap.general",
-        "LetValue.pap",
-        "LetValue.const"
+        "LetValue.pap"
       ],
       "path": "tests/elab/derivingHashable.lean",
       "sha256": "77652335aafbf37379135bd5668d9b870077c4bb46e749f6ee08d72589b902f8"
@@ -1761,7 +1517,6 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/diamond2.lean",
@@ -1775,8 +1530,7 @@
       "importFree": true,
       "matrixConstructs": [
         "LetValue.ctor.general",
-        "LetValue.pap",
-        "LetValue.const"
+        "LetValue.pap"
       ],
       "path": "tests/elab/diamond3.lean",
       "sha256": "babec17c0867d2f8650379e33939ddc0110b08b0d0828e86b6ae4dd1f88723d2"
@@ -1790,8 +1544,7 @@
       "importFree": true,
       "matrixConstructs": [
         "Code.jp.recursive",
-        "LetValue.ctor.general",
-        "LetValue.const"
+        "LetValue.ctor.general"
       ],
       "path": "tests/elab/doMatchDiscrDep.lean",
       "sha256": "e37625498ad9c58d8304a9fc243186e0e7b94efc8e4c2c49e7c02279c713348d"
@@ -1809,8 +1562,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/doNotation1.lean",
@@ -1828,7 +1579,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.fap.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/doNotation2.lean",
@@ -1846,7 +1596,6 @@
         "LetValue.lit.str",
         "LetValue.fvar.app",
         "LetValue.ctor.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/doNotation3.lean",
@@ -1867,8 +1616,6 @@
         "LetValue.ctor.general",
         "LetValue.pap",
         "LetValue.reset_reuse",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/do_for_loop_levenstein_compiler_test.lean",
@@ -1885,7 +1632,6 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/dofun_prec.lean",
@@ -1930,12 +1676,27 @@
       "matrixConstructs": [
         "Code.fun",
         "LetValue.ctor.general",
-        "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const"
+        "LetValue.pap"
       ],
       "path": "tests/elab/doubleReset.lean",
       "sha256": "fe2ad857ab977818e21e7b2bcc09e6403378fb6093c35906320a3817f85bf4db"
+    },
+    {
+      "bytes": 838,
+      "emphasis": [
+        "closures",
+        "array_bytearray_sharing"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.pap",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/eagerCoeExpansion.lean",
+      "sha256": "0cc35fae680d3798f847ca220391caca95ba31c5e3d862fdfc7b2e24c46b85c8"
     },
     {
       "bytes": 150,
@@ -1944,8 +1705,7 @@
       ],
       "importFree": true,
       "matrixConstructs": [
-        "LetValue.ctor.general",
-        "LetValue.const"
+        "LetValue.ctor.general"
       ],
       "path": "tests/elab/eraseReps.lean",
       "sha256": "ccbe2984b877dddd934a942d4eba304b6baa2769133700d131de225e27e850bf"
@@ -1975,7 +1735,6 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/fib_correct.lean",
@@ -1989,11 +1748,27 @@
       "importFree": true,
       "matrixConstructs": [
         "LetValue.fvar.app",
-        "LetValue.pap",
-        "LetValue.const"
+        "LetValue.pap"
       ],
       "path": "tests/elab/fieldAutoBound.lean",
       "sha256": "3f4910649671550591badac63058ec2075e5670302ad06a33fcf2f826ebfb66e"
+    },
+    {
+      "bytes": 1699,
+      "emphasis": [
+        "closures",
+        "pap_partial_application"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.lit.str",
+        "LetValue.ctor.general",
+        "LetValue.pap",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/filePath.lean",
+      "sha256": "83b77e52822633a5cd8fae8fe950ee481c01918cfda4c10fa2805cb6f73190ab"
     },
     {
       "bytes": 74,
@@ -2005,8 +1780,7 @@
       "matrixConstructs": [
         "Code.fun",
         "LetValue.ctor.general",
-        "LetValue.pap",
-        "LetValue.const"
+        "LetValue.pap"
       ],
       "path": "tests/elab/filter.lean",
       "sha256": "6b81d457dc2bbcdf9459d36977685a3747ba1c6e8eb09bc20bde357837178e0d"
@@ -2020,8 +1794,7 @@
       "importFree": true,
       "matrixConstructs": [
         "Code.fun",
-        "LetValue.pap",
-        "LetValue.const"
+        "LetValue.pap"
       ],
       "path": "tests/elab/finFoldKernelReduce.lean",
       "sha256": "d178302dea58d793784aff5d4eb9b973f5a56720fd82bfe422e650f0d45f0d8e"
@@ -2033,8 +1806,7 @@
       ],
       "importFree": true,
       "matrixConstructs": [
-        "LetValue.pap",
-        "LetValue.const"
+        "LetValue.pap"
       ],
       "path": "tests/elab/fin_addNat_module.lean",
       "sha256": "b9b716693067811a90257711b7e519b8ae8cc691908289ac43ea882aa9537338"
@@ -2061,7 +1833,6 @@
       "matrixConstructs": [
         "LetValue.lit.str",
         "Type.signed_scalars",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/float_conversions.lean",
@@ -2079,11 +1850,26 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/funind_demo.lean",
       "sha256": "4bba76dab70de5ca4b035d8a14c882666f56c194012ef6693f25fd2692bdecba"
+    },
+    {
+      "bytes": 1834,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.fap.general",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/funind_fewer_levels.lean",
+      "sha256": "1aa00087be7e52c8aa9d663f7f8bf44973c40bc4e136e936822d7277d2dbeff6"
     },
     {
       "bytes": 2544,
@@ -2098,7 +1884,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/funind_mutual_dep.lean",
@@ -2119,7 +1904,6 @@
         "LetValue.ctor.general",
         "LetValue.pap",
         "LetValue.reset_reuse",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/getElemV.lean",
@@ -2137,31 +1921,10 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/grind_11086.lean",
       "sha256": "79841c3cecbcbe0c54d24c032263088e60ac52302c245695af350e8859697c4e"
-    },
-    {
-      "bytes": 4850,
-      "emphasis": [
-        "closures",
-        "pap_partial_application"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.fvar.app",
-        "LetValue.ctor.general",
-        "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/elab/grind_11124.lean",
-      "sha256": "dbdde408980ef07ebbe37460f49d6523da79b34fcf6c8b5fc604d639da527c65"
     },
     {
       "bytes": 7578,
@@ -2176,7 +1939,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/grind_11545.lean",
@@ -2192,8 +1954,7 @@
       "matrixConstructs": [
         "Code.fun",
         "LetValue.ctor.general",
-        "LetValue.pap",
-        "LetValue.const"
+        "LetValue.pap"
       ],
       "path": "tests/elab/grind_9899.lean",
       "sha256": "b99b5bdb84fd7e46846ac5a6b5ca423e2480427dff04a504799707ee2becf0be"
@@ -2223,8 +1984,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/grind_cat.lean",
@@ -2243,7 +2002,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/grind_cat2.lean",
@@ -2261,8 +2019,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/grind_constProp.lean",
@@ -2275,8 +2031,7 @@
       ],
       "importFree": true,
       "matrixConstructs": [
-        "Type.signed_scalars",
-        "LetValue.const"
+        "Type.signed_scalars"
       ],
       "path": "tests/elab/grind_cutsat_toint_1.lean",
       "sha256": "852e931a0b467f436d8c903e1011d0a28b1d85aea5a437ab2627db62a46234b5"
@@ -2306,7 +2061,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.reset_reuse",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/grind_guide.lean",
@@ -2325,7 +2079,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.reset_reuse",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/grind_interactive.lean",
@@ -2338,8 +2091,7 @@
       ],
       "importFree": true,
       "matrixConstructs": [
-        "Type.signed_scalars",
-        "LetValue.const"
+        "Type.signed_scalars"
       ],
       "path": "tests/elab/grind_lit_canon.lean",
       "sha256": "524b117ca0d4709ac8fc9477cc119f94ac1f897a41f9177662b47f75a018abd3"
@@ -2392,8 +2144,6 @@
         "LetValue.lit.str",
         "LetValue.fvar.app",
         "LetValue.ctor.general",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/grind_reducible.lean",
@@ -2415,7 +2165,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/grind_regression.lean",
@@ -2434,8 +2183,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/grind_t1.lean",
@@ -2449,8 +2196,7 @@
       "importFree": true,
       "matrixConstructs": [
         "LetValue.ctor.general",
-        "LetValue.reset_reuse",
-        "LetValue.const"
+        "LetValue.reset_reuse"
       ],
       "path": "tests/elab/haveI.lean",
       "sha256": "c15b5e9ba9fb07d694bec58def76488e9e7e47cd0c8605b3ce48c9f03e61cbe7"
@@ -2470,8 +2216,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.reset_reuse",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/heapSort.lean",
@@ -2490,21 +2234,22 @@
       "sha256": "cc19a3325458533c7e7e353cab152d2871902f2220b7b0a8e298729b62d4bd59"
     },
     {
-      "bytes": 782,
+      "bytes": 1647,
       "emphasis": [
-        "pap_partial_application"
+        "closures",
+        "pap_partial_application",
+        "array_bytearray_sharing"
       ],
       "importFree": true,
       "matrixConstructs": [
-        "LetValue.fvar.app",
+        "Code.fun",
+        "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
-      "path": "tests/elab/ifThenElseIssue.lean",
-      "sha256": "c86a1fda9db80e04163332a84bbb623f61aa60b85b05a5331a931df809ad0711"
+      "path": "tests/elab/ifThenElseIssue2.lean",
+      "sha256": "6ea6025b3c849bfcfffd743466caa3eb33765016fd570a7de7113ded106d8338"
     },
     {
       "bytes": 1247,
@@ -2533,11 +2278,26 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/ind_whnf.lean",
       "sha256": "4fd728c11a2cd3bb054b485b1ddcbef7243b49b7e2830d5df81ec2cc5c12088a"
+    },
+    {
+      "bytes": 2050,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.lit.str",
+        "LetValue.ctor.general",
+        "LetValue.fap.general",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/interp.lean",
+      "sha256": "b517907ce6fab3d214c8bedcab7e5d2e976c7f9b96fe5a9f7d844bf9ddcd1285"
     },
     {
       "bytes": 2052,
@@ -2551,7 +2311,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.reset_reuse",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/interp2.lean",
@@ -2584,29 +2343,13 @@
       "sha256": "3015bb45a41d08b9e7998ced79deb49db22d6743696bbd2c66c0179fc691273c"
     },
     {
-      "bytes": 695,
-      "emphasis": [],
-      "importFree": true,
-      "matrixConstructs": [
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "LetValue.fap.general",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/elab/isDefEqProjPerfIssue.lean",
-      "sha256": "5b2bda348e1701265019d154ec5525fb12c5cce838dff0ce9f67e93e8894235a"
-    },
-    {
       "bytes": 181,
       "emphasis": [
         "closures"
       ],
       "importFree": true,
       "matrixConstructs": [
-        "Code.fun",
-        "LetValue.const"
+        "Code.fun"
       ],
       "path": "tests/elab/issue10299.lean",
       "sha256": "e270a16d0b75ca22a5db88894a44d55a5214dd35c0056690c9f95939acbaae68"
@@ -2624,7 +2367,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/issue10573.lean",
@@ -2668,8 +2410,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.fap.general",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/issue13015.lean",
@@ -2690,7 +2430,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/issue2981.lean",
@@ -2709,8 +2448,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/issue4671.lean",
@@ -2744,6 +2481,22 @@
       "sha256": "d9d54fef59ecd2451505e3a4656d7b88d884587e0cf827dc60172651defd5dc8"
     },
     {
+      "bytes": 1866,
+      "emphasis": [
+        "pap_partial_application"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.fap.general",
+        "LetValue.pap",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/issue5767.lean",
+      "sha256": "1dcb4a494044722919a58e53bf92381c56a58f7d047111cab685431cf2f65325"
+    },
+    {
       "bytes": 1960,
       "emphasis": [
         "closures",
@@ -2757,7 +2510,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/issue5836.lean",
@@ -2800,8 +2552,7 @@
       "matrixConstructs": [
         "LetValue.fvar.app",
         "LetValue.ctor.general",
-        "LetValue.pap",
-        "LetValue.const"
+        "LetValue.pap"
       ],
       "path": "tests/elab/issue8360.lean",
       "sha256": "455a41cbf6318cbe048a166812d3279c5edb1912ad0158a5aedf685d410f6aeb"
@@ -2816,7 +2567,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/lambdaLiftCache.lean",
@@ -2834,7 +2584,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/lcnfCache.lean",
@@ -2853,8 +2602,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/lcnfCastIssue.lean",
@@ -2871,7 +2618,6 @@
         "LetValue.lit.str",
         "LetValue.fvar.app",
         "LetValue.ctor.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/lcnfInliningIssue.lean",
@@ -2929,7 +2675,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/linearCategory_perf_issue.lean",
@@ -2968,8 +2713,7 @@
       "importFree": true,
       "matrixConstructs": [
         "LetValue.ctor.general",
-        "LetValue.pap",
-        "LetValue.const"
+        "LetValue.pap"
       ],
       "path": "tests/elab/mapTR.lean",
       "sha256": "9a4307e4fbf33d2b6ea3469cfad0e2d2a06493313655fef94759ca12fa15ee65"
@@ -2987,7 +2731,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.fap.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/match1.lean",
@@ -3005,7 +2748,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/matchCongrEqns.lean",
@@ -3022,28 +2764,10 @@
         "Code.fun",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.proj",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/matchDiscrType.lean",
       "sha256": "b84662fdb06f21d97bac1745ab21d9931d529e249ed86d95d5487b50adccaa99"
-    },
-    {
-      "bytes": 623,
-      "emphasis": [
-        "closures"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.ctor.general",
-        "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/elab/matchNoPostponing.lean",
-      "sha256": "d9e8778f8c77f542fca23507390cd10a56e23d861d4b4f98771d06b0693d5507"
     },
     {
       "bytes": 100,
@@ -3064,11 +2788,26 @@
       ],
       "importFree": true,
       "matrixConstructs": [
-        "Code.fun",
-        "LetValue.const"
+        "Code.fun"
       ],
       "path": "tests/elab/matchPatternPartialApp.lean",
       "sha256": "d13b972d110b74c41eac433bce3851634adbfcf3752039f44de7ce5e2d0ffcc9"
+    },
+    {
+      "bytes": 1701,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.lit.str",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/matrix.lean",
+      "sha256": "a6b79a1ab274ff314f8d89f21a836da4720838a5ae00dcb5db6756e98241cfb1"
     },
     {
       "bytes": 99,
@@ -3086,6 +2825,22 @@
       "sha256": "b657d8ae2e9b1a6b7fbaf2da563f1884e36387aca2eb2a7d7995bce0b19d4fcf"
     },
     {
+      "bytes": 1418,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.lit.str",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/monadControl.lean",
+      "sha256": "5e4036d69306e4ab2cba7c808fe464881958fe65b4f9e1e51837b6fe9bad55df"
+    },
+    {
       "bytes": 2370,
       "emphasis": [
         "letrec"
@@ -3094,11 +2849,27 @@
       "matrixConstructs": [
         "Code.jp.recursive",
         "LetValue.ctor.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/multiTargetCasesInductionIssue.lean",
       "sha256": "096a9f32ea2d4db5a00ea7ab7c198c44672c8c2a25038f0850a89192b13db921"
+    },
+    {
+      "bytes": 1885,
+      "emphasis": [
+        "closures",
+        "pap_partial_application"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.ctor.general",
+        "LetValue.fap.general",
+        "LetValue.pap",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/mutualDefThms.lean",
+      "sha256": "53235833e66d99132708678cbb42c1f0e7bccbb12e35749b201c448e548cd6db"
     },
     {
       "bytes": 152,
@@ -3125,12 +2896,27 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/nested_inductive.lean",
       "sha256": "4b7f319094fac65a49597df97149c22e73c9489dd6fbd06a2b7962015516b59b"
+    },
+    {
+      "bytes": 376,
+      "emphasis": [
+        "closures",
+        "pap_partial_application"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.fap.general",
+        "LetValue.pap"
+      ],
+      "path": "tests/elab/nested_match_bug.lean",
+      "sha256": "802850188881bc41b82698532d19a15ff7a2a3d655164a6c4a4322388a3ada04"
     },
     {
       "bytes": 1613,
@@ -3145,8 +2931,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/new_compiler.lean",
@@ -3167,7 +2951,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/newfrontend1.lean",
@@ -3185,7 +2968,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.proj",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/newfrontend3.lean",
@@ -3203,8 +2985,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/no_grind_constProp.lean",
@@ -3223,7 +3003,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/nomatch_regression.lean",
@@ -3241,7 +3020,6 @@
         "LetValue.lit.str",
         "LetValue.fvar.app",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/notationDelab.lean",
@@ -3254,29 +3032,10 @@
       ],
       "importFree": true,
       "matrixConstructs": [
-        "Type.signed_scalars",
-        "LetValue.const"
+        "Type.signed_scalars"
       ],
       "path": "tests/elab/ofIntClamp.lean",
       "sha256": "dc338b65dbbc50961df8b83393574f64ef4e7b309a507987b9b9a28ff68b47ff"
-    },
-    {
-      "bytes": 22328,
-      "emphasis": [
-        "pap_partial_application"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "LetValue.fvar.app",
-        "LetValue.ctor.general",
-        "LetValue.fap.general",
-        "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/elab/omega.lean",
-      "sha256": "b3a5217392aea318d73758d267b24ba83c5cc6bc293b4dee1caf4370b139a8d6"
     },
     {
       "bytes": 1177,
@@ -3292,8 +3051,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/overAndPartialAppsAtWF.lean",
@@ -3328,7 +3085,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/partial_fixpoint.lean",
@@ -3347,31 +3103,10 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/partial_fixpoint_induct.lean",
       "sha256": "2ca10982c97d0c4c3b51d64a42c229f5e807c2e45d7bad306ed7916296d92a14"
-    },
-    {
-      "bytes": 8323,
-      "emphasis": [
-        "closures",
-        "pap_partial_application",
-        "array_bytearray_sharing"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "LetValue.fap.general",
-        "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const"
-      ],
-      "path": "tests/elab/postprocess_traces.lean",
-      "sha256": "19490448debf0341dc5905c99aa60a4e06a7fab179df43709a5c04fa2798b928"
     },
     {
       "bytes": 173,
@@ -3397,7 +3132,6 @@
         "LetValue.lit.str",
         "LetValue.fvar.app",
         "LetValue.ctor.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/pullInstancesDecidable.lean",
@@ -3414,7 +3148,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.fap.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/rc_tests.lean",
@@ -3433,7 +3166,6 @@
         "LetValue.ctor.general",
         "LetValue.pap",
         "LetValue.reset_reuse",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/ref1.lean",
@@ -3446,8 +3178,7 @@
       ],
       "importFree": true,
       "matrixConstructs": [
-        "Code.fun",
-        "LetValue.const"
+        "Code.fun"
       ],
       "path": "tests/elab/repeatConv.lean",
       "sha256": "25eb376ea99ca975bca123efa314334530afb1c5309984035799b5c9a7ac3416"
@@ -3464,7 +3195,6 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.reset_reuse",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/repr_issue.lean",
@@ -3490,8 +3220,7 @@
       "importFree": true,
       "matrixConstructs": [
         "Code.fun",
-        "LetValue.lit.str",
-        "LetValue.const"
+        "LetValue.lit.str"
       ],
       "path": "tests/elab/sanitizeMacroScopes.lean",
       "sha256": "2f1313c60eeb847848546e2298f2f5c465b274ad14397ec892b7043e8a86736c"
@@ -3509,7 +3238,6 @@
         "LetValue.ctor.general",
         "LetValue.pap",
         "LetValue.reset_reuse",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/sarray.lean",
@@ -3524,8 +3252,7 @@
       "importFree": true,
       "matrixConstructs": [
         "Code.fun",
-        "LetValue.pap",
-        "LetValue.const"
+        "LetValue.pap"
       ],
       "path": "tests/elab/simpHeartbeat14540.lean",
       "sha256": "2e324118a6da7ebdbe5edcd72eff54a510f64f0a89bb6b09e41fff6d6babc2fe"
@@ -3543,7 +3270,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/simpLoopProtection.lean",
@@ -3563,7 +3289,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/simpMatchDiscr.lean",
@@ -3576,8 +3301,7 @@
       ],
       "importFree": true,
       "matrixConstructs": [
-        "Code.fun",
-        "LetValue.const"
+        "Code.fun"
       ],
       "path": "tests/elab/simpRwBug.lean",
       "sha256": "7b4e4785de8efc291c047b70f6e9de49f4004cda1ceeb8c9b172828a86a88f00"
@@ -3602,8 +3326,7 @@
       "importFree": true,
       "matrixConstructs": [
         "Code.fun",
-        "LetValue.fvar.app",
-        "LetValue.proj"
+        "LetValue.fvar.app"
       ],
       "path": "tests/elab/simpcfg.lean",
       "sha256": "47f452db689ffe65978aa5bc1c5be8ea6f8229970814e142cd43db204ba48e1c"
@@ -3615,8 +3338,7 @@
       ],
       "importFree": true,
       "matrixConstructs": [
-        "Type.signed_scalars",
-        "LetValue.const"
+        "Type.signed_scalars"
       ],
       "path": "tests/elab/simprocSInt.lean",
       "sha256": "53f9501f0b6f5c529da4e88222fdece74ee0fdf93a6856c1c54967b118e908f0"
@@ -3635,8 +3357,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/simproc_timeout.lean",
@@ -3651,8 +3371,7 @@
       "importFree": true,
       "matrixConstructs": [
         "LetValue.pap",
-        "Type.signed_scalars",
-        "LetValue.const"
+        "Type.signed_scalars"
       ],
       "path": "tests/elab/sint-abs.lean",
       "sha256": "1a026f46f898137dc2d89461ca5c00af1469a63c4486e045bd5a1abc0fa182b4"
@@ -3666,7 +3385,6 @@
       "matrixConstructs": [
         "LetValue.fvar.app",
         "Type.signed_scalars",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/sint_basic.lean",
@@ -3691,8 +3409,7 @@
       ],
       "importFree": true,
       "matrixConstructs": [
-        "Type.signed_scalars",
-        "LetValue.const"
+        "Type.signed_scalars"
       ],
       "path": "tests/elab/sint_div_overflow.lean",
       "sha256": "a44c64f40a9aa2505fd46ad7af12d7c7c99faa67ec272305f633522ed4d5830a"
@@ -3706,11 +3423,27 @@
       "matrixConstructs": [
         "Code.fun",
         "LetValue.ctor.general",
-        "LetValue.pap",
-        "LetValue.const"
+        "LetValue.pap"
       ],
       "path": "tests/elab/spec_issue.lean",
       "sha256": "bd791f78a387bb86f81f32665f7bca78fa58d8190657affb92dd2861d0121a8d"
+    },
+    {
+      "bytes": 846,
+      "emphasis": [
+        "closures",
+        "pap_partial_application"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.lit.str",
+        "LetValue.ctor.general",
+        "LetValue.pap",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/specbug.lean",
+      "sha256": "00df4b104a63ba8fe14a638b26ad83f26ad4f6f28852bd5bab4e1ae285f8f703"
     },
     {
       "bytes": 380,
@@ -3723,11 +3456,26 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/specialize3.lean",
       "sha256": "1235436ea47b07c2ae618539a6d0d4225cd2100c34093923a7ea7acb1d367a93"
+    },
+    {
+      "bytes": 1891,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.lit.str",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/stateRef.lean",
+      "sha256": "98423407397bf88da46fd5ccec7061afb348539e4a88a776f8bf8473fb9c7960"
     },
     {
       "bytes": 266,
@@ -3737,11 +3485,26 @@
       "importFree": true,
       "matrixConstructs": [
         "LetValue.lit.str",
-        "LetValue.ctor.general",
-        "LetValue.const"
+        "LetValue.ctor.general"
       ],
       "path": "tests/elab/string_cases.lean",
       "sha256": "0c71606750450bb77760377f665eeb3f5fe729466b4ff7a4f34f11b8ba4a4136"
+    },
+    {
+      "bytes": 1387,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.lit.str",
+        "LetValue.ctor.general",
+        "LetValue.reset_reuse",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/string_simprocs.lean",
+      "sha256": "128e934efbec2b8801128ac9e017f1510ca5f88ae55e151d26ac2c4df9ca1dd8"
     },
     {
       "bytes": 1133,
@@ -3759,24 +3522,6 @@
       "sha256": "a7d8397b9f49bb19b67b0862955ba4efe1d6a81a20d3c1c6c7c561f9134ee7d9"
     },
     {
-      "bytes": 5053,
-      "emphasis": [
-        "closures"
-      ],
-      "importFree": true,
-      "matrixConstructs": [
-        "Code.fun",
-        "LetValue.fvar.app",
-        "LetValue.ctor.general",
-        "LetValue.fap.general",
-        "LetValue.proj",
-        "LetValue.const",
-        "LetValue.fap.local_call"
-      ],
-      "path": "tests/elab/strong_fixpoint_induction.lean",
-      "sha256": "a8df37bef2fac3cd357918d4129fa5706c23ef5bcc4177cf07160f78eb6da1b6"
-    },
-    {
       "bytes": 3484,
       "emphasis": [
         "closures",
@@ -3789,7 +3534,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/structuralOverNested.lean",
@@ -3809,11 +3553,27 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.fap.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/structuralRec1.lean",
       "sha256": "47b2708c10d6a39d947a2bdbab057d5a13e92b2c2bf06cbef6c290f05ce10a58"
+    },
+    {
+      "bytes": 2225,
+      "emphasis": [
+        "closures",
+        "array_bytearray_sharing"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.fap.general",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/subst.lean",
+      "sha256": "fcc22e78ffb1c397d89c436a3d0db1fb64a8e4cab4bd02386024d64877f35d1c"
     },
     {
       "bytes": 754,
@@ -3822,8 +3582,7 @@
       ],
       "importFree": true,
       "matrixConstructs": [
-        "Type.signed_scalars",
-        "LetValue.const"
+        "Type.signed_scalars"
       ],
       "path": "tests/elab/sym_cbv.lean",
       "sha256": "54dbc426c0ed904c04f989dd0af7d2d700f6aca5e0d682fd16bffa8c588d1949"
@@ -3851,7 +3610,6 @@
       "matrixConstructs": [
         "LetValue.ctor.general",
         "Type.signed_scalars",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/tagged_return_2.lean",
@@ -3869,7 +3627,6 @@
         "LetValue.lit.str",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/task_test2.lean",
@@ -3888,7 +3645,6 @@
         "LetValue.ctor.general",
         "LetValue.pap",
         "LetValue.reset_reuse",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/tempfile.lean",
@@ -3901,8 +3657,7 @@
       ],
       "importFree": true,
       "matrixConstructs": [
-        "LetValue.ctor.general",
-        "LetValue.const"
+        "LetValue.ctor.general"
       ],
       "path": "tests/elab/toArrayEq.lean",
       "sha256": "46f2d8edfb45078207f2858acb3617d6b936d9f1ed4313c04ec7826528ed4925"
@@ -3916,8 +3671,7 @@
       "matrixConstructs": [
         "LetValue.ctor.general",
         "LetValue.fap.general",
-        "LetValue.pap",
-        "LetValue.const"
+        "LetValue.pap"
       ],
       "path": "tests/elab/treeMap.lean",
       "sha256": "88f17096facd304234612b991d01f10ec10175eaa3eebbebe80fa628f3d4c3ff"
@@ -3934,11 +3688,42 @@
         "LetValue.lit.str",
         "LetValue.fvar.app",
         "LetValue.ctor.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/unexpected_result_with_bind.lean",
       "sha256": "b7f3af96802e6ae5cce5a4ac4d67e555d5f30b8d42fffde52d9d2aa02b5614f4"
+    },
+    {
+      "bytes": 1644,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.fvar.app",
+        "LetValue.ctor.general",
+        "LetValue.fap.general",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/unfoldLemma.lean",
+      "sha256": "c04b626bba42f908fa43d80c93ac43d3dde66b02ec868977b37da696dfbdfb05"
+    },
+    {
+      "bytes": 1582,
+      "emphasis": [
+        "closures"
+      ],
+      "importFree": true,
+      "matrixConstructs": [
+        "Code.fun",
+        "LetValue.lit.str",
+        "LetValue.ctor.general",
+        "LetValue.fap.general",
+        "LetValue.fap.local_call"
+      ],
+      "path": "tests/elab/unfoldr.lean",
+      "sha256": "4a62153cb8ae07defab3734e7fdbc0d8809b5f192fa1685390b71614555d183e"
     },
     {
       "bytes": 307,
@@ -3948,8 +3733,6 @@
       "importFree": true,
       "matrixConstructs": [
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/univIssue.lean",
@@ -3994,7 +3777,6 @@
         "LetValue.fap.general",
         "LetValue.pap",
         "LetValue.reset_reuse",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/wfEqnsIssue.lean",
@@ -4012,8 +3794,7 @@
         "Code.jp.recursive",
         "Code.fun",
         "LetValue.ctor.general",
-        "LetValue.fap.general",
-        "LetValue.const"
+        "LetValue.fap.general"
       ],
       "path": "tests/elab/wfOverapplicationIssue.lean",
       "sha256": "06ea319e484a1467a0019b5b8fa3310a38c8913eaed8994e24be49c2d4a78925"
@@ -4044,7 +3825,6 @@
         "LetValue.fvar.app",
         "LetValue.ctor.general",
         "LetValue.pap",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/wfWithSidecondition.lean",
@@ -4064,8 +3844,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/wf_preprocess.lean",
@@ -4084,8 +3862,6 @@
         "LetValue.ctor.general",
         "LetValue.fap.general",
         "LetValue.pap",
-        "LetValue.proj",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/wf_preprocess_leak.lean",
@@ -4102,7 +3878,6 @@
         "Code.jp.recursive",
         "LetValue.ctor.general",
         "LetValue.fap.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/whereFinally.lean",
@@ -4117,7 +3892,6 @@
       "matrixConstructs": [
         "LetValue.lit.str",
         "LetValue.ctor.general",
-        "LetValue.const",
         "LetValue.fap.local_call"
       ],
       "path": "tests/elab/whnfDelayedMVarIssue.lean",
@@ -4131,8 +3905,7 @@
       "importFree": true,
       "matrixConstructs": [
         "Code.fun",
-        "LetValue.fvar.app",
-        "LetValue.const"
+        "LetValue.fvar.app"
       ],
       "path": "tests/elab/zeroExitPoints.lean",
       "sha256": "a10f0f551a16191ba1e847a1b29da4c9e65f6e0e41f1076d233129e093d4501f"
@@ -4143,14 +3916,12 @@
     "Code.fun": "rejected",
     "Code.jp.recursive": "rejected",
     "DeclValue.extern": "rejected",
-    "LetValue.const": "rejected",
     "LetValue.ctor.general": "rejected",
     "LetValue.fap.general": "rejected",
     "LetValue.fap.local_call": "lowered_unproved",
     "LetValue.fvar.app": "rejected",
     "LetValue.lit.str": "rejected",
     "LetValue.pap": "rejected",
-    "LetValue.proj": "rejected",
     "LetValue.reset_reuse": "rejected",
     "Type.signed_scalars": "rejected"
   }

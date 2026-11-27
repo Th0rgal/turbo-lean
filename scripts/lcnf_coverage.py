@@ -23,12 +23,26 @@ Methodology & Honesty Rules:
   to another local user function (`LetValue.fap`), but `RealLCNFSemantics.evalLetValue` returns
   `.error (.unsupportedCall fn.toString)` whenever `(ctx.findLocalCallee? fn).isSome`. Because
   `lowerRealLCNFDecl_sound` is a forward simulation gated on `evalRealLCNFDecl ... = .ok (v, hst')`,
-  its conclusion is vacuous for any declaration that calls a local helper (`lowered_vacuous_local_call`,
-  classified under `lowered_unproved`). Rung **L2** (`420d1d1`) added a function environment to both
-  semantics and proved `lowerRealLCNFDecl_soundF` (`lean/LeanNative/Proofs/LowerCalls.lean`) for
-  non-recursive resolved calls whose arguments are all `.fvar`. Its contract hands the reclassification
-  of those declarations (L2's "matrix moves" accept) to this script, which does not perform it yet, so
-  every lowered declaration with a local call is still counted `lowered_unproved`.
+  its conclusion is vacuous for any declaration that calls a local helper. Rung **L2** (`420d1d1`)
+  added a function environment to both semantics and proved `lowerRealLCNFDecl_soundF`
+  (`lean/LeanNative/Proofs/LowerCalls.lean`), whose contract hands this reclassification to this
+  script (L2's "matrix moves" accept): a lowered declaration with local calls counts `proved` only
+  when that theorem applies to it with an environment built from the corpus, that is, when it and
+  every declaration it reaches has a facts row, lowered, sits on no call-graph cycle, makes no
+  self-call (L2 resolves a self-call once; recursion is L3's), passes only `.fvar` arguments at
+  every local call site (the source semantics errors on an erased argument), and has an unreserved
+  lowered name equal to the name a caller's map holds, with those lowered names pairwise distinct
+  (the `DeclEnvLowers` and `CtxMapsEnv` hypotheses). Any other lowered declaration with a local
+  call stays `lowered_unproved` (`lowered_vacuous_local_call`), and a callee the facts do not cover
+  never counts as qualifying. `auditMods` (Lean) and `_classify_decl_facts` (the sharded `Batteries`
+  path) implement the same rule, and the L2 tests run both on each compiled fixture. The facts line
+  percent-escapes every name: the pinned `Batteries` compiles declarations whose names hold `,`
+  (`«term∃ᵉ_,_»._closed_5`), and an unescaped callee list split them into names with no facts row
+  (`test_shard_facts_carry_comma_named_declarations_exactly`).
+- Local calls are found by a walk over every impure-code constructor (`codeLocalCallSites`, with the
+  arms of the call graph's `codeHasSelfTailCall`). An earlier walk stopped at the first `inc`, `dec`,
+  `del`, `oset`, `uset`, `sset` or `setTag` and so counted some declarations that call helpers as
+  having no local call (`test_local_call_after_an_rc_instruction_counts_as_a_local_call`).
 - A call to a user function OUTSIDE the measured corpus is refused by the real lowerer and
   counted `rejected`, not `proved`, in the one measured counterexample pinned by
   `test_out_of_corpus_callee_is_rejected_never_proved` (a two-module fixture audited caller-only:
@@ -51,6 +65,7 @@ import argparse
 import concurrent.futures
 import datetime
 import hashlib
+import inspect
 import json
 import os
 import subprocess
@@ -110,6 +125,16 @@ BATTERIES_REPO_URL = "https://github.com/leanprover-community/batteries.git"
 BATTERIES_PINNED_MODULE_COUNTS: dict[str, int] = {
     "66e469188fe07963e5cf666c7d4433f45b8131c5": 195,
 }
+# The revision each external corpus is measured at. A measured external entry
+# in the committed results records the `commit_sha` its tree was verified at,
+# and `--check` and `--json` refuse one that names another revision than its
+# pin. The classifier digest hashes the source that names these constants, not
+# their values, so without this a pin bump would leave the old revision's
+# committed counts passing CI, which builds neither tree.
+PINNED_EXTERNAL_REVISIONS: dict[str, str] = {
+    "external_batteries": PINNED_BATTERIES_REV,
+    "con_leche_h3_benchmark": PINNED_CON_LECHE_REV,
+}
 _LIVE_AUDIT_CACHE: dict[str, dict[str, Any]] = {}
 _CON_LECHE_CACHE: dict[str, dict[str, Any]] = {}
 _BATTERIES_CACHE: dict[str, dict[str, Any]] = {}
@@ -117,22 +142,43 @@ _BATTERIES_CACHE: dict[str, dict[str, Any]] = {}
 # The committed results pin the sha256 of every tracked bridge/semantics/proof
 # source they were measured from (`bridge_file_sha256` in
 # `scripts/lcnf_coverage_results.json`, written by `--write-results` and gated
-# by `--check`). The script itself carries no hard-coded digest: editing a
-# tracked file fails `--check` against the committed results until the
-# measurement is regenerated, and L1-L3 bridge PRs regenerate the JSON instead
-# of hand-editing this script.
+# by `--check` and `--json`). The tracked set is the lowering's bridge sources
+# with the helpers they take operator tables and ground-type lowering from
+# (RealLCNFShared.lean), the semantics the bridge proofs are stated in, and the
+# proofs the `proved` counts rest on. It is not the whole import cone of
+# LeanNative.IR.Bridge: the IR data types and codec (AST, Types, LCNF, Codec),
+# Semantics/, Transform/, Backend/, Frontend/ProofRetention.lean and the
+# SymbolicTV, loop-opt and peephole proofs are unpinned. CI does not compare
+# the in-repo counts, so an edit there reaches the committed counts only
+# through `--check`'s live re-measure, and the `Batteries` counts only where
+# `--check` runs on a built pinned `Batteries` tree. The
+# script itself carries no hard-coded digest: editing a tracked file fails
+# `--check` against the committed results until the measurement is
+# regenerated, and L1-L3 bridge PRs regenerate the JSON instead of hand-editing
+# this script. The same file pins `classifier_source_sha256`,
+# the digest of this script's own audit drivers and facts path
+# (`classifier_source_digest`), the toolchain, and the `commit_sha` each
+# external corpus was measured at (`PINNED_EXTERNAL_REVISIONS`); `--json` gates
+# all three too.
 TRACKED_BRIDGE_FILES: tuple[str, ...] = (
     "lean/LeanNative/IR/Bridge.lean",
     "lean/LeanNative/IR/RealLCNFBridge.lean",
+    "lean/LeanNative/IR/RealLCNFShared.lean",
     "lean/LeanNative/IR/RealLCNFSemantics.lean",
+    "lean/LeanNative/IR/RealLCNFCallSemantics.lean",
     "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean",
+    "lean/LeanNative/Proofs/LowerCalls.lean",
     "lean/LeanNative/IR/BridgeHelpers.lean",
 )
-# Every split helper module under these directories is tracked too (the S3a
-# split moved the helper bodies out of BridgeHelpers.lean); a helper file
-# added or removed changes the tracked set and fails `--check` until the
-# committed results are re-measured.
-TRACKED_BRIDGE_DIRS: tuple[str, ...] = ("lean/LeanNative/IR/BridgeHelpers",)
+# Every module directly under these directories is tracked too: the S3a split
+# moved the helper bodies out of BridgeHelpers.lean, and RealLCNFBridgeProofs.lean
+# is a re-export of the proof split under Proofs/RealLCNFBridge/. A module
+# added or removed there changes the tracked set and fails `--check` and
+# `--json` until the committed results are re-measured.
+TRACKED_BRIDGE_DIRS: tuple[str, ...] = (
+    "lean/LeanNative/IR/BridgeHelpers",
+    "lean/LeanNative/Proofs/RealLCNFBridge",
+)
 # Everything the measurement compiles or executes: the Lean tree (the tracked
 # bridge dirs included, so an untracked `*.lean` stray shows as `??`), this
 # script with its embedded audit driver, the C1 generators, and the C2 lake
@@ -147,10 +193,10 @@ MEASUREMENT_INPUT_PATHS: tuple[str, ...] = (
     "scripts/fuzz_lcnf_conformance.py",
     "verification/c2-lake-packages",
 )
-RESULTS_SCHEMA_VERSION = "turbo-lean-lcnf-coverage-results-v3"
+RESULTS_SCHEMA_VERSION = "turbo-lean-lcnf-coverage-results-v4"
 MEASURED_SOURCE_COMMIT_NOTE = (
-    "`measured_source_commit` is the commit of the tree the measurement was taken from "
-    "(recorded when `--write-results` ran, i.e. the parent of the commit that updates this file)."
+    "`measured_source_commit` is the commit of the tree the measurement was taken from, "
+    "recorded when `--write-results` ran."
 )
 
 LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
@@ -372,7 +418,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "lowered_unproved",
         "evidence_file": "lean/LeanNative/IR/RealLCNFSemantics.lean",
         "evidence_symbol": "if (ctx.findLocalCallee? fn).isSome then",
-        "notes": "Lowered to LNIRExpr.call by lowerImpureFapPure; evalLetValue returns .error (.unsupportedCall fn.toString) on a local callee, so lowerRealLCNFDecl_sound is vacuous here. L2 (420d1d1) proved lowerRealLCNFDecl_soundF (Proofs/LowerCalls.lean) for non-recursive resolved calls with all-.fvar arguments; this script does not yet reclassify those declarations (L2's \"matrix moves\" handoff), so every lowered declaration with a local call stays lowered_unproved.",
+        "notes": "Lowered to LNIRExpr.call by lowerImpureFapPure; evalLetValue returns .error (.unsupportedCall fn.toString) on a local callee, so lowerRealLCNFDecl_sound is vacuous here. L2 (420d1d1) proved lowerRealLCNFDecl_soundF (Proofs/LowerCalls.lean), and the corpus measurement counts a declaration with local calls proved when that theorem applies (its callee closure lowers, is acyclic and self-call free, passes only .fvar arguments, and has distinct unreserved lowered names). The construct stays lowered_unproved: a call with an erased argument, a self-call, or a callee that fails a condition is still outside every theorem.",
     },
     {
         "id": "LetValue.fap.gf_simd",
@@ -609,8 +655,9 @@ def _tracked_bridge_paths(root_dir: Path = ROOT_DIR) -> list[str]:
 
     The static `TRACKED_BRIDGE_FILES` plus every git-tracked `*.lean` directly
     under the `TRACKED_BRIDGE_DIRS` directories (`git ls-files`, so a scratch
-    or dotfile `.lean` stray never joins the measured set), following the S3a
-    BridgeHelpers/ split without hand-editing a list. Outside a git work tree
+    or dotfile `.lean` stray never joins the measured set), following the
+    BridgeHelpers/ and Proofs/RealLCNFBridge/ splits without hand-editing a
+    list. Outside a git work tree
     (test fixture roots), the direct-children filesystem glob is the fallback.
     """
     paths = set(TRACKED_BRIDGE_FILES)
@@ -713,16 +760,29 @@ import LeanNative.IR.Bridge
 
 open Lean Lean.Compiler.LCNF LeanNative.IR
 
-partial def codeHasLocalCall (localSet : Std.HashSet Name) (c : Code .impure) : Bool :=
+/-- Every local call site of `c` (a `.fap` whose callee is in `localSet`): the callee, and
+    whether every argument is an `.fvar`. The walk has the arms of `codeHasSelfTailCall`
+    (`lean/LeanNative/IR/BridgeHelpers/StateAndIntrinsics.lean`), which builds the call
+    graph, so the RC and field-set instructions of impure code (`inc`, `dec`, `del`, `oset`,
+    `uset`, `sset`, `setTag`) are walked through instead of ending the walk. The match is
+    exhaustive: a constructor added upstream fails to compile here rather than reading as
+    "no call". -/
+partial def codeLocalCallSites {pu} (localSet : Std.HashSet Name) (c : Code pu) : List (Name × Bool) :=
   match c with
   | .let d k =>
-    let hit := match d.value with
-      | .fap fn _ _ => localSet.contains fn
-      | _ => false
-    hit || codeHasLocalCall localSet k
-  | .jp j k => codeHasLocalCall localSet j.value || codeHasLocalCall localSet k
-  | .cases cs => cs.alts.any (fun a => codeHasLocalCall localSet a.getCode)
-  | _ => false
+    let here := match d.value with
+      | .fap fn args _ =>
+        if localSet.contains fn then
+          [(fn, args.all (fun a => match a with | .fvar _ => true | _ => false))]
+        else []
+      | _ => []
+    here ++ codeLocalCallSites localSet k
+  | .fun d k _ | .jp d k => codeLocalCallSites localSet d.value ++ codeLocalCallSites localSet k
+  | .inc _ _ _ _ k _ | .dec _ _ _ _ _ k _ | .del _ k _
+  | .oset _ _ _ k _ | .uset _ _ _ k _ | .sset _ _ _ _ _ k _ | .setTag _ _ k _ =>
+    codeLocalCallSites localSet k
+  | .cases cs => cs.alts.foldl (fun acc a => acc ++ codeLocalCallSites localSet a.getCode) []
+  | .jmp _ _ | .return _ | .unreach _ => []
 
 partial def declInMutualCycle (declMap : Std.HashMap Name (List Name)) (target : Name) : Bool :=
   let rec reaches (visited : List Name) (frontier : List Name) : Bool :=
@@ -733,6 +793,63 @@ partial def declInMutualCycle (declMap : Std.HashMap Name (List Name)) (target :
       else if visited.contains cur then reaches visited rest
       else reaches (cur :: visited) ((declMap.getD cur []) ++ rest)
   reaches [] (declMap.getD target [])
+
+/-- `reservedRuntimeName` of `lean/LeanNative/Proofs/RealLCNFBridge/CallsF.lean`, copied
+    because this driver imports `LeanNative.IR.Bridge` only; a test pins the copy. -/
+def auditReservedRuntimeName (s : String) : Bool :=
+  s.startsWith "lean_native_" || s == "lean_mark_mt"
+
+/-- A name as the shard facts line carries it: `%`, `|` and `,` are percent-escaped, so no
+    field separator (`|` between fields, `,` inside the callee list) survives, and the escape
+    is injective, so the parser's `_unescape_facts_name` recovers the name exactly. -/
+def auditEscape (s : String) : String :=
+  ((s.replace "%" "%25").replace "|" "%7C").replace "," "%2C"
+
+/-- One declaration's facts; the shard facts driver prints the same fields. -/
+structure AuditFacts where
+  cyc : Bool
+  ok : Bool
+  hasCall : Bool
+  selfCall : Bool
+  allFVar : Bool
+  mapped : String
+  lowered : String
+  callees : List Name
+
+/-- Whether `x` can be an entry of the function environment `lowerRealLCNFDecl_soundF`
+    (`Proofs/LowerCalls.lean`) needs: it has facts, is on no call cycle, lowered, makes no
+    self-call (L2 resolves a self-call once; recursion is L3's), passes only `.fvar`
+    arguments at every local call site (the source semantics errors on an erased one), has
+    an unreserved lowered name equal to the name a caller's map holds (`DeclEnvLowers`,
+    `CtxMapsEnv`), and every callee qualifies the same way. A name without facts fails. -/
+partial def auditQualifies (facts : Std.HashMap Name AuditFacts)
+    (memo : IO.Ref (Std.HashMap Name Bool)) (x : Name) : IO Bool := do
+  if let some b := (← memo.get).get? x then return b
+  let b ← match facts.get? x with
+    | none => pure false
+    | some f =>
+      if f.cyc || !f.ok || f.selfCall || !f.allFVar ||
+          auditReservedRuntimeName f.lowered || f.mapped != f.lowered then
+        pure false
+      else
+        f.callees.allM (auditQualifies facts memo)
+  memo.modify (·.insert x b)
+  return b
+
+partial def auditReach (facts : Std.HashMap Name AuditFacts) (seen : Std.HashSet Name) :
+    List Name → Std.HashSet Name
+  | [] => seen
+  | x :: rest =>
+    if seen.contains x then auditReach facts seen rest
+    else auditReach facts (seen.insert x) ((((facts.get? x).map (·.callees)).getD []) ++ rest)
+
+/-- The lowered names of `n` and of everything it reaches are pairwise distinct (the
+    freshness clause of `DeclEnvLowers`). -/
+def auditLoweredNamesDistinct (facts : Std.HashMap Name AuditFacts) (n : Name) : Bool :=
+  let names := (auditReach facts {} [n]).toList.map
+    (fun x => ((facts.get? x).map (·.lowered)).getD "")
+  let uniq := names.foldl (fun (s : Std.HashSet String) x => s.insert x) {}
+  uniq.size == names.length
 
 def runCoreOnEnv (env : Environment) (x : CoreM α) : IO (Except String α) := do
   let ctx : Core.Context := { fileName := "<audit>", fileMap := default, maxHeartbeats := 0 }
@@ -764,11 +881,15 @@ unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat ×
   -- auditMods calls, not one combined group) drives the local-callee
   -- classification, the call graph, and the bridge context, so a call to a
   -- user function declared in the same group is classified exactly like a
-  -- same-module call (a vacuous local call), matching the eval
-  -- `unsupportedCall` vacuity of `lowerRealLCNFDecl_sound` instead of being
-  -- rejected or counted proved. Compiler-generated auxiliary declarations are
-  -- excluded from the corpus (never measured, never expanded); the number
-  -- excluded is returned so the published denominator's scope is auditable.
+  -- same-module call instead of being rejected. A lowered declaration with
+  -- local calls is proved only when it qualifies (`auditQualifies`) and its
+  -- environment's lowered names are distinct, so `lowerRealLCNFDecl_soundF`
+  -- applies to it; otherwise it is lowered_unproved (the eval
+  -- `unsupportedCall` vacuity of `lowerRealLCNFDecl_sound`). The Python
+  -- `_classify_decl_facts` mirrors this classification for the sharded path.
+  -- Compiler-generated auxiliary declarations are excluded from the corpus
+  -- (never measured, never expanded); the number excluded is returned so the
+  -- published denominator's scope is auditable.
   let mut corpusDecls : Array (Name × Decl .impure) := #[]
   let mut auxTot := 0
   for modName in mods do
@@ -787,20 +908,47 @@ unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat ×
   for (_, d) in corpusDecls do
     if let .code c := d.value then
       callGraph := callGraph.insert d.name ((collectCodeLocalCallees corpusNames c).filter (· != d.name))
-  let mut tot := 0; let mut prv := 0; let mut unp := 0; let mut rej := 0; let mut cyc := 0
+  -- Pass 1: one facts row per declaration (a cycle member is not ingested).
+  let mut rows : Array (Name × AuditFacts) := #[]
+  let mut facts : Std.HashMap Name AuditFacts := {}
   for (_, d) in corpusDecls do
+    let cyc := declInMutualCycle callGraph d.name
+    let sites := match d.value with
+      | .code c => codeLocalCallSites localSet c
+      | .extern _ => []
+    let mut ok := false
+    let mut lowered := ""
+    if !cyc then
+      match (← runCoreOnEnv env (ingestLCNFImpureDecl d corpusNames .x86_64 true)) with
+      | .ok ld =>
+        ok := true
+        lowered := ld.name
+      | .error _ => pure ()
+    let f : AuditFacts := {
+      cyc, ok, lowered
+      hasCall := !sites.isEmpty
+      selfCall := sites.any (fun s => s.1 == d.name)
+      allFVar := sites.all (fun s => s.2)
+      mapped := mangleDeclNameInEnv env d.name
+      callees := callGraph.getD d.name [] }
+    rows := rows.push (d.name, f)
+    facts := facts.insert d.name f
+  -- Pass 2: classify.
+  let memo ← IO.mkRef ({} : Std.HashMap Name Bool)
+  let mut tot := 0; let mut prv := 0; let mut unp := 0; let mut rej := 0; let mut cyc := 0
+  for (n, f) in rows do
     tot := tot + 1
-    if declInMutualCycle callGraph d.name then
+    if f.cyc then
       rej := rej + 1
       cyc := cyc + 1
+    else if !f.ok then
+      rej := rej + 1
+    else if !f.hasCall then
+      prv := prv + 1
+    else if (← auditQualifies facts memo n) && auditLoweredNamesDistinct facts n then
+      prv := prv + 1
     else
-      let r ← runCoreOnEnv env (ingestLCNFImpureDecl d corpusNames .x86_64 true)
-      match r with
-      | .ok _ =>
-        let hasCall := match d.value with | .code c => codeHasLocalCall localSet c | .extern _ => false
-        if hasCall then unp := unp + 1 else prv := prv + 1
-      | .error _ =>
-        rej := rej + 1
+      unp := unp + 1
   return (tot, prv, unp, rej, cyc, auxTot)
 """
 
@@ -1401,60 +1549,167 @@ def _is_full_batteries_build(olean_root: Path) -> bool:
     return (olean_root.parent.parent / "bin" / "runLinter").is_file()
 
 
-def _merge_batteries_shard_facts(
-    decl_rows: list[tuple[str, bool, list[str], str]], aux_total: int
-) -> tuple[tuple[int, int, int, int, int, int], list[str]]:
-    """Whole-corpus classification over per-declaration shard facts.
+# One per-declaration facts row, as both audit drivers derive it (the Lean `AuditFacts`):
+# (decl name, has_local_call, same-corpus callees minus self, ingest verdict "ok" or
+# "err:<head>", has_self_call, every local call site's arguments are `.fvar`, the mangled
+# name a caller's map holds, the lowered declaration's name or ""). Every name is the one
+# the driver holds: the facts line percent-escapes the declaration, callee and symbol names
+# (`auditEscape`) and `_unescape_facts_name` decodes them.
+DeclFacts = tuple[str, bool, list[str], str, bool, bool, str, str]
 
-    `decl_rows` holds one row per non-aux corpus declaration, in corpus order:
-    (decl name, has_local_call, same-corpus callees minus self, ingest verdict
-    "ok" or "err:<head>"). The classification is auditMods' exactly: a
-    declaration on a directed call-graph cycle (reachable from its own callees;
-    self-edges are already removed at emission) is rejected_not_lowered without
-    consulting its ingest verdict; otherwise an ok ingest splits proved vs
-    lowered_unproved on has_local_call, and an ingest error is rejected.
-    Returns the auditMods tuple (total, proved, lowered_unproved, rejected,
-    rejected_not_lowered, aux_total) plus the rejection reason heads
-    ("mutual_cycle" or the error head), which are diagnostic only and are never
-    written to the committed results.
+_FACTS_NAME_ESCAPES = {"25": "%", "7C": "|", "2C": ","}
+
+
+def _unescape_facts_name(field: str) -> str:
+    """Invert the driver's `auditEscape` (`%25`, `%7C`, `%2C`).
+
+    Every `%` in an escaped name starts one of the three escapes, so decoding is
+    unambiguous; any other `%` raises ValueError instead of yielding a guessed name.
+    """
+    head, *rest = field.split("%")
+    out = [head]
+    for piece in rest:
+        code = piece[:2]
+        if code not in _FACTS_NAME_ESCAPES:
+            raise ValueError(f"bad escape %{code} in facts name {field!r}")
+        out.append(_FACTS_NAME_ESCAPES[code] + piece[2:])
+    return "".join(out)
+
+
+def _reserved_runtime_name(name: str) -> bool:
+    """`reservedRuntimeName` (`lean/LeanNative/Proofs/RealLCNFBridge/CallsF.lean`): runtime
+    intrinsic symbols a lowered local callee must not shadow. A test pins this copy, and the
+    driver's `auditReservedRuntimeName`, to the Lean definition."""
+    return name.startswith("lean_native_") or name == "lean_mark_mt"
+
+
+def _classify_decl_facts(decl_rows: list[DeclFacts]) -> list[tuple[str, str | None]]:
+    """Classify every facts row exactly as `auditMods` does.
+
+    Returns, per row and in row order, (class, rejection reason head or None), class one of
+    `proved`, `lowered_unproved`, `rejected`, `rejected_not_lowered`. A declaration on a
+    directed call-graph cycle (reachable from its own callees; self-edges are removed at
+    emission) is rejected_not_lowered without consulting its ingest verdict; an ingest error
+    is rejected; an ok declaration with no local call is proved. An ok declaration with local
+    calls is proved only when `lowerRealLCNFDecl_soundF` (L2, `Proofs/LowerCalls.lean`)
+    applies to it with an environment built from the corpus: it and everything it reaches
+    qualify (`_qualifies`, mirroring `auditQualifies`) and their lowered names are pairwise
+    distinct; otherwise it is lowered_unproved. A name without a facts row never qualifies,
+    so an unknown never counts as proved. The declaration itself is held to the same
+    per-declaration conditions as its callees, which is stricter than the theorem needs for
+    the top declaration and errs toward lowered_unproved.
     """
     edges: dict[str, list[str]] = {}
-    for name, _, callees, _ in decl_rows:
-        edges[name] = callees  # a duplicate name overwrites, as HashMap.insert does
+    rows_by_name: dict[str, DeclFacts] = {}
+    for row in decl_rows:
+        edges[row[0]] = row[2]  # a duplicate name overwrites, as HashMap.insert does
+        rows_by_name[row[0]] = row
+
+    cycle_memo: dict[str, bool] = {}
 
     def _on_cycle(target: str) -> bool:
         # declInMutualCycle's relation: DFS from the target's own callees over
         # the corpus call graph; true iff the target itself is reached (a node
         # absent from the graph contributes no edges).
+        if target in cycle_memo:
+            return cycle_memo[target]
         seen: set[str] = set()
         frontier = list(edges.get(target, ()))
+        found = False
         while frontier:
             cur = frontier.pop()
             if cur == target:
-                return True
+                found = True
+                break
             if cur in seen:
                 continue
             seen.add(cur)
             frontier.extend(edges.get(cur, ()))
-        return False
+        cycle_memo[target] = found
+        return found
 
-    tot = prv = unp = rej = cyc = 0
-    reasons: list[str] = []
-    for name, has_call, _, verdict in decl_rows:
-        tot += 1
-        if _on_cycle(name):
-            rej += 1
-            cyc += 1
-            reasons.append(REJECTED_NOT_LOWERED_REASON)
-        elif verdict == "ok":
-            if has_call:
-                unp += 1
+    def _qualifies_alone(name: str) -> bool:
+        # auditQualifies' per-declaration conditions, before the callees are visited.
+        row = rows_by_name.get(name)
+        if row is None or _on_cycle(name):
+            return False
+        _n, _hc, _callees, verdict, self_call, all_fvar, mapped, lowered = row
+        return (
+            verdict == "ok"
+            and not self_call
+            and all_fvar
+            and not _reserved_runtime_name(lowered)
+            and mapped == lowered
+        )
+
+    qual_memo: dict[str, bool] = {}
+
+    def _qualifies(start: str) -> bool:
+        # auditQualifies: the declaration and every callee qualify. A post-order walk with an
+        # explicit stack; a declaration that qualifies alone is on no cycle, so none of its
+        # callees is still being expanded when it is resolved.
+        stack: list[tuple[str, bool]] = [(start, False)]
+        while stack:
+            node, expanded = stack.pop()
+            if node in qual_memo:
+                continue
+            if not _qualifies_alone(node):
+                qual_memo[node] = False
+                continue
+            callees = edges.get(node, [])
+            if expanded:
+                qual_memo[node] = all(qual_memo.get(c, False) for c in callees)
             else:
-                prv += 1
+                stack.append((node, True))
+                stack.extend((c, False) for c in callees if c not in qual_memo)
+        return qual_memo[start]
+
+    def _lowered_names_distinct(start: str) -> bool:
+        # auditLoweredNamesDistinct: the freshness clause of `DeclEnvLowers`.
+        seen: set[str] = set()
+        stack = [start]
+        names: list[str] = []
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            row = rows_by_name.get(node)
+            names.append(row[7] if row is not None else "")
+            stack.extend(edges.get(node, ()))
+        return len(set(names)) == len(names)
+
+    out: list[tuple[str, str | None]] = []
+    for name, has_call, _callees, verdict, *_rest in decl_rows:
+        if _on_cycle(name):
+            out.append(("rejected_not_lowered", REJECTED_NOT_LOWERED_REASON))
+        elif verdict != "ok":
+            out.append(("rejected", verdict[4:] if verdict.startswith("err:") else verdict))
+        elif not has_call:
+            out.append(("proved", None))
+        elif _qualifies(name) and _lowered_names_distinct(name):
+            out.append(("proved", None))
         else:
-            rej += 1
-            reasons.append(verdict[4:] if verdict.startswith("err:") else verdict)
-    return (tot, prv, unp, rej, cyc, aux_total), reasons
+            out.append(("lowered_unproved", None))
+    return out
+
+
+def _merge_batteries_shard_facts(
+    decl_rows: list[DeclFacts], aux_total: int
+) -> tuple[tuple[int, int, int, int, int, int], list[str]]:
+    """Whole-corpus counts over per-declaration shard facts (`_classify_decl_facts`).
+
+    Returns the auditMods tuple (total, proved, lowered_unproved, rejected,
+    rejected_not_lowered, aux_total) plus the rejection reason heads ("mutual_cycle" or the
+    error head), which are diagnostic only and are never written to the committed results.
+    """
+    classes = _classify_decl_facts(decl_rows)
+    prv = sum(1 for cls, _ in classes if cls == "proved")
+    unp = sum(1 for cls, _ in classes if cls == "lowered_unproved")
+    cyc = sum(1 for cls, _ in classes if cls == "rejected_not_lowered")
+    rej = cyc + sum(1 for cls, _ in classes if cls == "rejected")
+    reasons = [reason for _, reason in classes if reason is not None]
+    return (len(classes), prv, unp, rej, cyc, aux_total), reasons
 
 
 def _lean_shard_facts_driver(all_modules: list[str], shard_modules: list[str]) -> str:
@@ -1464,9 +1719,15 @@ def _lean_shard_facts_driver(all_modules: list[str], shard_modules: list[str]) -
     and converts (`toImpureDecls`) the WHOLE corpus so that `corpusNames`, the
     local-callee set, the per-declaration callee lists, and every
     `ingestLCNFImpureDecl` call see exactly the global name set the monolithic
-    driver sees; only the per-declaration work (ingest, has-local-call, callee
-    emission) is restricted to this shard's modules. The whole-corpus cycle
-    pass runs once in `_merge_batteries_shard_facts` over the merged facts.
+    driver sees; only the per-declaration work (ingest, call-site facts, callee
+    emission) is restricted to this shard's modules. Each `SHARD_DECL` line is
+    one `DeclFacts` row: name | has_local_call | callees | has_self_call |
+    all-.fvar call arguments | the name a caller's map holds | the lowered name
+    | ingest verdict (last, as it is free text). Every name in the line is
+    percent-escaped (`auditEscape`), so a name holding `,` or `|` (the pinned
+    Batteries compiles some, such as `«term∃ᵉ_,_»._closed_5`) cannot split the
+    callee list or a field. The whole-corpus cycle pass and
+    the classification run once in `_classify_decl_facts` over the merged facts.
     Cycle members' ingest verdicts are computed here but ignored by the merger,
     which is sound because each ingest runs in a fresh `runCoreOnEnv` state and
     has no cross-declaration effect.
@@ -1506,16 +1767,20 @@ unsafe def main (args : List String) : IO Unit := do
         let callees := match d.value with
           | .code c => (collectCodeLocalCallees corpusNames c).filter (· != d.name)
           | _ => []
-        let hasCall := match d.value with
-          | .code c => codeHasLocalCall localSet c
-          | .extern _ => false
+        let sites := match d.value with
+          | .code c => codeLocalCallSites localSet c
+          | .extern _ => []
         let r ← runCoreOnEnv env (ingestLCNFImpureDecl d corpusNames .x86_64 true)
-        let verdict := match r with
-          | .ok _ => "ok"
-          | .error e => "err:" ++ (((e.replace "\\n" " ").replace "|" "/").take 200)
-        let calleeStr := String.intercalate "," (callees.map (fun n => n.toString))
-        let hc := if hasCall then "1" else "0"
-        IO.println s!"SHARD_DECL:{{d.name}}|{{hc}}|{{calleeStr}}|{{verdict}}"
+        let (verdict, lowered) := match r with
+          | .ok ld => ("ok", auditEscape ld.name)
+          | .error e => ("err:" ++ (((e.replace "\\n" " ").replace "|" "/").take 200), "")
+        let calleeStr := String.intercalate "," (callees.map (fun n => auditEscape n.toString))
+        let hc := if sites.isEmpty then "0" else "1"
+        let sc := if sites.any (fun s => s.1 == d.name) then "1" else "0"
+        let af := if sites.all (fun s => s.2) then "1" else "0"
+        let mapped := auditEscape (mangleDeclNameInEnv env d.name)
+        let name := auditEscape d.name.toString
+        IO.println s!"SHARD_DECL:{{name}}|{{hc}}|{{calleeStr}}|{{sc}}|{{af}}|{{mapped}}|{{lowered}}|{{verdict}}"
     IO.println s!"PROGRESS ingest {{modName}}"
   IO.println "SHARD_DONE"
 """
@@ -1531,12 +1796,31 @@ def _run_sharded_batteries_audit(
 ) -> tuple[tuple[int, int, int, int, int, int], list[str]]:
     """Measure a module corpus with the real lowerer, sharded across processes.
 
-    Each shard is one `lake env lean --run` of `_lean_shard_facts_driver`; the
-    merged per-declaration facts are classified by
-    `_merge_batteries_shard_facts` (the whole-corpus cycle pass included), so
-    the result tuple is `auditMods`-equivalent by construction. Fail-closed: a
+    `_collect_shard_facts` gathers the per-declaration facts and
+    `_merge_batteries_shard_facts` classifies them (the whole-corpus cycle pass
+    included), so the result tuple is `auditMods`-equivalent; a test runs both
+    paths on one compiled fixture.
+    """
+    decl_rows, aux_total = _collect_shard_facts(
+        root_dir, olean_root, modules, workers=workers, shard_count=shard_count, log_dir=log_dir
+    )
+    return _merge_batteries_shard_facts(decl_rows, aux_total)
+
+
+def _collect_shard_facts(
+    root_dir: Path,
+    olean_root: Path,
+    modules: list[str],
+    workers: int | None = None,
+    shard_count: int | None = None,
+    log_dir: Path | None = None,
+) -> tuple[list[DeclFacts], int]:
+    """Run `_lean_shard_facts_driver` over `modules` and return (facts rows, aux total).
+
+    Each shard is one `lake env lean --run` of the facts driver. Fail-closed: a
     shard that exits non-zero, omits `SHARD_DONE`, drops or duplicates a
-    module's `SHARD_AUX` line, or emits an unparsable facts line raises; a
+    module's `SHARD_AUX` line, or emits an unparsable facts line (a bad name
+    escape included) raises; a
     failed run is never converted into counts. `TURBO_BATTERIES_AUDIT_WORKERS`
     overrides the worker count; `TURBO_BATTERIES_AUDIT_LOG_DIR` (or `log_dir`)
     streams each shard's stdout to `<dir>/batteries-shard-<i>.log` for
@@ -1591,7 +1875,7 @@ def _run_sharded_batteries_audit(
             )
 
     aux_by_module: dict[str, int] = {}
-    decl_rows: list[tuple[str, bool, list[str], str]] = []
+    decl_rows: list[DeclFacts] = []
     for lines in shard_lines:
         for ln in lines:
             if ln.startswith("SHARD_AUX:"):
@@ -1600,19 +1884,22 @@ def _run_sharded_batteries_audit(
                     raise RuntimeError(f"module `{mod}` reported by more than one shard")
                 aux_by_module[mod] = int(aux)
             elif ln.startswith("SHARD_DECL:"):
-                parts = ln[len("SHARD_DECL:"):].split("|", 3)
-                if len(parts) != 4 or parts[1] not in ("0", "1"):
+                parts = ln[len("SHARD_DECL:"):].split("|", 7)
+                if len(parts) != 8 or any(parts[i] not in ("0", "1") for i in (1, 3, 4)):
                     raise RuntimeError(f"unparsable shard facts line: {ln!r}")
-                name, hc, callees_s, verdict = parts
-                callees = [c for c in callees_s.split(",") if c]
-                decl_rows.append((name, hc == "1", callees, verdict))
+                name, hc, callees_s, sc, af, mapped, lowered, verdict = parts
+                try:
+                    name, mapped, lowered = (_unescape_facts_name(s) for s in (name, mapped, lowered))
+                    callees = [_unescape_facts_name(c) for c in callees_s.split(",") if c]
+                except ValueError as exc:
+                    raise RuntimeError(f"unparsable shard facts line: {ln!r} ({exc})") from exc
+                decl_rows.append((name, hc == "1", callees, verdict, sc == "1", af == "1", mapped, lowered))
     missing = sorted(set(modules) - set(aux_by_module))
     if missing:
         raise RuntimeError(
             "sharded audit silently dropped module(s): " + ", ".join(missing)
         )
-    aux_total = sum(aux_by_module.values())
-    return _merge_batteries_shard_facts(decl_rows, aux_total)
+    return decl_rows, sum(aux_by_module.values())
 
 
 def measure_external_batteries(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
@@ -1791,6 +2078,56 @@ def build_live_corpora(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     return corpora
 
 
+def _classifier_source_texts() -> list[str]:
+    """The source of everything in this script that decides a declaration's class.
+
+    The bridge-file digests pin the tracked Lean files (TRACKED_BRIDGE_FILES and
+    TRACKED_BRIDGE_DIRS), not this script, so without this an edit
+    to the audit drivers or to the Python facts path would pass `--json`
+    against committed counts the edited code never produced; CI builds no
+    `Batteries` tree and cannot re-measure. Covered: the two Lean drivers and
+    the per-module driver builder, the AUDIT_RESULT parser and runner, the
+    shard facts driver, parser and name decoder, the classifier, the merger,
+    the sharded runner, and the `Batteries` module discovery and measurement.
+    """
+    funcs = (
+        _lean_audit_driver_for_modules,
+        _parse_audit_result,
+        _run_audit_driver,
+        _lean_shard_facts_driver,
+        _collect_shard_facts,
+        _unescape_facts_name,
+        _reserved_runtime_name,
+        _classify_decl_facts,
+        _merge_batteries_shard_facts,
+        _run_sharded_batteries_audit,
+        _batteries_modules,
+        measure_external_batteries,
+    )
+    return [
+        _LEAN_AUDIT_DRIVER_HEAD,
+        _LEAN_AUDIT_DRIVER_SRC,
+        json.dumps(_FACTS_NAME_ESCAPES, sort_keys=True),
+        REJECTED_NOT_LOWERED_REASON,
+        *(inspect.getsource(fn) for fn in funcs),
+    ]
+
+
+def classifier_source_digest() -> str:
+    """sha256 over `_classifier_source_texts()`, each text length-prefixed.
+
+    `--write-results` records it as `classifier_source_sha256`; `--check` and
+    `--json` refuse a live digest that differs from the committed one, so any
+    edit to the covered source (a comment included) needs a re-measure.
+    """
+    h = hashlib.sha256()
+    for text in _classifier_source_texts():
+        data = text.encode("utf-8")
+        h.update(len(data).to_bytes(8, "big"))
+        h.update(data)
+    return h.hexdigest()
+
+
 def build_coverage_report(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     file_digests = _bridge_digests(root_dir)
 
@@ -1806,6 +2143,7 @@ def build_coverage_report(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
         "leaf_id": "H1.0",
         "toolchain": PINNED_TOOLCHAIN,
         "bridge_source_digests": file_digests,
+        "classifier_source_sha256": classifier_source_digest(),
         "lcnf_constructor_matrix": {
             "summary": {
                 "total": len(rows),
@@ -1850,14 +2188,28 @@ def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[
         digests[rel] = actual
     if not digests:
         raise RuntimeError("refusing to write results: live report tracks no bridge files")
-    # Defense in depth: main() runs this before the measurement; a direct
-    # results_document caller gets the same refusal here.
+    # Defense in depth: main() runs these before the measurement; a direct
+    # results_document caller gets the same refusals here.
     _refuse_dirty_measurement_inputs(root_dir)
+    _refuse_toolchain_file_mismatch(root_dir)
+    classifier = report.get("classifier_source_sha256")
+    if not _is_hex_digest(classifier, 64):
+        raise RuntimeError(
+            f"refusing to write results: the live report's classifier_source_sha256 is {classifier!r}"
+        )
     corpora: dict[str, Any] = {}
     for cname, corp in report.get("corpora", {}).items():
         if corp.get("status") == "unknown" or corp.get("measurement_source") != "live_invocation":
             continue
+        pinned = PINNED_EXTERNAL_REVISIONS.get(cname)
+        if pinned is not None and corp.get("commit_sha") != pinned:
+            raise RuntimeError(
+                f"refusing to write results: corpus `{cname}` was measured at revision "
+                f"{corp.get('commit_sha')!r}, not the pinned {pinned}"
+            )
         entry: dict[str, Any] = {f: corp[f] for f in MEASURED_INT_FIELDS if f in corp}
+        if pinned is not None:
+            entry["commit_sha"] = pinned
         if "rejected_not_lowered_reason" in corp:
             entry["rejected_not_lowered_reason"] = corp["rejected_not_lowered_reason"]
         if "subcorpora" in corp:
@@ -1879,11 +2231,114 @@ def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[
         "measured_source_commit": head,
         "measured_source_commit_note": MEASURED_SOURCE_COMMIT_NOTE,
         "bridge_file_sha256": digests,
+        "classifier_source_sha256": classifier,
         "corpora": corpora,
     }
 
 
-def _validate_measured_entry(path: str, entry: Any, errors: list[str], depth: int = 0) -> None:
+def _committed_measured_corpora(results_path: Path) -> set[str] | None:
+    """The corpora the committed results measure, or None when there is no committed file.
+
+    Only a missing file means a first baseline. A file that exists but cannot be
+    read or parsed (merge-conflict markers after a rebase are the usual cause)
+    raises, because the corpora it measures cannot be checked.
+    """
+    try:
+        text = results_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError(
+            f"refusing to write results: cannot read {results_path.name} ({exc}), so the "
+            "corpora it measures cannot be checked"
+        ) from exc
+    try:
+        committed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"refusing to write results: {results_path.name} is not valid JSON ({exc}), so the "
+            "corpora it measures cannot be checked; repair it (merge-conflict markers are the "
+            "usual cause) or delete it to write a first baseline"
+        ) from exc
+    corpora = committed.get("corpora") if isinstance(committed, dict) else None
+    if not isinstance(corpora, dict):
+        raise RuntimeError(
+            f"refusing to write results: {results_path.name} has no `corpora` object, so the "
+            "corpora it measures cannot be checked; repair it or delete it to write a first baseline"
+        )
+    return {
+        cname
+        for cname, entry in corpora.items()
+        if isinstance(entry, dict) and entry.get("measurement_source") != "not_measured"
+    }
+
+
+def _external_tree_finders() -> dict[str, tuple[Any, str]]:
+    """How each pinned external corpus's `.olean` tree is found: (finder, its env var).
+
+    It names the same corpora as PINNED_EXTERNAL_REVISIONS (a self-test holds
+    the two equal), so a third external corpus cannot be added to one alone.
+    """
+    return {
+        "external_batteries": (_batteries_olean_root, BATTERIES_OLEANS_ENV),
+        "con_leche_h3_benchmark": (_con_leche_olean_root, CON_LECHE_OLEANS_ENV),
+    }
+
+
+def _refuse_missing_external_trees(results_path: Path, root_dir: Path = ROOT_DIR) -> None:
+    """Fail in seconds when `--write-results` has no tree for a committed external corpus.
+
+    `_refuse_dropped_corpora` makes the same refusal after the measurement; this
+    catches the common case, no tree at all, before the minutes-long audit.
+    """
+    base = _committed_measured_corpora(results_path)
+    if base is None:
+        return
+    missing = [
+        (cname, env)
+        for cname, (find_root, env) in sorted(_external_tree_finders().items())
+        if cname in base and find_root(root_dir) is None
+    ]
+    if missing:
+        raise RuntimeError(
+            "refusing to write results: no prebuilt `.olean` tree for "
+            + ", ".join(f"`{cname}` (set {env})" for cname, env in missing)
+            + f", which {results_path.name} measures, so this run would drop its counts"
+        )
+
+
+def _refuse_dropped_corpora(report: dict[str, Any], doc: dict[str, Any], results_path: Path) -> None:
+    """Refuse a new baseline that leaves out a corpus the committed one measured.
+
+    `results_document` keeps only the corpora this run measured, so a
+    `--write-results` run without an external tree (no `scratch/batteries`)
+    would replace that corpus's committed counts with nothing and still report
+    success. Dropping a corpus from the baseline takes an edit of the file.
+    """
+    base = _committed_measured_corpora(results_path)
+    if base is None:
+        return
+    dropped = sorted(base - set(doc.get("corpora", {})))
+    if not dropped:
+        return
+    live = report.get("corpora", {})
+    why = "; ".join(
+        f"`{c}`: {live[c].get('reason', 'no reason given')}"
+        if isinstance(live.get(c), dict)
+        else f"`{c}`: missing from the live report"
+        for c in dropped
+    )
+    raise RuntimeError(
+        "refusing to write results: this run did not measure "
+        + ", ".join(f"`{c}`" for c in dropped)
+        + f", which {results_path.name} measures ({why}); measure it and re-run, or delete "
+        "the entry from the file if dropping it is intended"
+    )
+
+
+def _validate_measured_entry(
+    path: str, entry: Any, errors: list[str], depth: int = 0, pinned_external: bool = False
+) -> None:
     """Fail-closed validation of one measured baseline corpus/subcorpus entry."""
     if not isinstance(entry, dict):
         errors.append(f"Results file `{path}` must be a JSON object, got {type(entry).__name__}")
@@ -1914,9 +2369,18 @@ def _validate_measured_entry(path: str, entry: Any, errors: list[str], depth: in
     allowed_keys = set(MEASURED_INT_FIELDS) | {"rejected_not_lowered_reason"}
     if depth == 0:
         allowed_keys.add("subcorpora")
+    if pinned_external:
+        # Only a pinned external corpus records the revision it was measured
+        # at; the in-repo counts belong to `measured_source_commit`.
+        allowed_keys.add("commit_sha")
     unknown = sorted(set(entry) - allowed_keys)
     if unknown:
         errors.append(f"Results file `{path}` carries unknown keys: {', '.join(unknown)}")
+    if pinned_external and "commit_sha" in entry and not _is_hex_digest(entry["commit_sha"], 40):
+        errors.append(
+            f"Results file `{path}` field `commit_sha` must be a 40-hex commit, "
+            f"got {entry['commit_sha']!r}"
+        )
     for f in MEASURED_INT_FIELDS:
         if f not in entry:
             errors.append(f"Results file `{path}` is missing measured field `{f}`")
@@ -1992,6 +2456,7 @@ def validate_results_document(doc: Any) -> list[str]:
         "measured_source_commit",
         "measured_source_commit_note",
         "bridge_file_sha256",
+        "classifier_source_sha256",
         "corpora",
     )
     unknown_top = sorted(set(doc) - set(required_top))
@@ -2005,11 +2470,7 @@ def validate_results_document(doc: Any) -> list[str]:
             f"Results file schemaVersion must be `{RESULTS_SCHEMA_VERSION}`, "
             f"got {doc.get('schemaVersion')!r}"
         )
-    if doc.get("toolchain") != PINNED_TOOLCHAIN:
-        errors.append(
-            f"Results file toolchain mismatch: file={doc.get('toolchain')!r} "
-            f"live={PINNED_TOOLCHAIN!r}"
-        )
+    _compare_committed_toolchain(doc, errors)
     msc = doc.get("measured_source_commit")
     if not _is_hex_digest(msc, 40):
         errors.append(
@@ -2037,12 +2498,19 @@ def validate_results_document(doc: Any) -> list[str]:
                 errors.append(
                     f"Results file `bridge_file_sha256[{rel}]` must be a 64-hex sha256, got {sha!r}"
                 )
+    if "classifier_source_sha256" in doc and not _is_hex_digest(doc["classifier_source_sha256"], 64):
+        errors.append(
+            "Results file `classifier_source_sha256` must be a 64-hex sha256, got "
+            f"{doc['classifier_source_sha256']!r}"
+        )
     corpora = doc.get("corpora", {})
     if not isinstance(corpora, dict):
         errors.append("Results file `corpora` must be a JSON object")
         return errors
     for cname, entry in corpora.items():
-        _validate_measured_entry(f"corpora.{cname}", entry, errors)
+        _validate_measured_entry(
+            f"corpora.{cname}", entry, errors, pinned_external=cname in PINNED_EXTERNAL_REVISIONS
+        )
     return errors
 
 
@@ -2105,6 +2573,107 @@ def _compare_committed_digests(
             )
 
 
+def _compare_committed_classifier(rep: dict[str, Any], committed: Any, errors: list[str]) -> None:
+    """Refuse committed counts measured with classifier source other than the live one."""
+    pinned = committed.get("classifier_source_sha256") if isinstance(committed, dict) else None
+    live = rep.get("classifier_source_sha256")
+    if not _is_hex_digest(pinned, 64):
+        errors.append(
+            "scripts/lcnf_coverage_results.json carries no valid `classifier_source_sha256`, "
+            "so the classifier source its counts were measured with cannot be gated "
+            "(re-run --write-results)"
+        )
+    elif live != pinned:
+        errors.append(
+            f"Classifier source digest mismatch: committed={pinned} live={live}; the "
+            "committed counts were measured with other audit-driver or classifier code "
+            "(re-run --write-results)"
+        )
+
+
+def _compare_committed_external_revisions(committed: Any, errors: list[str]) -> None:
+    """Refuse committed external-corpus counts measured at another revision than the pin."""
+    corpora = committed.get("corpora") if isinstance(committed, dict) else None
+    if not isinstance(corpora, dict):
+        return  # named by validate_results_document on the --check path
+    for cname, pinned in PINNED_EXTERNAL_REVISIONS.items():
+        entry = corpora.get(cname)
+        if not isinstance(entry, dict) or entry.get("measurement_source") == "not_measured":
+            continue
+        recorded = entry.get("commit_sha")
+        if recorded is None:
+            errors.append(
+                f"Corpus `{cname}` in scripts/lcnf_coverage_results.json records no `commit_sha`, "
+                "so the revision its counts were measured at cannot be gated (re-run --write-results)"
+            )
+        elif recorded != pinned:
+            errors.append(
+                f"Corpus `{cname}` in scripts/lcnf_coverage_results.json was measured at revision "
+                f"{recorded}, not the pinned {pinned}; re-run --write-results on a build of the "
+                "pinned revision"
+            )
+
+
+def _compare_committed_toolchain(committed: Any, errors: list[str]) -> None:
+    """Refuse committed counts measured with another toolchain than the pinned one.
+
+    The classifier digest hashes the source that names PINNED_TOOLCHAIN, not
+    its value, so this comparison is what ties the committed counts to it.
+    """
+    recorded = committed.get("toolchain") if isinstance(committed, dict) else None
+    if recorded != PINNED_TOOLCHAIN:
+        errors.append(
+            f"Results file toolchain mismatch: file={recorded!r} live={PINNED_TOOLCHAIN!r}"
+        )
+
+
+def _toolchain_file_mismatch(root_dir: Path) -> str | None:
+    """Why `lean/lean-toolchain` does not match PINNED_TOOLCHAIN, or None when it does.
+
+    The measurement runs `lake` in `lean/`, so elan builds and runs it with the
+    toolchain that file names, while the results record PINNED_TOOLCHAIN. A
+    `lean/` without the file falls back to elan's default toolchain, so that is
+    a mismatch too. Only a root with no `lean/` at all (a sparse test fixture)
+    is not compared.
+    """
+    lean_dir = root_dir / "lean"
+    if not lean_dir.is_dir():
+        return None
+    path = lean_dir / "lean-toolchain"
+    try:
+        named = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return (
+            f"lean/ has no readable lean-toolchain ({exc}), so elan would build with its "
+            f"default toolchain instead of PINNED_TOOLCHAIN {PINNED_TOOLCHAIN!r}"
+        )
+    if named != PINNED_TOOLCHAIN:
+        return (
+            f"lean/lean-toolchain names {named!r} but PINNED_TOOLCHAIN is {PINNED_TOOLCHAIN!r}, "
+            "so the measurement runs under a toolchain the results do not record (update "
+            "PINNED_TOOLCHAIN and re-run --write-results)"
+        )
+    return None
+
+
+def _compare_toolchain_file(root_dir: Path, errors: list[str]) -> None:
+    """Refuse a PINNED_TOOLCHAIN other than the toolchain `lean/lean-toolchain` names.
+
+    With the committed-toolchain comparison this holds the committed value, the
+    constant and the file equal on the `--check` and `--json` paths.
+    """
+    mismatch = _toolchain_file_mismatch(root_dir)
+    if mismatch is not None:
+        errors.append(mismatch)
+
+
+def _refuse_toolchain_file_mismatch(root_dir: Path = ROOT_DIR) -> None:
+    """Refuse `--write-results` before it measures under a toolchain the results would not record."""
+    mismatch = _toolchain_file_mismatch(root_dir)
+    if mismatch is not None:
+        raise RuntimeError(f"refusing to write results: {mismatch}")
+
+
 def check_coverage_report(
     root_dir: Path = ROOT_DIR,
     report: dict[str, Any] | None = None,
@@ -2120,6 +2689,7 @@ def check_coverage_report(
     for rel in rep.get("bridge_source_digests", {}):
         if not (root_dir / rel).is_file():
             errors.append(f"Missing tracked bridge file: {rel}")
+    _compare_toolchain_file(root_dir, errors)
 
     for row in rep["lcnf_constructor_matrix"]["rows"]:
         ev_file = root_dir / row["evidence_file"]
@@ -2244,6 +2814,8 @@ def check_coverage_report(
         if not isinstance(base_digests, dict):
             base_digests = {}  # already named by validate_results_document
         _compare_committed_digests(rep, base_digests, errors)
+        _compare_committed_classifier(rep, baseline_doc, errors)
+        _compare_committed_external_revisions(baseline_doc, errors)
         base_corpora = baseline_doc.get("corpora", {}) if isinstance(baseline_doc, dict) else {}
         if not isinstance(base_corpora, dict):
             base_corpora = {}
@@ -2384,6 +2956,10 @@ def check_coverage_report(
                     )
                 else:
                     _compare_committed_digests(rep, base_digests, errors)
+                _compare_committed_classifier(rep, committed, errors)
+                _compare_committed_external_revisions(committed, errors)
+                # The --check path gets this from validate_results_document.
+                _compare_committed_toolchain(committed, errors)
         else:
             errors.append(
                 "Missing committed results file scripts/lcnf_coverage_results.json: "
@@ -2581,8 +3157,12 @@ class TestLcnfCoverage(unittest.TestCase):
         # named error, and the tracked set covers the S3a BridgeHelpers/ split.
         rep = self._v_fake_live_report()
         tracked = _tracked_bridge_paths(ROOT_DIR)
-        self.assertGreaterEqual(len(tracked), 11, tracked)  # 5 static + the split helper files
+        # The S3a split's helper files join the static set; the sixth split
+        # module went with L1's compression post-pass (d24ad53), so no count
+        # is hard-coded here.
+        self.assertGreater(len(tracked), len(TRACKED_BRIDGE_FILES), tracked)
         self.assertIn("lean/LeanNative/IR/BridgeHelpers/RealBridgeCtxAndSlices.lean", tracked)
+        self.assertNotIn("lean/LeanNative/IR/BridgeHelpers/ScalarDagAndJoinPoints.lean", tracked)
         baseline = self._v_committed_baseline()
         self.assertEqual(sorted(baseline["bridge_file_sha256"]), tracked)
 
@@ -2611,6 +3191,536 @@ class TestLcnfCoverage(unittest.TestCase):
             any("NotTracked.lean" in e and "not tracked" in e for e in chk["errors"]),
             chk["errors"],
         )
+
+    def test_tracked_set_covers_the_shared_helpers_and_the_proof_split(self) -> None:
+        # The lowerer imports RealLCNFShared.lean for its operator tables,
+        # width and mask helpers and ground-type lowering, so an edit there
+        # changes the lowering behind every committed count. The `proved` rule
+        # rests on lowerRealLCNFDecl_soundF (Proofs/LowerCalls.lean), on the
+        # call semantics its conclusion is stated in, and on the proof split
+        # that RealLCNFBridgeProofs.lean, a one-line re-export, imports. All of
+        # them are pinned, the split by directory like the BridgeHelpers/ one.
+        tracked = set(_tracked_bridge_paths(ROOT_DIR))
+        for rel in (
+            "lean/LeanNative/IR/RealLCNFShared.lean",
+            "lean/LeanNative/IR/RealLCNFCallSemantics.lean",
+            "lean/LeanNative/Proofs/LowerCalls.lean",
+        ):
+            self.assertIn(rel, tracked)
+        split = subprocess.run(
+            ["git", "ls-files", "--", "lean/LeanNative/Proofs/RealLCNFBridge"],
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        self.assertIn("lean/LeanNative/Proofs/RealLCNFBridge/CallsF.lean", split)
+        self.assertLessEqual(set(split), tracked)
+        # The re-export pins nothing by itself, so what it imports is pinned.
+        reexport = (ROOT_DIR / "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean").read_text(
+            encoding="utf-8"
+        )
+        import re
+
+        # `public import` too, as build_c1_corpus_manifest.py's _IMPORT_RE reads it.
+        import_re = re.compile(r"^\s*(?:public\s+)?import\s+(.+)$", re.M)
+        self.assertEqual(
+            import_re.findall("public import LeanNative.A LeanNative.B\n"), ["LeanNative.A LeanNative.B"]
+        )
+        imported = [
+            mod
+            for line in import_re.findall(reexport)
+            for mod in line.split()
+            if mod.startswith("LeanNative.")
+        ]
+        self.assertTrue(imported)
+        for mod in imported:
+            self.assertIn(f"lean/{mod.replace('.', '/')}.lean", tracked)
+
+    def test_pinned_digests_are_the_measured_commits_bytes(self) -> None:
+        # The committed counts were measured at measured_source_commit, so each
+        # pinned bridge digest must hash that commit's bytes of its file, not
+        # only this tree's. A pin recorded without a re-measure is honest only
+        # then. A shallow checkout may not hold the commit and is skipped; a
+        # full clone without it fails, since the results then name a commit
+        # nobody can resolve (a rewritten history re-points the file).
+        baseline = self._v_committed_baseline()
+        commit = baseline["measured_source_commit"]
+        present = subprocess.run(
+            ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+        )
+        if present.returncode != 0:
+            shallow = subprocess.run(
+                ["git", "rev-parse", "--is-shallow-repository"],
+                cwd=str(ROOT_DIR),
+                capture_output=True,
+                text=True,
+            )
+            if shallow.returncode == 0 and shallow.stdout.strip() == "true":
+                self.skipTest(f"measured_source_commit {commit} is not in this shallow clone")
+            self.fail(
+                f"measured_source_commit {commit} is not in this clone, which is not shallow "
+                f"(git rev-parse --is-shallow-repository: rc={shallow.returncode} "
+                f"out={shallow.stdout.strip()!r} err={shallow.stderr.strip()!r})"
+            )
+
+        def not_at_commit(pins: dict[str, str]) -> list[str]:
+            bad = []
+            for rel, pinned in sorted(pins.items()):
+                blob = subprocess.run(
+                    ["git", "cat-file", "blob", f"{commit}:{rel}"],
+                    cwd=str(ROOT_DIR),
+                    capture_output=True,
+                )
+                if blob.returncode != 0 or hashlib.sha256(blob.stdout).hexdigest() != pinned:
+                    bad.append(rel)
+            return bad
+
+        pins = baseline["bridge_file_sha256"]
+        self.assertEqual(not_at_commit(pins), [])
+        # Control: a pin that is not the commit's bytes is reported.
+        first = sorted(pins)[0]
+        self.assertEqual(not_at_commit({first: "0" * 64}), [first])
+
+    def test_check_and_json_refuse_classifier_source_drift(self) -> None:
+        # The bridge-file digests pin only Lean sources, so an edit to the audit
+        # drivers or the Python facts path in this script passed `--json`
+        # against committed counts the edited code never produced (CI builds no
+        # Batteries tree to re-measure). The committed results pin
+        # `classifier_source_sha256`: a drifted or a missing pin fails both the
+        # `--check` path (`results=`) and the `--json` digest path.
+        self.assertIn(inspect.getsource(_classify_decl_facts), _classifier_source_texts())
+        self.assertIn(_LEAN_AUDIT_DRIVER_HEAD, _classifier_source_texts())
+        self.assertEqual(classifier_source_digest(), classifier_source_digest())
+        rep = self._v_fake_live_report()
+        baseline = self._v_committed_baseline()
+        baseline["schemaVersion"] = RESULTS_SCHEMA_VERSION
+        baseline["classifier_source_sha256"] = classifier_source_digest()
+        drifted = json.loads(json.dumps(baseline))
+        drifted["classifier_source_sha256"] = "0" * 64
+        dropped = json.loads(json.dumps(baseline))
+        del dropped["classifier_source_sha256"]
+
+        def gate_errors(errors: list[str]) -> list[str]:
+            return [e for e in errors if "classifier_source_sha256" in e or "Classifier source" in e]
+
+        self.assertEqual(gate_errors(check_coverage_report(ROOT_DIR, rep, results=baseline)["errors"]), [])
+        for doc in (drifted, dropped):
+            chk = check_coverage_report(ROOT_DIR, rep, results=doc)
+            self.assertFalse(chk["ok"])
+            self.assertTrue(gate_errors(chk["errors"]), chk["errors"])
+        with tempfile.TemporaryDirectory(prefix="lcnf-classifier-gate-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            committed = root / "scripts" / "lcnf_coverage_results.json"
+            for doc, want_gate_error in ((baseline, False), (drifted, True), (dropped, True)):
+                committed.write_text(json.dumps(doc), encoding="utf-8")
+                chk = check_coverage_report(root, rep, compare_results_digests=True)
+                self.assertEqual(bool(gate_errors(chk["errors"])), want_gate_error, chk["errors"])
+
+    def test_check_and_json_refuse_counts_from_another_external_revision(self) -> None:
+        # The classifier digest hashes the source text that names
+        # PINNED_BATTERIES_REV, not its value, so a bumped pin left the old
+        # revision's committed Batteries counts passing `--json`, which builds
+        # no Batteries tree. The committed entry of each external corpus
+        # records the `commit_sha` its measurement verified the tree at: one
+        # naming another revision than the pin, or none, fails both the
+        # `--check` path (`results=`) and the `--json` digest path.
+        rep = self._v_fake_live_report()
+        baseline = self._v_committed_baseline()
+        baseline["classifier_source_sha256"] = classifier_source_digest()
+        baseline["corpora"]["external_batteries"]["commit_sha"] = PINNED_BATTERIES_REV
+        moved = json.loads(json.dumps(baseline))
+        moved["corpora"]["external_batteries"]["commit_sha"] = "1" * 40
+        unrecorded = json.loads(json.dumps(baseline))
+        del unrecorded["corpora"]["external_batteries"]["commit_sha"]
+
+        def gate_errors(errors: list[str], corpus: str = "external_batteries") -> list[str]:
+            return [
+                e
+                for e in errors
+                if f"`{corpus}`" in e and ("measured at revision" in e or "records no `commit_sha`" in e)
+            ]
+
+        for doc in (moved, unrecorded):
+            chk = check_coverage_report(ROOT_DIR, rep, results=doc)
+            self.assertFalse(chk["ok"])
+            self.assertTrue(gate_errors(chk["errors"]), chk["errors"])
+        chk = check_coverage_report(ROOT_DIR, rep, results=baseline)
+        self.assertTrue(chk["ok"], chk["errors"])
+        # con-leche is the other pinned external corpus; it is not committed
+        # today, so its entry is planted here.
+        con_leche = dict(baseline["corpora"]["external_batteries"], commit_sha=PINNED_CON_LECHE_REV)
+        con_leche_moved = dict(con_leche, commit_sha="2" * 40)
+        with tempfile.TemporaryDirectory(prefix="lcnf-revision-gate-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            committed = root / "scripts" / "lcnf_coverage_results.json"
+            for doc, want_gate_error in ((moved, True), (unrecorded, True), (baseline, False)):
+                committed.write_text(json.dumps(doc), encoding="utf-8")
+                chk = check_coverage_report(root, rep, compare_results_digests=True)
+                self.assertEqual(bool(gate_errors(chk["errors"])), want_gate_error, chk["errors"])
+            for entry, want_gate_error in ((con_leche_moved, True), (con_leche, False)):
+                doc = json.loads(json.dumps(baseline))
+                doc["corpora"]["con_leche_h3_benchmark"] = entry
+                committed.write_text(json.dumps(doc), encoding="utf-8")
+                chk = check_coverage_report(root, rep, compare_results_digests=True)
+                self.assertEqual(
+                    bool(gate_errors(chk["errors"], "con_leche_h3_benchmark")),
+                    want_gate_error,
+                    chk["errors"],
+                )
+
+    def test_json_refuses_counts_measured_with_another_toolchain(self) -> None:
+        # The --check path compares the committed toolchain with
+        # PINNED_TOOLCHAIN in validate_results_document, but the --json path CI
+        # runs did not, and the classifier digest hashes the source that names
+        # PINNED_TOOLCHAIN, not its value. A toolchain bump without a
+        # re-measure left the old toolchain's committed counts passing CI.
+        rep = self._v_fake_live_report()
+        baseline = self._v_committed_baseline()
+        baseline["classifier_source_sha256"] = classifier_source_digest()
+        bumped = dict(baseline, toolchain="leanprover/lean4:v4.36.0")
+
+        def gate_errors(errors: list[str]) -> list[str]:
+            return [e for e in errors if "toolchain mismatch" in e]
+
+        with tempfile.TemporaryDirectory(prefix="lcnf-toolchain-gate-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            committed = root / "scripts" / "lcnf_coverage_results.json"
+            for doc, want_gate_error in ((bumped, True), (baseline, False)):
+                committed.write_text(json.dumps(doc), encoding="utf-8")
+                chk = check_coverage_report(root, rep, compare_results_digests=True)
+                self.assertEqual(bool(gate_errors(chk["errors"])), want_gate_error, chk["errors"])
+        # The --check path still names the mismatch once.
+        chk = check_coverage_report(ROOT_DIR, rep, results=bumped)
+        self.assertEqual(len(gate_errors(chk["errors"])), 1, chk["errors"])
+
+    def test_check_and_json_refuse_a_pinned_toolchain_lean_does_not_build_with(self) -> None:
+        # The measurement runs `lake` in lean/, so elan uses the toolchain
+        # lean/lean-toolchain names, while the results record PINNED_TOOLCHAIN.
+        # Nothing tied the two: a bump of lean/lean-toolchain alone left the
+        # old toolchain's committed counts passing --json. Both paths now hold
+        # the file equal to the constant.
+        rep = self._v_fake_live_report()
+        baseline = self._v_committed_baseline()
+
+        def gate_errors(errors: list[str]) -> list[str]:
+            return [e for e in errors if "lean/lean-toolchain" in e]
+
+        named = (ROOT_DIR / "lean" / "lean-toolchain").read_text(encoding="utf-8").strip()
+        self.assertEqual(named, PINNED_TOOLCHAIN)
+        self.assertEqual(gate_errors(check_coverage_report(ROOT_DIR, rep, results=baseline)["errors"]), [])
+        with tempfile.TemporaryDirectory(prefix="lcnf-toolchain-file-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            (root / "lean").mkdir()
+            (root / "scripts" / "lcnf_coverage_results.json").write_text(json.dumps(baseline), encoding="utf-8")
+            for text, want_gate_error in (("leanprover/lean4:v4.36.0\n", True), (PINNED_TOOLCHAIN + "\n", False)):
+                (root / "lean" / "lean-toolchain").write_text(text, encoding="utf-8")
+                for chk in (
+                    check_coverage_report(root, rep, compare_results_digests=True),
+                    check_coverage_report(root, rep, results=baseline),
+                ):
+                    self.assertEqual(bool(gate_errors(chk["errors"])), want_gate_error, chk["errors"])
+
+    def test_toolchain_file_check_fails_closed_when_lean_has_no_toolchain_file(self) -> None:
+        # Without lean/lean-toolchain, elan falls back to its default toolchain,
+        # so a checkout's lean/ without the file is refused rather than passed.
+        # Only a root with no lean/ at all (a sparse test fixture) is skipped.
+        rep = self._v_fake_live_report()
+
+        def gate_errors(errors: list[str]) -> list[str]:
+            return [e for e in errors if "lean-toolchain" in e]
+
+        with tempfile.TemporaryDirectory(prefix="lcnf-no-toolchain-file-") as tmp:
+            root = Path(tmp)
+            self.assertEqual(gate_errors(check_coverage_report(root, rep)["errors"]), [])
+            (root / "lean").mkdir()
+            chk = check_coverage_report(root, rep)
+            self.assertTrue(gate_errors(chk["errors"]), chk["errors"])
+
+    def test_write_results_refuses_a_toolchain_lean_does_not_build_with(self) -> None:
+        # The toolchain-file comparison ran only on the check paths, so
+        # --write-results measured under a bumped lean/lean-toolchain and wrote
+        # a file stamped with the old PINNED_TOOLCHAIN. It is refused before the
+        # measurement now.
+        import contextlib
+        import io
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        doc = self._v_committed_baseline()
+        with tempfile.TemporaryDirectory(prefix="lcnf-write-toolchain-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            (root / "lean").mkdir()
+            (root / "lean" / "lean-toolchain").write_text("leanprover/lean4:v4.36.0\n", encoding="utf-8")
+            results = root / "scripts" / "lcnf_coverage_results.json"
+            err = io.StringIO()
+            with mock.patch.object(m, "ROOT_DIR", root), mock.patch.object(
+                m, "RESULTS_FILE", results
+            ), mock.patch.object(m, "_refuse_dirty_measurement_inputs"), mock.patch.object(
+                m, "check_coverage_report", return_value={"ok": True, "errors": [], "report": {"corpora": {}}}
+            ) as measured, mock.patch.object(
+                m, "results_document", return_value=doc
+            ), mock.patch.object(
+                sys, "argv", ["lcnf_coverage.py", "--write-results"]
+            ), contextlib.redirect_stderr(err):
+                rc = m.main()
+            self.assertEqual(rc, 1, err.getvalue())
+            measured.assert_not_called()
+            self.assertFalse(results.exists())
+            self.assertIn("lean/lean-toolchain", err.getvalue())
+
+    def test_write_results_prints_the_check_errors_it_exits_on(self) -> None:
+        # --write-results writes the measurement and exits 1 when the check
+        # found errors; it now names them instead of exiting 1 in silence.
+        import contextlib
+        import io
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        planted = "planted check error"
+        doc = self._v_committed_baseline()
+        with tempfile.TemporaryDirectory(prefix="lcnf-write-errors-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            results = root / "scripts" / "lcnf_coverage_results.json"
+            err = io.StringIO()
+            with mock.patch.object(m, "ROOT_DIR", root), mock.patch.object(
+                m, "RESULTS_FILE", results
+            ), mock.patch.object(m, "_refuse_dirty_measurement_inputs"), mock.patch.object(
+                m, "check_coverage_report", return_value={"ok": False, "errors": [planted], "report": {"corpora": {}}}
+            ), mock.patch.object(
+                m, "results_document", return_value=doc
+            ), mock.patch.object(
+                sys, "argv", ["lcnf_coverage.py", "--write-results"]
+            ), contextlib.redirect_stderr(err):
+                rc = m.main()
+            self.assertEqual(rc, 1)
+            self.assertIn(f"[ERROR] {planted}", err.getvalue())
+
+    def test_write_results_records_the_external_revision(self) -> None:
+        # The live external entry names the revision its measurement verified
+        # the tree at, and the committed entry keeps it for the revision gate.
+        # A live entry naming another revision than the pin is refused.
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        rel = "lean/LeanNative/IR/Bridge.lean"
+        live = dict(
+            {f: 0 for f in MEASURED_INT_FIELDS},
+            measurement_source="live_invocation",
+            commit_sha=PINNED_BATTERIES_REV,
+        )
+        report = {
+            "bridge_source_digests": {rel: {"actual_sha256": "0" * 64}},
+            "classifier_source_sha256": "1" * 64,
+            "corpora": {"external_batteries": live},
+        }
+        moved = dict(report, corpora={"external_batteries": dict(live, commit_sha="1" * 40)})
+        with mock.patch.object(m, "_git_head", return_value="a" * 40), mock.patch.object(
+            m.subprocess, "run"
+        ) as run:
+            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            with self.assertRaises(RuntimeError) as ctx:
+                results_document(moved, ROOT_DIR)
+            doc = results_document(report, ROOT_DIR)
+        self.assertIn("external_batteries", str(ctx.exception))
+        self.assertIn(PINNED_BATTERIES_REV, str(ctx.exception))
+        self.assertEqual(doc["corpora"]["external_batteries"]["commit_sha"], PINNED_BATTERIES_REV)
+        self.assertEqual([e for e in validate_results_document(doc) if "commit_sha" in e], [])
+
+    def test_commit_sha_is_refused_on_an_in_repo_corpus(self) -> None:
+        # Only the pinned external corpora record the revision they were
+        # measured at; the in-repo counts belong to measured_source_commit, so
+        # a commit_sha planted on one of them is an unknown key.
+        baseline = self._v_committed_baseline()
+        self.assertEqual([e for e in validate_results_document(baseline) if "commit_sha" in e], [])
+        for cname in ("c1_corpus", "std_init_and_c2"):
+            planted = json.loads(json.dumps(baseline))
+            planted["corpora"][cname]["commit_sha"] = PINNED_BATTERIES_REV
+            errors = validate_results_document(planted)
+            self.assertTrue(
+                any(f"corpora.{cname}" in e and "unknown keys: commit_sha" in e for e in errors), errors
+            )
+
+    def test_write_results_refuses_to_drop_a_measured_corpus(self) -> None:
+        # results_document keeps only the corpora this run measured, so a
+        # `--write-results` run without an external tree (no scratch/batteries)
+        # rewrote the committed results without that corpus's counts and
+        # reported success. The write is refused instead, naming the corpus
+        # and why this run did not measure it; a run that measures every
+        # committed corpus still writes.
+        import contextlib
+        import io
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        committed = self._v_committed_baseline()
+        reason = "no prebuilt pinned Batteries `.olean` tree"
+        report = {
+            "corpora": {"external_batteries": {"measurement_source": "not_measured", "reason": reason}}
+        }
+        partial = json.loads(json.dumps(committed))
+        del partial["corpora"]["external_batteries"]
+        with tempfile.TemporaryDirectory(prefix="lcnf-drop-guard-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            results = root / "scripts" / "lcnf_coverage_results.json"
+            for doc, want_rc in ((partial, 1), (committed, 0)):
+                results.write_text(json.dumps(committed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                before = results.read_text(encoding="utf-8")
+                err = io.StringIO()
+                # TURBO_BATTERIES_OLEANS names an existing directory, so the tree
+                # check before the measurement passes and this exercises the
+                # guard after it, the one that sees what the run measured.
+                with mock.patch.object(m, "ROOT_DIR", root), mock.patch.object(
+                    m, "RESULTS_FILE", results
+                ), mock.patch.object(m, "_refuse_dirty_measurement_inputs"), mock.patch.dict(
+                    os.environ, {BATTERIES_OLEANS_ENV: str(root)}
+                ), mock.patch.object(
+                    m, "check_coverage_report", return_value={"ok": True, "errors": [], "report": report}
+                ), mock.patch.object(m, "results_document", return_value=doc), mock.patch.object(
+                    sys, "argv", ["lcnf_coverage.py", "--write-results"]
+                ), contextlib.redirect_stderr(err):
+                    rc = m.main()
+                self.assertEqual(rc, want_rc, err.getvalue())
+                if want_rc:
+                    self.assertEqual(results.read_text(encoding="utf-8"), before)
+                    self.assertIn("`external_batteries`", err.getvalue())
+                    self.assertIn(reason, err.getvalue())
+                else:
+                    self.assertEqual(json.loads(results.read_text(encoding="utf-8")), committed)
+
+    def test_write_results_refuses_a_corrupt_committed_file_before_measuring(self) -> None:
+        # Only a missing file means a first baseline. A committed file that
+        # exists but does not parse (merge-conflict markers after a rebase)
+        # read as missing, so the drop guard let the write replace it. The
+        # check before the measurement reads the same file and refuses first.
+        import contextlib
+        import io
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        committed = self._v_committed_baseline()
+        with tempfile.TemporaryDirectory(prefix="lcnf-corrupt-results-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            results = root / "scripts" / "lcnf_coverage_results.json"
+            text = json.dumps(committed, indent=2, sort_keys=True) + "\n"
+            corrupt = "<<<<<<< HEAD\n" + text + "=======\n" + text + ">>>>>>> other\n"
+            results.write_text(corrupt, encoding="utf-8")
+            err = io.StringIO()
+            with mock.patch.object(m, "ROOT_DIR", root), mock.patch.object(
+                m, "RESULTS_FILE", results
+            ), mock.patch.object(m, "_refuse_dirty_measurement_inputs"), mock.patch.object(
+                m, "check_coverage_report", return_value={"ok": True, "errors": [], "report": {"corpora": {}}}
+            ) as measured, mock.patch.object(
+                sys, "argv", ["lcnf_coverage.py", "--write-results"]
+            ), contextlib.redirect_stderr(err):
+                rc = m.main()
+            self.assertEqual(rc, 1, err.getvalue())
+            measured.assert_not_called()
+            self.assertEqual(results.read_text(encoding="utf-8"), corrupt)
+            self.assertIn("not valid JSON", err.getvalue())
+
+    def test_drop_guard_refuses_a_corrupt_committed_file(self) -> None:
+        # The guard after the measurement reads the committed file again, so a
+        # file that went corrupt after the first check is refused there too. A
+        # missing file is the first-baseline case and passes.
+        committed = self._v_committed_baseline()
+        report: dict[str, Any] = {"corpora": {}}
+        doc: dict[str, Any] = {"corpora": {}}
+        with tempfile.TemporaryDirectory(prefix="lcnf-drop-guard-corrupt-") as tmp:
+            results = Path(tmp) / "lcnf_coverage_results.json"
+            self.assertIsNone(_refuse_dropped_corpora(report, doc, results))
+            text = json.dumps(committed, indent=2, sort_keys=True) + "\n"
+            results.write_text(
+                "<<<<<<< HEAD\n" + text + "=======\n" + text + ">>>>>>> other\n", encoding="utf-8"
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                _refuse_dropped_corpora(report, doc, results)
+            self.assertIn("not valid JSON", str(ctx.exception))
+
+    def test_write_results_fails_before_measuring_without_a_committed_external_tree(self) -> None:
+        # The drop guard runs after the minutes-long measurement. With no tree
+        # at all for a committed external corpus, the refusal comes before it.
+        import contextlib
+        import io
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        committed = self._v_committed_baseline()
+        with tempfile.TemporaryDirectory(prefix="lcnf-no-tree-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            results = root / "scripts" / "lcnf_coverage_results.json"
+            results.write_text(json.dumps(committed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            before = results.read_text(encoding="utf-8")
+            err = io.StringIO()
+            with mock.patch.object(m, "ROOT_DIR", root), mock.patch.object(
+                m, "RESULTS_FILE", results
+            ), mock.patch.object(m, "_refuse_dirty_measurement_inputs"), mock.patch.dict(
+                os.environ, {BATTERIES_OLEANS_ENV: str(root / "no-such-tree")}
+            ), mock.patch.object(
+                m, "check_coverage_report", return_value={"ok": True, "errors": [], "report": {"corpora": {}}}
+            ) as measured, mock.patch.object(
+                m, "results_document", return_value=committed
+            ), mock.patch.object(
+                sys, "argv", ["lcnf_coverage.py", "--write-results"]
+            ), contextlib.redirect_stderr(err):
+                rc = m.main()
+            self.assertEqual(rc, 1, err.getvalue())
+            measured.assert_not_called()
+            self.assertEqual(results.read_text(encoding="utf-8"), before)
+            self.assertIn("`external_batteries`", err.getvalue())
+            self.assertIn(BATTERIES_OLEANS_ENV, err.getvalue())
+
+    def test_every_pinned_external_corpus_has_a_tree_finder(self) -> None:
+        # The no-tree check before the measurement skips a corpus it has no
+        # finder for, so a third external corpus added to
+        # PINNED_EXTERNAL_REVISIONS alone would be refused only after the full
+        # audit. The two tables name the same corpora.
+        import unittest.mock as mock
+
+        self.assertEqual(set(_external_tree_finders()), set(PINNED_EXTERNAL_REVISIONS))
+        # Control: a corpus pinned without a finder breaks the equality.
+        with mock.patch.dict(PINNED_EXTERNAL_REVISIONS, {"third_external": "0" * 40}):
+            self.assertNotEqual(set(_external_tree_finders()), set(PINNED_EXTERNAL_REVISIONS))
+
+    def test_write_results_reports_a_results_document_refusal_as_an_error(self) -> None:
+        # results_document's refusals (a dirty tree, a missing digest, an
+        # external entry measured at another revision) print as a named
+        # [ERROR] with exit 1, like the guards around them, not a traceback.
+        import contextlib
+        import io
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        refusal = "refusing to write results: corpus `external_batteries` was measured at revision 'x'"
+        with tempfile.TemporaryDirectory(prefix="lcnf-doc-refusal-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            results = root / "scripts" / "lcnf_coverage_results.json"
+            err = io.StringIO()
+            with mock.patch.object(m, "ROOT_DIR", root), mock.patch.object(
+                m, "RESULTS_FILE", results
+            ), mock.patch.object(m, "_refuse_dirty_measurement_inputs"), mock.patch.object(
+                m, "check_coverage_report", return_value={"ok": True, "errors": [], "report": {"corpora": {}}}
+            ), mock.patch.object(
+                m, "results_document", side_effect=RuntimeError(refusal)
+            ), mock.patch.object(
+                sys, "argv", ["lcnf_coverage.py", "--write-results"]
+            ), contextlib.redirect_stderr(err):
+                rc = m.main()
+            self.assertEqual(rc, 1)
+            self.assertIn(f"[ERROR] {refusal}", err.getvalue())
+            self.assertFalse(results.exists())
 
     def test_executes_live_lean_lowerer_on_corpora(self) -> None:
         live = execute_live_lean_audit(ROOT_DIR)
@@ -2783,6 +3893,7 @@ class TestLcnfCoverage(unittest.TestCase):
         }
         return {
             "bridge_source_digests": _bridge_digests(ROOT_DIR),
+            "classifier_source_sha256": classifier_source_digest(),
             "lcnf_constructor_matrix": {
                 "rows": [],
                 "summary": {"total": 0, "proved": 0, "lowered_unproved": 0, "rejected": 0},
@@ -3285,6 +4396,9 @@ class TestLcnfCoverage(unittest.TestCase):
                 dst = root / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(ROOT_DIR / rel, dst)
+            # A checkout always tracks lean/lean-toolchain, and the toolchain
+            # check refuses a lean/ without it.
+            shutil.copy2(ROOT_DIR / "lean" / "lean-toolchain", root / "lean" / "lean-toolchain")
             (root / "scripts").mkdir()
             (root / "scripts" / "lcnf_coverage_results.json").write_text(
                 json.dumps(baseline), encoding="utf-8"
@@ -3355,7 +4469,11 @@ class TestLcnfCoverage(unittest.TestCase):
 
         m = sys.modules[__name__]
         rel = "lean/LeanNative/IR/Bridge.lean"
-        report = {"bridge_source_digests": {rel: {"actual_sha256": "0" * 64}}, "corpora": {}}
+        report = {
+            "bridge_source_digests": {rel: {"actual_sha256": "0" * 64}},
+            "classifier_source_sha256": "1" * 64,
+            "corpora": {},
+        }
         with mock.patch.object(m, "_git_head", return_value="a" * 40), mock.patch.object(
             m.subprocess, "run"
         ) as run:
@@ -3375,7 +4493,13 @@ class TestLcnfCoverage(unittest.TestCase):
         ) as run:
             run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
             doc = results_document(report, ROOT_DIR)
+            # A clean tree still refuses a report without the classifier digest.
+            unpinned = {k: v for k, v in report.items() if k != "classifier_source_sha256"}
+            with self.assertRaises(RuntimeError) as ctx:
+                results_document(unpinned, ROOT_DIR)
         self.assertEqual(doc["bridge_file_sha256"], {rel: "0" * 64})
+        self.assertEqual(doc["classifier_source_sha256"], "1" * 64)
+        self.assertIn("classifier_source_sha256", str(ctx.exception))
 
     def test_write_results_refuses_untracked_bridge_stray(self) -> None:
         # Round-2 F1, real temp git repo: an UNTRACKED `*.lean` directly under
@@ -3447,6 +4571,7 @@ class TestLcnfCoverage(unittest.TestCase):
                 dst = root / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(ROOT_DIR / rel, dst)
+            shutil.copy2(ROOT_DIR / "lean" / "lean-toolchain", root / "lean" / "lean-toolchain")
             rep = build_coverage_report(root)
             rep["lcnf_constructor_matrix"] = {
                 "rows": [],
@@ -3647,15 +4772,17 @@ class TestLcnfCoverage(unittest.TestCase):
                 text=True,
             )
 
-    def test_cross_module_user_call_is_vacuous_not_rejected(self) -> None:
+    def test_cross_module_user_call_is_a_local_call_not_rejected(self) -> None:
         # Counterexample (real lowerer, two compiled modules): a declaration in
         # one measured module calling a user function declared in another
-        # measured module. The per-module localSet misses the cross-module
-        # callee, so the real lowerer fails it as an unsupported call and the
-        # driver counts it `rejected`, while the honest classification for a
-        # call into a measured corpus declaration is a vacuous local call
-        # (`lowered_unproved`) — eval `unsupportedCall` makes the pinned
-        # simulation vacuous exactly like the same-module helper case.
+        # measured module. A per-module localSet would miss the cross-module
+        # callee, so the real lowerer would fail it as an unsupported call and
+        # the driver would count it `rejected`; the group-wide localSet makes it
+        # a local call. Under L2's reclassification that call qualifies (a plain
+        # variable argument; the callee lowers with no call of its own and an
+        # export name that both its map entry and its lowering use), so the
+        # caller counts proved. Before the reclassification it was a vacuous
+        # local call (`lowered_unproved`), measured (2, 1, 1, 0, 0).
         _ensure_lean_build(ROOT_DIR)
         with tempfile.TemporaryDirectory(prefix="lcnf-xmod-") as tmp:
             root = Path(tmp)
@@ -3663,12 +4790,14 @@ class TestLcnfCoverage(unittest.TestCase):
             counts = _run_audit_driver(
                 ROOT_DIR, _lean_audit_driver_for_modules(["SAux", "SCaller"]), [str(root)]
             )
+            rows, aux = _collect_shard_facts(ROOT_DIR, root, ["SAux", "SCaller"], workers=1)
         tot, prv, unp, rej, cyc, _aux = counts
         self.assertEqual(tot, 2, counts)
-        self.assertEqual(prv, 1, counts)  # the callee itself lowers and proves
-        self.assertEqual(unp, 1, counts)  # the cross-module caller is a vacuous local call
+        self.assertEqual(prv, 2, counts)  # the callee and its cross-module caller
+        self.assertEqual(unp, 0, counts)
         self.assertEqual(rej, 0, counts)  # a corpus-local call is not an unsupported construct
         self.assertEqual(cyc, 0, counts)
+        self.assertEqual(_merge_batteries_shard_facts(rows, aux)[0], counts)
 
     def test_out_of_corpus_callee_is_rejected_never_proved(self) -> None:
         # H1.0a-S classification investigation, pinned: a call to a user
@@ -3686,6 +4815,48 @@ class TestLcnfCoverage(unittest.TestCase):
             )
         tot, prv, unp, rej, cyc, _aux = counts
         self.assertEqual((tot, prv, unp, rej, cyc), (1, 0, 0, 1, 0), counts)
+
+    def test_local_call_after_an_rc_instruction_counts_as_a_local_call(self) -> None:
+        # The has-local-call walk follows every impure-code constructor, as
+        # the call graph (`collectCodeLocalCallees` -> `codeHasSelfTailCall`)
+        # does. It used to stop at the first `inc`/`dec`/`del`/`oset`/`uset`/
+        # `sset`/`setTag`, so `bumpThenRec` below, whose impure body starts
+        # with `inc o` (it keeps `o` after handing it to the consuming
+        # `bump`) and then calls `bump` and the rejected `selfRec`, was
+        # counted proved: a vacuous declaration presented as proved. Measured
+        # with the old walk on the pinned toolchain: (3, 2, 0, 1, 0).
+        got = measure_fixture_corpus(
+            ROOT_DIR,
+            "inductive Opt where\n"
+            "  | none\n"
+            "  | some (v : UInt64)\n"
+            "partial def selfRec (x : UInt64) : UInt64 := if x == 0 then 0 else selfRec (x - 1) + 2\n"
+            "@[noinline] def bump (o : Opt) : Opt :=\n"
+            "  match o with\n"
+            "  | .none => .none\n"
+            "  | .some v => .some (v + 1)\n"
+            "def bumpThenRec (o : Opt) (x : UInt64) : UInt64 :=\n"
+            "  match bump o with\n"
+            "  | .none => selfRec x\n"
+            "  | .some _ =>\n"
+            "    match o with\n"
+            "    | .none => 1\n"
+            "    | .some _ => selfRec (x + 1)\n",
+            mod_name="RcFirstCall",
+        )
+        # bump: proved (no local call); selfRec: rejected (self-recursion);
+        # bumpThenRec: lowered, with local calls -> lowered_unproved.
+        self.assertEqual(
+            (
+                got["total_declarations"],
+                got["proved"],
+                got["lowered_unproved"],
+                got["rejected"],
+                got["rejected_not_lowered"],
+            ),
+            (3, 1, 1, 1, 0),
+            got,
+        )
 
     def test_audit_driver_never_silently_drops_a_module(self) -> None:
         # H1.0a-S acceptance: an EXECUTABLE failure reproduction of the silent
@@ -3942,20 +5113,248 @@ unsafe def main (args : List String) : IO Unit := do
         # H1.0b sharded path: the Python merger classifies per-declaration shard
         # facts exactly as auditMods does. A cycle member is rejected_not_lowered
         # without consulting its ingest verdict (even an "ok" or an error), a
-        # non-cycle ok declaration splits proved vs lowered_unproved on
-        # has_local_call, an ingest error is rejected with its reason head, and
-        # a callee absent from the corpus graph contributes no edges.
+        # non-cycle ok declaration with no local call is proved, an ingest error
+        # is rejected with its reason head, a declaration that calls into the
+        # cycle stays lowered_unproved, and so does one whose callee is absent
+        # from the corpus graph (the L2 rules are in
+        # test_l2_call_classification_is_fail_closed).
+        f = self._facts
         rows = [
-            ("A", True, ["B"], "ok"),  # on the 2-cycle with B -> rejected_not_lowered
-            ("B", True, ["A"], "err:boom"),  # same cycle; its ingest verdict is ignored
-            ("C", True, ["A"], "ok"),  # calls into the cycle, not on it -> lowered_unproved
-            ("D", False, [], "ok"),  # fully lowered, no local call -> proved
-            ("E", False, [], "err:unsupported thing"),  # rejected with its reason head
-            ("F", True, ["Z"], "ok"),  # callee outside the graph -> lowered_unproved
+            f("A", True, ["B"]),  # on the 2-cycle with B -> rejected_not_lowered
+            f("B", True, ["A"], "err:boom"),  # same cycle; its ingest verdict is ignored
+            f("C", True, ["A"]),  # calls into the cycle, not on it -> lowered_unproved
+            f("D", False, []),  # fully lowered, no local call -> proved
+            f("E", False, [], "err:unsupported thing"),  # rejected with its reason head
+            f("F", True, ["Z"]),  # callee outside the graph -> lowered_unproved
         ]
         counts, reasons = _merge_batteries_shard_facts(rows, aux_total=7)
         self.assertEqual(counts, (6, 1, 2, 3, 2, 7))
         self.assertEqual(sorted(reasons), ["mutual_cycle", "mutual_cycle", "unsupported thing"])
+
+    # ------------------------------------------------------------------
+    # L2 reclassification ("matrix moves", the Acceptance section of
+    # lean/LeanNative/Proofs/LowerCalls.lean): a lowered declaration with
+    # local calls counts proved only when lowerRealLCNFDecl_soundF applies
+    # with an environment built from the corpus.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _facts(
+        name: str,
+        has_call: bool,
+        callees: list[str],
+        verdict: str = "ok",
+        *,
+        self_call: bool = False,
+        all_fvar: bool = True,
+        mapped: str | None = None,
+        lowered: str | None = None,
+    ) -> DeclFacts:
+        symbol = f"l_{name}"
+        mapped = symbol if mapped is None else mapped
+        if lowered is None:
+            lowered = symbol if verdict == "ok" else ""
+        return (name, has_call, list(callees), verdict, self_call, all_fvar, mapped, lowered)
+
+    def test_l2_call_classification_is_fail_closed(self) -> None:
+        """Every condition of the reclassification, on synthetic facts rows.
+
+        Named limitation: the pinned toolchain's lowerer rejects every
+        declaration that calls itself ("unsupported self-tail recursion ... no
+        qualified loop lowering", measured on `L2Rec.selfRec` below), so a
+        self-call that survives lowering cannot occur today, and `selfy` here
+        exists only as a synthetic row. The self-call condition is therefore
+        covered by synthetic rows alone; the compiled fixtures cover the shapes
+        the lowerer does produce.
+        """
+        f = self._facts
+        rows = [
+            f("leaf", False, []),  # no local call -> proved
+            f("q", True, ["leaf"]),  # qualifying call -> proved
+            f("chain", True, ["q"]),  # qualifies transitively -> proved
+            f("deep", True, ["chain"]),  # three levels down -> proved
+            f("erased", True, ["leaf"], all_fvar=False),  # an erased argument
+            f("selfy", True, [], self_call=True),  # calls itself yet lowered (synthetic)
+            f("callsSelfy", True, ["selfy"]),  # the callee calls itself
+            f("bad", False, [], "err:boom"),  # rejected
+            f("callsBad", True, ["bad"]),  # the callee did not lower
+            f("deepBad", True, ["callsBad"]),  # a grandchild did not lower
+            f("callsGhost", True, ["ghost"]),  # the callee has no facts row
+            f("rsv", False, [], mapped="lean_native_x", lowered="lean_native_x"),  # call-free -> proved
+            f("callsRsv", True, ["rsv"]),  # the callee's lowered name is reserved
+            f("skew", False, [], mapped="l_skew", lowered="l_other"),  # call-free -> proved
+            f("callsSkew", True, ["skew"]),  # the caller's map name is not the lowered name
+            f("twinA", False, [], mapped="l_twin", lowered="l_twin"),
+            f("twinB", False, [], mapped="l_twin", lowered="l_twin"),
+            f("callsTwins", True, ["twinA", "twinB"]),  # two entries share a lowered name
+            f("cycA", True, ["cycB"]),
+            f("cycB", True, ["cycA"]),
+            f("callsCyc", True, ["cycA"]),  # the callee is on a cycle
+        ]
+        got = {row[0]: cls for row, (cls, _) in zip(rows, _classify_decl_facts(rows))}
+        proved = {"leaf", "q", "chain", "deep", "rsv", "skew", "twinA", "twinB"}
+        unproved = {
+            "erased", "selfy", "callsSelfy", "callsBad", "deepBad", "callsGhost",
+            "callsRsv", "callsSkew", "callsTwins", "callsCyc",
+        }
+        want = {name: "proved" for name in proved}
+        want.update({name: "lowered_unproved" for name in unproved})
+        want.update({"bad": "rejected", "cycA": "rejected_not_lowered", "cycB": "rejected_not_lowered"})
+        self.assertEqual(got, want)
+        counts, reasons = _merge_batteries_shard_facts(rows, aux_total=0)
+        self.assertEqual(counts, (21, 8, 10, 3, 2, 0))
+        self.assertEqual(sorted(reasons), ["boom", "mutual_cycle", "mutual_cycle"])
+
+    def test_reserved_runtime_name_copies_match_the_proof_definition(self) -> None:
+        # The driver's auditReservedRuntimeName and the Python copy must stay the
+        # predicate DeclEnvLowers uses (CallsF.lean), which the driver cannot import.
+        src = (ROOT_DIR / "lean/LeanNative/Proofs/RealLCNFBridge/CallsF.lean").read_text(encoding="utf-8")
+        lines = src.splitlines()
+        head = "def reservedRuntimeName (s : String) : Bool :="
+        self.assertIn(head, lines)
+        body = lines[lines.index(head) + 1].strip()
+        self.assertEqual(body, 's.startsWith "lean_native_" || s == "lean_mark_mt"')
+        self.assertIn("def auditReservedRuntimeName (s : String) : Bool :=\n  " + body, _LEAN_AUDIT_DRIVER_HEAD)
+        for name, want in (
+            ("lean_native_alloc", True),
+            ("lean_mark_mt", True),
+            ("lean_mark_mt2", False),
+            ("l_lean_native_x", False),
+            ("", False),
+        ):
+            self.assertEqual(_reserved_runtime_name(name), want, name)
+
+    def test_facts_name_escape_is_injective(self) -> None:
+        # The facts line carries every name through the driver's escape and the
+        # parser decodes it, so the facts path sees the driver's names only if
+        # the escape is injective and leaves no field separator behind. Red
+        # first: an escape that replaced `|` and `,` by `/` mapped "a|b", "a,b"
+        # and "a/b" to one string (these 10 inputs gave 7 distinct outputs).
+        main_src = """
+unsafe def main (_args : List String) : IO Unit := do
+  let raws : List String :=
+    ["a|b", "a,b", "a/b", "a%b", "a%7Cb", "a%2Cb", "a%25b", "ab", "a||b", "a|,b"]
+  let outs := raws.map auditEscape
+  let distinct := (outs.foldl (fun (s : Std.HashSet String) x => s.insert x) {}).size
+  let withSep := (outs.filter (fun s => s.contains '|' || s.contains ',')).length
+  IO.println s!"AUDIT_RESULT:{raws.length},{distinct},{withSep},0,0,0"
+"""
+        _ensure_lean_build(ROOT_DIR)
+        got = _run_audit_driver(ROOT_DIR, _LEAN_AUDIT_DRIVER_HEAD + main_src, [])
+        self.assertEqual(got, (10, 10, 0, 0, 0, 0), got)
+
+    def test_unescape_facts_name_inverts_the_driver_escape(self) -> None:
+        # `auditEscape` maps `%` to %25, `|` to %7C and `,` to %2C; the decoder
+        # inverts exactly that and refuses any other `%` rather than guess.
+        for escaped, raw in (
+            ("Foo.bar", "Foo.bar"),
+            ("A.«term∃ᵉ_%2C_»._closed_5", "A.«term∃ᵉ_,_»._closed_5"),
+            ("a%7Cb%2Cc", "a|b,c"),
+            ("a%25b", "a%b"),
+            ("%252C", "%2C"),
+            ("%25%2C%7C", "%,|"),
+            ("", ""),
+        ):
+            self.assertEqual(_unescape_facts_name(escaped), raw, escaped)
+        for bad in ("a%b", "a%", "a%2", "%7c", "%20"):
+            with self.assertRaises(ValueError, msg=bad):
+                _unescape_facts_name(bad)
+
+    def _both_paths(self, mod_name: str, body: str) -> tuple[tuple[int, ...], dict[str, str], dict[str, DeclFacts]]:
+        """Compile `body` as module `mod_name` and measure it on both paths: one
+        auditMods run, and the facts driver classified by `_classify_decl_facts`.
+        Asserts the two agree; returns (auditMods counts, class by declaration,
+        facts row by declaration)."""
+        _ensure_lean_build(ROOT_DIR)
+        env = _lean_env()
+        with tempfile.TemporaryDirectory(prefix="lcnf-l2-") as tmp:
+            root = Path(tmp)
+            src = root / f"{mod_name}.lean"
+            src.write_text(f"namespace {mod_name}\n{body}end {mod_name}\n", encoding="utf-8")
+            subprocess.run(
+                ["lean", f"--root={root}", "-o", str(root / f"{mod_name}.olean"), str(src)],
+                cwd=str(ROOT_DIR / "lean"),
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            counts = _run_audit_driver(ROOT_DIR, _lean_audit_driver_for_modules([mod_name]), [str(root)])
+            rows, aux = _collect_shard_facts(ROOT_DIR, root, [mod_name], workers=1)
+        self.assertEqual(_merge_batteries_shard_facts(rows, aux)[0], counts, "facts path disagrees with auditMods")
+        classes = {row[0]: cls for row, (cls, _) in zip(rows, _classify_decl_facts(rows))}
+        return counts, classes, {row[0]: row for row in rows}
+
+    def test_l2_qualifying_local_calls_count_proved(self) -> None:
+        # Red first: before the reclassification the pinned toolchain measured
+        # this fixture (4 total, 1 proved, 3 lowered_unproved, 0, 0); every
+        # local call here qualifies, so all four declarations are proved.
+        counts, classes, _rows = self._both_paths(
+            "L2Qual",
+            "@[noinline] def leaf (x : UInt64) : UInt64 := x * 3 + 1\n"
+            "def caller (x : UInt64) : UInt64 := leaf x + leaf (x + 2)\n"
+            "@[noinline] def chainB (x : UInt64) : UInt64 := leaf x + 5\n"
+            "def chainA (x : UInt64) : UInt64 := chainB x * 2\n",
+        )
+        self.assertEqual(counts[:5], (4, 4, 0, 0, 0), counts)
+        for decl in ("leaf", "caller", "chainB", "chainA"):
+            self.assertEqual(classes[f"L2Qual.{decl}"], "proved", classes)
+
+    def test_l2_erased_argument_call_stays_unproved(self) -> None:
+        # Every parameter of constLeaf is unused, so the compiler's ReduceArity
+        # pass rewrites each call to `constLeaf._redArg ◾`: an erased argument
+        # at a resolved local call site. evalArg errors on it, so
+        # lowerRealLCNFDecl_soundF says nothing about the call and the callers
+        # stay lowered_unproved (measured the same before the reclassification).
+        counts, classes, rows = self._both_paths(
+            "L2Erased",
+            "@[noinline] def constLeaf (x : UInt64) : UInt64 := 42\n"
+            "def callsConst (x : UInt64) : UInt64 := constLeaf x + x\n",
+        )
+        self.assertEqual(counts[:5], (4, 1, 3, 0, 0), counts)
+        caller = rows["L2Erased.callsConst"]
+        self.assertTrue(caller[1] and not caller[5], caller)  # a local call, not all-.fvar
+        self.assertEqual(classes["L2Erased.callsConst"], "lowered_unproved", classes)
+        self.assertEqual(classes["L2Erased.constLeaf._redArg"], "proved", classes)
+
+    def test_l2_self_recursive_callee_keeps_its_caller_unproved(self) -> None:
+        # The lowerer rejects selfRec (a self-call), so callsSelfRec's callee
+        # closure does not lower and the caller stays lowered_unproved.
+        counts, classes, rows = self._both_paths(
+            "L2Rec",
+            "partial def selfRec (x : UInt64) : UInt64 := if x == 0 then 0 else selfRec (x - 1) + 2\n"
+            "def callsSelfRec (x : UInt64) : UInt64 := selfRec x + 1\n",
+        )
+        self.assertEqual(counts[:5], (2, 0, 1, 1, 0), counts)
+        self.assertTrue(rows["L2Rec.selfRec"][4], rows["L2Rec.selfRec"])  # has_self_call
+        self.assertEqual(classes["L2Rec.selfRec"], "rejected", classes)
+        self.assertEqual(classes["L2Rec.callsSelfRec"], "lowered_unproved", classes)
+
+    def test_shard_facts_carry_comma_named_declarations_exactly(self) -> None:
+        # The facts path's call graph must be the one auditMods walks. A compiled
+        # declaration's name can hold a comma: the pinned Batteries has
+        # `«term∃ᵉ_,_»._closed_5`, Init.Data.Array.Basic has `«term#[_,]»`.
+        # When the facts line printed names raw, the parser's split of the
+        # callee list on "," turned such a callee into fragments with no facts
+        # row, so its callers could not qualify and a cycle through it was
+        # missed. This fixture has both shapes; `_both_paths` asserts the two
+        # paths agree, and every callee must resolve to a facts row.
+        counts, classes, rows = self._both_paths(
+            "L2Comma",
+            "@[noinline] def «leaf,x» (x : UInt64) : UInt64 := x * 3 + 1\n"
+            "def callsComma (x : UInt64) : UInt64 := «leaf,x» x + 2\n"
+            "mutual\n"
+            "partial def «even,p» (n : UInt64) : Bool := if n == 0 then true else «odd,p» (n - 1)\n"
+            "partial def «odd,p» (n : UInt64) : Bool := if n == 0 then false else «even,p» (n - 1)\n"
+            "end\n",
+        )
+        self.assertEqual(counts[:5], (4, 2, 0, 2, 2), counts)
+        for callee in (c for row in rows.values() for c in row[2]):
+            self.assertIn(callee, rows, "a callee without a facts row")
+        self.assertEqual(classes["L2Comma.«leaf,x»"], "proved", classes)
+        self.assertEqual(classes["L2Comma.callsComma"], "proved", classes)
+        self.assertEqual(classes["L2Comma.«even,p»"], "rejected_not_lowered", classes)
+        self.assertEqual(classes["L2Comma.«odd,p»"], "rejected_not_lowered", classes)
 
     def test_con_leche_reports_natoppins_exclusion_and_rejects_partial_tree(self) -> None:
         # Point 4: con-leche output must state the NatOpPins exclusion and its reason
@@ -4294,10 +5693,14 @@ def main() -> int:
         return 2
 
     if args.write_results:
-        # Fail in seconds on a dirty measurement tree, not minutes into the
-        # audit: the same guard runs again inside results_document.
+        # Fail in seconds on a dirty measurement tree, a lean/lean-toolchain other
+        # than PINNED_TOOLCHAIN, or a committed external corpus with no tree to
+        # measure it, not minutes into the audit: the same guards run again inside
+        # results_document and _refuse_dropped_corpora.
         try:
             _refuse_dirty_measurement_inputs(ROOT_DIR)
+            _refuse_toolchain_file_mismatch(ROOT_DIR)
+            _refuse_missing_external_trees(RESULTS_FILE, ROOT_DIR)
         except RuntimeError as exc:
             print(f"  [ERROR] {exc}", file=sys.stderr)
             return 1
@@ -4308,13 +5711,20 @@ def main() -> int:
         compare_results_digests=not args.write_results,
     )
     if args.write_results:
-        RESULTS_FILE.write_text(
-            json.dumps(results_document(chk["report"], ROOT_DIR), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        try:
+            doc = results_document(chk["report"], ROOT_DIR)
+            _refuse_dropped_corpora(chk["report"], doc, RESULTS_FILE)
+        except RuntimeError as exc:
+            print(f"  [ERROR] {exc}", file=sys.stderr)
+            return 1
+        RESULTS_FILE.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(f"[lcnf-coverage] wrote {RESULTS_FILE.relative_to(ROOT_DIR)}", file=sys.stderr)
         if not args.json:
-            return 0 if chk["ok"] else 1
+            if not chk["ok"]:
+                for err in chk["errors"]:
+                    print(f"  [ERROR] {err}", file=sys.stderr)
+                return 1
+            return 0
 
     if args.json or not args.check:
         out = dict(chk["report"])
