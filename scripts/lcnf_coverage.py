@@ -2920,8 +2920,12 @@ class TestLcnfCoverage(unittest.TestCase):
         # named error, and the tracked set covers the S3a BridgeHelpers/ split.
         rep = self._v_fake_live_report()
         tracked = _tracked_bridge_paths(ROOT_DIR)
-        self.assertGreaterEqual(len(tracked), 11, tracked)  # 5 static + the split helper files
+        # The S3a split's helper files join the static set; the sixth split
+        # module went with L1's compression post-pass (d24ad53), so no count
+        # is hard-coded here.
+        self.assertGreater(len(tracked), len(TRACKED_BRIDGE_FILES), tracked)
         self.assertIn("lean/LeanNative/IR/BridgeHelpers/RealBridgeCtxAndSlices.lean", tracked)
+        self.assertNotIn("lean/LeanNative/IR/BridgeHelpers/ScalarDagAndJoinPoints.lean", tracked)
         baseline = self._v_committed_baseline()
         self.assertEqual(sorted(baseline["bridge_file_sha256"]), tracked)
 
