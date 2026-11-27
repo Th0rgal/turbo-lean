@@ -4674,8 +4674,13 @@ pub(super) fn lakefile_lexical_guard(
         if c == '#' && next.is_some_and(|d| d.is_alphabetic() || d == '_') {
             return Err("`#` command".into());
         }
-        if c == '@' && next == Some('[') && strip_lake_target_attr_block(&src[i..]).is_none() {
-            return Err("attribute other than a Lake target attribute".into());
+        if c == '@' && next == Some('[') {
+            let line_end = src[i..]
+                .find(['\n', '\r'])
+                .map_or(src.len(), |off| i + off);
+            if strip_lake_target_attr_block(&src[i..line_end]).is_none() {
+                return Err("attribute other than a Lake target attribute".into());
+            }
         }
         if c == '«' {
             let pre = &src[line_start..i];
@@ -4770,21 +4775,33 @@ pub(super) fn lakefile_lexical_guard(
 /// Lake's target attributes (`Lake.DSL` registers exactly these three tags for targets).
 const LAKE_TARGET_ATTRS: [&str; 3] = ["default_target", "test_driver", "lint_driver"];
 
-/// Strips one leading Lake target attribute block — `@[default_target]` or a comma list such as
-/// Lake 4.x's `@[default_target, test_driver]` — returning the rest of the line, whether the block
-/// marks a default target, and how many attribute names it held. `None` for any other `@[...]`,
-/// so non-Lake attributes keep failing closed.
+/// Strips one leading single-line Lake target attribute block — `@[default_target]` or a comma
+/// list such as Lake 4.x's `@[default_target, test_driver]` — returning the rest of the line,
+/// whether the block marks a default target, and how many attribute names it held. Returns `None`
+/// for multi-line blocks, empty elements, duplicate names, or any non-Lake attribute so all
+/// non-canonical `@[...]` forms fail closed.
 pub(super) fn strip_lake_target_attr_block(s: &str) -> Option<(&str, bool, usize)> {
     let body = s.strip_prefix("@[")?;
     let end = body.find(']')?;
-    let names: Vec<&str> = body[..end].split(',').map(str::trim).collect();
-    if names.is_empty() || !names.iter().all(|n| LAKE_TARGET_ATTRS.contains(n)) {
+    let inner = &body[..end];
+    if inner.contains(['\n', '\r']) {
+        return None;
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for raw in inner.split(',') {
+        let name = raw.trim();
+        if name.is_empty() || !LAKE_TARGET_ATTRS.contains(&name) || seen.contains(&name) {
+            return None;
+        }
+        seen.push(name);
+    }
+    if seen.is_empty() {
         return None;
     }
     Some((
         &body[end + 1..],
-        names.contains(&"default_target"),
-        names.len(),
+        seen.contains(&"default_target"),
+        seen.len(),
     ))
 }
 

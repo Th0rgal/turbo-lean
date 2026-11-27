@@ -6342,6 +6342,9 @@ pub(super) fn record_verified_dep_source_cached(
     defer_disk_flush: bool,
     precomputed_ws_inputs: Option<&str>,
 ) {
+    if package_is_read_only(&cfg.root_pkg.pkg_root, &node.pkg_root) {
+        return;
+    }
     let src_raw = fs::read_to_string(&node.src_path).ok();
     if closure_has_elab_host_effects
         || src_raw.as_ref().is_none_or(|src| {

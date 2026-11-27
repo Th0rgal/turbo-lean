@@ -598,11 +598,29 @@ lean_exe paretoTests where
             "@[default_target, simp]\nlean_lib X where\n",
             "@[simp] lean_lib X where\n",
             "@[default_target,]\nlean_lib X where\n",
+            "@[,default_target]\nlean_lib X where\n",
+            "@[default_target,,test_driver]\nlean_lib X where\n",
+            "@[,]\nlean_lib X where\n",
+            "@[]\nlean_lib X where\n",
+            "@[default_target, default_target]\nlean_lib X where\n",
+            "@[default_target, default_target] lean_lib X where\n",
+            "@[test_driver, test_driver]\nlean_lib X where\n",
+            "@[default_target\n]\nlean_lib X where\n",
+            "@[default_target,\ntest_driver]\nlean_lib X where\n",
         ] {
             fs::write(&lf, format!("{head}{tail}")).unwrap();
             let err = parse_lakefile_lean(&dir, &lf, true).map(|p| p.unsupported);
             assert!(!matches!(err, Ok(None)), "{tail} must fail closed: {err:?}");
         }
+        assert!(strip_lake_target_attr_block("@[default_target, default_target]").is_none());
+        assert!(strip_lake_target_attr_block("@[default_target,,test_driver]").is_none());
+        assert!(strip_lake_target_attr_block("@[,]").is_none());
+        assert!(strip_lake_target_attr_block("@[]").is_none());
+        assert!(strip_lake_target_attr_block("@[default_target\n]").is_none());
+        assert_eq!(
+            strip_lake_target_attr_block("@[default_target, test_driver] lean_lib X"),
+            Some((" lean_lib X", true, 2))
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -637,10 +655,15 @@ lean_exe paretoTests where
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// `#299`: a module two globbing libraries can build takes the options of the library Lake
-    /// builds it through. Expected values were recorded from stock Lake v4.35.0
-    /// (`maxRecDepth` in each module's `.setup.json`): importer target first, otherwise the
-    /// last library that globs the module.
+    /// `#299`: a module two globbing libraries can build takes the options of the library it is
+    /// routed through. Requested target libraries enqueue all of their configured modules first in
+    /// target order (BFS worklist), while import-only edges resolve via Lake's `findModule?` (the
+    /// last library that globs the module). Stock Lake v4.35.0 (`maxRecDepth` in
+    /// `Parent/Child/X.setup.json`) matches all cases below when `Child/` precedes `AA.lean` in
+    /// directory order; note that Lake 4.35's DFS `recBuildLean` is `readdir`/glob-order-sensitive
+    /// when `Parent.AA` runs before `Parent.Child.X` (resolving `import Parent.Child.X` through
+    /// `findModule?` -> `B`/2222), whereas `build_module_dag` deterministically attributes target
+    /// `A`'s own configured module `Parent.Child.X` to `A`/1111 regardless of `readdir` order.
     #[test]
     fn test_l299_glob_option_routing_matches_lake() {
         let dir = make_temp_test_dir("l299_glob_opts");
@@ -662,13 +685,14 @@ lean_exe paretoTests where
             other => panic!("{other:?}"),
         };
         // (A's globs, targets, expected (target, maxRecDepth) for `Parent.Child.X`)
-        let cases: [(&str, &[&str], (&str, u64)); 7] = [
+        let cases: [(&str, &[&str], (&str, u64)); 8] = [
             (".submodules `Parent", &["A"], ("A", 1111)),
             (".submodules `Parent", &["B"], ("B", 2222)),
             (".submodules `Parent", &["Parent.Child.X"], ("B", 2222)),
             (".submodules `Parent", &["U"], ("B", 2222)),
             (".one `Parent.AA", &["A"], ("B", 2222)),
             (".one `Parent.Child.X, .one `Parent.AA", &["A"], ("A", 1111)),
+            (".one `Parent.AA, .one `Parent.Child.X", &["A"], ("A", 1111)),
             (".submodules `Parent", &["B", "A"], ("B", 2222)),
         ];
         for (globs, targets, want) in cases {
@@ -4050,6 +4074,185 @@ lean_lib Smoke where
             snapshot(&tree.project)?,
             dep_before,
             "stale run wrote into dependency"
+        );
+        Ok(())
+    }
+
+    /// `#436` regression: warm-adopt of an external path dependency with a stale manifest,
+    /// `hydrate_project_traces`, and direct `record_verified_dep_source` must never write,
+    /// overwrite, or delete `.turbo_verified_sources.json`, lock files, or directories inside
+    /// the external dependency.
+    #[test]
+    fn test_p7_external_path_dep_warm_adopt_stale_manifest_and_hydrate_write_nothing() -> Result<()>
+    {
+        use crate::worktree_test_support::{snapshot, LakeTree};
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = LakeTree::new(
+            "p7_external_stale_manifest",
+            &[("P/A.lean", "def depValue : Nat := 7\n")],
+        )?;
+        let caller = tree.root.join("caller");
+        fs::create_dir_all(&caller)?;
+        fs::write(
+            caller.join("lean-toolchain"),
+            include_str!("../../../lean/lean-toolchain"),
+        )?;
+        fs::write(
+            caller.join("lakefile.toml"),
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"fixture\"\npath = \"../project\"\n[[lean_lib]]\nname = \"App\"\n",
+        )?;
+        fs::write(
+            caller.join("App.lean"),
+            "import P.A\ntheorem app : depValue = 7 := rfl\n",
+        )?;
+        let out = Command::new("lake")
+            .args(["build", "App"])
+            .current_dir(&caller)
+            .output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let dep_lock = tree.project.join(".lake/build/.turbo_publish.lock");
+        if dep_lock.exists() {
+            fs::remove_file(&dep_lock)?;
+        }
+        let dep_manifest = tree
+            .project
+            .join(".lake/build/.turbo_verified_sources.json");
+        if dep_manifest.exists() {
+            fs::remove_file(&dep_manifest)?;
+        }
+
+        // 1. With no manifest in the external dep, `hydrate_project_traces` must not create one.
+        let dep_no_manifest = snapshot(&tree.project)?;
+        let hyd = hydrate_project_traces(&caller)?;
+        assert_eq!(
+            hyd.packages_scanned, 1,
+            "external dep must not be scanned for hydration"
+        );
+        assert!(!dep_manifest.exists());
+        assert_eq!(
+            snapshot(&tree.project)?,
+            dep_no_manifest,
+            "hydrate_project_traces wrote into external dep"
+        );
+
+        // 2. Seed a stale manifest (stale header digests, empty modules) so `P.A` enters the DAG
+        //    and takes the `WarmAdopted` path on an explicit build (`fixture/P.A`, `App`).
+        let stale_header_manifest = VerifiedDepManifest {
+            pkg_name: "fixture".to_string(),
+            toolchain: "stale-toolchain".to_string(),
+            lean_githash: "0000000000000000000000000000000000000000".to_string(),
+            pkg_config_digest: "stale-config-digest".to_string(),
+            lake_inputs_digest: "stale-inputs-digest".to_string(),
+            workspace_config_digest: "stale-ws-digest".to_string(),
+            allowed_axioms: Vec::new(),
+            kernel_policy_digest: "stale-policy".to_string(),
+            modules: BTreeMap::new(),
+            cfg: None,
+            dep_import_memo: DepImportMemo::default(),
+        };
+        fs::write(&dep_manifest, serde_json::to_vec(&stale_header_manifest)?)?;
+        let dep_stale_header = snapshot(&tree.project)?;
+
+        let cfg = resolve_project_config(&caller)?;
+        let targets = vec!["fixture/P.A".to_string(), "App".to_string()];
+        let dag = build_module_dag(&cfg, &targets)?;
+        assert!(
+            dag.nodes.contains_key("P.A"),
+            "external dep module must be a DAG node to exercise WarmAdopted"
+        );
+
+        let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        let report = build_project_modules_native(
+            &mut store,
+            &caller,
+            &targets,
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        assert_eq!(report.modules_compiled, 0);
+        assert!(report.modules_up_to_date_reused >= 1);
+        assert!(!dep_lock.exists());
+        assert_eq!(
+            snapshot(&tree.project)?,
+            dep_stale_header,
+            "warm-adopt of external dep with stale manifest wrote into external dep"
+        );
+
+        // Direct `record_verified_dep_source` on an external dep node must also be a no-op.
+        let pa_node = &dag.nodes["P.A"];
+        let pa_td = compute_module_artifact_tier_digests_with_policy(&pa_node.olean_path, true)?;
+        let mut olean_digs = HashMap::new();
+        let mut tier_digs = HashMap::new();
+        olean_digs.insert("P.A".to_string(), pa_td.full.clone());
+        tier_digs.insert("P.A".to_string(), pa_td);
+        record_verified_dep_source(
+            &cfg,
+            &dag,
+            pa_node,
+            &olean_digs["P.A"],
+            false,
+            &olean_digs,
+            &tier_digs,
+        );
+        assert_eq!(
+            snapshot(&tree.project)?,
+            dep_stale_header,
+            "record_verified_dep_source wrote into external dep"
+        );
+
+        // `hydrate_project_traces` must also leave the external dep's stale manifest untouched.
+        let _ = hydrate_project_traces(&caller)?;
+        assert_eq!(
+            snapshot(&tree.project)?,
+            dep_stale_header,
+            "hydrate_project_traces modified external dep stale manifest"
+        );
+
+        // 3. Stale manifest with an entry for `P/A.lean` (`raw_has_entry == true`) on a cold
+        //    store: warm-adopt refuses to adopt and read-only guard refuses to compile, writing
+        //    nothing inside the external dep.
+        let mut stale_entry_manifest = stale_header_manifest;
+        stale_entry_manifest.modules.insert(
+            "P/A.lean".to_string(),
+            VerifiedDepModuleEntry {
+                src_blake3: "deadbeef".to_string(),
+                olean_artifact_digest: "deadbeef".to_string(),
+                lake_inputs_digest: "stale-inputs-digest".to_string(),
+                ..Default::default()
+            },
+        );
+        fs::write(&dep_manifest, serde_json::to_vec(&stale_entry_manifest)?)?;
+        let dep_stale_entry = snapshot(&tree.project)?;
+        let mut cold_store = TurboStore::open(Some(&tree.root.join("cache_stale_entry")))?;
+        let err = format!(
+            "{:#}",
+            build_project_modules_native(
+                &mut cold_store,
+                &caller,
+                &targets,
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("outside this project"), "{err}");
+        assert!(!dep_lock.exists());
+        assert_eq!(
+            snapshot(&tree.project)?,
+            dep_stale_entry,
+            "failed build on external dep with stale entry wrote into external dep"
         );
         Ok(())
     }
@@ -9881,9 +10084,8 @@ root = "Main"
                 .is_empty()
         );
 
-        let samelib_base = dir.join("samelib_proj");
-        let samelib_dep = samelib_base.join("dep");
-        let samelib_root = samelib_base.join("root");
+        let samelib_root = dir.join("samelib_proj/root");
+        let samelib_dep = samelib_root.join("deps/dep");
         fs::create_dir_all(samelib_dep.join("Dep")).unwrap();
         fs::create_dir_all(samelib_root.join("App")).unwrap();
         for p in [&samelib_dep, &samelib_root] {
@@ -9906,7 +10108,7 @@ root = "Main"
         .unwrap();
         fs::write(
             samelib_root.join("lakefile.toml"),
-            "name = \"root_pkg\"\n[[require]]\nname = \"dep_pkg\"\npath = \"../dep\"\n[[lean_lib]]\nname = \"Foo\"\nprecompileModules = true\nroots = [\"App.Main\"]\n",
+            "name = \"root_pkg\"\n[[require]]\nname = \"dep_pkg\"\npath = \"deps/dep\"\n[[lean_lib]]\nname = \"Foo\"\nprecompileModules = true\nroots = [\"App.Main\"]\n",
         )
         .unwrap();
         fs::write(
@@ -9915,7 +10117,7 @@ root = "Main"
   "version": "1.1.0",
   "packagesDir": ".lake/packages",
   "packages": [
-    {"type": "path", "scope": "", "name": "dep_pkg", "inherited": false, "dir": "../dep", "configFile": "lakefile.toml"}
+    {"type": "path", "scope": "", "name": "dep_pkg", "inherited": false, "dir": "deps/dep", "configFile": "lakefile.toml"}
   ]
 }
 "#,

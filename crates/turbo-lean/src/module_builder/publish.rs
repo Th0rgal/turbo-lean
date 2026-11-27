@@ -2954,6 +2954,7 @@ pub(super) fn build_shared_object(
 pub(super) fn build_wave_native_artifacts(
     cfg: &ProjectConfig,
     dag: &ModuleDag,
+    canon_project_dir: &Path,
     wave: &[String],
     preserve_project: bool,
     completed_mods: &HashSet<String>,
@@ -2966,7 +2967,7 @@ pub(super) fn build_wave_native_artifacts(
         let Some(node) = dag.nodes.get(mod_name) else {
             continue;
         };
-        if package_is_read_only(&cfg.root_pkg.pkg_root, &node.pkg_root) {
+        if package_is_read_only(canon_project_dir, &node.pkg_root) {
             continue;
         }
         if node.needs_co_export {
@@ -2994,7 +2995,7 @@ pub(super) fn build_wave_native_artifacts(
         else {
             continue;
         };
-        if package_is_read_only(&cfg.root_pkg.pkg_root, &pkg.pkg_root) {
+        if package_is_read_only(canon_project_dir, &pkg.pkg_root) {
             built_shared_libs.insert(key);
             continue;
         }
@@ -3566,7 +3567,7 @@ pub(super) fn store_module_artifacts_in_cas(
             .lock()
             .map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
         let preserve_lake = crate::lake_build::worktree_auto_link_disabled(canon_project_dir)
-            || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
+            || package_is_read_only(canon_project_dir, &node.pkg_root);
         let _flock_guard = acquire_publish_flock_mode(&node.pkg_root, false, preserve_lake)?;
         let artifact_files = collect_module_artifact_paths(node);
         let paths: Vec<_> = artifact_files.iter().map(|(_, p)| p.clone()).collect();
@@ -4312,7 +4313,7 @@ pub(crate) fn hydrate_project_traces_with_store(
     for (is_root, pkg) in
         std::iter::once((true, &cfg.root_pkg)).chain(cfg.dep_pkgs.iter().map(|dp| (false, dp)))
     {
-        if crate::lake_build::worktree_auto_link_disabled(&pkg.pkg_root) {
+        if package_is_read_only(&canon_dir, &pkg.pkg_root) {
             continue;
         }
         report.packages_scanned += 1;
@@ -4337,6 +4338,9 @@ pub(crate) fn hydrate_project_traces_with_store(
 
     let write_empty_manifests_with_root_inputs = |pkgs: &[&PackageConfig]| -> Result<()> {
         for pkg in pkgs {
+            if package_is_read_only(&canon_dir, &pkg.pkg_root) {
+                continue;
+            }
             let build_dir = pkg.pkg_root.join(".lake/build");
             let manifest_path = build_dir.join(".turbo_verified_sources.json");
             if pkg.pkg_root == cfg.root_pkg.pkg_root && !expected_lake_inputs.is_empty() {
@@ -4613,6 +4617,9 @@ pub(crate) fn hydrate_project_traces_with_store(
     }
 
     for pkg in &scanned_pkgs {
+        if package_is_read_only(&canon_dir, &pkg.pkg_root) {
+            continue;
+        }
         let build_dir = pkg.pkg_root.join(".lake/build");
         let manifest_path = build_dir.join(".turbo_verified_sources.json");
         let keep_empty_root_inputs =
@@ -5582,7 +5589,7 @@ pub(crate) fn build_project_modules_native_with_options(
                     if let Some(node) = dag
                         .nodes
                         .get(&mod_name)
-                        .filter(|n| !n.pkg_root.starts_with(&canon_dir))
+                        .filter(|n| preserve_project || package_is_read_only(&canon_dir, &n.pkg_root))
                     {
                         fatal_err = Some(read_only_package_rebuild_error(
                             &canon_dir,
@@ -6193,7 +6200,7 @@ pub(crate) fn build_project_modules_native_with_options(
                                 if !json_output && !formatted_stdout.trim().is_empty() {
                                     print!("{}", formatted_stdout);
                                 }
-                                if emit_lake_sidecars {
+                                if emit_lake_sidecars && !preserve_lake {
                                     write_lake_module_hashes_and_trace_with_memo(
                                         &cfg,
                                         &dag,
@@ -6353,6 +6360,7 @@ pub(crate) fn build_project_modules_native_with_options(
                                     if let Err(e) = build_wave_native_artifacts(
                                         &cfg,
                                         &dag,
+                                        &canon_dir,
                                         std::slice::from_ref(&mod_name),
                                         preserve_project,
                                         &completed_mods,
@@ -6728,8 +6736,9 @@ pub fn build_cone_export_filter(
         for (ext_mod, ext_path) in &node.external_olean_deps {
             allowed_replay_modules.insert(ext_mod.clone());
             if !tier_digests.contains_key(ext_mod) {
+                let preserve_ext = preserve_project || !ext_path.starts_with(&canon_dir);
                 if let Ok(td) =
-                    compute_module_artifact_tier_digests_with_policy(ext_path, preserve_project)
+                    compute_module_artifact_tier_digests_with_policy(ext_path, preserve_ext)
                 {
                     tier_digests.insert(ext_mod.clone(), td);
                 }
@@ -6745,11 +6754,13 @@ pub fn build_cone_export_filter(
         let Some(node) = dag.nodes.get(mod_name) else {
             continue;
         };
+        let preserve_node =
+            preserve_project || package_is_read_only(&canon_dir, &node.pkg_root);
         let Ok((dep_digests_vec, _, dynlib_digests)) =
             gather_module_dep_digests_and_dynlibs(&cfg, &dag, node, &tier_digests)
         else {
             if let Ok(disk_td) =
-                compute_module_artifact_tier_digests_with_policy(&node.olean_path, preserve_project)
+                compute_module_artifact_tier_digests_with_policy(&node.olean_path, preserve_node)
             {
                 tier_digests.insert(mod_name.clone(), disk_td);
             }
@@ -6791,7 +6802,7 @@ pub fn build_cone_export_filter(
         }
         if resolved_tiers.is_none() {
             if let Ok(disk_td) =
-                compute_module_artifact_tier_digests_with_policy(&node.olean_path, preserve_project)
+                compute_module_artifact_tier_digests_with_policy(&node.olean_path, preserve_node)
             {
                 resolved_tiers = Some(disk_td);
             }
