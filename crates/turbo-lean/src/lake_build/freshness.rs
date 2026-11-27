@@ -2728,19 +2728,172 @@ pub(crate) fn choose_same_fs_staging_base_with(
         .unwrap_or_else(|| preferred.to_path_buf())
 }
 
+/// #440: per-UID private staging subdirectory under `std::env::temp_dir()` so the standalone
+/// re-check never stages directly inside shared sticky `/tmp` (`0o1777`).
+pub(crate) fn private_temp_staging_candidate() -> PathBuf {
+    #[cfg(unix)]
+    let uid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let uid = 0u32;
+    std::env::temp_dir().join(format!("turbo-lean-staging-{uid}"))
+}
+
 /// #440: ordered same-filesystem staging candidates for the standalone re-check. The turbo
-/// store's own `staging` dir comes first, then the system temp dir, then a private scratch dir
-/// under the root package's `.lake` — never inside `lib/lean` (it would shadow `LEAN_PATH`
-/// resolution) and only when `.lake` may be written (`lake_scratch` is `None` under
-/// `--no-auto-worktree-link` / preserved `.lake` snapshots). Each candidate is accepted by
-/// [`choose_same_fs_staging_base_with`] only when its `st_dev` matches the source `.olean` trees.
+/// store's own `staging` dir comes first, then a per-UID private subdirectory under the system
+/// temp dir (`turbo-lean-staging-<uid>`), then a private scratch dir under the root package's
+/// `.lake` — never inside `lib/lean` (it would shadow `LEAN_PATH` resolution) and only when
+/// `.lake` may be written (`lake_scratch` is `None` under `--no-auto-worktree-link` / preserved
+/// `.lake` snapshots). Each candidate is accepted by [`choose_same_fs_staging_base_with`] only
+/// when its `st_dev` matches the source `.olean` trees.
 pub(crate) fn same_fs_staging_candidates(
     store_root: &Path,
     lake_scratch: Option<&Path>,
 ) -> Vec<PathBuf> {
-    let mut out = vec![store_root.join("staging"), std::env::temp_dir()];
+    let mut out = vec![store_root.join("staging"), private_temp_staging_candidate()];
     out.extend(lake_scratch.map(Path::to_path_buf));
     out
+}
+
+/// #440: ensure `dir` exists as a non-symlink directory owned by the current UID with mode
+/// `0o700` before passing it to `PrivateScratchDir::create`. Creates missing directories with
+/// `0o700` and tightens an existing owner-owned permissive directory (e.g. `0o755` under default
+/// `umask 022`) via fd-bound `fchmod`, while rejecting symlinks, non-directories, foreign-owned
+/// directories, and raw root / shared `temp_dir()` paths.
+pub(crate) fn ensure_private_dir(dir: &Path) -> Result<()> {
+    let normalized: PathBuf = dir.components().collect();
+    if normalized.as_os_str().is_empty()
+        || normalized == Path::new(".")
+        || normalized.parent().is_none()
+    {
+        anyhow::bail!(
+            "Refusing to use empty, relative `.`, or root directory `{}` as private staging base",
+            dir.display()
+        );
+    }
+    let temp_dir: PathBuf = std::env::temp_dir().components().collect();
+    if normalized == temp_dir
+        || fs::canonicalize(&temp_dir)
+            .ok()
+            .zip(fs::canonicalize(&normalized).ok())
+            .is_some_and(|(t, n)| t == n)
+    {
+        anyhow::bail!(
+            "Refusing to use shared temp directory `{}` directly as private staging base",
+            dir.display()
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        match fs::symlink_metadata(&normalized) {
+            Ok(sym) => {
+                if sym.file_type().is_symlink() || !sym.file_type().is_dir() {
+                    anyhow::bail!(
+                        "Refusing to use non-directory or symlink `{}` as private staging base",
+                        dir.display()
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut builder = fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                match builder.create(&normalized) {
+                    Ok(()) => {}
+                    Err(ce) if ce.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(ce) => {
+                        return Err(ce).with_context(|| {
+                            format!("Failed to create private staging base `{}`", dir.display())
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("Failed to inspect private staging base `{}`", dir.display())
+                });
+            }
+        }
+
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+        let dir_f = opts.open(&normalized).with_context(|| {
+            format!(
+                "Failed to open private staging base `{}` with O_NOFOLLOW|O_DIRECTORY",
+                dir.display()
+            )
+        })?;
+        let meta = dir_f
+            .metadata()
+            .with_context(|| format!("Failed to stat private staging base `{}`", dir.display()))?;
+        let lmeta = fs::symlink_metadata(&normalized)
+            .with_context(|| format!("Failed to lstat private staging base `{}`", dir.display()))?;
+        if lmeta.file_type().is_symlink()
+            || !lmeta.file_type().is_dir()
+            || !meta.file_type().is_dir()
+            || lmeta.dev() != meta.dev()
+            || lmeta.ino() != meta.ino()
+        {
+            anyhow::bail!(
+                "Private staging base `{}` failed nofollow inode verification",
+                dir.display()
+            );
+        }
+
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            anyhow::bail!(
+                "Private staging base `{}` is not owned by current uid ({})",
+                dir.display(),
+                euid
+            );
+        }
+        if (meta.mode() & 0o777) != 0o700 {
+            dir_f
+                .set_permissions(fs::Permissions::from_mode(0o700))
+                .with_context(|| {
+                    format!(
+                        "Failed to tighten permissions to 0700 on private staging base `{}`",
+                        dir.display()
+                    )
+                })?;
+            let after = dir_f.metadata().with_context(|| {
+                format!(
+                    "Failed to re-stat private staging base `{}` after chmod",
+                    dir.display()
+                )
+            })?;
+            if after.uid() != euid || (after.mode() & 0o777) != 0o700 {
+                anyhow::bail!(
+                    "Private staging base `{}` did not retain 0700 owner-only permissions",
+                    dir.display()
+                );
+            }
+        }
+        let lmeta_after = fs::symlink_metadata(&normalized).with_context(|| {
+            format!("Failed to re-lstat private staging base `{}`", dir.display())
+        })?;
+        if lmeta_after.file_type().is_symlink()
+            || !lmeta_after.file_type().is_dir()
+            || lmeta_after.dev() != meta.dev()
+            || lmeta_after.ino() != meta.ino()
+        {
+            anyhow::bail!(
+                "Private staging base `{}` changed during permission hardening",
+                dir.display()
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(&normalized).with_context(|| {
+            format!("Failed to create private staging base `{}`", dir.display())
+        })?;
+        Ok(())
+    }
 }
 
 /// Filesystem-backed counterpart of [`choose_same_fs_staging_base_with`] used by the standalone
@@ -3026,7 +3179,7 @@ pub(super) fn check_and_audit_standalone_modules(
         &store.root,
         lake_scratch.as_deref(),
     );
-    fs::create_dir_all(&staging_base)?;
+    ensure_private_dir(&staging_base)?;
     let scratch = crate::check::PrivateScratchDir::create(&staging_base, "standalone_recheck")?;
     let staging_dir = scratch
         .path
@@ -6112,8 +6265,8 @@ mod tests {
         // tmpfs (dev 1, as on many CI hosts): the tmpfs temp dir must never be picked, the
         // store's same-device staging dir wins.
         let store_root = Path::new("/store");
-        let tmp = std::env::temp_dir();
-        let tmp_s = tmp.to_string_lossy().into_owned();
+        let tmp_candidate = private_temp_staging_candidate();
+        let tmp_s = tmp_candidate.to_string_lossy().into_owned();
         let dev_of = |p: &Path| {
             let s = p.to_string_lossy();
             if s == "/dev/shm/stage" || s == tmp_s {
@@ -6130,9 +6283,13 @@ mod tests {
             candidates,
             vec![
                 store_root.join("staging"),
-                tmp.clone(),
+                tmp_candidate.clone(),
                 lake_scratch.to_path_buf()
             ]
+        );
+        assert!(
+            candidates.iter().all(|c| c != &std::env::temp_dir()),
+            "never stage directly inside raw shared temp_dir()"
         );
         assert!(
             candidates.iter().all(|c| !c.ends_with("lib/lean")),
@@ -6180,6 +6337,133 @@ mod tests {
             ),
             PathBuf::from("/dev/shm/stage")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_tightens_0755_store_staging_and_temp_fallback_for_private_scratch_dir()
+    -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tmp_dir("staging_perm_regression");
+        let store_root = dir.join("store");
+        let store_staging = store_root.join("staging");
+        fs::create_dir_all(&store_staging)?;
+        fs::set_permissions(&store_staging, fs::Permissions::from_mode(0o755))?;
+        assert_eq!(
+            fs::symlink_metadata(&store_staging)?.mode() & 0o777,
+            0o755,
+            "precondition: <store.root>/staging created with default umask 022 mode 0755"
+        );
+        // Prove the baseline bug: without `ensure_private_dir`, `PrivateScratchDir::create` fails
+        // with PermissionDenied on a `0o755` `<store.root>/staging` directory.
+        assert!(
+            crate::check::PrivateScratchDir::create(&store_staging, "standalone_recheck").is_err(),
+            "PrivateScratchDir::create must reject untightened 0o755 <store.root>/staging"
+        );
+
+        // Case 1: `<store.root>/staging` selected by `choose_same_fs_staging_base_with`
+        // (preferred `/dev/shm` on dev 1, workspace + store on dev 2).
+        let src = dir.join("proj/.lake/build/lib/lean");
+        fs::create_dir_all(&src)?;
+        let candidates = same_fs_staging_candidates(&store_root, None);
+        let dev_store_match = |p: &Path| {
+            if p == Path::new("/dev/shm/stage") {
+                Some(1)
+            } else if p.starts_with(&store_root) || p.starts_with(&src) {
+                Some(2)
+            } else {
+                Some(3)
+            }
+        };
+        let selected_store = choose_same_fs_staging_base_with(
+            Path::new("/dev/shm/stage"),
+            std::slice::from_ref(&src),
+            &candidates,
+            &dev_store_match,
+        );
+        assert_eq!(selected_store, store_staging);
+        ensure_private_dir(&selected_store)?;
+        assert_eq!(fs::symlink_metadata(&selected_store)?.mode() & 0o777, 0o700);
+        let scratch_store =
+            crate::check::PrivateScratchDir::create(&selected_store, "standalone_recheck")?;
+        assert_eq!(
+            fs::symlink_metadata(&scratch_store.path)?.mode() & 0o777,
+            0o700
+        );
+        scratch_store.remove()?;
+
+        // Case 2: fresh (not yet existing) `<store.root>/staging` is created with 0o700 directly.
+        let fresh_staging = dir.join("fresh_store/staging");
+        ensure_private_dir(&fresh_staging)?;
+        assert_eq!(fs::symlink_metadata(&fresh_staging)?.mode() & 0o777, 0o700);
+        let scratch_fresh =
+            crate::check::PrivateScratchDir::create(&fresh_staging, "standalone_recheck")?;
+        assert_eq!(
+            fs::symlink_metadata(&scratch_fresh.path)?.mode() & 0o777,
+            0o700
+        );
+        scratch_fresh.remove()?;
+
+        // Case 3: `/tmp` fallback selects per-UID private subdir under `temp_dir()` (never raw
+        // `/tmp`), tightens/creates it to 0o700, and succeeds in `PrivateScratchDir::create`.
+        let tmp_candidate = private_temp_staging_candidate();
+        assert_ne!(tmp_candidate, std::env::temp_dir());
+        assert_eq!(tmp_candidate.parent(), Some(std::env::temp_dir().as_path()));
+        assert!(
+            ensure_private_dir(&std::env::temp_dir()).is_err(),
+            "ensure_private_dir must refuse raw shared temp_dir()"
+        );
+        let dev_tmp_match = |p: &Path| {
+            if p == Path::new("/dev/shm/stage") || p.starts_with(&store_root) {
+                Some(1)
+            } else if p == tmp_candidate || p.starts_with(&src) {
+                Some(2)
+            } else {
+                Some(3)
+            }
+        };
+        let selected_tmp = choose_same_fs_staging_base_with(
+            Path::new("/dev/shm/stage"),
+            std::slice::from_ref(&src),
+            &candidates,
+            &dev_tmp_match,
+        );
+        assert_eq!(selected_tmp, tmp_candidate);
+        ensure_private_dir(&selected_tmp)?;
+        assert_eq!(fs::symlink_metadata(&selected_tmp)?.mode() & 0o777, 0o700);
+        let scratch_tmp =
+            crate::check::PrivateScratchDir::create(&selected_tmp, "standalone_recheck")?;
+        assert_eq!(
+            fs::symlink_metadata(&scratch_tmp.path)?.mode() & 0o777,
+            0o700
+        );
+        scratch_tmp.remove()?;
+
+        // Case 4: `.lake/build/turbo_recheck_staging` pre-existing with 0o755 is tightened to 0o700.
+        let lake_scratch = dir.join("proj/.lake/build/turbo_recheck_staging");
+        fs::create_dir_all(&lake_scratch)?;
+        fs::set_permissions(&lake_scratch, fs::Permissions::from_mode(0o755))?;
+        ensure_private_dir(&lake_scratch)?;
+        assert_eq!(fs::symlink_metadata(&lake_scratch)?.mode() & 0o777, 0o700);
+        let scratch_lake =
+            crate::check::PrivateScratchDir::create(&lake_scratch, "standalone_recheck")?;
+        assert_eq!(
+            fs::symlink_metadata(&scratch_lake.path)?.mode() & 0o777,
+            0o700
+        );
+        scratch_lake.remove()?;
+
+        // Case 5: symlinks are rejected even when pointing at an existing 0o700 directory.
+        let symlink_staging = dir.join("symlink_staging");
+        std::os::unix::fs::symlink(&fresh_staging, &symlink_staging)?;
+        assert!(
+            ensure_private_dir(&symlink_staging).is_err(),
+            "ensure_private_dir must reject symlinks"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[cfg(unix)]
