@@ -3682,16 +3682,17 @@ lean_lib Smoke where
         //    canonicalized the gate's compare): this entry is a SYMLINK to the other checkout, so
         //    running `lake build +DepPin` from the project root would write through the symlink —
         //    the very publish this gate stops — and the message must instead point at the
-        //    checkout's own workspace, with the marker hint naming the packages dir, the only
-        //    place this gate honors the owner marker.
+        //    checkout's own workspace. No marker hint is suggested for THIS shape (an in-tree
+        //    packages dir with one symlinked entry): per `non_owned_dep_refresh_remedy`'s
+        //    contract, no owner marker clears the gate here, and the packages-dir marker hint
+        //    belongs to the relocated-packages-dir shape that case 4 below pins.
         let err = build_module_dag(&cfg, &["App".to_string()])
             .expect_err("stale pinned out-of-tree dep must not become a DAG build node")
             .to_string();
         assert!(
             err.contains("outside the project root")
                 && err.contains("own workspace (`lake build` in ")
-                && err.contains("put a `.turbo-lean-packages-owner` file naming")
-                && err.contains("in the packages dir")
+                && !err.contains(".turbo-lean-packages-owner")
                 && !err.contains("`lake build +DepPin` from the project root")
                 && !err.contains("adopted read-only"),
             "unexpected error: {err}"
