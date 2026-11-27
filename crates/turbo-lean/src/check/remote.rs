@@ -324,7 +324,7 @@ pub fn try_stateless_remote_check(
         .iter()
         .zip(&attested)
         .map(|(s, att)| pack::CheckShardBatchItem {
-            shard_key: compute_shard_key_with_args(&toolchain, s, &file_lean_args),
+            shard_key: compute_shard_key_with_args(&toolchain, s, &file_lean_args, None),
             decl_name: s.rooted_name(),
             prefix_env_hash: s.prefix_env_hash.clone(),
             stmt_hash: s.stmt_hash.clone(),
@@ -477,7 +477,7 @@ fn try_stateless_remote_single_decl_check(
     let file_lean_args = crate::module_builder::validate_effective_lean_args(
         &crate::module_builder::try_resolve_lean_args_for_path(&canon_dir, Some(&canon_file))?,
     )?;
-    let shard_key = compute_shard_key_with_args(&toolchain, shard, &file_lean_args);
+    let shard_key = compute_shard_key_with_args(&toolchain, shard, &file_lean_args, None);
     let rooted_target = shard.rooted_name();
     let single_set = HashSet::from([rooted_target.clone()]);
     let pruned_src = splitter::build_pruned_imports_shard_source(&active_src, &single_set);

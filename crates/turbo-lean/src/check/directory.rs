@@ -66,6 +66,7 @@ pub(super) fn check_directory(
     let (split_entries, split_cache_hits) =
         load_and_split_files_with_hashes_cached(store, &dir_files)?;
     let mut parsed_files = Vec::with_capacity(split_entries.len());
+    let kernel_audit_digest = kernel_prov.shard_cache_digest();
     let mut all_shard_keys = Vec::new();
     let mut sorry_files: Vec<PathBuf> = Vec::new();
     let tainted_sorry_paths = if allow_sorry {
@@ -97,7 +98,12 @@ pub(super) fn check_directory(
             .unwrap_or_default();
         let mut file_keys = Vec::with_capacity(split.shards.len());
         for s in &split.shards {
-            let k = compute_shard_key_with_args(toolchain, s, &file_lean_args);
+            let k = compute_shard_key_with_args(
+                toolchain,
+                s,
+                &file_lean_args,
+                kernel_audit_digest.as_deref(),
+            );
             all_shard_keys.push(k.clone());
             file_keys.push(k);
         }

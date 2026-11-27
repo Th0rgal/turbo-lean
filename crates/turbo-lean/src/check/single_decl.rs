@@ -576,7 +576,7 @@ theorem good : Witness.value = 7 := rfl
                 .is_clean_for_certification()
         );
         let attested = crate::check::confirm_decl_identity(source, shard, &scratch.path, &file)?;
-        let key = compute_shard_key_with_args(toolchain, shard, &[]);
+        let key = compute_shard_key_with_args(toolchain, shard, &[], None);
         let receipt = make_attested_shard_receipt_bytes(
             shard.decl_name(),
             &shard.prefix_env_hash,
@@ -1307,7 +1307,7 @@ theorem good : Witness.value = 7 := rfl
                             .find(|s| s.decl_name() == "N.good")
                             .unwrap();
                         let key =
-                            compute_shard_key_with_args("leanprover/lean4:v4.35.0", target, &[]);
+                            compute_shard_key_with_args("leanprover/lean4:v4.35.0", target, &[], None);
                         assert!(
                             store
                                 .batch_get_theorem_shards(&[key], "trusted")?
@@ -1470,7 +1470,7 @@ theorem good : Witness.value = 7 := rfl
                 .iter()
                 .find(|s| s.decl_name() == "z_proof_final")
                 .unwrap();
-            let key = compute_shard_key_with_args("leanprover/lean4:v4.35.0", target, &[]);
+            let key = compute_shard_key_with_args("leanprover/lean4:v4.35.0", target, &[], None);
             assert!(
                 store
                     .batch_get_theorem_shards(&[key], "trusted")?
@@ -3671,7 +3671,12 @@ pub(super) fn check_single_decl(
     let file_lean_args =
         crate::module_builder::try_resolve_lean_args_for_path(canon_dir, Some(&active_file))?;
 
-    let shard_key = compute_shard_key_with_args(toolchain, shard, &file_lean_args);
+    let shard_key = compute_shard_key_with_args(
+        toolchain,
+        shard,
+        &file_lean_args,
+        kernel_prov.shard_cache_digest().as_deref(),
+    );
     let make_cache_hit_json = |coalesced: bool, elapsed_ms: u128| {
         let cached_consts =
             crate::accelerators::lookup_distilled_constants(target_decl, &shard.signature_text);

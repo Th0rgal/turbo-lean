@@ -912,16 +912,18 @@ fn test_lean_args_digest_isolates_shard_and_fission_cache_keys() {
         tc,
         shard,
         &["-DmaxHeartbeats=4000000".to_string()],
+        None,
     );
     let with_other = crate::lake_build::compute_shard_key_with_args(
         tc,
         shard,
         &["-DmaxHeartbeats=200000".to_string()],
+        None,
     );
     assert_ne!(bare, with_hb);
     assert_ne!(with_hb, with_other);
     assert_eq!(
-        crate::lake_build::compute_shard_key_with_args(tc, shard, &[]),
+        crate::lake_build::compute_shard_key_with_args(tc, shard, &[], None),
         bare
     );
 
@@ -933,6 +935,77 @@ fn test_lean_args_digest_isolates_shard_and_fission_cache_keys() {
         &["-DmaxHeartbeats=4000000".to_string()],
     );
     assert_ne!(f_bare, f_hb);
+}
+
+#[test]
+fn test_shard_key_binds_kernel_audit_digest() {
+    let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let src = "theorem posture_thm (n : Nat) : n + 0 = n := by\n  simp\n";
+    let split = split_lean_source(src, &[]);
+    let shard = &split.shards[0];
+    let tc = "leanprover/lean4:v4.35.0";
+    let prov = |engine, rev: Option<&str>| crate::kernel::KernelProvenance {
+        requested_engine: crate::kernel::KernelEngineSelection::Auto,
+        kernel_engine: engine,
+        lean_toolchain: tc.to_string(),
+        con_leche_rev: rev.map(str::to_string),
+        fallback_reason: None,
+    };
+    let key = |p: &crate::kernel::KernelProvenance| {
+        crate::lake_build::compute_shard_key_with_args(
+            tc,
+            shard,
+            &[],
+            p.shard_cache_digest().as_deref(),
+        )
+    };
+    use crate::kernel::ResolvedKernelEngine as E;
+    // Roadmap G1a: the standard kernel keeps the domain Lake seeding/replay records under, while
+    // every other kernel configuration gets its own key, so a verdict is never served across them.
+    let standard = key(&prov(E::Standard, None));
+    assert_eq!(
+        standard,
+        crate::lake_build::compute_shard_key_with_args(tc, shard, &[], None),
+        "standard kernel must share the seeded/replayed key domain"
+    );
+    let rev = crate::kernel::PINNED_CON_LECHE_REV;
+    let con_leche = key(&prov(E::ConLeche, Some(rev)));
+    let both = key(&prov(E::Both, Some(rev)));
+    let other_rev = key(&prov(E::ConLeche, Some("0000000000000000000000000000000000000000")));
+    assert_ne!(standard, con_leche);
+    assert_ne!(standard, both);
+    assert_ne!(con_leche, both);
+    assert_ne!(con_leche, other_rev, "the con-leche revision is bound");
+    assert_eq!(con_leche, key(&prov(E::ConLeche, Some(rev))), "deterministic");
+}
+
+#[test]
+fn test_shard_key_binds_csimp_allowlist() {
+    let _guard = crate::pack::tests::env_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let split = split_lean_source("theorem csimp_key_thm : True := trivial\n", &[]);
+    let shard = &split.shards[0];
+    let tc = "leanprover/lean4:v4.35.0";
+    let key = || crate::lake_build::compute_shard_key_with_args(tc, shard, &[], None);
+    let prev = std::env::var_os("TURBO_LEAN_ALLOWED_CSIMP");
+    std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP");
+    let none = key();
+    std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", "Batteries.scan_eq");
+    let one = key();
+    std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", "Batteries.scan_eq,Batteries.fold_eq");
+    let two = key();
+    match prev {
+        Some(v) => std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", v),
+        None => std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP"),
+    }
+    // The zero-config effective allowlist is exported through `TURBO_LEAN_ALLOWED_CSIMP`, so a
+    // dependency gaining or losing an auto-allowed `@[csimp]` theorem moves the key.
+    assert_ne!(none, one);
+    assert_ne!(one, two);
+    assert_ne!(none, two);
 }
 
 #[test]
@@ -2629,7 +2702,7 @@ fn test_cached_directory_check_does_not_require_local_toolchain_compiler() -> Re
 
     let split = split_lean_source(src, &[]);
     let shard = &split.shards[0];
-    let shard_key = compute_shard_key_with_args(missing_tc, shard, &[]);
+    let shard_key = compute_shard_key_with_args(missing_tc, shard, &[], None);
     let receipt = make_shard_receipt_bytes(
         shard.decl_name(),
         &shard.prefix_env_hash,
@@ -3385,7 +3458,7 @@ fn test_remote_http_check_never_stages_cas_blobs_before_attestation_and_reuses_c
         let raw_keys: Vec<String> = split
             .shards
             .iter()
-            .map(|s| compute_shard_key_with_args(toolchain, s, &[]))
+            .map(|s| compute_shard_key_with_args(toolchain, s, &[], None))
             .collect();
         assert!(
                 reuse_store

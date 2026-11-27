@@ -6,12 +6,14 @@ mod cache;
 mod env;
 mod freshness;
 mod impact;
+mod policy;
 
 pub use self::build::*;
 pub use self::cache::*;
 pub(crate) use self::env::*;
 pub use self::freshness::*;
 pub use self::impact::*;
+pub(crate) use self::policy::*;
 
 #[cfg(test)]
 mod tests;

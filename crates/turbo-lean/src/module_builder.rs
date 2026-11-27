@@ -1383,7 +1383,7 @@ lean_lib Later where
                     .first()
                     .expect("both sources declare one theorem")
                     .clone();
-                let shard_key = lake_build::compute_shard_key_with_args("tc", &shard, &[]);
+                let shard_key = lake_build::compute_shard_key_with_args("tc", &shard, &[], None);
                 (
                     deps.clone(),
                     lake_build::compute_file_split_key_with_deps(&sb, &deps),

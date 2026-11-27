@@ -1365,6 +1365,17 @@ pub(super) fn ensure_project_imports_fresh_inner(
     // `input_file`) or has an unparseable manifest/config that fails static resolution.
     let _ = crate::module_builder::try_project_lake_inputs_tag(canon_dir)?;
 
+    // Zero-config `csimp` import policy (`#411`/`#412`, roadmap P9): dependency-package
+    // `@[csimp]` theorems are auto-allowed, while a project-owned `@[csimp]` theorem the
+    // configured allowlist does not cover fails closed here — before any Lake rebuild, audit,
+    // or replay work — naming the `[csimp] allow` fix. Read-only: the effective allowlist is
+    // exported to the worker environment by the CLI preflight, never mutated mid-walk.
+    super::preflight_zero_config_csimp_import_policy(
+        canon_dir,
+        super::CsimpPreflightScope::Targets(target_files.to_vec()),
+        false,
+    )?;
+
     let manifest_path = verified_sources_manifest_path(canon_dir);
     // Pins and artifact digests describe disk whatever policy they were recorded under, so only
     // the schema has to match here. A manifest that exists but does not parse (legacy schema,

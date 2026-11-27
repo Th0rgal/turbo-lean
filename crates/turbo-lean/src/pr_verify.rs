@@ -403,7 +403,7 @@ impl BaseShardRef for splitter::TheoremShard {
         &self.prefix_env_hash
     }
     fn shard_key(&self, toolchain: &str, file_lean_args: &[String]) -> std::borrow::Cow<'_, str> {
-        std::borrow::Cow::Owned(compute_shard_key_with_args(toolchain, self, file_lean_args))
+        std::borrow::Cow::Owned(compute_shard_key_with_args(toolchain, self, file_lean_args, None))
     }
 }
 
@@ -531,7 +531,7 @@ impl PrClassificationAccum {
         for s in cur_split.shards {
             let qualified = format!("{}::{}", rel_path, s.name);
             if let Some(bs) = base_by_name.get(s.name.as_str()) {
-                let k = compute_shard_key_with_args(&self.toolchain, &s, file_lean_args);
+                let k = compute_shard_key_with_args(&self.toolchain, &s, file_lean_args, None);
                 if k == bs.shard_key(&self.toolchain, base_lean_args).as_ref() {
                     self.unchanged_theorems.push(qualified);
                 } else if s.stmt_hash == bs.stmt_hash()
@@ -547,7 +547,7 @@ impl PrClassificationAccum {
                     file_verify_list.push((k, s, false));
                 }
             } else {
-                let k = compute_shard_key_with_args(&self.toolchain, &s, file_lean_args);
+                let k = compute_shard_key_with_args(&self.toolchain, &s, file_lean_args, None);
                 file_has_stmt_change = true;
                 self.statement_edited_theorems.push(qualified);
                 file_verify_list.push((k, s, false));
@@ -585,7 +585,7 @@ impl PrClassificationAccum {
             .insert(rel_path.clone(), cur_split.interface_hash);
         let mut file_verify_list = Vec::new();
         for s in cur_split.shards {
-            let k = compute_shard_key_with_args(&self.toolchain, &s, file_lean_args);
+            let k = compute_shard_key_with_args(&self.toolchain, &s, file_lean_args, None);
             self.statement_edited_theorems
                 .push(format!("{}::{}", rel_path, s.name));
             file_verify_list.push((k, s, false));
@@ -718,7 +718,7 @@ pub(crate) fn build_cached_head_file_entry(
             stmt_hash: sh.stmt_hash.clone(),
             prefix_env_hash: sh.prefix_env_hash.clone(),
             proof_hash: sh.proof_hash.clone(),
-            shard_key: compute_shard_key_with_args(toolchain, sh, file_lean_args),
+            shard_key: compute_shard_key_with_args(toolchain, sh, file_lean_args, None),
         })
         .collect();
 

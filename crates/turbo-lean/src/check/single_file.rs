@@ -49,10 +49,18 @@ pub(super) fn check_single_file(
         canon_dir,
         Some(canon_resolved_initial),
     )?;
+    let kernel_audit_digest = kernel_prov.shard_cache_digest();
     let file_shard_keys: Vec<String> = split
         .shards
         .iter()
-        .map(|shard| compute_shard_key_with_args(toolchain, shard, &file_lean_args))
+        .map(|shard| {
+            compute_shard_key_with_args(
+                toolchain,
+                shard,
+                &file_lean_args,
+                kernel_audit_digest.as_deref(),
+            )
+        })
         .collect();
     let client_attested_keys: Vec<String> = file_shard_keys
         .iter()

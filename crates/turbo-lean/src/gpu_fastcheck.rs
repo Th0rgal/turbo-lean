@@ -6798,7 +6798,7 @@ pub fn evaluate_agent_step_value(
             let shard_keys: Vec<String> = target_shards
                 .iter()
                 .map(|s| {
-                    crate::lake_build::compute_shard_key_with_args(&toolchain, s, &file_lean_args)
+                    crate::lake_build::compute_shard_key_with_args(&toolchain, s, &file_lean_args, None)
                 })
                 .collect();
             if let Ok(cached_map) = store.batch_get_theorem_shards(&shard_keys, "trusted") {
@@ -6872,6 +6872,7 @@ pub fn evaluate_agent_step_value(
                             &toolchain,
                             sh,
                             &file_lean_args,
+                            None,
                         );
                         let n = cached_map
                             .get(&sh_key)
