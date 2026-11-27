@@ -214,6 +214,23 @@ pub fn probe_con_leche_support_for_selection(
     lean_toolchain: &str,
     workspace_root: Option<&Path>,
 ) -> Option<String> {
+    probe_con_leche_support_for_selection_with_bin_env(
+        requested,
+        lean_toolchain,
+        workspace_root,
+        std::env::var_os(CON_LECHE_BIN_ENV).as_deref(),
+    )
+}
+
+/// Same as [`probe_con_leche_support_for_selection`], but takes the `TURBO_CON_LECHE_BIN` value
+/// explicitly instead of reading the process environment (so callers/tests never need to mutate
+/// process-wide state).
+pub fn probe_con_leche_support_for_selection_with_bin_env(
+    requested: KernelEngineSelection,
+    lean_toolchain: &str,
+    workspace_root: Option<&Path>,
+    con_leche_bin_env: Option<&OsStr>,
+) -> Option<String> {
     if !matches!(
         requested,
         KernelEngineSelection::Auto
@@ -225,7 +242,7 @@ pub fn probe_con_leche_support_for_selection(
     if normalize_lean_toolchain(lean_toolchain) != PINNED_CON_LECHE_TOOLCHAIN {
         return None;
     }
-    let bin = discover_con_leche_binary(workspace_root).ok()?;
+    let bin = discover_con_leche_binary_with_bin_env(workspace_root, con_leche_bin_env).ok()?;
     if let Some(proj) = workspace_root {
         let canon_proj = proj.canonicalize().ok()?;
         let checkout = canon_proj
@@ -286,10 +303,31 @@ pub fn resolve_kernel_engine_in_workspace(
     lean_toolchain: &str,
     workspace_root: Option<&Path>,
 ) -> Result<KernelProvenance> {
+    resolve_kernel_engine_in_workspace_with_bin_env(
+        requested,
+        lean_toolchain,
+        workspace_root,
+        std::env::var_os(CON_LECHE_BIN_ENV).as_deref(),
+    )
+}
+
+/// Same as [`resolve_kernel_engine_in_workspace`], but takes the `TURBO_CON_LECHE_BIN` value
+/// explicitly instead of reading the process environment.
+pub fn resolve_kernel_engine_in_workspace_with_bin_env(
+    requested: KernelEngineSelection,
+    lean_toolchain: &str,
+    workspace_root: Option<&Path>,
+    con_leche_bin_env: Option<&OsStr>,
+) -> Result<KernelProvenance> {
     let lean_toolchain = normalize_lean_toolchain(lean_toolchain);
     let probed_con_leche_rev = workspace_root
         .and_then(|root| {
-            probe_con_leche_support_for_selection(requested, &lean_toolchain, Some(root))
+            probe_con_leche_support_for_selection_with_bin_env(
+                requested,
+                &lean_toolchain,
+                Some(root),
+                con_leche_bin_env,
+            )
         })
         .or_else(|| probe_con_leche_support(&lean_toolchain));
     let routed_tag =
@@ -390,7 +428,20 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 pub fn discover_con_leche_binary(workspace_root: Option<&Path>) -> Result<PathBuf> {
-    if let Ok(raw) = std::env::var(CON_LECHE_BIN_ENV) {
+    discover_con_leche_binary_with_bin_env(
+        workspace_root,
+        std::env::var_os(CON_LECHE_BIN_ENV).as_deref(),
+    )
+}
+
+/// Same as [`discover_con_leche_binary`], but takes the `TURBO_CON_LECHE_BIN` value explicitly
+/// instead of reading the process environment. Non-UTF-8 values are ignored, matching
+/// `std::env::var` semantics.
+pub fn discover_con_leche_binary_with_bin_env(
+    workspace_root: Option<&Path>,
+    con_leche_bin_env: Option<&OsStr>,
+) -> Result<PathBuf> {
+    if let Some(raw) = con_leche_bin_env.and_then(OsStr::to_str) {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
             let p = PathBuf::from(trimmed);
@@ -788,8 +839,10 @@ pub fn compute_transitive_csimp_posture_digest(
 /// Canonical module name of one `exported_imports` token.
 ///
 /// ZygoteWorker records each import as `Module:e=<bool>:m=<bool>:a=<bool>`. A bare module name
-/// (no `:e=` metadata) is accepted as-is. Empty, whitespace-only, or malformed tokens fail closed
-/// instead of being skipped, so a blank import can never hide a hole in the closure.
+/// (no `:` at all) is accepted as-is. Any `:` starts the metadata suffix, which must be exactly
+/// `:e=<bool>:m=<bool>:a=<bool>` — strict key order, no duplicate or unknown keys, no empty `::`
+/// segments. Empty, whitespace-only, or malformed tokens fail closed instead of being skipped or
+/// truncated, so a blank or spoofed import can never hide a hole in the closure.
 fn canonical_exported_import_module(raw: &str) -> Result<&str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -802,28 +855,32 @@ fn canonical_exported_import_module(raw: &str) -> Result<&str> {
             "[TurboLean.KernelGate] exported import `{trimmed}` contains whitespace (fail-closed)"
         );
     }
-    let name = trimmed.split(":e=").next().unwrap_or("");
+    let (name, meta) = match trimmed.split_once(':') {
+        None => (trimmed, None),
+        Some((name, meta)) => (name, Some(meta)),
+    };
     if name.is_empty() {
         anyhow::bail!(
             "[TurboLean.KernelGate] exported import `{trimmed}` has an empty module name (fail-closed)"
         );
     }
-    if let Some(meta) = trimmed.strip_prefix(name) {
-        if !meta.is_empty() {
-            let flags: Vec<&str> = meta.split(':').filter(|part| !part.is_empty()).collect();
-            let well_formed = flags.len() == 3
-                && flags.iter().all(|flag| {
-                    let Some((key, value)) = flag.split_once('=') else {
-                        return false;
-                    };
-                    matches!(key, "e" | "m" | "a") && matches!(value, "true" | "false")
+    if let Some(meta) = meta {
+        let fields: Vec<&str> = meta.split(':').collect();
+        let well_formed = fields.len() == 3
+            && fields
+                .iter()
+                .zip(["e", "m", "a"])
+                .all(|(field, expected_key)| {
+                    matches!(
+                        field.split_once('='),
+                        Some((key, "true" | "false")) if key == expected_key
+                    )
                 });
-            if !well_formed {
-                anyhow::bail!(
-                    "[TurboLean.KernelGate] malformed exported-import metadata `{trimmed}`: \
-                     expected `Module:e=<bool>:m=<bool>:a=<bool>` (fail-closed)"
-                );
-            }
+        if !well_formed {
+            anyhow::bail!(
+                "[TurboLean.KernelGate] malformed exported-import metadata `{trimmed}`: \
+                 expected exactly `Module:e=<bool>:m=<bool>:a=<bool>` (fail-closed)"
+            );
         }
     }
     Ok(name)
@@ -1322,6 +1379,8 @@ mod tests {
             "MidA:e=true",
             ":e=true:m=false:a=false",
             "Mid A:e=true:m=false:a=false",
+            "MidA:m=false:a=false",
+            "MidA:bogus",
         ] {
             let err = scan_transitive_csimp_posture("Root", |m| {
                 if m == "Root" {
@@ -1334,6 +1393,49 @@ mod tests {
             assert!(
                 err.to_string().contains(malformed) || err.to_string().contains("malformed"),
                 "malformed exported import `{malformed}` must fail closed: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_canonical_exported_import_module_requires_exact_metadata_suffix() {
+        assert_eq!(canonical_exported_import_module("MidA").unwrap(), "MidA");
+        assert_eq!(
+            canonical_exported_import_module("Mathlib.Data.Nat").unwrap(),
+            "Mathlib.Data.Nat"
+        );
+        assert_eq!(
+            canonical_exported_import_module(" MidA:e=true:m=false:a=true ").unwrap(),
+            "MidA"
+        );
+        for malformed in [
+            // Missing `e=`: previously parsed as a bare module name `MidA:m=false:a=false`.
+            "MidA:m=false:a=false",
+            "MidA:bogus",
+            "MidA:",
+            // Wrong order, duplicates, unknown keys.
+            "MidA:m=false:e=true:a=false",
+            "MidA:a=false:m=false:e=true",
+            "MidA:e=true:e=true:m=false:a=false",
+            "MidA:e=true:m=false:m=false:a=false",
+            "MidA:e=true:m=false:x=false",
+            // Empty `::` segments anywhere.
+            "MidA::e=true:m=false:a=false",
+            "MidA:e=true::m=false:a=false",
+            "MidA:e=true:m=false::a=false",
+            "MidA:e=true:m=false:a=false:",
+            // Trailing junk or bad values.
+            "MidA:e=true:m=false:a=false:bogus",
+            "MidA:e=true:m=false:a=",
+            "MidA:e=TRUE:m=false:a=false",
+            "MidA:e:m=false:a=false",
+            ":e=true:m=false:a=false",
+        ] {
+            let err = canonical_exported_import_module(malformed).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("malformed") || msg.contains("empty module name"),
+                "malformed exported import `{malformed}` must fail closed: {msg}"
             );
         }
     }

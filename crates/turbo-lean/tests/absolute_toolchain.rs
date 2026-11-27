@@ -206,50 +206,42 @@ write_pkt() {
   printf '%04x%s' "$(( ${#1} + 4 ))" "$1"
 }
 write_flush() { printf '0000'; }
-read_pkt || exit 0
-dd bs=1 count="$bodylen" of=/dev/null 2>/dev/null
-read_pkt || exit 0
-dd bs=1 count="$bodylen" of=/dev/null 2>/dev/null
-read_pkt || exit 0
+drain_until_flush() {
+  while read_pkt; do
+    [ "$bodylen" -lt 0 ] && return 0
+    dd bs=1 count="$bodylen" of=/dev/null 2>/dev/null
+  done
+  exit 0
+}
+# Handshake: client sends `git-filter-client`, `version=2`, flush.
+drain_until_flush
 write_pkt 'git-filter-server
 '
 write_pkt 'version=2
 '
 write_flush
+# Capability negotiation: client sends `capability=clean`, `capability=smudge`
+# (and possibly others), flush. Advertise exactly clean + smudge, then flush.
+drain_until_flush
+write_pkt 'capability=clean
+'
+write_pkt 'capability=smudge
+'
+write_flush
+# Commands: `command=<clean|smudge>`, `pathname=...`, flush, content, flush.
 while read_pkt; do
   [ "$bodylen" -lt 0 ] && continue
   dd bs=1 count="$bodylen" of="$tmp" 2>/dev/null
-      case "$(cat "$tmp" 2>/dev/null)" in
-        capability=clean|capability=smudge)
-          while read_pkt; do
-            [ "$bodylen" -lt 0 ] && break
-            dd bs=1 count="$bodylen" of=/dev/null 2>/dev/null
-          done
-          write_pkt 'status=success
-'
-          write_flush
-          ;;
-        capability=*)
-          while read_pkt; do
-            [ "$bodylen" -lt 0 ] && break
-            dd bs=1 count="$bodylen" of=/dev/null 2>/dev/null
-          done
-          write_pkt 'status=error
-'
-          write_flush
-          ;;
-        command=*)
-      while read_pkt; do
-        [ "$bodylen" -lt 0 ] && break
-        dd bs=1 count="$bodylen" of=/dev/null 2>/dev/null
-      done
+  case "$(cat "$tmp" 2>/dev/null)" in
+    command=*)
+      drain_until_flush
       : > "$tmp"
       while read_pkt; do
         [ "$bodylen" -lt 0 ] && break
         dd bs=1 count="$bodylen" 2>/dev/null >> "$tmp"
       done
       sz=$(wc -c < "$tmp")
-      write_pkt '
+      write_pkt 'status=success
 '
       write_flush
       if [ "$sz" -gt 0 ]; then
@@ -257,11 +249,11 @@ while read_pkt; do
         cat "$tmp"
       fi
       write_flush
+      # Empty status list: keep `status=success`.
+      write_flush
       ;;
     *)
-      write_pkt '
-'
-      write_flush
+      exit 1
       ;;
   esac
 done
@@ -290,9 +282,15 @@ done
                 .arg(path),
         );
     }
-    // Only the side effect matters: Git >= 2.53 also starts the configured
-    // `filter.attack.process` here, and the marker-only shim does not speak the
-    // long-running filter protocol, so `git status` itself may fail.
+    // A required filter turns every protocol error into a hard Git failure, so
+    // a non-compliant fixture can never be masked as a silent pass-through.
+    checked(Command::new(&host_git).current_dir(&f.0).args([
+        "config",
+        "filter.attack.required",
+        "true",
+    ]));
+    // Only the side effect matters: the marker-only `core.fsmonitor` shim does
+    // not speak the fsmonitor hook protocol, so `git status` itself may fail.
     let _ = Command::new(&host_git)
         .current_dir(&f.0)
         .args(["status", "--porcelain"])

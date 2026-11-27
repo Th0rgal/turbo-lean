@@ -84,7 +84,10 @@ impl KernelTestFixture {
             .env("TURBO_LEAN_TELEMETRY", "off")
             .env("TURBO_LEAN_NO_REMOTE_TELEMETRY", "1")
             .env_remove("TURBO_LEAN_KERNEL_ENGINE")
-            .env_remove("TURBO_LEAN_KERNEL_ENGINE_FROM_CONFIG");
+            .env_remove("TURBO_LEAN_KERNEL_ENGINE_FROM_CONFIG")
+            // Never inherit an ambient con-leche override; tests that need one set it explicitly
+            // on the spawned `Command` (`.env(kernel::CON_LECHE_BIN_ENV, ..)`).
+            .env_remove(kernel::CON_LECHE_BIN_ENV);
         cmd
     }
 }
@@ -1113,32 +1116,33 @@ fn auto_kernel_routes_to_con_leche_when_pinned_toolchain_binary_is_provisioned()
         "#!/usr/bin/env bash\nif [ \"${1:-}\" = \"--version\" ]; then echo 'con-leche 0.1.0'; exit 0; fi\nexit 0\n",
     );
 
-    let prev = std::env::var_os(kernel::CON_LECHE_BIN_ENV);
-    std::env::set_var(kernel::CON_LECHE_BIN_ENV, &fake_bin);
-    let auto_v435 = kernel::resolve_kernel_engine_in_workspace(
+    // Inject the `TURBO_CON_LECHE_BIN` value explicitly instead of mutating the process-wide
+    // environment, which would race with other tests spawning commands in parallel.
+    let bin_env = Some(fake_bin.as_os_str());
+    let auto_v435 = kernel::resolve_kernel_engine_in_workspace_with_bin_env(
         kernel::KernelEngineSelection::Auto,
         kernel::PINNED_CON_LECHE_TOOLCHAIN,
         Some(&proj),
+        bin_env,
     );
-    let auto_other = kernel::resolve_kernel_engine_in_workspace(
+    let auto_other = kernel::resolve_kernel_engine_in_workspace_with_bin_env(
         kernel::KernelEngineSelection::Auto,
         "leanprover/lean4:v4.15.0",
         Some(&proj),
+        bin_env,
     );
-    let auto_no_ws = kernel::resolve_kernel_engine_in_workspace(
+    let auto_no_ws = kernel::resolve_kernel_engine_in_workspace_with_bin_env(
         kernel::KernelEngineSelection::Auto,
         kernel::PINNED_CON_LECHE_TOOLCHAIN,
         None,
+        bin_env,
     );
-    let explicit_std = kernel::resolve_kernel_engine_in_workspace(
+    let explicit_std = kernel::resolve_kernel_engine_in_workspace_with_bin_env(
         kernel::KernelEngineSelection::Standard,
         kernel::PINNED_CON_LECHE_TOOLCHAIN,
         Some(&proj),
+        bin_env,
     );
-    match prev {
-        Some(v) => std::env::set_var(kernel::CON_LECHE_BIN_ENV, v),
-        None => std::env::remove_var(kernel::CON_LECHE_BIN_ENV),
-    }
 
     let auto_v435 = auto_v435.unwrap();
     assert_eq!(auto_v435.requested_engine, kernel::KernelEngineSelection::Auto);
