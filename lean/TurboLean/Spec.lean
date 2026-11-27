@@ -77,6 +77,7 @@ export TurboLean.PolicyGates (
   routeKernelEngine
   verifyKernelEngineRoute
   verifyReceiptProvenanceAdmission
+  verifyKernelAuditAdmission
   matryoshkaTierRouterSpec
   isClosedSectionNeededC
   cAbiIsClosedSectionNeeded
@@ -123,6 +124,7 @@ export TurboLean.PolicyGates (
   verifyHygieneItemAdmittedC
   routeKernelEngineC
   verifyReceiptProvenanceAdmissionC
+  verifyKernelAuditAdmissionC
   combinedStepC
 )
 
@@ -1423,5 +1425,47 @@ theorem receipt_provenance_admission_v2_enforces_engine_revision_consistency
   receiptProvenanceAdmissionMetaSpec.rejects_unsafe s fun ⟨_, h⟩ => by
     rcases h with ⟨hv, _⟩ | ⟨_, _, _, ⟨_, _⟩ | ⟨_ | _, _⟩⟩ <;>
       rcases h_bad with hb | hb | ⟨_, _⟩ | ⟨_ | _, _⟩ <;> simp_all <;> omega
+
+structure KernelAuditAdmissionState where
+  oleanState      : UInt8
+  readerOk        : Bool
+  expectedModules : UInt32
+  auditedModules  : UInt32
+  violationCount  : UInt32
+  deriving Repr, DecidableEq, BEq
+
+def kernelAuditAdmissionMetaSpec : MetaGateSpec KernelAuditAdmissionState
+    (fun s => s.oleanState = 3 ∧ s.readerOk = true ∧ s.expectedModules ≠ 0 ∧
+      s.auditedModules = s.expectedModules ∧ s.violationCount = 0) where
+  gate := fun s =>
+    verifyKernelAuditAdmission
+      s.oleanState s.readerOk s.expectedModules s.auditedModules s.violationCount
+  sound := fun s h => by
+    simpa [verifyKernelAuditAdmission, Bool.and_eq_true, beq_iff_eq, bne_iff_ne, and_assoc]
+      using h
+  complete := fun s h => by
+    simpa [verifyKernelAuditAdmission, Bool.and_eq_true, beq_iff_eq, bne_iff_ne, and_assoc]
+      using h
+  posWitness := ⟨3, true, 1, 1, 0⟩
+  negWitness := ⟨1, true, 1, 1, 0⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem kernel_audit_admission_fails_closed_without_fresh_olean
+    (s : KernelAuditAdmissionState) (h_state : s.oleanState ≠ 3) :
+    verifyKernelAuditAdmission
+      s.oleanState s.readerOk s.expectedModules s.auditedModules s.violationCount = false :=
+  kernelAuditAdmissionMetaSpec.rejects_unsafe s fun ⟨h, _⟩ => h_state h
+
+theorem kernel_audit_admission_rejects_kernel_violations
+    (s : KernelAuditAdmissionState)
+    (h_bad : s.readerOk = false ∨ s.auditedModules ≠ s.expectedModules ∨ s.violationCount ≠ 0) :
+    verifyKernelAuditAdmission
+      s.oleanState s.readerOk s.expectedModules s.auditedModules s.violationCount = false :=
+  kernelAuditAdmissionMetaSpec.rejects_unsafe s fun ⟨_, hr, _, ha, hv⟩ => by
+    rcases h_bad with h | h | h
+    · simp [hr] at h
+    · exact h ha
+    · exact h hv
 
 end TurboLean.Spec

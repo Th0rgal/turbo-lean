@@ -195,7 +195,7 @@ flowchart LR
 | **H2.3** | Parallel replay under the RAM budget | `zygote/worker.rs` (pool; partly `dispatch.rs`; shared with `S3b-E`/`S3b-M` — do not run in parallel) | P3 | bench scaling | M |
 | **H2.G** *RO* | GPU-addressable share of loop time | doc only | M1 | number against the 10% line | S |
 | **A1** *(done `#462` `4e2ba1c`)* | `#367`: strict `[audit_spec]` TOML | `audit_spec.rs` parser | – | typo-key test fails closed | S |
-| **A2** *RO* | `#367`: kernel-backed witness | `PolicyGates.lean` | A1 | `audit-spec` JSON | L |
+| **A2** *RO* *(done, branch `a2-audit-spec-kernel`)* | `#367`: kernel-backed witness. `audit-spec --kernel` (or `kernel = true`) replays each file's compiled `.olean` through the in-kernel `--audit-modules` reader and admits it only through `verifyKernelAuditAdmission` (fresh `.olean`, reader ok, every expected module audited, zero violations); a missing, stale or tampered `.olean` fails closed | `PolicyGates.lean`, `audit_spec.rs` | A1 | `audit-spec` JSON `kernel_audit` / `kernel_violations` | L |
 | **A1j** | Strict `[audit_spec]` JSON: a misspelled top-level key beside the `audit_spec` / `audit-spec` object fails closed (A1 closed this for TOML only) | `audit_spec.rs` (JSON path) | A1 | test: JSON config with a misspelled top-level key fails closed | S |
 | **L299** | `#299`, one fixture per bullet | `module_builder/dag.rs` (lakefile parser; shared with P7 — do not run in parallel) | S1 | Lake-parity fixtures | M |
 | **H1.0** *RO* | Generated `LCNF` coverage matrix on `Batteries` and C1. Unresolved split parent, encoded as `H1.0a-V` → `H1.0a-S` (same paths, sequential) plus `H1.0b`; it resolves only through `H1.0b`. Existing draft `#458` (`fd8d618a`) covers the first half and is **blocked**: it must not merge before the defects `H1.0a-V`/`H1.0a-S` harden are fixed | `scripts/lcnf_coverage.py` | H1.0b | CI job emits JSON | M |
@@ -212,7 +212,7 @@ flowchart LR
 | **C4x** *(done `#472` `64d63bd`)* | 10k-seed nightly alias fuzzing | `fuzz_lcnf_conformance.py` | – | nightly green | M |
 | **C1x** | C1 corpus to 250 programs, chosen by the matrix | corpus manifest | H1.0 | `--tier C1` | L |
 
-**Start width**: R0, H1.0a-V, M1a, S3b-E, A2, A1j, P2, P3, P5, P6, P7, P10, L299, H1.1, C2x have no unmet dependency and disjoint files (P7 and L299 share `module_builder/dag.rs` — do not run in parallel): fifteen leaves, about eight at once per machine because six need Lean builds.
+**Start width**: R0, H1.0a-V, M1a, S3b-E, A1j, P2, P3, P5, P6, P7, P10, L299, H1.1, C2x have no unmet dependency and disjoint files (P7 and L299 share `module_builder/dag.rs` — do not run in parallel): fourteen leaves, about eight at once per machine because six need Lean builds.
 
 **Critical path**: H1.0a-V → H1.0a-S → H1.0b → H1.0 → L1 → L2 → L3 → H1.4, with H1.1 in parallel into L1. Three large proof items in series; nothing shortens it except starting H1.0a-V and H1.1 now.
 

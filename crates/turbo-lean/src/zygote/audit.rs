@@ -471,6 +471,62 @@ pub(crate) fn record_snapshot_modules_in_store(
     Ok(())
 }
 
+/// Read-only kernel audit for `audit-spec --kernel`: replay `mod_name` from a sealed `.olean`
+/// closure snapshot through `--audit-modules` and return the auditor's verdict, including its
+/// violations, without failing on them. `Err` means the reader itself could not run or answer.
+pub(crate) fn read_module_kernel_audit_reply(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_name: &str,
+    lean_path_env: &str,
+) -> Result<ZygoteAuditModulesReply> {
+    anyhow::ensure!(
+        !mod_name.trim().is_empty(),
+        "In-kernel `.olean` audit received an empty module name: fail-closed"
+    );
+    let mod_names = vec![mod_name.to_string()];
+    let snap = materialize_bound_audit_closure(cfg, &mod_names, lean_path_env)?;
+    let (snap_lp, _) = ensure_bound_audit_closure(&snap, "audit_spec_kernel_before")?;
+    let pinned_fd = snapshot_pinned_dir_raw_fd(&snap);
+    let lp = snapshot_parent_search_path(&snap).unwrap_or(snap_lp);
+    let (mut cmd, timeout) = kernel_reader_command(&store.root, cfg, &lp, &[], false)?;
+    cmd.arg("--audit-modules");
+    for a in pinned_ffi_allow_args(cfg, &mod_names) {
+        cmd.arg(a);
+    }
+    cmd.arg(mod_name);
+    let out = crate::module_builder::run_command_with_timeout_pinned_fd(
+        &mut cmd, timeout, false, pinned_fd,
+    )
+    .context("Failed to execute in-kernel `.olean` auditor (`--audit-modules`)")?;
+    ensure_live_closure_matches_snapshot(&snap, "audit_spec_kernel_after")?;
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let json_line = stdout_str
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| l.starts_with('{') && l.ends_with('}'))
+        .unwrap_or("");
+    let mut reply: ZygoteAuditModulesReply = serde_json::from_str(json_line).map_err(|e| {
+        anyhow::anyhow!(
+            "In-kernel `.olean` auditor gave no verdict (exit={}, {e}):\nstdout: {}\nstderr: {}",
+            out.status,
+            stdout_str.trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+    })?;
+    if !out.status.success() && reply.ok {
+        reply.ok = false;
+    }
+    if !reply.ok && reply.violations.is_empty() {
+        reply.violations.push(format!(
+            "[TurboLean.KernelGate] auditor rejected `{mod_name}` without a violation (exit={})",
+            out.status
+        ));
+    }
+    Ok(reply)
+}
+
 pub(crate) fn audit_compiled_modules_with_zygote(
     store: &TurboStore,
     cfg: &crate::module_builder::ProjectConfig,

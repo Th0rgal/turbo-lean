@@ -94,5 +94,8 @@
 4. The `Contract V4 M2`/`M3` theorems are stated over the in-repo `"OLEN"` v1 model — `ConLeche.lean`
    says so in-file (`lean/TurboLean/ConLeche.lean:7,12`: "binary `"OLEN"` v1 … shard model format,
    NOT raw Lean 4 `.olean`"), as does the root `README.md:42`; the proof against real `.olean`
-   files is open (leaf `G1b` caveat, PR `#460`), and the kernel-backed `ConstantInfo` witness is
-   leaf `A2`.
+   files is open (leaf `G1b` caveat, PR `#460`). The kernel-backed witness of leaf `A2`
+   (`audit-spec --kernel`) reads real `.olean` files through Lean's own kernel replay, but it
+   trusts Lake's trace and `.hash` sidecars to bind the `.olean` to its source: an attacker who
+   rewrites the `.olean`, its sidecar and its trace consistently is caught only by the kernel
+   replay itself, not by the freshness check.
