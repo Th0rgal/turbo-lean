@@ -90,7 +90,7 @@ UNMEASURED_OUTCOMES = ("NOT_APPLICABLE", "INFRA", "TIMEOUT", "ERROR")
 # Signatures that mean the build infrastructure failed, not the proof stack
 # (subset of scripts/emitter_mutants.json `infra_signatures`, plus the form
 # Lake prints when a child `lean` is OOM-killed). Only consulted on rc != 0,
-# and only on error lines / the failing tail block (review r2 F3): a dependent
+# and only on error lines / the failing tail block: a dependent
 # module's own `info:`/`#eval` output inside an otherwise-real kill log must
 # not turn the kill into INFRA. The loose substrings "sigkill" and bare
 # "code 137" are gone for the same reason; rc 137 / -9 is the primary OOM

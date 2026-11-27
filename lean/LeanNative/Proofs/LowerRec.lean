@@ -115,7 +115,7 @@ findings folded before the Part II statements freeze):
   code.
 
 Amendment 3 (2026-11-26; the Part II status decision, and
-review findings 1-2): the resolved local-call rule binds the call result at the
+two review findings): the resolved local-call rule binds the call result at the
 caller's declared lowered type `rawTy`. Until this amendment it bound at
 `if isUnboxedScalarOrTuple rawTy then rawTy else .i64`, the unresolved `.fap` arm's
 fallback, while the lowering allocates the destination at `rawTy` itself

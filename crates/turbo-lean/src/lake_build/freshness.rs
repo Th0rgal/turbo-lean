@@ -1481,7 +1481,7 @@ pub(crate) fn input_closure_sweep_mods(
             // and the per-module SOURCE reads run only for nodes that came out stale.
             // A fresh Mathlib import therefore costs no source reads per sweep.
             if !node_owned(n) {
-                // cf31dd1e F6: an EXCLUDED non-owned input-bearing seed used to fail
+                // An EXCLUDED non-owned input-bearing seed used to fail
                 // the freshness check loudly; now that the sweep skips it, a stale one
                 // must not go silent while the purge path fails closed on the same
                 // state. This orders the work by cost: the artifact

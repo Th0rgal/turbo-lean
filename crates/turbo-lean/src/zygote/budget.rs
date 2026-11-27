@@ -239,8 +239,8 @@ impl WorkerBudget {
     /// kill note's "raise the budget" advice pointed the wrong way). A tighter budget
     /// (the governor documents 256 and 512 MiB values) still gets the 4096 MiB floor
     /// cap while scheduling width, SHM quotas and batch sizing enforce the real share.
-    /// That floor is a REAL limit where tight budgets used to run uncapped (review
-    /// a64324fd F7): a worker whose writable virtual footprint passes 4096 MiB now
+    /// That floor is a REAL limit where tight budgets used to run uncapped: a
+    /// worker whose writable virtual footprint passes 4096 MiB now
     /// fails under `--max-memory-mb 4096 -j 8` where it passed before, and raising
     /// `--max-memory-mb` moves the cap only once the per-worker share exceeds
     /// `REPLAY_WORKER_EST_RSS_MB` (2048 MiB) — below that, lowering `--jobs` is what
@@ -324,8 +324,8 @@ impl WorkerBudget {
     }
 
     /// A named explanation when a replay worker's failure may trace to the per-worker
-    /// memory cap (#435). The ALLOCATION SIGNATURE on stderr decides first (review
-    /// bfa9d056 F2): an `RLIMIT_DATA` breach surfaces as a failed allocation (ENOMEM /
+    /// memory cap (#435). The ALLOCATION SIGNATURE on stderr decides first: an
+    /// `RLIMIT_DATA` breach surfaces as a failed allocation (ENOMEM /
     /// `std::bad_alloc` / "out of memory"), and a C++ `bad_alloc` that nobody catches
     /// reaches `std::terminate` and ABORTS, so the definite attribution must not be
     /// masked by the SIGABRT that delivery takes. A signal exit WITHOUT the signature
@@ -402,8 +402,8 @@ impl WorkerBudget {
     }
 
     /// True only for the DEFINITE memory-cap attribution — the allocation-failure note
-    /// (`"per-worker memory cap of"`), never the "may have been" signal note (review
-    /// a64324fd F5). Bisection is skipped only when the worker provably hit the cap,
+    /// (`"per-worker memory cap of"`), never the "may have been" signal note.
+    /// Bisection is skipped only when the worker provably hit the cap,
     /// because halving a capped chunk redoes full-closure loads under the same cap; a
     /// SIGSEGV or SIGKILL with no allocation signature still gets the bisection that
     /// isolates the failing module. An abort DELIVERING an allocation failure (SIGABRT

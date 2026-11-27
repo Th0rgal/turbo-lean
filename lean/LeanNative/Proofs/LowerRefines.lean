@@ -51,15 +51,15 @@ timeout / OOM controls through the real two-stage `run_one`; CI
 (`.github/workflows/nightly-conformance.yml`, job `proof-mutant-sample`) runs that
 self-test plus a pinned KILLED subset nightly; the full matrix runs behind `--full`.
 
-### Measurement record, including what the pre-r1 harness got wrong
+### Measurement record, including what the earlier harness got wrong
 
-Two full 60-mutant passes ran under the pre-r1 classifier (pass 1 at d1c2254d, pass 2 at
+Two full 60-mutant passes ran under the earlier classifier (pass 1 at d1c2254d, pass 2 at
 8147df02; both read "58/60" with 0 stillborn / 0 infra) and DISAGREED on which mutants
 survived. The root cause is measured, not guessed: two Tests modules run elaboration-time
 `#eval` IO against SHARED temp paths, so a concurrent build (another matrix worker, or any
 sibling checkout building this library on the same host) fails them for reasons unrelated
 to the mutant. `Tests/EvalLCNFCLITests.lean` writes a fixed-name fixture under `$TMPDIR`
-(the host-shared `/tmp` for every pre-r1 worker): pass 2's artifact records
+(the host-shared `/tmp` for every earlier-pass worker): pass 2's artifact records
 `EvalLCNFCLITests.lean:21:0: no such file or directory` as the `first_error` on all three
 of its `EvalLCNFCLITests` "kills", and a 3-repetition re-run reproduced that false kill
 LIVE, alternating between two concurrently built mutants with scheduling.
@@ -69,12 +69,12 @@ TMPDIR-isolated workers collided — one worker's tampered pack overwrites anoth
 pack ("pack integrity regression") or the cleanup removes it mid-read (ENOENT); a
 3-repetition isolated re-run recorded both texts, non-deterministically, on the three
 retTy mutants (1-2 of 3 identical runs each). Every kill attributed to either module in
-the pre-r1 passes is therefore environment, not the mutant; per the non-inflation rule
-("a mutant killed only by flakiness or build nondeterminism is SURVIVED") neither pre-r1
+those earlier passes is therefore environment, not the mutant; per the non-inflation rule
+("a mutant killed only by flakiness or build nondeterminism is SURVIVED") neither earlier
 number is reused. The fixes: the r1 harness gives every scratch a private TMPDIR and
 TURBO_LEAN_HOME, and this leaf's Tests edit gives the pack fixture a per-run unique name under `$TMPDIR`
 with `finally` cleanup, collision-free even under one shared TMPDIR. The number of record
-comes from the r1 harness over the fixed tree, measured at commit 88324526 with a
+comes from the fixed harness over the fixed tree, measured at commit 88324526 with a
 3-repetition determinism read of all five implicated ids first (identical verdicts 3/3
 each: four KILLED by this file's pins, the budget mutant SURVIVED 3/3):
 
@@ -252,7 +252,7 @@ private def jmpPreState : RealBridgeState :=
   | .error _ => false
 
 /-! ### Pin 4 — `orderAltsPure` puts every constructor alternative before `.default`.
-Kills `RS-orderalts-id-00` deterministically (the pre-r1 "kill" was the TMPDIR collision;
+Kills `RS-orderalts-id-00` deterministically (the earlier "kill" was the TMPDIR collision;
 the lowering and the semantics share this definition, so the differential cannot see it). -/
 
 private def altCtorTrue : Alt .impure :=

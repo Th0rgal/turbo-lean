@@ -61,7 +61,7 @@ post-pass.
    (`compressScalarCode`, `gateCodeWithSymbolicTV` and their collectors), the dead state
    converters (`bridgeStateToRealM`, `syncRealToBridgeStateM`), and the `BridgeState`
    fields only those read. Zero-reference sweeps with planted positive controls are in
-   this branch's commit messages; `lean/LeanNative/Tests/BridgeHelpersSplitPin.lean` pins the
+   the PR's commit history; `lean/LeanNative/Tests/BridgeHelpersSplitPin.lean` pins the
    surviving inventory.
 3. A declaration explicitly requested with compiled code fails closed by name instead of
    being dropped silently; a constant with no compiled code is skipped. Specifically,

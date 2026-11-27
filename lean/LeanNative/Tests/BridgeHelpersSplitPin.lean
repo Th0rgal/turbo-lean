@@ -9,7 +9,7 @@ open Lean
 Pinned inventory of `lean/LeanNative/IR/BridgeHelpers/` (S3a split; updated by L1 and its
 fix rounds; made falsifiable in a later revision).
 
-Why this shape: the r1 pin checked privates with `!env.contains n`, which holds for a
+Why this shape: the first pin checked privates with `!env.contains n`, which holds for a
 correctly private declaration and equally for a deleted one, and its public check could
 not see leftover public declarations. This version derives the ACTUAL inventory from the
 environment and compares both directions:
@@ -24,7 +24,7 @@ environment and compares both directions:
   constants through `privateToUserName?` (existence — a deleted private fails) and must
   not be visible as a public name (the leak check).
 
-Red-first evidence (recorded in this branch's history): a scratch copy of this checker with a planted
+Red-first evidence (recorded in the PR's commit history): a scratch copy of this checker with a planted
 deleted name (`compressScalarCode` / `initialSeenVarsForCode`) fails the missing checks,
 and a copy with `BridgeM` omitted from the list fails the leftover check, on the same
 build that passes the true lists.

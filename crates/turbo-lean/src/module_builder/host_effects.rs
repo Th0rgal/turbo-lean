@@ -72,8 +72,8 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
         // traces do not cover host reads, and deleting is not ours to do (#434: the
         // package belongs to a shared or foreign checkout), so the walk fails closed,
         // deletes nothing, and names the action that clears the condition — WHICH
-        // workspace refreshes the artifact depends on where the package lives (review
-        // cf31dd1e F3; see `non_owned_dep_refresh_remedy`) — after which the walk no
+        // workspace refreshes the artifact depends on where the package lives
+        // (see `non_owned_dep_refresh_remedy`) — after which the walk no
         // longer refuses. Staleness is the mtime gate of
         // `spec_own_artifact_stale_on_disk` (source, package config, resolved
         // `include_str` targets); a `run_cmd` host read whose external input changed
@@ -1023,11 +1023,11 @@ fn pkg_root_owned_by_project(
                 && pkg_repo == root_repo
         }
         // A plain-directory `path` dependency (`require foo from
-        // "../foo"`, no `.git` anywhere above it) is editable scratch — finding 6's
-        // shape — whether or not the PROJECT is a git checkout; the previous
+        // "../foo"`, no `.git` anywhere above it) is editable scratch —
+        // whether or not the PROJECT is a git checkout; the previous
         // `(None, Some(_)) => false` arm silently dropped it from the closure sweep
         // and made the purge refuse as soon as the project was in git. Review
-        // a64324fd F4 bounds the grant: only a RELATIVE, symlink-free declared dir
+        // The grant is bounded: only a RELATIVE, symlink-free declared dir
         // outside the project's own packagesDir SLOT counts. An absolute entry
         // (`/opt/mathlib`, a store path) is a shared install, a symlinked `../foo`
         // reaches a shared directory, and a git-less copy under the slot is the #434
@@ -1170,8 +1170,8 @@ fn owner_marker_names_project(pkg_root: &Path, root_canon: &Path) -> bool {
 }
 
 /// Where the caller honors a `.turbo-lean-packages-owner` marker, so the remedy's
-/// marker hint names a location that would actually clear the refusal (review
-/// a64324fd F2). The ownership walk (`pkg_root_owned_by_project`) and the freshness
+/// marker hint names a location that would actually clear the refusal.
+/// The ownership walk (`pkg_root_owned_by_project`) and the freshness
 /// sweep read the marker from the package root or the directory that holds it; the
 /// #436 build-scope gate (`dag.rs`) honors only a marker in the project's canonical
 /// packages dir, so a marker placed in the package root cannot clear that gate.
@@ -2949,8 +2949,8 @@ pub(super) fn run_audit_chunk_subprocess(
     record_scheduler_test_event("audit_subprocess_end", mod_names);
     // An allocation failure under the worker cap names the knob (so
     // `error_names_memory_cap` can classify it), and a memory-capped failure is never
-    // bisected — the halving would redo full-closure loads under the same cap. Review
-    // a64324fd F5: only the DEFINITE allocation signature skips bisection; the "may
+    // bisected — the halving would redo full-closure loads under the same cap. Only
+    // the DEFINITE allocation signature skips bisection; the "may
     // have been" signal note covers any SIGSEGV/SIGABRT (a Lean stack overflow, an
     // unrelated crash), which still deserves the bisection that isolates the module.
     let attempt = out.and_then(|o| {
@@ -3876,7 +3876,7 @@ mod host_effect_taint_tests {
     /// The editable-sibling grant must not depend on whether the
     /// PROJECT is a git checkout. The previous `(None, Some(_)) => false` arm silently
     /// un-owned a plain-directory sibling the moment the project was in git — the
-    /// ordinary finding-6 layout — so this is the sibling test again with
+    /// same plain-directory sibling layout — so this is the sibling test again with
     /// `git init` run on the project side.
     #[test]
     fn host_effects_plain_sibling_of_git_project_stays_project_owned() -> Result<()> {

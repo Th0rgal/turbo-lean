@@ -158,8 +158,8 @@ An explicitly requested declaration whose constant kind carries compiled code (a
 `Unsupported` error instead of being dropped silently — the "imported declarations are
 outside" wording for an imported name, "no impure LCNF form" for a local one; a constant
 with no compiled code (here: a theorem) is skipped silently. Red evidence, both recorded in
-this branch's commit messages: on the pre-r1 tree `UInt64.add` was accepted as an EMPTY module;
-on the pre-r2 tree the LOCAL type-alias case below was accepted as an empty module too. -/
+the PR's commit history: one earlier revision accepted `UInt64.add` as an EMPTY module;
+a later one accepted the LOCAL type-alias case below as an empty module too. -/
 
 private theorem l1NonCodeProbe : True := trivial
 

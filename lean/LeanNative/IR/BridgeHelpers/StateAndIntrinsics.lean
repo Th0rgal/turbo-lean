@@ -13,7 +13,7 @@ L1 (`roadmap/HORIZONS.md` rung L1): the `BridgeM` lowering utilities that lived 
 `substLNIRExprVars`, `freshenJoinPointCode`, `spliceJoinPointJmp`, `orderAlts`,
 `lowerLitValueM`, `lowerLitValue`, `internParams`, `lowerRefOp`, `inferImpureRhsType`,
 `lookupCtorIdx`) served only the deleted second lowering (`lowerPureCode`) and are deleted
-with it. Round 1 also deleted the compression producer's state:
+with it. The same cleanup also deleted the compression producer's state:
 the `jpMap`, `jpIndexMap`, `localFunMap`, `inJoinPointBody`, `activeCtor`, `fvarCtor`,
 `hasExtern`, `mangledSymbol` and `isSimpleGround` fields were read by nothing once the
 post-pass was removed. What stays: the slimmed `BridgeState`/`BridgeM` (the driver's

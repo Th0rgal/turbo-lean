@@ -10309,8 +10309,7 @@ pub(super) fn build_module_dag_inner(
                             &spec.pkg_root,
                             // This gate honors the marker only in the project's
                             // canonical packages dir (above), so the remedy's marker
-                            // hint must point there, not at the package root (review
-                            // a64324fd F2).
+                            // hint must point there, not at the package root.
                             super::host_effects::OwnerMarkerSite::PackagesDir({
                                 let pd = root_pkg.pkg_root.join(&root_pkg.packages_dir);
                                 pd.canonicalize().unwrap_or(pd)
