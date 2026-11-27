@@ -56,7 +56,8 @@ Honesty rules (matching `scripts/lcnf_coverage.py`)
   records as `frontend_error`, never as an expected rejection. Import-free
   files that a leg run measured failing elaboration all the same are listed
   in `NONELABORATING_PROGRAMS` with that run (`tests/elab/linterCoe.lean`,
-  2026-11-27), and `detectorDigest` covers the list.
+  2026-11-27). `detectorDigest` covers the list, and the manifest-only gate
+  refuses a program row on it.
 - `matrixSource.measuredSourceCommit` is read from the committed results when
   `--write` runs, never typed by hand (a hand-copied value went stale through
   two re-measurements). It names the measurement that was committed when the
@@ -149,23 +150,29 @@ TARGET_CONSTRUCT_SPEC: tuple[tuple[str, str, str], ...] = (
     ("Type.signed_scalars", "rejected", r"\b(?:Int(?:8|16|32|64)|ISize)\b"),
     ("LetValue.fap.local_call", "lowered_unproved", _MULTI_DEF),
 )
-EXCLUDED_TARGETS: dict[str, str] = {
+# Matrix target rows the corpus does not select for, each as (the matrix status
+# its reason was written against, the reason). The self-test holds each status
+# to the matrix row, so a status change re-opens the exclusion.
+EXCLUDED_TARGETS: dict[str, tuple[str, str]] = {
     "LetValue.fap.gf_simd": (
+        "lowered_unproved",
         "GF(2^128)/BabyBear/Goldilocks SIMD intrinsic whitelist has no syntactic surface "
         "in upstream test files; the matrix row records 0 hits across Std/Init+C2, C1, "
-        "and con-leche corpora."
+        "and con-leche corpora.",
     ),
     "LetValue.proj": (
+        "rejected",
         "Pure-phase construct: toImpure rewrites it into the LetValue.oproj / uproj / sproj "
         "forms before the lowerer runs, so no declaration is refused because of it. The "
         "matrix row records rejected because L1 (81986e6a) deleted the pure-phase lowering; a "
-        "program selected for `.fst` / `.snd` would exercise no rejected path."
+        "program selected for `.fst` / `.snd` would exercise no rejected path.",
     ),
     "LetValue.const": (
+        "rejected",
         "Pure-phase construct: toImpure rewrites it into the LetValue.fap / pap forms before "
         "the lowerer runs, so no declaration is refused because of it. The matrix row records "
         "rejected because L1 (81986e6a) deleted the pure-phase lowering; a program selected for "
-        "a `Foo.bar` reference would exercise no rejected path."
+        "a `Foo.bar` reference would exercise no rejected path.",
     ),
 }
 
@@ -382,7 +389,7 @@ def build_manifest(
             "measuredSourceCommit": measured_commit,
         },
         "targetConstructs": dict(TARGET_STATUS),
-        "excludedTargets": dict(EXCLUDED_TARGETS),
+        "excludedTargets": {cid: reason for cid, (_status, reason) in EXCLUDED_TARGETS.items()},
         "emphasis": {
             name: {"pattern": pat, "count": emphasis_counts[name], "required": attained[name]}
             for name, pat, _q in EMPHASIS_SPEC
@@ -416,7 +423,8 @@ def verify_manifest(
     if manifest.get("detectorDigest") != detector_digest():
         reasons.append(
             "detectorDigest does not match the current detector set (TARGET_CONSTRUCT_SPEC, "
-            "EMPHASIS_SPEC, MAX_PROGRAM_BYTES, import-free rule, CORPUS_PILES); regenerate with --write"
+            "EMPHASIS_SPEC, MAX_PROGRAM_BYTES, import-free rule, CORPUS_PILES, "
+            "NONELABORATING_PROGRAMS); regenerate with --write"
         )
     pin = manifest.get("pin", {})
     for key, want in (
@@ -466,6 +474,9 @@ def verify_manifest(
             break
         if p.get("importFree") is not True:
             reasons.append(f"{path!r} is not import-free; the leg elaborates programs standalone")
+            break
+        if path in NONELABORATING_PROGRAMS:
+            reasons.append(f"{path!r} is listed in NONELABORATING_PROGRAMS; it does not elaborate standalone")
             break
         if not p.get("matrixConstructs") or not set(p["matrixConstructs"]) <= set(TARGET_STATUS):
             reasons.append(f"{path!r} has empty or unknown matrixConstructs")
@@ -628,13 +639,7 @@ class C1CorpusManifestSelfTest(unittest.TestCase):
             self.assertEqual(by_id.get(cid), status, f"matrix drift on {cid}")
         # Each exclusion pins the matrix status its recorded reason was written
         # against, so a status change re-opens the exclusion.
-        excluded_status = {
-            "LetValue.fap.gf_simd": "lowered_unproved",
-            "LetValue.proj": "rejected",
-            "LetValue.const": "rejected",
-        }
-        self.assertEqual(set(EXCLUDED_TARGETS), set(excluded_status))
-        for cid, status in excluded_status.items():
+        for cid, (status, _reason) in EXCLUDED_TARGETS.items():
             self.assertEqual(by_id.get(cid), status, f"exclusion drift on {cid}")
         unproved_or_rejected = {
             rid for rid, st in by_id.items() if st in ("lowered_unproved", "rejected")
@@ -732,6 +737,36 @@ class C1CorpusManifestSelfTest(unittest.TestCase):
             paths = [c["path"] for c in enumerate_candidates(root)]
             self.assertNotIn("tests/elab/linterCoe.lean", paths)
             self.assertIn("tests/elab/synth_hof.lean", paths)
+
+    def test_gate_names_and_refuses_nonelaborating_programs(self):
+        # detectorDigest covers NONELABORATING_PROGRAMS, so its mismatch message
+        # names the list. A program row on the list is refused directly, not
+        # only through the digest that adding the entry also moves.
+        import tempfile
+
+        listed = sorted(NONELABORATING_PROGRAMS)[0]
+        with tempfile.TemporaryDirectory(prefix="c1x_nonelab_gate_") as tmp:
+            root = Path(tmp)
+            manifest = self._small_manifest(root)
+            mp = root / "manifest.json"
+            n = len(_SYNTH_FILES)
+
+            mp.write_text(json.dumps(dict(manifest, detectorDigest="0" * 64)), encoding="utf-8")
+            red = verify_manifest(mp, expect_program_count=n)
+            self.assertTrue(
+                any("detectorDigest" in r and "NONELABORATING_PROGRAMS" in r for r in red["reasons"]),
+                red["reasons"],
+            )
+
+            listed_row = json.loads(json.dumps(manifest))
+            listed_row["programs"][0]["path"] = listed
+            mp.write_text(json.dumps(listed_row), encoding="utf-8")
+            red2 = verify_manifest(mp, expect_program_count=n)
+            self.assertFalse(red2["ok"])
+            self.assertTrue(
+                any(listed in r and "NONELABORATING_PROGRAMS" in r for r in red2["reasons"]),
+                red2["reasons"],
+            )
 
     def test_fill_step_skips_constructless_candidates(self):
         # R6: the fill step never pads the corpus with a candidate carrying no
