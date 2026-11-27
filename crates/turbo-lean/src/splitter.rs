@@ -1854,10 +1854,28 @@ fn chunk_declared_names(chunk: &str) -> Vec<String> {
         "def", "theorem", "lemma", "abbrev", "instance", "opaque", "structure", "class",
         "inductive", "irreducible_def", "initialize", "builtin_initialize", "alias",
     ];
-    let toks: Vec<&str> = chunk
-        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ':'))
-        .filter(|t| !t.is_empty())
-        .collect();
+    // Binder brackets and `:` are kept as their own tokens so that a declaration keyword directly
+    // followed by one (`instance : T := ...`, `instance [C] : T`, `structure : ...`) is recognised
+    // as anonymous rather than mis-naming the type after the colon. Anonymous host readers then set
+    // `unnamed_host_reader` (fail closed) in [`pinned_dep_source_may_read_host_state`].
+    let is_punct = |c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ':');
+    let mut toks: Vec<&str> = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in chunk.char_indices() {
+        if c.is_whitespace() || is_punct(c) {
+            if let Some(s) = start.take() {
+                toks.push(&chunk[s..i]);
+            }
+            if is_punct(c) {
+                toks.push(&chunk[i..i + c.len_utf8()]);
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        toks.push(&chunk[s..]);
+    }
     let mut out = Vec::new();
     // `initialize <name> : T ← e` declares `<name>`; `initialize e` (e.g. `addLinter l`) declares
     // nothing.
@@ -15044,6 +15062,31 @@ public def api := by
         ] {
             assert!(pinned_dep_source_may_read_host_state(src), "{src}");
         }
+    }
+
+    #[test]
+    fn test_host_effects_pinned_dep_anonymous_instance_host_reader_is_unnamed() {
+        // `instance : T := ...` declares no name: the type after `:` must not be mistaken for one.
+        for chunk in [
+            "instance : T := IO.FS.readFile \"/x\"\n",
+            "instance [Inhabited α] : T α := IO.FS.readFile \"/x\"\n",
+            "instance (priority := low) : T := IO.FS.readFile \"/x\"\n",
+            "structure : Type\n",
+        ] {
+            assert!(chunk_declared_names(chunk).is_empty(), "{chunk}");
+        }
+        assert_eq!(chunk_declared_names("instance foo : T := x\n"), vec!["foo"]);
+        assert_eq!(chunk_declared_names("def bar (n : Nat) : Nat := n\n"), vec!["bar"]);
+        assert_eq!(chunk_declared_names("structure S where\n  x : Nat\n"), vec!["S"]);
+        // An anonymous host reader is unnamed, so any executing (non-linter) chunk taints, even one
+        // that never names `T`: fail closed.
+        let anon = "class T where\n  v : IO String\ninstance : T := ⟨IO.FS.readFile \"/x\"⟩\nrun_cmd do\n  let _ ← (T.v : IO String)\n";
+        assert!(pinned_dep_source_may_read_host_state(anon), "{anon}");
+        let anon_plain = "instance : T := IO.FS.readFile \"/x\"\nrun_cmd pure ()\n";
+        assert!(pinned_dep_source_may_read_host_state(anon_plain), "{anon_plain}");
+        // Contrast: a *named* host-reading instance that no executing chunk references stays clean.
+        let named = "instance fooInst : T := IO.FS.readFile \"/x\"\nrun_cmd pure ()\n";
+        assert!(!pinned_dep_source_may_read_host_state(named), "{named}");
     }
 
     #[test]

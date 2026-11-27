@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn test_host_effects_git_pinned_initialize_read_still_taints_and_keeps_external_oleans(
+    fn test_host_effects_git_pinned_initialize_read_fails_closed_and_keeps_external_oleans(
     ) -> Result<()> {
         let _env_guard = native_build_env_guard();
         let dir = make_temp_test_dir("host_effects_pinned_init_read");
@@ -215,10 +215,26 @@ mod tests {
         let root_olean = proj.join(".lake/build/lib/lean/App/Use.olean");
         fs::create_dir_all(root_olean.parent().unwrap())?;
         fs::write(&root_olean, b"olean")?;
-        let purged = purge_elab_host_effect_artifacts_in_closure(&cfg, &[String::from("App.Use")])?;
-        assert!(purged, "a tainted closure must force `bypass_lake_cache`");
+        // A genuinely tainted external dep must fail closed (Lake cannot see the host-state rotation,
+        // so a cache bypass would silently trust the stale `.olean`), naming the module, deleting
+        // nothing: neither its own `.olean` nor the root importer's.
+        let err = purge_elab_host_effect_artifacts_in_closure(&cfg, &[String::from("App.Use")])
+            .expect_err("a tainted external host-effect dep must fail closed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("DepLint.Bad") && msg.contains("Refusing to trust stale external"),
+            "error must name the external module: {msg}"
+        );
         assert!(ext_olean.exists(), "external package `.olean`s must never be deleted");
-        assert!(!root_olean.exists(), "the tainted importer's own `.olean` must be purged");
+        assert!(root_olean.exists(), "a fail-closed bail must not leave a half-purged tree");
+        // A tainted root module (no external taint) is still purged and forces a cache bypass.
+        fs::write(
+            proj.join("App/Use.lean"),
+            "import DepLint.Header\ninitialize s : String ← IO.FS.readFile \"/etc/hostname\"\n",
+        )?;
+        let purged = purge_elab_host_effect_artifacts_in_closure(&cfg, &[String::from("App.Use")])?;
+        assert!(purged, "a tainted root closure must force `bypass_lake_cache`");
+        assert!(!root_olean.exists(), "the tainted root module's own `.olean` must be purged");
         // An unreadable dependency source stays tainted (fail closed, Gap 2).
         fs::write(&root_olean, b"olean")?;
         let header = dep_spec(&cfg, "DepLint.Header");
@@ -228,10 +244,11 @@ mod tests {
         fs::write(&header_ext_olean, b"olean")?;
         // Invalid UTF-8: the file still resolves, but `read_to_string` fails.
         fs::write(&header.src_path, b"\xff\xfe import Lean\n")?;
-        let purged = purge_elab_host_effect_artifacts_in_closure(&cfg, &[String::from("App.Use")])?;
+        let res = purge_elab_host_effect_artifacts_in_closure(&cfg, &[String::from("App.Use")]);
         fs::write(&header.src_path, &saved)?;
-        assert!(purged, "an unreadable source must taint its closure");
-        assert!(!root_olean.exists(), "importers of an unreadable source are purged");
+        let msg = format!("{:#}", res.expect_err("an unreadable external source must fail closed"));
+        assert!(msg.contains("DepLint.Header"), "error must name the module: {msg}");
+        assert!(root_olean.exists(), "nothing is purged on a fail-closed bail");
         assert!(header_ext_olean.exists(), "external `.olean`s stay untouched");
         unmark_trusted_snapshot_root(&dir);
         crate::zygote::purge_snapshot_dir(&dir);

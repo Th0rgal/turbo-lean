@@ -48,21 +48,13 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
         }
     }
     let mut tainted: HashSet<(PathBuf, String)> = HashSet::new();
-    let mut purged_any = false;
-    // External package `.olean`s (`.lake/packages/*`, out-of-tree path deps) are never deleted: a
-    // tainted external module still taints its importers and forces `bypass_lake_cache`, but its
-    // artifacts belong to the dependency checkout.
-    let mut purge = |spec: &DiscoveredModuleSpec| -> Result<()> {
-        if spec_in_project(cfg, spec) {
-            crate::lake_build::remove_spec_build_artifacts_checked(spec)?;
-        }
-        purged_any = true;
-        Ok(())
-    };
+    // Taint is computed for the whole closure before anything is deleted, so a fail-closed bail on
+    // an external module never leaves a half-purged build tree behind.
+    let mut to_purge: Vec<DiscoveredModuleSpec> = Vec::new();
     for spec in postorder {
         let Ok(src_raw) = fs::read_to_string(&spec.src_path) else {
             tainted.insert((spec.pkg_root.clone(), spec.module_name.clone()));
-            purge(&spec)?;
+            to_purge.push(spec);
             continue;
         };
         let hdr = parse_header_info(&src_raw);
@@ -81,10 +73,47 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
             });
         if imp_tainted || spec_source_has_disallowed_elab_host_effects(cfg, &spec, &src_raw) {
             tainted.insert((spec.pkg_root.clone(), spec.module_name.clone()));
-            purge(&spec)?;
+            to_purge.push(spec);
         }
     }
-    Ok(purged_any)
+    // External package `.olean`s (`.lake/packages/*`, out-of-tree path deps) are never deleted, and
+    // a tainted one is never trusted either: Lake's trace cannot observe the host state (environment,
+    // files) its elaborators read, so bypassing the artifact cache would not make Lake re-elaborate
+    // it. Fail closed instead, naming the module(s). Clean linter-only deps do not taint at all.
+    let external: Vec<&DiscoveredModuleSpec> =
+        to_purge.iter().filter(|s| !spec_in_project(cfg, s)).collect();
+    if !external.is_empty() {
+        return Err(external_host_effect_dependency_error(
+            &external,
+            "may read host state (environment variables, files) at elaboration or import time",
+        ));
+    }
+    for spec in &to_purge {
+        crate::lake_build::remove_spec_build_artifacts_checked(spec)?;
+    }
+    Ok(!to_purge.is_empty())
+}
+
+/// Fail-closed error for stale or host-state-dependent `.olean`s that live in a dependency checkout
+/// (outside the root project). turbo-lean never deletes such artifacts and never trusts them.
+pub(crate) fn external_host_effect_dependency_error(
+    specs: &[&DiscoveredModuleSpec],
+    why: &str,
+) -> anyhow::Error {
+    let mut mods: Vec<String> = specs
+        .iter()
+        .map(|s| format!("`{}` (package `{}`)", s.module_name, s.pkg_root.display()))
+        .collect();
+    mods.sort();
+    mods.dedup();
+    anyhow::anyhow!(
+        "Refusing to trust stale external host-effect dependency module(s) {}: the module {}, so its \
+         `.olean` cannot be proven fresh, and turbo-lean never deletes dependency-checkout artifacts. \
+         Rebuild that dependency package explicitly under the current host state (or remove the host \
+         read from it), then retry.",
+        mods.join(", "),
+        why
+    )
 }
 
 pub(crate) fn source_ineligible_for_stamp_reuse(

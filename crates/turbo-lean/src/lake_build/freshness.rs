@@ -3528,12 +3528,19 @@ pub(crate) fn recheck_dependents_if_nonlocal_for_check(
                                     .map(|s| crate::module_builder::source_uses_include_str(&s))
                                     .unwrap_or(true)
                             {
-                                // External package `.olean`s are never deleted; a stale external
-                                // `include_str` module is never trusted either: Lake rebuilds it
-                                // with its artifact cache bypassed.
-                                if crate::module_builder::spec_in_project(&cfg, &spec) {
-                                    remove_spec_build_artifacts_checked(&spec)?;
+                                // External package `.olean`s are never deleted, and a stale external
+                                // `include_str` module is never trusted either: Lake's trace does not
+                                // cover the included file, so a cache bypass alone would not rebuild
+                                // it. Fail closed, naming the module.
+                                if !crate::module_builder::spec_in_project(&cfg, &spec) {
+                                    return Err(
+                                        crate::module_builder::external_host_effect_dependency_error(
+                                            &[&spec],
+                                            "embeds files via `include_str`/`include_bin` that Lake does not trace",
+                                        ),
+                                    );
                                 }
+                                remove_spec_build_artifacts_checked(&spec)?;
                                 bypass_lake_cache = true;
                             }
                         }
