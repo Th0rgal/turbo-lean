@@ -23,12 +23,23 @@ Methodology & Honesty Rules:
   to another local user function (`LetValue.fap`), but `RealLCNFSemantics.evalLetValue` returns
   `.error (.unsupportedCall fn.toString)` whenever `(ctx.findLocalCallee? fn).isSome`. Because
   `lowerRealLCNFDecl_sound` is a forward simulation gated on `evalRealLCNFDecl ... = .ok (v, hst')`,
-  its conclusion is vacuous for any declaration that calls a local helper (`lowered_vacuous_local_call`,
-  classified under `lowered_unproved`). Rung **L2** (`420d1d1`) added a function environment to both
-  semantics and proved `lowerRealLCNFDecl_soundF` (`lean/LeanNative/Proofs/LowerCalls.lean`) for
-  non-recursive resolved calls whose arguments are all `.fvar`. Its contract hands the reclassification
-  of those declarations (L2's "matrix moves" accept) to this script, which does not perform it yet, so
-  every lowered declaration with a local call is still counted `lowered_unproved`.
+  its conclusion is vacuous for any declaration that calls a local helper. Rung **L2** (`420d1d1`)
+  added a function environment to both semantics and proved `lowerRealLCNFDecl_soundF`
+  (`lean/LeanNative/Proofs/LowerCalls.lean`), whose contract hands this reclassification to this
+  script (L2's "matrix moves" accept): a lowered declaration with local calls counts `proved` only
+  when that theorem applies to it with an environment built from the corpus, that is, when it and
+  every declaration it reaches has a facts row, lowered, sits on no call-graph cycle, makes no
+  self-call (L2 resolves a self-call once; recursion is L3's), passes only `.fvar` arguments at
+  every local call site (the source semantics errors on an erased argument), and has an unreserved
+  lowered name equal to the name a caller's map holds, with those lowered names pairwise distinct
+  (the `DeclEnvLowers` and `CtxMapsEnv` hypotheses). Any other lowered declaration with a local
+  call stays `lowered_unproved` (`lowered_vacuous_local_call`), and a callee the facts do not cover
+  never counts as qualifying. `auditMods` (Lean) and `_classify_decl_facts` (the sharded `Batteries`
+  path) implement the same rule, and a test runs both on one compiled fixture.
+- Local calls are found by a walk over every impure-code constructor (`codeLocalCallSites`, with the
+  arms of the call graph's `codeHasSelfTailCall`). An earlier walk stopped at the first `inc`, `dec`,
+  `del`, `oset`, `uset`, `sset` or `setTag` and so counted some declarations that call helpers as
+  having no local call (`test_local_call_after_an_rc_instruction_counts_as_a_local_call`).
 - A call to a user function OUTSIDE the measured corpus is refused by the real lowerer and
   counted `rejected`, not `proved`, in the one measured counterexample pinned by
   `test_out_of_corpus_callee_is_rejected_never_proved` (a two-module fixture audited caller-only:
@@ -372,7 +383,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "lowered_unproved",
         "evidence_file": "lean/LeanNative/IR/RealLCNFSemantics.lean",
         "evidence_symbol": "if (ctx.findLocalCallee? fn).isSome then",
-        "notes": "Lowered to LNIRExpr.call by lowerImpureFapPure; evalLetValue returns .error (.unsupportedCall fn.toString) on a local callee, so lowerRealLCNFDecl_sound is vacuous here. L2 (420d1d1) proved lowerRealLCNFDecl_soundF (Proofs/LowerCalls.lean) for non-recursive resolved calls with all-.fvar arguments; this script does not yet reclassify those declarations (L2's \"matrix moves\" handoff), so every lowered declaration with a local call stays lowered_unproved.",
+        "notes": "Lowered to LNIRExpr.call by lowerImpureFapPure; evalLetValue returns .error (.unsupportedCall fn.toString) on a local callee, so lowerRealLCNFDecl_sound is vacuous here. L2 (420d1d1) proved lowerRealLCNFDecl_soundF (Proofs/LowerCalls.lean), and the corpus measurement counts a declaration with local calls proved when that theorem applies (its callee closure lowers, is acyclic and self-call free, passes only .fvar arguments, and has distinct unreserved lowered names). The construct stays lowered_unproved: a call with an erased argument, a self-call, or a callee that fails a condition is still outside every theorem.",
     },
     {
         "id": "LetValue.fap.gf_simd",
@@ -713,25 +724,29 @@ import LeanNative.IR.Bridge
 
 open Lean Lean.Compiler.LCNF LeanNative.IR
 
-/-- Whether `c` makes a local call (a `.fap` whose callee is in `localSet`). The walk has
-    the arms of `codeHasSelfTailCall` (`lean/LeanNative/IR/BridgeHelpers/StateAndIntrinsics.lean`),
-    which builds the call graph, so the RC and field-set instructions of impure code (`inc`,
-    `dec`, `del`, `oset`, `uset`, `sset`, `setTag`) are walked through instead of ending the
-    walk. The match is exhaustive: a constructor added upstream fails to compile here rather
-    than reading as "no call". -/
-partial def codeHasLocalCall {pu} (localSet : Std.HashSet Name) (c : Code pu) : Bool :=
+/-- Every local call site of `c` (a `.fap` whose callee is in `localSet`): the callee, and
+    whether every argument is an `.fvar`. The walk has the arms of `codeHasSelfTailCall`
+    (`lean/LeanNative/IR/BridgeHelpers/StateAndIntrinsics.lean`), which builds the call
+    graph, so the RC and field-set instructions of impure code (`inc`, `dec`, `del`, `oset`,
+    `uset`, `sset`, `setTag`) are walked through instead of ending the walk. The match is
+    exhaustive: a constructor added upstream fails to compile here rather than reading as
+    "no call". -/
+partial def codeLocalCallSites {pu} (localSet : Std.HashSet Name) (c : Code pu) : List (Name × Bool) :=
   match c with
   | .let d k =>
-    let hit := match d.value with
-      | .fap fn _ _ => localSet.contains fn
-      | _ => false
-    hit || codeHasLocalCall localSet k
-  | .fun d k _ | .jp d k => codeHasLocalCall localSet d.value || codeHasLocalCall localSet k
+    let here := match d.value with
+      | .fap fn args _ =>
+        if localSet.contains fn then
+          [(fn, args.all (fun a => match a with | .fvar _ => true | _ => false))]
+        else []
+      | _ => []
+    here ++ codeLocalCallSites localSet k
+  | .fun d k _ | .jp d k => codeLocalCallSites localSet d.value ++ codeLocalCallSites localSet k
   | .inc _ _ _ _ k _ | .dec _ _ _ _ _ k _ | .del _ k _
   | .oset _ _ _ k _ | .uset _ _ _ k _ | .sset _ _ _ _ _ k _ | .setTag _ _ k _ =>
-    codeHasLocalCall localSet k
-  | .cases cs => cs.alts.any (fun a => codeHasLocalCall localSet a.getCode)
-  | .jmp _ _ | .return _ | .unreach _ => false
+    codeLocalCallSites localSet k
+  | .cases cs => cs.alts.foldl (fun acc a => acc ++ codeLocalCallSites localSet a.getCode) []
+  | .jmp _ _ | .return _ | .unreach _ => []
 
 partial def declInMutualCycle (declMap : Std.HashMap Name (List Name)) (target : Name) : Bool :=
   let rec reaches (visited : List Name) (frontier : List Name) : Bool :=
@@ -742,6 +757,63 @@ partial def declInMutualCycle (declMap : Std.HashMap Name (List Name)) (target :
       else if visited.contains cur then reaches visited rest
       else reaches (cur :: visited) ((declMap.getD cur []) ++ rest)
   reaches [] (declMap.getD target [])
+
+/-- `reservedRuntimeName` of `lean/LeanNative/Proofs/RealLCNFBridge/CallsF.lean`, copied
+    because this driver imports `LeanNative.IR.Bridge` only; a test pins the copy. -/
+def auditReservedRuntimeName (s : String) : Bool :=
+  s.startsWith "lean_native_" || s == "lean_mark_mt"
+
+/-- A name as a facts row carries it: `%`, `|` and `,` are percent-escaped, so no field
+    separator (`|` between fields, `,` inside the callee list) survives, and two names are
+    equal exactly when their escapes are. The facts comparisons rely on that injectivity. -/
+def auditEscape (s : String) : String :=
+  ((s.replace "%" "%25").replace "|" "%7C").replace "," "%2C"
+
+/-- One declaration's facts; the shard facts driver prints the same fields. -/
+structure AuditFacts where
+  cyc : Bool
+  ok : Bool
+  hasCall : Bool
+  selfCall : Bool
+  allFVar : Bool
+  mapped : String
+  lowered : String
+  callees : List Name
+
+/-- Whether `x` can be an entry of the function environment `lowerRealLCNFDecl_soundF`
+    (`Proofs/LowerCalls.lean`) needs: it has facts, is on no call cycle, lowered, makes no
+    self-call (L2 resolves a self-call once; recursion is L3's), passes only `.fvar`
+    arguments at every local call site (the source semantics errors on an erased one), has
+    an unreserved lowered name equal to the name a caller's map holds (`DeclEnvLowers`,
+    `CtxMapsEnv`), and every callee qualifies the same way. A name without facts fails. -/
+partial def auditQualifies (facts : Std.HashMap Name AuditFacts)
+    (memo : IO.Ref (Std.HashMap Name Bool)) (x : Name) : IO Bool := do
+  if let some b := (← memo.get).get? x then return b
+  let b ← match facts.get? x with
+    | none => pure false
+    | some f =>
+      if f.cyc || !f.ok || f.selfCall || !f.allFVar ||
+          auditReservedRuntimeName f.lowered || f.mapped != f.lowered then
+        pure false
+      else
+        f.callees.allM (auditQualifies facts memo)
+  memo.modify (·.insert x b)
+  return b
+
+partial def auditReach (facts : Std.HashMap Name AuditFacts) (seen : Std.HashSet Name) :
+    List Name → Std.HashSet Name
+  | [] => seen
+  | x :: rest =>
+    if seen.contains x then auditReach facts seen rest
+    else auditReach facts (seen.insert x) ((((facts.get? x).map (·.callees)).getD []) ++ rest)
+
+/-- The lowered names of `n` and of everything it reaches are pairwise distinct (the
+    freshness clause of `DeclEnvLowers`). -/
+def auditLoweredNamesDistinct (facts : Std.HashMap Name AuditFacts) (n : Name) : Bool :=
+  let names := (auditReach facts {} [n]).toList.map
+    (fun x => ((facts.get? x).map (·.lowered)).getD "")
+  let uniq := names.foldl (fun (s : Std.HashSet String) x => s.insert x) {}
+  uniq.size == names.length
 
 def runCoreOnEnv (env : Environment) (x : CoreM α) : IO (Except String α) := do
   let ctx : Core.Context := { fileName := "<audit>", fileMap := default, maxHeartbeats := 0 }
@@ -773,11 +845,15 @@ unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat ×
   -- auditMods calls, not one combined group) drives the local-callee
   -- classification, the call graph, and the bridge context, so a call to a
   -- user function declared in the same group is classified exactly like a
-  -- same-module call (a vacuous local call), matching the eval
-  -- `unsupportedCall` vacuity of `lowerRealLCNFDecl_sound` instead of being
-  -- rejected or counted proved. Compiler-generated auxiliary declarations are
-  -- excluded from the corpus (never measured, never expanded); the number
-  -- excluded is returned so the published denominator's scope is auditable.
+  -- same-module call instead of being rejected. A lowered declaration with
+  -- local calls is proved only when it qualifies (`auditQualifies`) and its
+  -- environment's lowered names are distinct, so `lowerRealLCNFDecl_soundF`
+  -- applies to it; otherwise it is lowered_unproved (the eval
+  -- `unsupportedCall` vacuity of `lowerRealLCNFDecl_sound`). The Python
+  -- `_classify_decl_facts` mirrors this classification for the sharded path.
+  -- Compiler-generated auxiliary declarations are excluded from the corpus
+  -- (never measured, never expanded); the number excluded is returned so the
+  -- published denominator's scope is auditable.
   let mut corpusDecls : Array (Name × Decl .impure) := #[]
   let mut auxTot := 0
   for modName in mods do
@@ -796,20 +872,47 @@ unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat ×
   for (_, d) in corpusDecls do
     if let .code c := d.value then
       callGraph := callGraph.insert d.name ((collectCodeLocalCallees corpusNames c).filter (· != d.name))
-  let mut tot := 0; let mut prv := 0; let mut unp := 0; let mut rej := 0; let mut cyc := 0
+  -- Pass 1: one facts row per declaration (a cycle member is not ingested).
+  let mut rows : Array (Name × AuditFacts) := #[]
+  let mut facts : Std.HashMap Name AuditFacts := {}
   for (_, d) in corpusDecls do
+    let cyc := declInMutualCycle callGraph d.name
+    let sites := match d.value with
+      | .code c => codeLocalCallSites localSet c
+      | .extern _ => []
+    let mut ok := false
+    let mut lowered := ""
+    if !cyc then
+      match (← runCoreOnEnv env (ingestLCNFImpureDecl d corpusNames .x86_64 true)) with
+      | .ok ld =>
+        ok := true
+        lowered := auditEscape ld.name
+      | .error _ => pure ()
+    let f : AuditFacts := {
+      cyc, ok, lowered
+      hasCall := !sites.isEmpty
+      selfCall := sites.any (fun s => s.1 == d.name)
+      allFVar := sites.all (fun s => s.2)
+      mapped := auditEscape (mangleDeclNameInEnv env d.name)
+      callees := callGraph.getD d.name [] }
+    rows := rows.push (d.name, f)
+    facts := facts.insert d.name f
+  -- Pass 2: classify.
+  let memo ← IO.mkRef ({} : Std.HashMap Name Bool)
+  let mut tot := 0; let mut prv := 0; let mut unp := 0; let mut rej := 0; let mut cyc := 0
+  for (n, f) in rows do
     tot := tot + 1
-    if declInMutualCycle callGraph d.name then
+    if f.cyc then
       rej := rej + 1
       cyc := cyc + 1
+    else if !f.ok then
+      rej := rej + 1
+    else if !f.hasCall then
+      prv := prv + 1
+    else if (← auditQualifies facts memo n) && auditLoweredNamesDistinct facts n then
+      prv := prv + 1
     else
-      let r ← runCoreOnEnv env (ingestLCNFImpureDecl d corpusNames .x86_64 true)
-      match r with
-      | .ok _ =>
-        let hasCall := match d.value with | .code c => codeHasLocalCall localSet c | .extern _ => false
-        if hasCall then unp := unp + 1 else prv := prv + 1
-      | .error _ =>
-        rej := rej + 1
+      unp := unp + 1
   return (tot, prv, unp, rej, cyc, auxTot)
 """
 
@@ -1410,60 +1513,149 @@ def _is_full_batteries_build(olean_root: Path) -> bool:
     return (olean_root.parent.parent / "bin" / "runLinter").is_file()
 
 
-def _merge_batteries_shard_facts(
-    decl_rows: list[tuple[str, bool, list[str], str]], aux_total: int
-) -> tuple[tuple[int, int, int, int, int, int], list[str]]:
-    """Whole-corpus classification over per-declaration shard facts.
+# One per-declaration facts row, as both audit drivers derive it (the Lean `AuditFacts`):
+# (decl name, has_local_call, same-corpus callees minus self, ingest verdict "ok" or
+# "err:<head>", has_self_call, every local call site's arguments are `.fvar`, the mangled
+# name a caller's map holds, the lowered declaration's name or ""). The two symbol names
+# arrive percent-escaped (`auditEscape`); the escape is injective, so comparing them is
+# comparing the names.
+DeclFacts = tuple[str, bool, list[str], str, bool, bool, str, str]
 
-    `decl_rows` holds one row per non-aux corpus declaration, in corpus order:
-    (decl name, has_local_call, same-corpus callees minus self, ingest verdict
-    "ok" or "err:<head>"). The classification is auditMods' exactly: a
-    declaration on a directed call-graph cycle (reachable from its own callees;
-    self-edges are already removed at emission) is rejected_not_lowered without
-    consulting its ingest verdict; otherwise an ok ingest splits proved vs
-    lowered_unproved on has_local_call, and an ingest error is rejected.
-    Returns the auditMods tuple (total, proved, lowered_unproved, rejected,
-    rejected_not_lowered, aux_total) plus the rejection reason heads
-    ("mutual_cycle" or the error head), which are diagnostic only and are never
-    written to the committed results.
+
+def _reserved_runtime_name(name: str) -> bool:
+    """`reservedRuntimeName` (`lean/LeanNative/Proofs/RealLCNFBridge/CallsF.lean`): runtime
+    intrinsic symbols a lowered local callee must not shadow. A test pins this copy, and the
+    driver's `auditReservedRuntimeName`, to the Lean definition."""
+    return name.startswith("lean_native_") or name == "lean_mark_mt"
+
+
+def _classify_decl_facts(decl_rows: list[DeclFacts]) -> list[tuple[str, str | None]]:
+    """Classify every facts row exactly as `auditMods` does.
+
+    Returns, per row and in row order, (class, rejection reason head or None), class one of
+    `proved`, `lowered_unproved`, `rejected`, `rejected_not_lowered`. A declaration on a
+    directed call-graph cycle (reachable from its own callees; self-edges are removed at
+    emission) is rejected_not_lowered without consulting its ingest verdict; an ingest error
+    is rejected; an ok declaration with no local call is proved. An ok declaration with local
+    calls is proved only when `lowerRealLCNFDecl_soundF` (L2, `Proofs/LowerCalls.lean`)
+    applies to it with an environment built from the corpus: it and everything it reaches
+    qualify (`_qualifies`, mirroring `auditQualifies`) and their lowered names are pairwise
+    distinct; otherwise it is lowered_unproved. A name without a facts row never qualifies,
+    so an unknown never counts as proved. The declaration itself is held to the same
+    per-declaration conditions as its callees, which is stricter than the theorem needs for
+    the top declaration and errs toward lowered_unproved.
     """
     edges: dict[str, list[str]] = {}
-    for name, _, callees, _ in decl_rows:
-        edges[name] = callees  # a duplicate name overwrites, as HashMap.insert does
+    rows_by_name: dict[str, DeclFacts] = {}
+    for row in decl_rows:
+        edges[row[0]] = row[2]  # a duplicate name overwrites, as HashMap.insert does
+        rows_by_name[row[0]] = row
+
+    cycle_memo: dict[str, bool] = {}
 
     def _on_cycle(target: str) -> bool:
         # declInMutualCycle's relation: DFS from the target's own callees over
         # the corpus call graph; true iff the target itself is reached (a node
         # absent from the graph contributes no edges).
+        if target in cycle_memo:
+            return cycle_memo[target]
         seen: set[str] = set()
         frontier = list(edges.get(target, ()))
+        found = False
         while frontier:
             cur = frontier.pop()
             if cur == target:
-                return True
+                found = True
+                break
             if cur in seen:
                 continue
             seen.add(cur)
             frontier.extend(edges.get(cur, ()))
-        return False
+        cycle_memo[target] = found
+        return found
 
-    tot = prv = unp = rej = cyc = 0
-    reasons: list[str] = []
-    for name, has_call, _, verdict in decl_rows:
-        tot += 1
-        if _on_cycle(name):
-            rej += 1
-            cyc += 1
-            reasons.append(REJECTED_NOT_LOWERED_REASON)
-        elif verdict == "ok":
-            if has_call:
-                unp += 1
+    def _qualifies_alone(name: str) -> bool:
+        # auditQualifies' per-declaration conditions, before the callees are visited.
+        row = rows_by_name.get(name)
+        if row is None or _on_cycle(name):
+            return False
+        _n, _hc, _callees, verdict, self_call, all_fvar, mapped, lowered = row
+        return (
+            verdict == "ok"
+            and not self_call
+            and all_fvar
+            and not _reserved_runtime_name(lowered)
+            and mapped == lowered
+        )
+
+    qual_memo: dict[str, bool] = {}
+
+    def _qualifies(start: str) -> bool:
+        # auditQualifies: the declaration and every callee qualify. A post-order walk with an
+        # explicit stack; a declaration that qualifies alone is on no cycle, so none of its
+        # callees is still being expanded when it is resolved.
+        stack: list[tuple[str, bool]] = [(start, False)]
+        while stack:
+            node, expanded = stack.pop()
+            if node in qual_memo:
+                continue
+            if not _qualifies_alone(node):
+                qual_memo[node] = False
+                continue
+            callees = edges.get(node, [])
+            if expanded:
+                qual_memo[node] = all(qual_memo.get(c, False) for c in callees)
             else:
-                prv += 1
+                stack.append((node, True))
+                stack.extend((c, False) for c in callees if c not in qual_memo)
+        return qual_memo[start]
+
+    def _lowered_names_distinct(start: str) -> bool:
+        # auditLoweredNamesDistinct: the freshness clause of `DeclEnvLowers`.
+        seen: set[str] = set()
+        stack = [start]
+        names: list[str] = []
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            row = rows_by_name.get(node)
+            names.append(row[7] if row is not None else "")
+            stack.extend(edges.get(node, ()))
+        return len(set(names)) == len(names)
+
+    out: list[tuple[str, str | None]] = []
+    for name, has_call, _callees, verdict, *_rest in decl_rows:
+        if _on_cycle(name):
+            out.append(("rejected_not_lowered", REJECTED_NOT_LOWERED_REASON))
+        elif verdict != "ok":
+            out.append(("rejected", verdict[4:] if verdict.startswith("err:") else verdict))
+        elif not has_call:
+            out.append(("proved", None))
+        elif _qualifies(name) and _lowered_names_distinct(name):
+            out.append(("proved", None))
         else:
-            rej += 1
-            reasons.append(verdict[4:] if verdict.startswith("err:") else verdict)
-    return (tot, prv, unp, rej, cyc, aux_total), reasons
+            out.append(("lowered_unproved", None))
+    return out
+
+
+def _merge_batteries_shard_facts(
+    decl_rows: list[DeclFacts], aux_total: int
+) -> tuple[tuple[int, int, int, int, int, int], list[str]]:
+    """Whole-corpus counts over per-declaration shard facts (`_classify_decl_facts`).
+
+    Returns the auditMods tuple (total, proved, lowered_unproved, rejected,
+    rejected_not_lowered, aux_total) plus the rejection reason heads ("mutual_cycle" or the
+    error head), which are diagnostic only and are never written to the committed results.
+    """
+    classes = _classify_decl_facts(decl_rows)
+    prv = sum(1 for cls, _ in classes if cls == "proved")
+    unp = sum(1 for cls, _ in classes if cls == "lowered_unproved")
+    cyc = sum(1 for cls, _ in classes if cls == "rejected_not_lowered")
+    rej = cyc + sum(1 for cls, _ in classes if cls == "rejected")
+    reasons = [reason for _, reason in classes if reason is not None]
+    return (len(classes), prv, unp, rej, cyc, aux_total), reasons
 
 
 def _lean_shard_facts_driver(all_modules: list[str], shard_modules: list[str]) -> str:
@@ -1473,9 +1665,12 @@ def _lean_shard_facts_driver(all_modules: list[str], shard_modules: list[str]) -
     and converts (`toImpureDecls`) the WHOLE corpus so that `corpusNames`, the
     local-callee set, the per-declaration callee lists, and every
     `ingestLCNFImpureDecl` call see exactly the global name set the monolithic
-    driver sees; only the per-declaration work (ingest, has-local-call, callee
-    emission) is restricted to this shard's modules. The whole-corpus cycle
-    pass runs once in `_merge_batteries_shard_facts` over the merged facts.
+    driver sees; only the per-declaration work (ingest, call-site facts, callee
+    emission) is restricted to this shard's modules. Each `SHARD_DECL` line is
+    one `DeclFacts` row: name | has_local_call | callees | has_self_call |
+    all-.fvar call arguments | the name a caller's map holds | the lowered name
+    | ingest verdict (last, as it is free text). The whole-corpus cycle pass and
+    the classification run once in `_classify_decl_facts` over the merged facts.
     Cycle members' ingest verdicts are computed here but ignored by the merger,
     which is sound because each ingest runs in a fresh `runCoreOnEnv` state and
     has no cross-declaration effect.
@@ -1515,16 +1710,19 @@ unsafe def main (args : List String) : IO Unit := do
         let callees := match d.value with
           | .code c => (collectCodeLocalCallees corpusNames c).filter (· != d.name)
           | _ => []
-        let hasCall := match d.value with
-          | .code c => codeHasLocalCall localSet c
-          | .extern _ => false
+        let sites := match d.value with
+          | .code c => codeLocalCallSites localSet c
+          | .extern _ => []
         let r ← runCoreOnEnv env (ingestLCNFImpureDecl d corpusNames .x86_64 true)
-        let verdict := match r with
-          | .ok _ => "ok"
-          | .error e => "err:" ++ (((e.replace "\\n" " ").replace "|" "/").take 200)
+        let (verdict, lowered) := match r with
+          | .ok ld => ("ok", auditEscape ld.name)
+          | .error e => ("err:" ++ (((e.replace "\\n" " ").replace "|" "/").take 200), "")
         let calleeStr := String.intercalate "," (callees.map (fun n => n.toString))
-        let hc := if hasCall then "1" else "0"
-        IO.println s!"SHARD_DECL:{{d.name}}|{{hc}}|{{calleeStr}}|{{verdict}}"
+        let hc := if sites.isEmpty then "0" else "1"
+        let sc := if sites.any (fun s => s.1 == d.name) then "1" else "0"
+        let af := if sites.all (fun s => s.2) then "1" else "0"
+        let mapped := auditEscape (mangleDeclNameInEnv env d.name)
+        IO.println s!"SHARD_DECL:{{d.name}}|{{hc}}|{{calleeStr}}|{{sc}}|{{af}}|{{mapped}}|{{lowered}}|{{verdict}}"
     IO.println s!"PROGRESS ingest {{modName}}"
   IO.println "SHARD_DONE"
 """
@@ -1540,10 +1738,28 @@ def _run_sharded_batteries_audit(
 ) -> tuple[tuple[int, int, int, int, int, int], list[str]]:
     """Measure a module corpus with the real lowerer, sharded across processes.
 
-    Each shard is one `lake env lean --run` of `_lean_shard_facts_driver`; the
-    merged per-declaration facts are classified by
-    `_merge_batteries_shard_facts` (the whole-corpus cycle pass included), so
-    the result tuple is `auditMods`-equivalent by construction. Fail-closed: a
+    `_collect_shard_facts` gathers the per-declaration facts and
+    `_merge_batteries_shard_facts` classifies them (the whole-corpus cycle pass
+    included), so the result tuple is `auditMods`-equivalent; a test runs both
+    paths on one compiled fixture.
+    """
+    decl_rows, aux_total = _collect_shard_facts(
+        root_dir, olean_root, modules, workers=workers, shard_count=shard_count, log_dir=log_dir
+    )
+    return _merge_batteries_shard_facts(decl_rows, aux_total)
+
+
+def _collect_shard_facts(
+    root_dir: Path,
+    olean_root: Path,
+    modules: list[str],
+    workers: int | None = None,
+    shard_count: int | None = None,
+    log_dir: Path | None = None,
+) -> tuple[list[DeclFacts], int]:
+    """Run `_lean_shard_facts_driver` over `modules` and return (facts rows, aux total).
+
+    Each shard is one `lake env lean --run` of the facts driver. Fail-closed: a
     shard that exits non-zero, omits `SHARD_DONE`, drops or duplicates a
     module's `SHARD_AUX` line, or emits an unparsable facts line raises; a
     failed run is never converted into counts. `TURBO_BATTERIES_AUDIT_WORKERS`
@@ -1600,7 +1816,7 @@ def _run_sharded_batteries_audit(
             )
 
     aux_by_module: dict[str, int] = {}
-    decl_rows: list[tuple[str, bool, list[str], str]] = []
+    decl_rows: list[DeclFacts] = []
     for lines in shard_lines:
         for ln in lines:
             if ln.startswith("SHARD_AUX:"):
@@ -1609,19 +1825,18 @@ def _run_sharded_batteries_audit(
                     raise RuntimeError(f"module `{mod}` reported by more than one shard")
                 aux_by_module[mod] = int(aux)
             elif ln.startswith("SHARD_DECL:"):
-                parts = ln[len("SHARD_DECL:"):].split("|", 3)
-                if len(parts) != 4 or parts[1] not in ("0", "1"):
+                parts = ln[len("SHARD_DECL:"):].split("|", 7)
+                if len(parts) != 8 or any(parts[i] not in ("0", "1") for i in (1, 3, 4)):
                     raise RuntimeError(f"unparsable shard facts line: {ln!r}")
-                name, hc, callees_s, verdict = parts
+                name, hc, callees_s, sc, af, mapped, lowered, verdict = parts
                 callees = [c for c in callees_s.split(",") if c]
-                decl_rows.append((name, hc == "1", callees, verdict))
+                decl_rows.append((name, hc == "1", callees, verdict, sc == "1", af == "1", mapped, lowered))
     missing = sorted(set(modules) - set(aux_by_module))
     if missing:
         raise RuntimeError(
             "sharded audit silently dropped module(s): " + ", ".join(missing)
         )
-    aux_total = sum(aux_by_module.values())
-    return _merge_batteries_shard_facts(decl_rows, aux_total)
+    return decl_rows, sum(aux_by_module.values())
 
 
 def measure_external_batteries(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
@@ -3656,15 +3871,17 @@ class TestLcnfCoverage(unittest.TestCase):
                 text=True,
             )
 
-    def test_cross_module_user_call_is_vacuous_not_rejected(self) -> None:
+    def test_cross_module_user_call_is_a_local_call_not_rejected(self) -> None:
         # Counterexample (real lowerer, two compiled modules): a declaration in
         # one measured module calling a user function declared in another
-        # measured module. The per-module localSet misses the cross-module
-        # callee, so the real lowerer fails it as an unsupported call and the
-        # driver counts it `rejected`, while the honest classification for a
-        # call into a measured corpus declaration is a vacuous local call
-        # (`lowered_unproved`) — eval `unsupportedCall` makes the pinned
-        # simulation vacuous exactly like the same-module helper case.
+        # measured module. A per-module localSet would miss the cross-module
+        # callee, so the real lowerer would fail it as an unsupported call and
+        # the driver would count it `rejected`; the group-wide localSet makes it
+        # a local call. Under L2's reclassification that call qualifies (a plain
+        # variable argument; the callee lowers with no call of its own and an
+        # export name that both its map entry and its lowering use), so the
+        # caller counts proved. Before the reclassification it was a vacuous
+        # local call (`lowered_unproved`), measured (2, 1, 1, 0, 0).
         _ensure_lean_build(ROOT_DIR)
         with tempfile.TemporaryDirectory(prefix="lcnf-xmod-") as tmp:
             root = Path(tmp)
@@ -3672,12 +3889,14 @@ class TestLcnfCoverage(unittest.TestCase):
             counts = _run_audit_driver(
                 ROOT_DIR, _lean_audit_driver_for_modules(["SAux", "SCaller"]), [str(root)]
             )
+            rows, aux = _collect_shard_facts(ROOT_DIR, root, ["SAux", "SCaller"], workers=1)
         tot, prv, unp, rej, cyc, _aux = counts
         self.assertEqual(tot, 2, counts)
-        self.assertEqual(prv, 1, counts)  # the callee itself lowers and proves
-        self.assertEqual(unp, 1, counts)  # the cross-module caller is a vacuous local call
+        self.assertEqual(prv, 2, counts)  # the callee and its cross-module caller
+        self.assertEqual(unp, 0, counts)
         self.assertEqual(rej, 0, counts)  # a corpus-local call is not an unsupported construct
         self.assertEqual(cyc, 0, counts)
+        self.assertEqual(_merge_batteries_shard_facts(rows, aux)[0], counts)
 
     def test_out_of_corpus_callee_is_rejected_never_proved(self) -> None:
         # H1.0a-S classification investigation, pinned: a call to a user
@@ -3993,20 +4212,209 @@ unsafe def main (args : List String) : IO Unit := do
         # H1.0b sharded path: the Python merger classifies per-declaration shard
         # facts exactly as auditMods does. A cycle member is rejected_not_lowered
         # without consulting its ingest verdict (even an "ok" or an error), a
-        # non-cycle ok declaration splits proved vs lowered_unproved on
-        # has_local_call, an ingest error is rejected with its reason head, and
-        # a callee absent from the corpus graph contributes no edges.
+        # non-cycle ok declaration with no local call is proved, an ingest error
+        # is rejected with its reason head, a declaration that calls into the
+        # cycle stays lowered_unproved, and so does one whose callee is absent
+        # from the corpus graph (the L2 rules are in
+        # test_l2_call_classification_is_fail_closed).
+        f = self._facts
         rows = [
-            ("A", True, ["B"], "ok"),  # on the 2-cycle with B -> rejected_not_lowered
-            ("B", True, ["A"], "err:boom"),  # same cycle; its ingest verdict is ignored
-            ("C", True, ["A"], "ok"),  # calls into the cycle, not on it -> lowered_unproved
-            ("D", False, [], "ok"),  # fully lowered, no local call -> proved
-            ("E", False, [], "err:unsupported thing"),  # rejected with its reason head
-            ("F", True, ["Z"], "ok"),  # callee outside the graph -> lowered_unproved
+            f("A", True, ["B"]),  # on the 2-cycle with B -> rejected_not_lowered
+            f("B", True, ["A"], "err:boom"),  # same cycle; its ingest verdict is ignored
+            f("C", True, ["A"]),  # calls into the cycle, not on it -> lowered_unproved
+            f("D", False, []),  # fully lowered, no local call -> proved
+            f("E", False, [], "err:unsupported thing"),  # rejected with its reason head
+            f("F", True, ["Z"]),  # callee outside the graph -> lowered_unproved
         ]
         counts, reasons = _merge_batteries_shard_facts(rows, aux_total=7)
         self.assertEqual(counts, (6, 1, 2, 3, 2, 7))
         self.assertEqual(sorted(reasons), ["mutual_cycle", "mutual_cycle", "unsupported thing"])
+
+    # ------------------------------------------------------------------
+    # L2 reclassification ("matrix moves", the Acceptance section of
+    # lean/LeanNative/Proofs/LowerCalls.lean): a lowered declaration with
+    # local calls counts proved only when lowerRealLCNFDecl_soundF applies
+    # with an environment built from the corpus.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _facts(
+        name: str,
+        has_call: bool,
+        callees: list[str],
+        verdict: str = "ok",
+        *,
+        self_call: bool = False,
+        all_fvar: bool = True,
+        mapped: str | None = None,
+        lowered: str | None = None,
+    ) -> DeclFacts:
+        symbol = f"l_{name}"
+        mapped = symbol if mapped is None else mapped
+        if lowered is None:
+            lowered = symbol if verdict == "ok" else ""
+        return (name, has_call, list(callees), verdict, self_call, all_fvar, mapped, lowered)
+
+    def test_l2_call_classification_is_fail_closed(self) -> None:
+        """Every condition of the reclassification, on synthetic facts rows.
+
+        Named limitation: the pinned toolchain's lowerer rejects every
+        declaration that calls itself ("unsupported self-tail recursion ... no
+        qualified loop lowering", measured on `L2Rec.selfRec` below), so a
+        self-call that survives lowering cannot occur today, and `selfy` here
+        exists only as a synthetic row. The self-call condition is therefore
+        covered by synthetic rows alone; the compiled fixtures cover the shapes
+        the lowerer does produce.
+        """
+        f = self._facts
+        rows = [
+            f("leaf", False, []),  # no local call -> proved
+            f("q", True, ["leaf"]),  # qualifying call -> proved
+            f("chain", True, ["q"]),  # qualifies transitively -> proved
+            f("deep", True, ["chain"]),  # three levels down -> proved
+            f("erased", True, ["leaf"], all_fvar=False),  # an erased argument
+            f("selfy", True, [], self_call=True),  # calls itself yet lowered (synthetic)
+            f("callsSelfy", True, ["selfy"]),  # the callee calls itself
+            f("bad", False, [], "err:boom"),  # rejected
+            f("callsBad", True, ["bad"]),  # the callee did not lower
+            f("deepBad", True, ["callsBad"]),  # a grandchild did not lower
+            f("callsGhost", True, ["ghost"]),  # the callee has no facts row
+            f("rsv", False, [], mapped="lean_native_x", lowered="lean_native_x"),  # call-free -> proved
+            f("callsRsv", True, ["rsv"]),  # the callee's lowered name is reserved
+            f("skew", False, [], mapped="l_skew", lowered="l_other"),  # call-free -> proved
+            f("callsSkew", True, ["skew"]),  # the caller's map name is not the lowered name
+            f("twinA", False, [], mapped="l_twin", lowered="l_twin"),
+            f("twinB", False, [], mapped="l_twin", lowered="l_twin"),
+            f("callsTwins", True, ["twinA", "twinB"]),  # two entries share a lowered name
+            f("cycA", True, ["cycB"]),
+            f("cycB", True, ["cycA"]),
+            f("callsCyc", True, ["cycA"]),  # the callee is on a cycle
+        ]
+        got = {row[0]: cls for row, (cls, _) in zip(rows, _classify_decl_facts(rows))}
+        proved = {"leaf", "q", "chain", "deep", "rsv", "skew", "twinA", "twinB"}
+        unproved = {
+            "erased", "selfy", "callsSelfy", "callsBad", "deepBad", "callsGhost",
+            "callsRsv", "callsSkew", "callsTwins", "callsCyc",
+        }
+        want = {name: "proved" for name in proved}
+        want.update({name: "lowered_unproved" for name in unproved})
+        want.update({"bad": "rejected", "cycA": "rejected_not_lowered", "cycB": "rejected_not_lowered"})
+        self.assertEqual(got, want)
+        counts, reasons = _merge_batteries_shard_facts(rows, aux_total=0)
+        self.assertEqual(counts, (21, 8, 10, 3, 2, 0))
+        self.assertEqual(sorted(reasons), ["boom", "mutual_cycle", "mutual_cycle"])
+
+    def test_reserved_runtime_name_copies_match_the_proof_definition(self) -> None:
+        # The driver's auditReservedRuntimeName and the Python copy must stay the
+        # predicate DeclEnvLowers uses (CallsF.lean), which the driver cannot import.
+        src = (ROOT_DIR / "lean/LeanNative/Proofs/RealLCNFBridge/CallsF.lean").read_text(encoding="utf-8")
+        lines = src.splitlines()
+        head = "def reservedRuntimeName (s : String) : Bool :="
+        self.assertIn(head, lines)
+        body = lines[lines.index(head) + 1].strip()
+        self.assertEqual(body, 's.startsWith "lean_native_" || s == "lean_mark_mt"')
+        self.assertIn("def auditReservedRuntimeName (s : String) : Bool :=\n  " + body, _LEAN_AUDIT_DRIVER_HEAD)
+        for name, want in (
+            ("lean_native_alloc", True),
+            ("lean_mark_mt", True),
+            ("lean_mark_mt2", False),
+            ("l_lean_native_x", False),
+            ("", False),
+        ):
+            self.assertEqual(_reserved_runtime_name(name), want, name)
+
+    def test_facts_name_escape_is_injective(self) -> None:
+        # The mapped-equals-lowered and distinct-lowered-names conditions compare
+        # the strings a facts row carries, so they are exact only if the driver's
+        # escape is injective and leaves no field separator behind. Red first: an
+        # escape that replaced `|` and `,` by `/` mapped "a|b", "a,b" and "a/b" to
+        # one string (these 10 inputs gave 7 distinct outputs). The reserved-name
+        # predicate must read an escaped name exactly as the raw one.
+        main_src = """
+unsafe def main (_args : List String) : IO Unit := do
+  let raws : List String :=
+    ["a|b", "a,b", "a/b", "a%b", "a%7Cb", "a%2Cb", "a%25b", "ab", "a||b", "a|,b"]
+  let outs := raws.map auditEscape
+  let distinct := (outs.foldl (fun (s : Std.HashSet String) x => s.insert x) {}).size
+  let withSep := (outs.filter (fun s => s.contains '|' || s.contains ',')).length
+  let rsvOk := auditReservedRuntimeName (auditEscape "lean_native_x") &&
+    auditReservedRuntimeName (auditEscape "lean_mark_mt") &&
+    !auditReservedRuntimeName (auditEscape "lean_mark_mt,")
+  IO.println s!"AUDIT_RESULT:{raws.length},{distinct},{withSep},{if rsvOk then 0 else 1},0,0"
+"""
+        _ensure_lean_build(ROOT_DIR)
+        got = _run_audit_driver(ROOT_DIR, _LEAN_AUDIT_DRIVER_HEAD + main_src, [])
+        self.assertEqual(got, (10, 10, 0, 0, 0, 0), got)
+
+    def _both_paths(self, mod_name: str, body: str) -> tuple[tuple[int, ...], dict[str, str], dict[str, DeclFacts]]:
+        """Compile `body` as module `mod_name` and measure it on both paths: one
+        auditMods run, and the facts driver classified by `_classify_decl_facts`.
+        Asserts the two agree; returns (auditMods counts, class by declaration,
+        facts row by declaration)."""
+        _ensure_lean_build(ROOT_DIR)
+        env = _lean_env()
+        with tempfile.TemporaryDirectory(prefix="lcnf-l2-") as tmp:
+            root = Path(tmp)
+            src = root / f"{mod_name}.lean"
+            src.write_text(f"namespace {mod_name}\n{body}end {mod_name}\n", encoding="utf-8")
+            subprocess.run(
+                ["lean", f"--root={root}", "-o", str(root / f"{mod_name}.olean"), str(src)],
+                cwd=str(ROOT_DIR / "lean"),
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            counts = _run_audit_driver(ROOT_DIR, _lean_audit_driver_for_modules([mod_name]), [str(root)])
+            rows, aux = _collect_shard_facts(ROOT_DIR, root, [mod_name], workers=1)
+        self.assertEqual(_merge_batteries_shard_facts(rows, aux)[0], counts, "facts path disagrees with auditMods")
+        classes = {row[0]: cls for row, (cls, _) in zip(rows, _classify_decl_facts(rows))}
+        return counts, classes, {row[0]: row for row in rows}
+
+    def test_l2_qualifying_local_calls_count_proved(self) -> None:
+        # Red first: before the reclassification the pinned toolchain measured
+        # this fixture (4 total, 1 proved, 3 lowered_unproved, 0, 0); every
+        # local call here qualifies, so all four declarations are proved.
+        counts, classes, _rows = self._both_paths(
+            "L2Qual",
+            "@[noinline] def leaf (x : UInt64) : UInt64 := x * 3 + 1\n"
+            "def caller (x : UInt64) : UInt64 := leaf x + leaf (x + 2)\n"
+            "@[noinline] def chainB (x : UInt64) : UInt64 := leaf x + 5\n"
+            "def chainA (x : UInt64) : UInt64 := chainB x * 2\n",
+        )
+        self.assertEqual(counts[:5], (4, 4, 0, 0, 0), counts)
+        for decl in ("leaf", "caller", "chainB", "chainA"):
+            self.assertEqual(classes[f"L2Qual.{decl}"], "proved", classes)
+
+    def test_l2_erased_argument_call_stays_unproved(self) -> None:
+        # Every parameter of constLeaf is unused, so the compiler's ReduceArity
+        # pass rewrites each call to `constLeaf._redArg ◾`: an erased argument
+        # at a resolved local call site. evalArg errors on it, so
+        # lowerRealLCNFDecl_soundF says nothing about the call and the callers
+        # stay lowered_unproved (measured the same before the reclassification).
+        counts, classes, rows = self._both_paths(
+            "L2Erased",
+            "@[noinline] def constLeaf (x : UInt64) : UInt64 := 42\n"
+            "def callsConst (x : UInt64) : UInt64 := constLeaf x + x\n",
+        )
+        self.assertEqual(counts[:5], (4, 1, 3, 0, 0), counts)
+        caller = rows["L2Erased.callsConst"]
+        self.assertTrue(caller[1] and not caller[5], caller)  # a local call, not all-.fvar
+        self.assertEqual(classes["L2Erased.callsConst"], "lowered_unproved", classes)
+        self.assertEqual(classes["L2Erased.constLeaf._redArg"], "proved", classes)
+
+    def test_l2_self_recursive_callee_keeps_its_caller_unproved(self) -> None:
+        # The lowerer rejects selfRec (a self-call), so callsSelfRec's callee
+        # closure does not lower and the caller stays lowered_unproved.
+        counts, classes, rows = self._both_paths(
+            "L2Rec",
+            "partial def selfRec (x : UInt64) : UInt64 := if x == 0 then 0 else selfRec (x - 1) + 2\n"
+            "def callsSelfRec (x : UInt64) : UInt64 := selfRec x + 1\n",
+        )
+        self.assertEqual(counts[:5], (2, 0, 1, 1, 0), counts)
+        self.assertTrue(rows["L2Rec.selfRec"][4], rows["L2Rec.selfRec"])  # has_self_call
+        self.assertEqual(classes["L2Rec.selfRec"], "rejected", classes)
+        self.assertEqual(classes["L2Rec.callsSelfRec"], "lowered_unproved", classes)
 
     def test_con_leche_reports_natoppins_exclusion_and_rejects_partial_tree(self) -> None:
         # Point 4: con-leche output must state the NatOpPins exclusion and its reason
