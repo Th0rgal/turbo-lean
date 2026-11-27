@@ -259,13 +259,21 @@ pub(crate) fn are_all_project_oleans_up_to_date(
             return false;
         }
         checked_oleans += 1;
+        // #483.2 / #339 (P10): content-hash freshness already held above (source BLAKE3, artifact
+        // digest, dep `.olean` interface pins). When the `.olean` is a CAS-installed hardlink its
+        // mtime is the CAS blob's, so the mtime-ordering rejections below would spuriously fail
+        // the fast path for frozen-cone leaf workers and trigger an upstream rebuild.
+        let cas_hardlinked = crate::module_builder::no_rebuild_upstream_enabled()
+            && crate::module_builder::olean_installed_as_cas_hardlink(&olean_path);
         let olean_mtime = olean_meta.modified().ok();
-        if let (Some(om), Some(lm)) = (olean_mtime, lakefile_mtime) {
-            if om < lm {
-                return false;
+        if !cas_hardlinked {
+            if let (Some(om), Some(lm)) = (olean_mtime, lakefile_mtime) {
+                if om < lm {
+                    return false;
+                }
             }
         }
-        if opt_out {
+        if opt_out && !cas_hardlinked {
             let src_path = canon_dir.join(rel_path);
             let src_mtime = fs::metadata(&src_path).and_then(|m| m.modified()).ok();
             let is_mtime_fresh = match (src_mtime, olean_mtime) {
@@ -1759,7 +1767,18 @@ pub(super) fn ensure_project_imports_fresh_inner(
                     && root_cfg
                         .as_ref()
                         .is_some_and(|cfg| !cfg.lean_bin.as_os_str().is_empty())));
-        let mtime_stale = if cryptographically_verified {
+        // #483.2 / #339 (P10): when the `.olean` is a CAS-installed hardlink its `mtime` is the
+        // CAS blob's, not the worktree's, so mtime ordering proves nothing in either direction.
+        // Under `--no-rebuild-upstream` a manifest entry that passes the content-hash checks
+        // above (source BLAKE3 + artifact digest + dep `.olean` interface pins) counts as fresh
+        // regardless of how its `mtime` compares to sources or sibling `.olean`s.
+        let cas_hardlink_content_fresh = crate::module_builder::no_rebuild_upstream_enabled()
+            && olean_meta.is_some()
+            && crate::module_builder::olean_installed_as_cas_hardlink(dep_olean)
+            && has_manifest_entry
+            && !identity_stale
+            && !manifest_stale;
+        let mtime_stale = if cryptographically_verified || cas_hardlink_content_fresh {
             false
         } else {
             match (&olean_meta, &src_meta) {
@@ -1847,7 +1866,10 @@ pub(super) fn ensure_project_imports_fresh_inner(
                 .unwrap_or(&info.dep_src)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let self_crypto_verified = !opt_out_for_prop
+            // #483.2 / #339 (P10): a CAS-hardlinked `.olean` of a manifest-recorded module is
+            // judged by its content hashes (checked above), never by mtime ordering against
+            // sibling CAS-hardlinked artifacts whose blob mtimes are unrelated.
+            let self_crypto_verified = (!opt_out_for_prop
                 && (tier_pin_exempt_mods.contains(&info.mod_name)
                     || manifest_opt
                         .as_ref()
@@ -1855,7 +1877,12 @@ pub(super) fn ensure_project_imports_fresh_inner(
                     || (info.is_lake_target
                         && root_cfg
                             .as_ref()
-                            .is_some_and(|cfg| !cfg.lean_bin.as_os_str().is_empty())));
+                            .is_some_and(|cfg| !cfg.lean_bin.as_os_str().is_empty()))))
+                || (crate::module_builder::no_rebuild_upstream_enabled()
+                    && manifest_opt
+                        .as_ref()
+                        .is_some_and(|m| m.modules.contains_key(&dep_rel))
+                    && crate::module_builder::olean_installed_as_cas_hardlink(&info.dep_olean));
             let self_om = fs::metadata(&info.dep_olean)
                 .and_then(|m| m.modified())
                 .ok();
@@ -1959,6 +1986,14 @@ pub(super) fn ensure_project_imports_fresh_inner(
         // standalone non-target `.olean`s left in `.lake/build/lib/lean`.
         let mut locally_rebuilt = None;
         if !lake_targets.is_empty() {
+            // #483.2 / #339 (P10): a frozen-cone leaf worker fails fast naming the stale/missing
+            // upstream imports instead of silently triggering a multi-hour upstream rebuild.
+            if crate::module_builder::no_rebuild_upstream_enabled() {
+                anyhow::bail!(
+                    "--no-rebuild-upstream (--frozen-cone): upstream import(s) stale or missing: {}; refusing to trigger an upstream rebuild. Materialize upstream `.olean`s from the CAS or build upstream first.",
+                    lake_targets.join(", ")
+                );
+            }
             let bypass_lake_cache = if let Some(ref cfg) = root_cfg {
                 crate::module_builder::purge_elab_host_effect_artifacts_in_closure(
                     cfg,
@@ -2569,6 +2604,196 @@ pub struct StandaloneOleanOverlay {
     pub(super) _scratch: crate::check::PrivateScratchDir,
 }
 
+/// #441: per-module compile timeout for the standalone re-check phase. Delegates to
+/// `module_compile_timeout_secs` so `TURBO_LEAN_MODULE_TIMEOUT_SECS` (and the untrusted-mode
+/// clamp) governs it instead of a hard-coded 300 s.
+pub(super) fn standalone_recheck_compile_timeout(is_untrusted: bool) -> std::time::Duration {
+    std::time::Duration::from_secs(crate::module_builder::module_compile_timeout_secs(
+        is_untrusted,
+    ))
+}
+
+/// #442: module-relative stem for every artifact that participates in the standalone re-check
+/// `.olean` tree. Lean 4.31+ module-system imports resolve `<Mod>.ir` IR data files next to their
+/// `.olean` on `LEAN_PATH`, so `.ir` files must be merged alongside the artifact-set suffixes or
+/// re-checked imports fail with `missing IR data file`.
+pub(super) fn standalone_olean_tree_rel_stem(rel: &str) -> Option<String> {
+    rel.strip_suffix(".olean.server")
+        .or_else(|| rel.strip_suffix(".olean.private"))
+        .or_else(|| rel.strip_suffix(".olean"))
+        .or_else(|| rel.strip_suffix(".ilean"))
+        .or_else(|| rel.strip_suffix(".ir"))
+        .map(String::from)
+}
+
+/// #440: device id of `path` on unix (`None` when it cannot be determined).
+pub(crate) fn fs_device_id(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).ok().map(|m| m.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// #440: pick the staging base for the standalone re-check so populating `olean_out_dir` never
+/// falls back to copying: `store.fast_staging_dir()` is RAM-backed `/dev/shm`, and when the
+/// workspace `.olean` trees live on another filesystem every `fs::hard_link` fails with EXDEV and
+/// `merge_pkg_oleans_into_staging` would copy multi-GiB dependency trees into RAM. When the
+/// preferred base cannot hardlink the sources, the first fallback sharing a source device wins;
+/// when no candidate shares it (or devices are undeterminable), the preferred base is kept and
+/// the per-file copy fallback remains as the last resort.
+pub(crate) fn choose_same_fs_staging_base_with(
+    preferred: &Path,
+    source_dirs: &[PathBuf],
+    fallbacks: &[PathBuf],
+    device_of: &dyn Fn(&Path) -> Option<u64>,
+) -> PathBuf {
+    let Some(src_dev) = source_dirs.iter().find_map(|d| device_of(d)) else {
+        return preferred.to_path_buf();
+    };
+    if device_of(preferred) == Some(src_dev) {
+        return preferred.to_path_buf();
+    }
+    fallbacks
+        .iter()
+        .find(|f| device_of(f) == Some(src_dev))
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| preferred.to_path_buf())
+}
+
+/// Filesystem-backed counterpart of [`choose_same_fs_staging_base_with`] used by the standalone
+/// re-check: an explicit `TURBO_LEAN_STAGING_DIR` is honored verbatim, otherwise the fast staging
+/// dir is kept only when it can hardlink the workspace `.olean` trees, else `/tmp` or the root
+/// package's own build dir (always on the sources' filesystem) is used.
+pub(crate) fn choose_same_fs_staging_base(
+    preferred: &Path,
+    source_dirs: &[PathBuf],
+    root_pkg_build_dir: &Path,
+) -> PathBuf {
+    if std::env::var_os("TURBO_LEAN_STAGING_DIR").is_some() {
+        return preferred.to_path_buf();
+    }
+    let fallbacks = vec![
+        std::env::temp_dir().clone(),
+        root_pkg_build_dir.to_path_buf(),
+    ];
+    choose_same_fs_staging_base_with(preferred, source_dirs, &fallbacks, &fs_device_id)
+}
+
+/// #483.2 / #339 (P10): workspace imports of `cfg` whose expected `.olean` artifact is missing on
+/// disk, paired with the path a rebuild would produce (cheap: config + stat only, no hashing).
+pub(super) fn missing_target_import_oleans(
+    cfg: &crate::module_builder::ProjectConfig,
+    imports: &[String],
+) -> Vec<(String, PathBuf)> {
+    let lib_lean_dir = cfg
+        .root_pkg
+        .pkg_root
+        .join(&cfg.root_pkg.build_dir)
+        .join(&cfg.root_pkg.lean_lib_dir);
+    imports
+        .iter()
+        .filter_map(|m| {
+            let rel = crate::module_builder::module_name_to_rel_slash(m);
+            let olean = if let Some(spec) =
+                crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, m)
+            {
+                spec.build_lib_lean_dir.join(format!("{}.olean", rel))
+            } else {
+                let mut found = None;
+                for dp in &cfg.dep_pkgs {
+                    if let Some(spec) =
+                        crate::module_builder::resolve_module_in_package(dp, false, m)
+                    {
+                        found = Some(spec.build_lib_lean_dir.join(format!("{}.olean", rel)));
+                        break;
+                    }
+                }
+                found.unwrap_or_else(|| lib_lean_dir.join(format!("{}.olean", rel)))
+            };
+            (!olean.is_file()).then(|| (m.clone(), olean))
+        })
+        .collect()
+}
+
+/// #442/#440: merge target-owned `.olean` artifacts (including Lean 4.31+ `.ir` data files) from
+/// `pkg`'s Lake build tree into `dst_dir` by hard link (copy fallback; always copying when
+/// `preserve_lake` is active so `.lake` link counts and `ctime` stay untouched).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn merge_pkg_oleans_into_staging(
+    pkg: &crate::module_builder::PackageConfig,
+    is_root: bool,
+    dst_dir: &Path,
+    preserve_lake: bool,
+    standalone_names: &HashSet<&str>,
+    is_untrusted: bool,
+    verified_target_modules: Option<&HashSet<String>>,
+) -> Result<()> {
+    let pkg_preserve_lake = preserve_lake || worktree_auto_link_disabled(&pkg.pkg_root);
+    let src_dir = pkg.pkg_root.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
+    if !src_dir.is_dir() {
+        return Ok(());
+    }
+    let mut stack = vec![(src_dir.clone(), dst_dir.to_path_buf())];
+    while let Some((cur_src, cur_dst)) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&cur_src) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let dst_p = cur_dst.join(entry.file_name());
+            if meta.file_type().is_dir() {
+                stack.push((p, dst_p));
+            } else if meta.file_type().is_file() {
+                let base_rel = if let Ok(r) = p.strip_prefix(&src_dir) {
+                    standalone_olean_tree_rel_stem(&r.to_string_lossy())
+                } else {
+                    None
+                };
+                let Some(rel_no_ext) = base_rel else {
+                    continue;
+                };
+                let mod_name = crate::module_builder::format_lean_module_name_from_parts(
+                    Path::new(&rel_no_ext)
+                        .components()
+                        .filter_map(|c| c.as_os_str().to_str()),
+                );
+                if mod_name.is_empty()
+                    || standalone_names.contains(mod_name.as_str())
+                    || crate::module_builder::resolve_module_in_package(pkg, is_root, &mod_name)
+                        .is_none()
+                    || (is_untrusted
+                        && !verified_target_modules
+                            .is_some_and(|allowed| allowed.contains(mod_name.as_str())))
+                {
+                    continue;
+                }
+                if dst_p.exists() {
+                    continue;
+                }
+                if let Some(parent) = dst_p.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if pkg_preserve_lake || fs::hard_link(&p, &dst_p).is_err() {
+                    fs::copy(&p, &dst_p)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_and_audit_standalone_modules(
     store_opt: Option<&TurboStore>,
@@ -2640,39 +2865,33 @@ pub(super) fn check_and_audit_standalone_modules(
         }
         target_imports.sort();
         target_imports.dedup();
+        // #483.2 / #339 (P10): a frozen-cone leaf worker must fail fast (<2s: config resolve +
+        // stat only, no hashing, no Lake) naming the missing upstream `.olean`, instead of
+        // silently triggering a multi-hour upstream rebuild below.
+        if crate::module_builder::no_rebuild_upstream_enabled() {
+            let missing = missing_target_import_oleans(&cfg, &target_imports);
+            if !missing.is_empty() {
+                anyhow::bail!(
+                    "--no-rebuild-upstream (--frozen-cone): missing upstream `.olean` artifact(s): {}; refusing to trigger an upstream rebuild",
+                    missing
+                        .iter()
+                        .map(|(m, p)| format!("{m} ({})", p.display()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
         if worktree_auto_link_disabled(canon_dir) {
             ensure_project_imports_fresh_for_check(canon_dir, &standalone_files)?;
         } else {
             ensure_project_imports_fresh_for_check(canon_dir, &standalone_files)?;
-            let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
-            let missing_target_imports: Vec<String> = target_imports
-                .iter()
-                .filter(|m| {
-                    let rel = crate::module_builder::module_name_to_rel_slash(m);
-                    if let Some(spec) =
-                        crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, m)
-                    {
-                        return !spec
-                            .build_lib_lean_dir
-                            .join(format!("{}.olean", rel))
-                            .is_file();
-                    }
-                    for dp in &cfg.dep_pkgs {
-                        if let Some(spec) =
-                            crate::module_builder::resolve_module_in_package(dp, false, m)
-                        {
-                            return !spec
-                                .build_lib_lean_dir
-                                .join(format!("{}.olean", rel))
-                                .is_file();
-                        }
-                    }
-                    !lib_lean_dir.join(format!("{}.olean", rel)).is_file()
-                })
-                .cloned()
-                .collect();
+            let missing_target_imports = missing_target_import_oleans(&cfg, &target_imports);
             if !missing_target_imports.is_empty() {
-                let targets = lake_refresh_targets(canon_dir, &missing_target_imports);
+                let names: Vec<String> = missing_target_imports
+                    .iter()
+                    .map(|(m, _)| m.clone())
+                    .collect();
+                let targets = lake_refresh_targets(canon_dir, &names);
                 lake_build_modules(canon_dir, &targets, rev)?;
             }
         }
@@ -2700,7 +2919,24 @@ pub(super) fn check_and_audit_standalone_modules(
 
     // Elaborate standalone modules in topological order into an isolated staging directory outside `.lake`
     // (preserving `--no-auto-worktree-link` worktrees) and run Stage 1C / kernel replay over the outputs.
-    let staging_base = store.fast_staging_dir();
+    // #440: keep the staging base on the workspace `.olean` trees' filesystem when the fast
+    // `/dev/shm` staging dir would force every `fs::hard_link` into a multi-GiB cross-device copy.
+    let root_build_dir = cfg
+        .root_pkg
+        .pkg_root
+        .join(&cfg.root_pkg.build_dir)
+        .join(&cfg.root_pkg.lean_lib_dir);
+    let mut merge_source_dirs: Vec<PathBuf> = cfg
+        .dep_pkgs
+        .iter()
+        .map(|dp| dp.pkg_root.join(&dp.build_dir).join(&dp.lean_lib_dir))
+        .collect();
+    merge_source_dirs.push(root_build_dir.clone());
+    let staging_base = choose_same_fs_staging_base(
+        &store.fast_staging_dir(),
+        &merge_source_dirs,
+        &root_build_dir,
+    );
     fs::create_dir_all(&staging_base)?;
     let scratch = crate::check::PrivateScratchDir::create(&staging_base, "standalone_recheck")?;
     let staging_dir = scratch
@@ -2710,88 +2946,44 @@ pub(super) fn check_and_audit_standalone_modules(
     let olean_out_dir = staging_dir.join("oleans");
     fs::create_dir_all(&olean_out_dir)?;
 
-    // Populate `olean_out_dir` with hard links (falling back to copies; always copying when
-    // `preserve_lake` is active so `.lake` link counts and `ctime` stay untouched) of target-owned
-    // `.olean` files from root/dependency `.lake/build/lib/lean` directories so `olean_out_dir` can
-    // sit FIRST on `LEAN_PATH`. In Lean 4's `SearchPath.findWithExt`, a matching top-level subdirectory
-    // (e.g. `TurboLean/` in `.lake/build/lib/lean`) pins module resolution (`TurboLean.olean` AND
-    // `TurboLean.Spec`) to the first directory containing either `TurboLean/` or `TurboLean.olean`.
-    // Merging target-owned `.olean`s into `olean_out_dir` lets both `TurboLean.olean` and
-    // `TurboLean/Spec.olean` resolve cleanly without touching `.lake` (preserving
-    // `--no-auto-worktree-link` snapshots) while never copying unverified non-target `.olean`s.
+    // #442: merge target-owned `.olean`s (and Lean 4.31+ `.ir` IR data files) into `olean_out_dir`
+    // by hard link (copy fallback; always copying when `preserve_lake` is active so `.lake` link
+    // counts and `ctime` stay untouched) from root/dependency `.lake/build/lib/lean` directories so
+    // `olean_out_dir` can sit FIRST on `LEAN_PATH`. In Lean 4's `SearchPath.findWithExt`, a matching
+    // top-level subdirectory (e.g. `TurboLean/` in `.lake/build/lib/lean`) pins module resolution
+    // (`TurboLean.olean` AND `TurboLean.Spec`) to the first directory containing either `TurboLean/`
+    // or `TurboLean.olean`. Merging target-owned artifacts into `olean_out_dir` lets both
+    // `TurboLean.olean` and `TurboLean/Spec.olean` (and their `.ir` files) resolve cleanly without
+    // touching `.lake` (preserving `--no-auto-worktree-link` snapshots) while never copying
+    // unverified non-target `.olean`s.
     let preserve_lake = worktree_auto_link_disabled(canon_dir);
-    let merge_pkg_oleans = |pkg: &crate::module_builder::PackageConfig,
-                            is_root: bool,
-                            dst_dir: &Path|
-     -> Result<()> {
-        let pkg_preserve_lake = preserve_lake || worktree_auto_link_disabled(&pkg.pkg_root);
-        let src_dir = pkg.pkg_root.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
-        if !src_dir.is_dir() {
-            return Ok(());
-        }
-        let mut stack = vec![(src_dir.clone(), dst_dir.to_path_buf())];
-        while let Some((cur_src, cur_dst)) = stack.pop() {
-            let Ok(rd) = fs::read_dir(&cur_src) else {
-                continue;
-            };
-            for entry in rd.flatten() {
-                let p = entry.path();
-                let Ok(meta) = fs::symlink_metadata(&p) else {
-                    continue;
-                };
-                if meta.file_type().is_symlink() {
-                    continue;
-                }
-                let dst_p = cur_dst.join(entry.file_name());
-                if meta.file_type().is_dir() {
-                    stack.push((p, dst_p));
-                } else if meta.file_type().is_file() {
-                    let base_rel = if let Ok(r) = p.strip_prefix(&src_dir) {
-                        let rs = r.to_string_lossy();
-                        rs.strip_suffix(".olean.server")
-                            .or_else(|| rs.strip_suffix(".olean.private"))
-                            .or_else(|| rs.strip_suffix(".olean"))
-                            .or_else(|| rs.strip_suffix(".ilean"))
-                            .map(String::from)
-                    } else {
-                        None
-                    };
-                    let Some(rel_no_ext) = base_rel else {
-                        continue;
-                    };
-                    let mod_name = crate::module_builder::format_lean_module_name_from_parts(
-                        Path::new(&rel_no_ext)
-                            .components()
-                            .filter_map(|c| c.as_os_str().to_str()),
-                    );
-                    if mod_name.is_empty()
-                        || standalone_names.contains(mod_name.as_str())
-                        || crate::module_builder::resolve_module_in_package(pkg, is_root, &mod_name)
-                            .is_none()
-                        || (is_untrusted
-                            && !verified_target_modules
-                                .is_some_and(|allowed| allowed.contains(mod_name.as_str())))
-                    {
-                        continue;
-                    }
-                    if dst_p.exists() {
-                        continue;
-                    }
-                    if let Some(parent) = dst_p.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    if pkg_preserve_lake || fs::hard_link(&p, &dst_p).is_err() {
-                        fs::copy(&p, &dst_p)?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    };
+    let merge_pkg_oleans =
+        |pkg: &crate::module_builder::PackageConfig, is_root: bool, dst_dir: &Path| -> Result<()> {
+            merge_pkg_oleans_into_staging(
+                pkg,
+                is_root,
+                dst_dir,
+                preserve_lake,
+                &standalone_names,
+                is_untrusted,
+                verified_target_modules,
+            )
+        };
     merge_pkg_oleans(&cfg.root_pkg, true, &olean_out_dir)?;
     for dp in &cfg.dep_pkgs {
         merge_pkg_oleans(dp, false, &olean_out_dir)?;
     }
+
+    // #441: the per-module compile timeout follows `TURBO_LEAN_MODULE_TIMEOUT_SECS`
+    // (`module_compile_timeout_secs`) instead of a hard-coded 300 s; announce the phase so
+    // hung/failing standalone compiles are attributable in CI logs.
+    let compile_timeout = standalone_recheck_compile_timeout(is_untrusted);
+    eprintln!(
+        "[turbo-lean] standalone re-check: compiling {} standalone module(s), per-module timeout {}s (untrusted={})",
+        standalone_modules.len(),
+        compile_timeout.as_secs(),
+        is_untrusted
+    );
 
     let (base_lp, ld_library_path_env) =
         crate::module_builder::build_lean_search_path(&cfg, is_untrusted);
@@ -2907,11 +3099,8 @@ pub(super) fn check_and_audit_standalone_modules(
                 .arg("-o")
                 .arg(&staged_olean);
 
-            let out = crate::module_builder::run_command_with_timeout(
-                &mut cmd,
-                std::time::Duration::from_secs(300),
-                true,
-            )?;
+            let out =
+                crate::module_builder::run_command_with_timeout(&mut cmd, compile_timeout, true)?;
             if !out.status.success() {
                 anyhow::bail!(
                     "Untrusted standalone Lean module `{}` failed compilation:\n{}\n{}",
@@ -3035,11 +3224,8 @@ pub(super) fn check_and_audit_standalone_modules(
             .arg(&spec.src_root)
             .arg("-o")
             .arg(&published_olean);
-            let out = crate::module_builder::run_command_with_timeout(
-                &mut cmd,
-                std::time::Duration::from_secs(300),
-                false,
-            )?;
+            let out =
+                crate::module_builder::run_command_with_timeout(&mut cmd, compile_timeout, false)?;
             if !out.status.success() {
                 anyhow::bail!(
                     "Standalone Lean module `{}` failed compilation:\n{}\n{}",
@@ -5384,4 +5570,560 @@ pub(crate) fn build_imported_standalone_modules_overlay(
         false,
     )?;
     Ok(overlay)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "turbo_lb_freshness_{tag}_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ))
+    }
+
+    /// Run `f` with `TURBO_LEAN_NO_REBUILD_UPSTREAM` forced to `enabled`, restoring the ambient
+    /// value afterwards (tests run under `RUST_TEST_THREADS=1`; the lock also guards against
+    /// unrelated env-toggling tests).
+    fn with_no_rebuild_upstream<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let env = crate::module_builder::NO_REBUILD_UPSTREAM_ENV;
+        let saved = std::env::var(env).ok();
+        if enabled {
+            std::env::set_var(env, "1");
+        } else {
+            std::env::remove_var(env);
+        }
+        let out = f();
+        match saved {
+            Some(v) => std::env::set_var(env, v),
+            None => std::env::remove_var(env),
+        }
+        out
+    }
+
+    fn fixture_pkg(
+        pkg_root: &Path,
+        name: &str,
+        lib_glob_root: &str,
+    ) -> crate::module_builder::PackageConfig {
+        crate::module_builder::PackageConfig {
+            name: name.to_string(),
+            base_name: String::new(),
+            pkg_root: pkg_root.to_path_buf(),
+            config_file_kind: "lakefile.toml".to_string(),
+            src_dir: PathBuf::from("src"),
+            build_dir: PathBuf::from(".lake/build"),
+            bin_dir: PathBuf::from("bin"),
+            lean_lib_dir: PathBuf::from("lib/lean"),
+            native_lib_dir: PathBuf::from("lib"),
+            ir_dir: PathBuf::from("ir"),
+            packages_dir: PathBuf::from(".lake/packages"),
+            more_lean_args: Vec::new(),
+            weak_lean_args: Vec::new(),
+            lean_options: Default::default(),
+            precompile_modules: false,
+            platform_independent: None,
+            default_targets: Vec::new(),
+            libs: vec![crate::module_builder::LeanLibConfig {
+                name: lib_glob_root.to_string(),
+                src_dir: None,
+                roots: Vec::new(),
+                globs: vec![crate::module_builder::GlobSpec::AndSubmodules(
+                    lib_glob_root.to_string(),
+                )],
+                more_lean_args: Vec::new(),
+                weak_lean_args: Vec::new(),
+                lean_options: Default::default(),
+                precompile_modules: None,
+                platform_independent: None,
+                default_facets: Vec::new(),
+                is_default_target: true,
+                needs: Vec::new(),
+                custom_target_needs: Vec::new(),
+                unsupported: None,
+                native_unsupported: None,
+                link_unsupported: None,
+            }],
+            exes: Vec::new(),
+            extern_libs: Vec::new(),
+            custom_targets: Vec::new(),
+            inputs: Vec::new(),
+            config_digest: "fixture".to_string(),
+            pre_recipe_config_digest: String::new(),
+            unsupported: None,
+            native_unsupported: None,
+            link_unsupported: None,
+        }
+    }
+
+    fn fixture_project_config(
+        root: &crate::module_builder::PackageConfig,
+    ) -> crate::module_builder::ProjectConfig {
+        crate::module_builder::ProjectConfig {
+            toolchain: "leanprover/lean4:v4.35.0".to_string(),
+            lean_bin: PathBuf::from("lean"),
+            lean_githash: "eb6cafb7290e8bd5f2937522d8d804f58f02bafc".to_string(),
+            toolchain_lib_lean: PathBuf::from("/nonexistent/lean/library"),
+            toolchain_lib: PathBuf::from("/nonexistent/lean"),
+            root_pkg: root.clone(),
+            manifest_packages: Vec::new(),
+            dep_pkgs: Vec::new(),
+            canonical_config_digest: "fixture".to_string(),
+            is_untrusted: false,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // #442: `.ir` files participate in the standalone re-check tree.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn standalone_olean_tree_rel_stem_includes_ir() {
+        assert_eq!(
+            standalone_olean_tree_rel_stem("Up/Base.ir").as_deref(),
+            Some("Up/Base")
+        );
+        assert_eq!(
+            standalone_olean_tree_rel_stem("Up/Base.olean").as_deref(),
+            Some("Up/Base")
+        );
+        assert_eq!(
+            standalone_olean_tree_rel_stem("Up/Base.olean.server").as_deref(),
+            Some("Up/Base")
+        );
+        assert_eq!(
+            standalone_olean_tree_rel_stem("Up/Base.olean.private").as_deref(),
+            Some("Up/Base")
+        );
+        assert_eq!(
+            standalone_olean_tree_rel_stem("Up/Base.ilean").as_deref(),
+            Some("Up/Base")
+        );
+        // Non-search-path sidecars and foreign artifacts never merge.
+        assert_eq!(standalone_olean_tree_rel_stem("Up/Base.c"), None);
+        assert_eq!(standalone_olean_tree_rel_stem("Up/Base.trace"), None);
+        assert_eq!(standalone_olean_tree_rel_stem("Up/Base.olean.hash"), None);
+        assert_eq!(standalone_olean_tree_rel_stem("Up/Base.ir.sig"), None);
+        assert_eq!(standalone_olean_tree_rel_stem("Up/Base.lean"), None);
+    }
+
+    #[test]
+    fn merge_pkg_oleans_includes_ir_files_in_recheck_tree() -> Result<()> {
+        let dir = tmp_dir("merge_ir");
+        let pkg_root = dir.join("proj");
+        let lib_lean = pkg_root.join(".lake/build/lib/lean");
+        fs::create_dir_all(lib_lean.join("Up"))?;
+        fs::create_dir_all(pkg_root.join("src/Up"))?;
+        fs::write(pkg_root.join("src/Up.lean"), "prelude\n")?;
+        fs::write(pkg_root.join("src/Up/Base.lean"), "def baseVal := 1\n")?;
+        fs::write(lib_lean.join("Up.olean"), b"o1")?;
+        fs::write(lib_lean.join("Up.ir"), b"ir1")?;
+        fs::write(lib_lean.join("Up.ilean"), b"i1")?;
+        fs::write(lib_lean.join("Up.olean.server"), b"s1")?;
+        fs::write(lib_lean.join("Up.c"), b"c1")?;
+        fs::write(lib_lean.join("Up.olean.hash"), b"h1")?;
+        fs::write(lib_lean.join("Up/Base.olean"), b"o2")?;
+        fs::write(lib_lean.join("Up/Base.ir"), b"ir2")?;
+        fs::write(lib_lean.join("Stranger.olean"), b"x")?;
+
+        let pkg = fixture_pkg(&pkg_root, "proj", "Up");
+        let dst = dir.join("dst/oleans");
+        fs::create_dir_all(&dst)?;
+        merge_pkg_oleans_into_staging(&pkg, true, &dst, false, &HashSet::new(), false, None)?;
+
+        // RED-then-GREEN (#442): without the `.ir` suffix in the merge stem, `Up.ir` /
+        // `Up/Base.ir` are absent and Lean 4.31+ module-system imports fail with
+        // `missing IR data file` once `olean_out_dir` pins module resolution.
+        for f in [
+            "Up.olean",
+            "Up.ir",
+            "Up.ilean",
+            "Up.olean.server",
+            "Up/Base.olean",
+            "Up/Base.ir",
+        ] {
+            assert!(dst.join(f).is_file(), "expected merged artifact `{f}`");
+        }
+        assert_eq!(fs::read(dst.join("Up.ir"))?, b"ir1".to_vec());
+        assert_eq!(fs::read(dst.join("Up/Base.ir"))?, b"ir2".to_vec());
+        assert!(
+            !dst.join("Up.c").exists(),
+            "`.c` is not a search-path artifact"
+        );
+        assert!(!dst.join("Up.olean.hash").exists());
+        assert!(
+            !dst.join("Stranger.olean").exists(),
+            "non-package `.olean`s are never merged"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // #441: standalone re-check compiles honor TURBO_LEAN_MODULE_TIMEOUT_SECS.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn standalone_recheck_timeout_follows_module_timeout_env() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("TURBO_LEAN_MODULE_TIMEOUT_SECS").ok();
+        let set = |v: Option<&str>| match v {
+            Some(v) => std::env::set_var("TURBO_LEAN_MODULE_TIMEOUT_SECS", v),
+            None => std::env::remove_var("TURBO_LEAN_MODULE_TIMEOUT_SECS"),
+        };
+        // Default: the historical 300 s is preserved when nothing is configured.
+        set(None);
+        assert_eq!(
+            standalone_recheck_compile_timeout(false),
+            std::time::Duration::from_secs(300)
+        );
+        assert_eq!(
+            standalone_recheck_compile_timeout(true),
+            std::time::Duration::from_secs(300)
+        );
+        // RED-then-GREEN (#441): the env-configured timeout now governs the re-check phase.
+        set(Some("45"));
+        assert_eq!(
+            standalone_recheck_compile_timeout(false),
+            std::time::Duration::from_secs(45)
+        );
+        assert_eq!(
+            standalone_recheck_compile_timeout(true),
+            std::time::Duration::from_secs(45)
+        );
+        // Untrusted-mode clamp still applies through the re-check phase.
+        set(Some("5"));
+        assert_eq!(
+            standalone_recheck_compile_timeout(true),
+            std::time::Duration::from_secs(15)
+        );
+        set(Some("100000"));
+        assert_eq!(
+            standalone_recheck_compile_timeout(true),
+            std::time::Duration::from_secs(600)
+        );
+        match saved {
+            Some(v) => std::env::set_var("TURBO_LEAN_MODULE_TIMEOUT_SECS", v),
+            None => std::env::remove_var("TURBO_LEAN_MODULE_TIMEOUT_SECS"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // #440: same-filesystem staging base (never copy into /dev/shm).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn choose_same_fs_staging_base_prefers_hardlink_compatible_device() {
+        let dev_of = |p: &Path| match p.to_str() {
+            Some("shm") | Some("tmp") => Some(1),
+            Some("store") | Some("proj") => Some(2),
+            _ => None,
+        };
+        // Preferred already shares the sources' device: keep it.
+        assert_eq!(
+            choose_same_fs_staging_base_with(
+                Path::new("store"),
+                &[PathBuf::from("proj")],
+                &[],
+                &dev_of
+            ),
+            PathBuf::from("store")
+        );
+        // Cross-device preferred: the first same-device fallback wins.
+        assert_eq!(
+            choose_same_fs_staging_base_with(
+                Path::new("shm"),
+                &[PathBuf::from("proj")],
+                &[PathBuf::from("tmp"), PathBuf::from("store")],
+                &dev_of
+            ),
+            PathBuf::from("store")
+        );
+        // No same-device fallback: keep the preferred base (per-file copy fallback remains).
+        assert_eq!(
+            choose_same_fs_staging_base_with(
+                Path::new("shm"),
+                &[PathBuf::from("proj")],
+                &[PathBuf::from("tmp")],
+                &dev_of
+            ),
+            PathBuf::from("shm")
+        );
+        // Undeterminable source device: keep the preferred base.
+        assert_eq!(
+            choose_same_fs_staging_base_with(
+                Path::new("shm"),
+                &[PathBuf::from("nowhere")],
+                &[PathBuf::from("store")],
+                &dev_of
+            ),
+            PathBuf::from("shm")
+        );
+    }
+
+    #[test]
+    fn choose_same_fs_staging_base_real_fs_keeps_same_device_preferred() -> Result<()> {
+        let dir = tmp_dir("stagefs");
+        let src = dir.join("proj/.lake/build/lib/lean");
+        fs::create_dir_all(&src)?;
+        let preferred = dir.join("preferred");
+        fs::create_dir_all(&preferred)?;
+        // /dev/shm-style fast dir on the same filesystem (as in containers without a separate
+        // shm mount): the preferred base must be kept.
+        assert_eq!(
+            choose_same_fs_staging_base(&preferred, std::slice::from_ref(&src), &dir),
+            preferred
+        );
+        // An explicit TURBO_LEAN_STAGING_DIR is honored verbatim.
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("TURBO_LEAN_STAGING_DIR").ok();
+        std::env::set_var("TURBO_LEAN_STAGING_DIR", &preferred);
+        assert_eq!(
+            choose_same_fs_staging_base(&preferred, &[src], &dir),
+            preferred
+        );
+        match saved {
+            Some(v) => std::env::set_var("TURBO_LEAN_STAGING_DIR", v),
+            None => std::env::remove_var("TURBO_LEAN_STAGING_DIR"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // #483.2 / #339 (P10): frozen-cone leaf workers.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn missing_target_import_oleans_names_missing_upstream_artifacts() -> Result<()> {
+        let dir = tmp_dir("missing_upstream");
+        let root = dir.join("root");
+        let dep = dir.join("dep");
+        for pkg_root in [&root, &dep] {
+            let lib_lean = pkg_root.join(".lake/build/lib/lean");
+            fs::create_dir_all(lib_lean.join("Up"))?;
+            fs::create_dir_all(pkg_root.join("src/Up"))?;
+        }
+        fs::create_dir_all(dep.join(".lake/build/lib/lean/Dep"))?;
+        fs::create_dir_all(dep.join("src/Dep"))?;
+        fs::write(root.join("src/Up.lean"), "prelude\n")?;
+        fs::write(root.join("src/Up/Base.lean"), "def baseVal := 1\n")?;
+        fs::write(root.join(".lake/build/lib/lean/Up.olean"), b"o")?;
+        // `Up/Base.olean` deliberately missing.
+        fs::write(dep.join("src/Dep.lean"), "prelude\n")?;
+        fs::write(dep.join("src/Dep/Core.lean"), "def coreVal := 1\n")?;
+        fs::write(dep.join(".lake/build/lib/lean/Dep/Core.olean"), b"o")?;
+
+        let mut cfg = fixture_project_config(&fixture_pkg(&root, "root", "Up"));
+        let mut dep_pkg = fixture_pkg(&dep, "dep", "Dep");
+        dep_pkg.name = "dep".to_string();
+        cfg.dep_pkgs.push(dep_pkg);
+
+        let missing = missing_target_import_oleans(
+            &cfg,
+            &[
+                "Up".to_string(),
+                "Up.Base".to_string(),
+                "Dep.Core".to_string(),
+            ],
+        );
+        assert_eq!(
+            missing,
+            vec![(
+                "Up.Base".to_string(),
+                root.join(".lake/build/lib/lean/Up/Base.olean")
+            )]
+        );
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn frozen_cone_missing_upstream_olean_fails_fast_without_rebuild() -> Result<()> {
+        let dir = tmp_dir("frozencone");
+        let proj = dir.join("proj");
+        fs::create_dir_all(proj.join("Up"))?;
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"fc\"\ndefaultTargets = [\"Up\"]\n[[lean_lib]]\nname = \"Up\"\nglobs = [\"Up.+\"]\n",
+        )?;
+        fs::write(proj.join("Up.lean"), "def upVal : Nat := 1\n")?;
+        fs::write(proj.join("Up/Base.lean"), "def baseVal : Nat := 1\n")?;
+        let main_lean = proj.join("Up/Main.lean");
+        fs::write(
+            &main_lean,
+            "import Up.Base\ntheorem base_eq : baseVal = 1 := rfl\n",
+        )?;
+
+        let spec = StandaloneModuleSpec {
+            module_name: "Up.Main".to_string(),
+            src_path: main_lean,
+            src_root: proj.join("Up"),
+            is_module: false,
+            imports: vec!["Up.Base".to_string()],
+            import_visibilities: HashMap::new(),
+        };
+        let canon = proj.canonicalize()?;
+
+        let t0 = std::time::Instant::now();
+        let err = match with_no_rebuild_upstream(true, || {
+            check_and_audit_standalone_modules(
+                None,
+                &canon,
+                std::slice::from_ref(&spec),
+                false,
+                None,
+                None,
+                false,
+                false,
+            )
+        }) {
+            Ok(_) => {
+                panic!("frozen-cone leaf worker must fail fast on the missing upstream `.olean`")
+            }
+            Err(err) => err,
+        };
+        let elapsed = t0.elapsed();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--no-rebuild-upstream") && msg.contains("Up.Base"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("Up/Base.olean"),
+            "error must name the missing upstream `.olean` path: {msg}"
+        );
+        assert!(
+            !proj.join(".lake/build/lib/lean/Up/Base.olean").exists(),
+            "frozen-cone must never trigger an upstream rebuild"
+        );
+        // The fail-fast path is config-resolve + stat only; a Lake invocation would take far
+        // longer than this generous guard.
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "fail-fast took too long: {elapsed:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cas_hardlinked_oleans_are_fresh_by_content_hash_not_mtime() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, SystemTime};
+
+        // Native builds serialize on the env lock + bwrap lock (see the wave8 e2e tests); the
+        // flag toggling below therefore happens without re-taking `env_test_lock`.
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = tmp_dir("cashash");
+        let proj = dir.join("proj");
+        fs::create_dir_all(proj.join("Up"))?;
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"cashash\"\ndefaultTargets = [\"Up\"]\n[[lean_lib]]\nname = \"Up\"\nglobs = [\"Up.+\"]\n",
+        )?;
+        let base_lean = proj.join("Up/Base.lean");
+        fs::write(&base_lean, "def baseVal : Nat := 1\n")?;
+
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        crate::lake_build::run_build_command(
+            &mut store,
+            true,
+            vec!["Up/Base.lean".to_string()],
+            proj.clone(),
+            "trusted".to_string(),
+            0,
+            false,
+        )?;
+        let base_olean = proj.join(".lake/build/lib/lean/Up/Base.olean");
+        let manifest_path = proj.join(".lake/build/.turbo_verified_sources.json");
+        assert!(base_olean.is_file(), "build must materialize Up/Base.olean");
+        assert!(
+            manifest_path.is_file(),
+            "build must populate .turbo_verified_sources.json"
+        );
+
+        // Simulate the leaf-worker checkout: sources and lakefile younger than the
+        // CAS-restored `.olean`.
+        std::thread::sleep(Duration::from_millis(50));
+        fs::write(&base_lean, fs::read(&base_lean)?)?;
+        let lakefile = proj.join("lakefile.toml");
+        fs::write(&lakefile, fs::read(&lakefile)?)?;
+
+        let canon_proj = proj.canonicalize()?;
+        let mut fhashes = BTreeMap::new();
+        fhashes.insert(
+            "Up/Base.lean".to_string(),
+            blake3::hash(&fs::read(&base_lean)?).to_hex().to_string(),
+        );
+
+        // CAS-install the built `.olean`: identical bytes, past blob mtime, sealed 0444,
+        // shared with a second link (the CAS blob).
+        let cas_file = dir.join("cas/blob");
+        fs::create_dir_all(cas_file.parent().unwrap())?;
+        fs::copy(&base_olean, &cas_file)?;
+        {
+            let f = fs::OpenOptions::new().write(true).open(&cas_file)?;
+            f.set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(86_400)),
+            )?;
+        }
+        fs::set_permissions(&cas_file, fs::Permissions::from_mode(0o444))?;
+        fs::remove_file(&base_olean)?;
+        fs::hard_link(&cas_file, &base_olean)?;
+        assert!(crate::module_builder::olean_installed_as_cas_hardlink(
+            &base_olean
+        ));
+
+        let probe = |enabled: bool| {
+            let saved = std::env::var(crate::module_builder::NO_REBUILD_UPSTREAM_ENV).ok();
+            if enabled {
+                std::env::set_var(crate::module_builder::NO_REBUILD_UPSTREAM_ENV, "1");
+            } else {
+                std::env::remove_var(crate::module_builder::NO_REBUILD_UPSTREAM_ENV);
+            }
+            let out = are_all_project_oleans_up_to_date(&canon_proj, &fhashes);
+            match saved {
+                Some(v) => std::env::set_var(crate::module_builder::NO_REBUILD_UPSTREAM_ENV, v),
+                None => std::env::remove_var(crate::module_builder::NO_REBUILD_UPSTREAM_ENV),
+            }
+            out
+        };
+
+        // Without the frozen-cone flag, mtime ordering spuriously rejects the fresh tree
+        // (the `.olean` predates both the source rewrite and the lakefile bump).
+        assert!(
+            !probe(false),
+            "mtime-based freshness must keep rejecting CAS-skewed trees without the flag"
+        );
+
+        // RED-then-GREEN (#483.2 / #339 P10): under `--no-rebuild-upstream`, content hashes
+        // (source BLAKE3 + artifact digest + dep `.olean` interface pins) decide, so the
+        // CAS-hardlinked tree is fresh and no upstream rebuild is triggered.
+        assert!(
+            probe(true),
+            "CAS-hardlinked `.olean` must be fresh by content hash under --no-rebuild-upstream"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
 }

@@ -91,6 +91,15 @@ pub(crate) struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     no_auto_worktree_link: bool,
 
+    /// Never rebuild upstream dependencies: fail fast naming the missing/stale upstream .olean (leaf workers; alias --frozen-cone; also TURBO_LEAN_NO_REBUILD_UPSTREAM=1)
+    #[arg(
+        long,
+        global = true,
+        visible_alias = "frozen-cone",
+        default_value_t = false
+    )]
+    no_rebuild_upstream: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -784,6 +793,12 @@ pub(crate) fn apply_global_cli_env(cli: &Cli) {
     }
     if cli.no_auto_worktree_link {
         std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", "1");
+    }
+    // #483.2 / #339 (P10): `--no-rebuild-upstream` / `--frozen-cone` flips the freshness gates
+    // (`module_builder::no_rebuild_upstream_enabled`) so leaf workers fail fast on a missing or
+    // stale upstream `.olean` instead of silently triggering an upstream rebuild.
+    if cli.no_rebuild_upstream {
+        std::env::set_var(module_builder::NO_REBUILD_UPSTREAM_ENV, "1");
     }
 }
 
