@@ -2215,6 +2215,46 @@ def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[
     }
 
 
+def _refuse_dropped_corpora(report: dict[str, Any], doc: dict[str, Any], results_path: Path) -> None:
+    """Refuse a new baseline that leaves out a corpus the committed one measured.
+
+    `results_document` keeps only the corpora this run measured, so a
+    `--write-results` run without an external tree (no `scratch/batteries`)
+    would replace that corpus's committed counts with nothing and still report
+    success. Dropping a corpus from the baseline takes an edit of the file.
+    """
+    try:
+        committed = json.loads(results_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return  # no readable baseline to drop from; this run writes the first one
+    base = committed.get("corpora") if isinstance(committed, dict) else None
+    if not isinstance(base, dict):
+        return
+    kept = doc.get("corpora", {})
+    dropped = [
+        cname
+        for cname, entry in sorted(base.items())
+        if isinstance(entry, dict)
+        and entry.get("measurement_source") != "not_measured"
+        and cname not in kept
+    ]
+    if not dropped:
+        return
+    live = report.get("corpora", {})
+    why = "; ".join(
+        f"`{c}`: {live[c].get('reason', 'no reason given')}"
+        if isinstance(live.get(c), dict)
+        else f"`{c}`: missing from the live report"
+        for c in dropped
+    )
+    raise RuntimeError(
+        "refusing to write results: this run did not measure "
+        + ", ".join(f"`{c}`" for c in dropped)
+        + f", which {results_path.name} measures ({why}); measure it and re-run, or delete "
+        "the entry from the file if dropping it is intended"
+    )
+
+
 def _validate_measured_entry(path: str, entry: Any, errors: list[str], depth: int = 0) -> None:
     """Fail-closed validation of one measured baseline corpus/subcorpus entry."""
     if not isinstance(entry, dict):
@@ -3123,6 +3163,49 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertIn(PINNED_BATTERIES_REV, str(ctx.exception))
         self.assertEqual(doc["corpora"]["external_batteries"]["commit_sha"], PINNED_BATTERIES_REV)
         self.assertEqual([e for e in validate_results_document(doc) if "commit_sha" in e], [])
+
+    def test_write_results_refuses_to_drop_a_measured_corpus(self) -> None:
+        # results_document keeps only the corpora this run measured, so a
+        # `--write-results` run without an external tree (no scratch/batteries)
+        # rewrote the committed results without that corpus's counts and
+        # reported success. The write is refused instead, naming the corpus
+        # and why this run did not measure it; a run that measures every
+        # committed corpus still writes.
+        import contextlib
+        import io
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        committed = self._v_committed_baseline()
+        reason = "no prebuilt pinned Batteries `.olean` tree"
+        report = {
+            "corpora": {"external_batteries": {"measurement_source": "not_measured", "reason": reason}}
+        }
+        partial = json.loads(json.dumps(committed))
+        del partial["corpora"]["external_batteries"]
+        with tempfile.TemporaryDirectory(prefix="lcnf-drop-guard-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            results = root / "scripts" / "lcnf_coverage_results.json"
+            for doc, want_rc in ((partial, 1), (committed, 0)):
+                results.write_text(json.dumps(committed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                before = results.read_text(encoding="utf-8")
+                err = io.StringIO()
+                with mock.patch.object(m, "ROOT_DIR", root), mock.patch.object(
+                    m, "RESULTS_FILE", results
+                ), mock.patch.object(m, "_refuse_dirty_measurement_inputs"), mock.patch.object(
+                    m, "check_coverage_report", return_value={"ok": True, "errors": [], "report": report}
+                ), mock.patch.object(m, "results_document", return_value=doc), mock.patch.object(
+                    sys, "argv", ["lcnf_coverage.py", "--write-results"]
+                ), contextlib.redirect_stderr(err):
+                    rc = m.main()
+                self.assertEqual(rc, want_rc, err.getvalue())
+                if want_rc:
+                    self.assertEqual(results.read_text(encoding="utf-8"), before)
+                    self.assertIn("`external_batteries`", err.getvalue())
+                    self.assertIn(reason, err.getvalue())
+                else:
+                    self.assertEqual(json.loads(results.read_text(encoding="utf-8")), committed)
 
     def test_executes_live_lean_lowerer_on_corpora(self) -> None:
         live = execute_live_lean_audit(ROOT_DIR)
@@ -5105,10 +5188,13 @@ def main() -> int:
         compare_results_digests=not args.write_results,
     )
     if args.write_results:
-        RESULTS_FILE.write_text(
-            json.dumps(results_document(chk["report"], ROOT_DIR), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        doc = results_document(chk["report"], ROOT_DIR)
+        try:
+            _refuse_dropped_corpora(chk["report"], doc, RESULTS_FILE)
+        except RuntimeError as exc:
+            print(f"  [ERROR] {exc}", file=sys.stderr)
+            return 1
+        RESULTS_FILE.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(f"[lcnf-coverage] wrote {RESULTS_FILE.relative_to(ROOT_DIR)}", file=sys.stderr)
         if not args.json:
             return 0 if chk["ok"] else 1
