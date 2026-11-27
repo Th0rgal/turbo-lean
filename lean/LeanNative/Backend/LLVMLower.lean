@@ -32,7 +32,7 @@ open LeanNative.Backend.LLVMAst
 
 def c64 (n : Nat) : Operand := .constInt .i64 (BitVec.ofNat 64 n)
 
-def c256 (n : Nat) : Operand := .constInt .i256 (BitVec.ofNat 256 n)
+def cW (w : IntWidth) (n : Nat) : Operand := .constInt w (BitVec.ofNat w.bits n)
 
 def w64 : LLVMType := .int .i64
 
@@ -58,38 +58,40 @@ def ScalarTyEnv.empty : ScalarTyEnv := fun _ => none
 def ScalarTyEnv.bind (Γ : ScalarTyEnv) (x : VarId) (ty : LNIRType) : ScalarTyEnv :=
   fun y => if y == x then some ty else Γ y
 
-/-- Guarded 64-bit unsigned `div` / `mod` sequence avoiding LLVM division-by-zero UB. -/
-def emitDivRem (k : Nat) (isRem : Bool) (a b : Operand) : RegName × Nat × List LLVMInstr :=
+/-- Guarded unsigned `div` / `mod` sequence (width `w`) avoiding LLVM division-by-zero UB. -/
+def emitDivRem (k : Nat) (isRem : Bool) (a b : Operand) (w : IntWidth := .i64) : RegName × Nat × List LLVMInstr :=
   let z := tmpReg k
   let safe := tmpReg (k + 1)
   let raw := tmpReg (k + 2)
   let res := tmpReg (k + 3)
   let divOp : LLVMInstr :=
-    if isRem then .urem raw .i64 a (.reg safe)
-    else .udiv raw false .i64 a (.reg safe)
-  let fallback : Operand := if isRem then a else c64 0
+    if isRem then .urem raw w a (.reg safe)
+    else .udiv raw false w a (.reg safe)
+  let fallback : Operand := if isRem then a else cW w 0
   (res, k + 4,
-    [ .icmp z .eq w64 b (c64 0)
-    , .select safe (.reg z) w64 (c64 1) b
+    [ .icmp z .eq (.int w) b (cW w 0)
+    , .select safe (.reg z) (.int w) (cW w 1) b
     , divOp
-    , .select res (.reg z) w64 fallback (.reg raw) ])
+    , .select res (.reg z) (.int w) fallback (.reg raw) ])
 
-/-- Masked 64-bit shift sequence avoiding LLVM overshift poison (`amt = b & 63`). -/
-def emitShift (k : Nat) (op : BinOp) (a b : Operand) : RegName × Nat × List LLVMInstr :=
+/-- Width-`w` shift of `a` by `amt`: `.shr` → `lshr`, `.sar` → `ashr`, otherwise `shl`. -/
+def shiftInstr (op : BinOp) (res : RegName) (w : IntWidth) (a amt : Operand) : LLVMInstr :=
+  match op with
+  | .shr => .lshr res false w a amt
+  | .sar => .ashr res false w a amt
+  | _    => .shl res .none w a amt
+
+/-- Masked shift sequence avoiding LLVM overshift poison (`amt = b & (w.bits - 1)`). -/
+def emitShift (k : Nat) (op : BinOp) (a b : Operand) (w : IntWidth := .i64) : RegName × Nat × List LLVMInstr :=
   let amt := tmpReg k
   let res := tmpReg (k + 1)
-  let shInstr : LLVMInstr :=
-    match op with
-    | .shr => .lshr res false .i64 a (.reg amt)
-    | .sar => .ashr res false .i64 a (.reg amt)
-    | _    => .shl res .none .i64 a (.reg amt)
-  (res, k + 2, [.and_ amt .i64 b (c64 63), shInstr])
+  (res, k + 2, [.and_ amt w b (cW w (w.bits - 1)), shiftInstr op res w a (.reg amt)])
 
-/-- `icmp` followed by `zext i1 -> i64` producing a `{0, 1}` 64-bit word. -/
-def emitCmp (k : Nat) (pred : ICmpPred) (a b : Operand) : RegName × Nat × List LLVMInstr :=
+/-- `icmp` followed by `zext i1 -> iw` producing a `{0, 1}` word. -/
+def emitCmp (k : Nat) (pred : ICmpPred) (a b : Operand) (w : IntWidth := .i64) : RegName × Nat × List LLVMInstr :=
   let bit := tmpReg k
   let res := tmpReg (k + 1)
-  (res, k + 2, [.icmp bit pred w64 a b, .zext res .i1 (.reg bit) .i64])
+  (res, k + 2, [.icmp bit pred (.int w) a b, .zext res .i1 (.reg bit) w])
 
 /-- Lowered scalar expression output: inferred type, result register, updated temp
 counter, and straight-line `LLVMAst` instruction list. -/
