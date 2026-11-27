@@ -116,7 +116,7 @@ pub(crate) const PINNED_FFI_PACKAGES: &[PinnedFfiPackage] = &[
     },
 ];
 
-pub(crate) fn pinned_ffi_allow_args(
+pub(crate) fn hardcoded_pinned_ffi_allow_args(
     cfg: &crate::module_builder::ProjectConfig,
     mod_names: &[String],
 ) -> Vec<String> {
@@ -170,6 +170,14 @@ pub(crate) fn pinned_ffi_allow_args(
             out.push(format!("--ffi-allow={}={}={}", pin.module, decl, sym));
         }
     }
+    out
+}
+
+pub(crate) fn pinned_ffi_allow_args(
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+) -> Vec<String> {
+    let mut out = hardcoded_pinned_ffi_allow_args(cfg, mod_names);
     out.extend(project_ffi_allow_args(mod_names));
     out
 }
@@ -471,6 +479,113 @@ pub(crate) fn record_snapshot_modules_in_store(
     Ok(())
 }
 
+/// Allowlist override env vars honored by `ZygoteWorker.lean` / host audit helpers.
+/// `audit-spec --kernel` strips every one before spawning the kernel reader so caller-exported
+/// environment variables can never weaken the kernel witness.
+const KERNEL_AUDIT_CLEARED_ALLOW_ENVS: &[&str] = &[
+    "TURBO_LEAN_ALLOWED_AXIOMS",
+    "TURBO_LEAN_ALLOWED_AXIOMS_FROM_CONFIG",
+    "TURBO_LEAN_ALLOWED_UNSAFE",
+    "TURBO_LEAN_ALLOWED_UNSAFE_FROM_CONFIG",
+    "TURBO_LEAN_ALLOWED_CSIMP",
+    "TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG",
+    "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY",
+    "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY_FROM_CONFIG",
+    "TURBO_LEAN_ALLOWED_FFI",
+    "TURBO_LEAN_ALLOWED_FFI_FROM_CONFIG",
+];
+
+/// Strictly validate a single-module `--audit-modules` subprocess reply for `audit-spec --kernel`.
+/// Enforces the same fail-closed invariants as `parse_audit_modules_reply`: rejects empty/multi-line
+/// or non-JSON stdout, missing/multiple/mismatched `audited` entries, `used_sorry` or non-empty
+/// `sorry_decls`, `ok: true` with non-empty `violations` or non-zero exit, and exit 0 with
+/// `ok: false` or violations. A legitimate kernel rejection (non-zero exit, `ok: false`, exact
+/// matching `audited`, no `sorry` fields) returns `Ok(reply)` with `reply.ok == false` so the
+/// caller can surface `kernel_violations`.
+pub(crate) fn parse_module_kernel_audit_reply(
+    out: &std::process::Output,
+    mod_name: &str,
+) -> Result<ZygoteAuditModulesReply> {
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    let non_empty_lines: Vec<&str> = stdout_str
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if non_empty_lines.len() != 1 {
+        anyhow::bail!(
+            "In-kernel `.olean` auditor produced {} non-empty stdout lines (expected exactly 1 JSON object, exit={}):\nstdout: {}\nstderr: {}",
+            non_empty_lines.len(),
+            out.status,
+            stdout_str.trim(),
+            stderr_str.trim()
+        );
+    }
+    let json_line = non_empty_lines[0];
+    if !(json_line.starts_with('{') && json_line.ends_with('}')) {
+        anyhow::bail!(
+            "In-kernel `.olean` auditor stdout is not a JSON object (exit={}):\nstdout: {}\nstderr: {}",
+            out.status,
+            stdout_str.trim(),
+            stderr_str.trim()
+        );
+    }
+    let mut reply: ZygoteAuditModulesReply = serde_json::from_str(json_line).map_err(|e| {
+        anyhow::anyhow!(
+            "In-kernel `.olean` auditor gave no verdict (exit={}, {e}):\nstdout: {}\nstderr: {}",
+            out.status,
+            stdout_str.trim(),
+            stderr_str.trim()
+        )
+    })?;
+    let expected = [mod_name.to_string()];
+    if reply.audited.as_deref() != Some(&expected[..]) {
+        anyhow::bail!(
+            "In-kernel `.olean` auditor `audited` list {:?} did not match requested `{mod_name}` (exit={}):\nstdout: {}\nstderr: {}",
+            reply.audited,
+            out.status,
+            stdout_str.trim(),
+            stderr_str.trim()
+        );
+    }
+    if reply.used_sorry || !reply.sorry_decls.is_empty() {
+        anyhow::bail!(
+            "In-kernel `.olean` auditor reported `sorry` usage for `{mod_name}` (used_sorry={}, sorry_decls={:?}, exit={}): fail-closed",
+            reply.used_sorry,
+            reply.sorry_decls,
+            out.status
+        );
+    }
+    if reply.ok && !reply.violations.is_empty() {
+        anyhow::bail!(
+            "In-kernel `.olean` auditor returned contradictory `ok: true` with {} violation(s) for `{mod_name}` (exit={}): fail-closed",
+            reply.violations.len(),
+            out.status
+        );
+    }
+    if reply.ok && !out.status.success() {
+        anyhow::bail!(
+            "In-kernel `.olean` auditor returned `ok: true` with non-zero exit status ({}) for `{mod_name}`: fail-closed",
+            out.status
+        );
+    }
+    if out.status.success() && (!reply.ok || !reply.violations.is_empty()) {
+        anyhow::bail!(
+            "In-kernel `.olean` auditor exited 0 with rejected verdict for `{mod_name}` (ok={}, violations={}): fail-closed",
+            reply.ok,
+            reply.violations.len()
+        );
+    }
+    if !reply.ok && reply.violations.is_empty() {
+        reply.violations.push(format!(
+            "[TurboLean.KernelGate] auditor rejected `{mod_name}` without a violation (exit={})",
+            out.status
+        ));
+    }
+    Ok(reply)
+}
+
 /// Read-only kernel audit for `audit-spec --kernel`: replay `mod_name` from a sealed `.olean`
 /// closure snapshot through `--audit-modules` and return the auditor's verdict, including its
 /// violations, without failing on them. `Err` means the reader itself could not run or answer.
@@ -490,8 +605,16 @@ pub(crate) fn read_module_kernel_audit_reply(
     let pinned_fd = snapshot_pinned_dir_raw_fd(&snap);
     let lp = snapshot_parent_search_path(&snap).unwrap_or(snap_lp);
     let (mut cmd, timeout) = kernel_reader_command(&store.root, cfg, &lp, &[], false)?;
+    for key in KERNEL_AUDIT_CLEARED_ALLOW_ENVS {
+        cmd.env_remove(key);
+    }
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("TURBO_LEAN_ALLOWED_") {
+            cmd.env_remove(k);
+        }
+    }
     cmd.arg("--audit-modules");
-    for a in pinned_ffi_allow_args(cfg, &mod_names) {
+    for a in hardcoded_pinned_ffi_allow_args(cfg, &mod_names) {
         cmd.arg(a);
     }
     cmd.arg(mod_name);
@@ -500,31 +623,7 @@ pub(crate) fn read_module_kernel_audit_reply(
     )
     .context("Failed to execute in-kernel `.olean` auditor (`--audit-modules`)")?;
     ensure_live_closure_matches_snapshot(&snap, "audit_spec_kernel_after")?;
-    let stdout_str = String::from_utf8_lossy(&out.stdout);
-    let json_line = stdout_str
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|l| l.starts_with('{') && l.ends_with('}'))
-        .unwrap_or("");
-    let mut reply: ZygoteAuditModulesReply = serde_json::from_str(json_line).map_err(|e| {
-        anyhow::anyhow!(
-            "In-kernel `.olean` auditor gave no verdict (exit={}, {e}):\nstdout: {}\nstderr: {}",
-            out.status,
-            stdout_str.trim(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )
-    })?;
-    if !out.status.success() && reply.ok {
-        reply.ok = false;
-    }
-    if !reply.ok && reply.violations.is_empty() {
-        reply.violations.push(format!(
-            "[TurboLean.KernelGate] auditor rejected `{mod_name}` without a violation (exit={})",
-            out.status
-        ));
-    }
-    Ok(reply)
+    parse_module_kernel_audit_reply(&out, mod_name)
 }
 
 pub(crate) fn audit_compiled_modules_with_zygote(
@@ -2210,4 +2309,117 @@ pub(crate) fn audit_compiled_shard_module_with_zygote(
         verify_attested_decl_types(&parsed_reply.decl_types.unwrap_or_default(), expected_types)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod module_kernel_audit_reply_tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+
+    #[cfg(unix)]
+    fn make_output(code: i32, stdout: &str) -> std::process::Output {
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_module_kernel_audit_reply_accepts_clean_pass_and_normal_rejection() {
+        let ok_out = make_output(
+            0,
+            r#"{"ok":true,"audited":["App.Main"],"violations":[]}"#,
+        );
+        let reply = parse_module_kernel_audit_reply(&ok_out, "App.Main").unwrap();
+        assert!(reply.ok);
+        assert!(reply.violations.is_empty());
+        assert_eq!(reply.audited.as_deref(), Some(&["App.Main".to_string()][..]));
+
+        let rej_out = make_output(
+            1,
+            r#"{"ok":false,"audited":["App.Sneaky"],"violations":["[TurboLean.KernelGate] custom axiom `a`"]}"#,
+        );
+        let rej = parse_module_kernel_audit_reply(&rej_out, "App.Sneaky").unwrap();
+        assert!(!rej.ok);
+        assert_eq!(rej.violations.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_module_kernel_audit_reply_rejects_contradictory_sorry_mismatched_and_ambiguous_replies()
+    {
+        let bad_cases = [
+            (
+                "ok:true with non-empty violations (exit 0)",
+                0,
+                r#"{"ok":true,"audited":["App.Main"],"violations":["[TurboLean.KernelGate] custom axiom `a`"]}"#,
+            ),
+            (
+                "ok:true with non-empty violations (exit 1)",
+                1,
+                r#"{"ok":true,"audited":["App.Main"],"violations":["[TurboLean.KernelGate] custom axiom `a`"]}"#,
+            ),
+            (
+                "used_sorry:true with ok:true",
+                0,
+                r#"{"ok":true,"audited":["App.Main"],"violations":[],"used_sorry":true}"#,
+            ),
+            (
+                "non-empty sorry_decls with ok:true and used_sorry:false",
+                0,
+                r#"{"ok":true,"audited":["App.Main"],"violations":[],"used_sorry":false,"sorry_decls":["App.Main.t"]}"#,
+            ),
+            (
+                "mismatched audited module name",
+                0,
+                r#"{"ok":true,"audited":["App.Other"],"violations":[]}"#,
+            ),
+            (
+                "multiple audited entries including target",
+                0,
+                r#"{"ok":true,"audited":["App.Main","App.Other"],"violations":[]}"#,
+            ),
+            (
+                "duplicate audited entries",
+                0,
+                r#"{"ok":true,"audited":["App.Main","App.Main"],"violations":[]}"#,
+            ),
+            (
+                "missing audited field",
+                0,
+                r#"{"ok":true,"violations":[]}"#,
+            ),
+            (
+                "trailing non-JSON output",
+                0,
+                "{\"ok\":true,\"audited\":[\"App.Main\"],\"violations\":[]}\ntrailing noise\n",
+            ),
+            (
+                "leading extra line before JSON",
+                0,
+                "{\"ok\":false,\"audited\":[\"App.Main\"],\"violations\":[\"bad\"]}\n{\"ok\":true,\"audited\":[\"App.Main\"],\"violations\":[]}\n",
+            ),
+            (
+                "exit 0 with ok:false",
+                0,
+                r#"{"ok":false,"audited":["App.Main"],"violations":["[TurboLean.KernelGate] bad"]}"#,
+            ),
+            (
+                "exit 1 with ok:true",
+                1,
+                r#"{"ok":true,"audited":["App.Main"],"violations":[]}"#,
+            ),
+        ];
+        for (label, code, stdout) in bad_cases {
+            let out = make_output(code, stdout);
+            let res = parse_module_kernel_audit_reply(&out, "App.Main");
+            assert!(
+                res.is_err(),
+                "expected fail-closed Err for `{label}`, got {res:?}"
+            );
+        }
+    }
 }

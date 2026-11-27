@@ -4014,6 +4014,37 @@ impl KernelAuditOutcome {
         }
     }
 
+    fn apply_reply(&mut self, mod_name: &str, reply: crate::zygote::ZygoteAuditModulesReply) {
+        let exact_audited =
+            reply.audited.as_deref() == Some(std::slice::from_ref(&mod_name.to_string()));
+        let has_sorry = reply.used_sorry || !reply.sorry_decls.is_empty();
+        self.audited_modules = u32::from(exact_audited);
+        self.violations = reply.violations;
+        if has_sorry {
+            let detail = if reply.sorry_decls.is_empty() {
+                format!("[TurboLean.KernelGate] auditor reported `sorry` usage for `{mod_name}`")
+            } else {
+                format!(
+                    "[TurboLean.KernelGate] auditor reported `sorry` declarations for `{mod_name}`: {}",
+                    reply.sorry_decls.join(", ")
+                )
+            };
+            self.violations.push(detail);
+        }
+        if !exact_audited {
+            self.error = Some(format!(
+                "auditor `audited` list {:?} did not match requested `{mod_name}`",
+                reply.audited
+            ));
+        } else if reply.ok && !self.violations.is_empty() {
+            self.error = Some(format!(
+                "auditor returned contradictory `ok: true` with {} violation(s) for `{mod_name}`",
+                self.violations.len()
+            ));
+        }
+        self.reader_ok = reply.ok && exact_audited && !has_sorry && self.violations.is_empty();
+    }
+
     fn admitted(&self) -> bool {
         crate::c_abi::verify_kernel_audit_admission(
             self.state,
@@ -4130,16 +4161,7 @@ fn kernel_audit_compiled_file(file: &Path) -> KernelAuditOutcome {
         &spec.module_name,
         &lean_path_env,
     ) {
-        Ok(reply) => {
-            out.reader_ok = reply.ok;
-            out.audited_modules = reply
-                .audited
-                .as_deref()
-                .map_or(0, |a| a.iter().filter(|m| **m == spec.module_name).count())
-                .try_into()
-                .unwrap_or(u32::MAX);
-            out.violations = reply.violations;
-        }
+        Ok(reply) => out.apply_reply(&spec.module_name, reply),
         Err(e) => out.error = Some(format!("{e:#}")),
     }
     out
@@ -5106,6 +5128,108 @@ mod kernel_audit_tests {
         assert!(raw.into_policy_config().unwrap().kernel);
         assert!(toml::from_str::<RawAuditSpecSection>("kernal = true").is_err());
         assert!(!AuditSpecPolicyConfig::default().kernel);
+    }
+
+    #[test]
+    fn kernel_audit_apply_reply_rejects_violations_sorry_and_mismatched_audited() {
+        let fresh_outcome = || KernelAuditOutcome {
+            module: Some("App.Main".into()),
+            olean: None,
+            state: S::Fresh,
+            reader_ok: false,
+            audited_modules: 0,
+            violations: Vec::new(),
+            error: None,
+        };
+
+        // Positive control: clean exact reply admits.
+        let mut clean = fresh_outcome();
+        clean.apply_reply(
+            "App.Main",
+            crate::zygote::ZygoteAuditModulesReply {
+                ok: true,
+                audited: Some(vec!["App.Main".into()]),
+                ..Default::default()
+            },
+        );
+        let mut rep = serde_json::json!({"ok": true});
+        clean.attach(&mut rep);
+        assert_eq!(rep["ok"], true);
+        assert_eq!(rep["kernel_audit"]["admitted"], true);
+
+        // Negative controls: `ok: true` with violations, `used_sorry`, `sorry_decls`,
+        // or missing/mismatched/extra `audited` entries must ALL fail closed.
+        let bad_replies = [
+            (
+                "ok:true with non-empty violations",
+                crate::zygote::ZygoteAuditModulesReply {
+                    ok: true,
+                    audited: Some(vec!["App.Main".into()]),
+                    violations: vec!["[TurboLean.KernelGate] custom axiom `a`".into()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "used_sorry:true with ok:true",
+                crate::zygote::ZygoteAuditModulesReply {
+                    ok: true,
+                    audited: Some(vec!["App.Main".into()]),
+                    used_sorry: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "non-empty sorry_decls with ok:true",
+                crate::zygote::ZygoteAuditModulesReply {
+                    ok: true,
+                    audited: Some(vec!["App.Main".into()]),
+                    sorry_decls: vec!["App.Main.t".into()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "mismatched audited module name",
+                crate::zygote::ZygoteAuditModulesReply {
+                    ok: true,
+                    audited: Some(vec!["App.Other".into()]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "extra audited entry alongside requested module",
+                crate::zygote::ZygoteAuditModulesReply {
+                    ok: true,
+                    audited: Some(vec!["App.Main".into(), "App.Other".into()]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "duplicate audited entries",
+                crate::zygote::ZygoteAuditModulesReply {
+                    ok: true,
+                    audited: Some(vec!["App.Main".into(), "App.Main".into()]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "missing audited field",
+                crate::zygote::ZygoteAuditModulesReply {
+                    ok: true,
+                    audited: None,
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (label, reply) in bad_replies {
+            let mut o = fresh_outcome();
+            o.apply_reply("App.Main", reply);
+            let mut rep = serde_json::json!({"ok": true});
+            o.attach(&mut rep);
+            assert!(!o.reader_ok, "{label}: reader_ok must be false");
+            assert_eq!(rep["ok"], false, "{label}: {rep}");
+            assert_eq!(rep["kernel_audit"]["admitted"], false, "{label}: {rep}");
+        }
     }
 }
 

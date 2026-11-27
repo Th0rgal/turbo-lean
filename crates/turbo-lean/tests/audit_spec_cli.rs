@@ -1964,3 +1964,80 @@ fn kernel_mode_fails_closed_outside_a_lake_project() {
         Some("missing")
     );
 }
+
+#[test]
+fn kernel_mode_ignores_caller_allowlist_env_vars() {
+    if !lake_available() {
+        eprintln!("skipping kernel_mode_ignores_caller_allowlist_env_vars: `lake` not on PATH");
+        return;
+    }
+    let fx = AuditSpecFixture::new("kernel_env_override");
+    fx.write("lean-toolchain", "leanprover/lean4:v4.35.0\n");
+    fx.write(
+        "lakefile.toml",
+        "name = \"env_pkg\"\ndefaultTargets = [\"EnvApp\"]\n[[lean_lib]]\nname = \"EnvApp\"\nroots = [\"EnvApp.Bypass\"]\n",
+    );
+    let bypass_src = r#"
+macro "use_sorry_ax" : tactic => `(tactic| exact sorryAx _ false)
+
+axiom custom_env_ax : ∀ n : Nat, n + 1 > n
+
+unsafe def badUnsafe (n : Nat) : Nat := n + 1
+
+def slowFn (n : Nat) : Nat := n + 1
+def fastFn (n : Nat) : Nat := n
+attribute [implemented_by fastFn] slowFn
+
+@[extern "fake_env_c_sym"]
+opaque fakeExtern (n : Nat) : Nat
+
+theorem thm_sorry (n : Nat) : n + 1 > n := by use_sorry_ax
+theorem thm_ax (n : Nat) : n + 1 > n := custom_env_ax n
+"#;
+    fx.write("EnvApp/Bypass.lean", bypass_src);
+    let built = Command::new("lake")
+        .arg("build")
+        .env("LEAN_NUM_THREADS", "2")
+        .current_dir(&fx.root)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "lake build failed:\n{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let out = fx
+        .cli("kernel-env")
+        .env("TURBO_LEAN_ALLOWED_AXIOMS", "*")
+        .env("TURBO_LEAN_ALLOWED_UNSAFE", "*")
+        .env("TURBO_LEAN_ALLOWED_CSIMP", "*")
+        .env("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY", "*")
+        .env("TURBO_LEAN_ALLOWED_FFI", "EnvApp.Bypass=fakeExtern=fake_env_c_sym")
+        .args(["--json", "audit-spec", "--kernel"])
+        .arg(fx.root.join("EnvApp/Bypass.lean"))
+        .output()
+        .unwrap();
+    let json = assert_cli_fail_json(&out, "kernel with allowlist env vars set");
+    assert_eq!(json["kernel_audit"]["olean_state"].as_str(), Some("fresh"), "{json}");
+    assert_eq!(json["kernel_audit"]["admitted"].as_bool(), Some(false), "{json}");
+    let violations: Vec<String> = json["kernel_violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    for needle in [
+        "disallowed axiom `sorryAx`",
+        "custom axiom `custom_env_ax`",
+        "unsafe declaration `badUnsafe`",
+        "implemented_by bypass on `slowFn`",
+        "extern/implemented_by bypass on `fakeExtern`",
+    ] {
+        assert!(
+            violations.iter().any(|v| v.contains(needle)),
+            "expected kernel violation `{needle}` even with TURBO_LEAN_ALLOWED_* env vars set; got: {violations:?}"
+        );
+    }
+}
