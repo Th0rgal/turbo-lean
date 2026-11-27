@@ -1774,12 +1774,17 @@ pub fn read_project_peak_rss_mb(project_dir: &Path) -> Option<u64> {
     (mb > 0).then_some(mb)
 }
 
-/// Best-effort atomic persistence of observed peak RSS (KiB) for `project_dir` under `cache_root()`.
+/// Best-effort atomic persistence of the high-water peak RSS (KiB) for `project_dir` under
+/// `cache_root()`: a smaller (e.g. cache-hit) run never lowers a previously recorded peak.
 pub fn record_project_peak_rss_kib(project_dir: &Path, peak_rss_kib: u64) {
-    if peak_rss_kib == 0 {
+    let path = project_peak_rss_cache_path(project_dir);
+    let existing = fs::read(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<PersistedPeakRss>(&raw).ok())
+        .map_or(0, |rec| rec.peak_rss_kib);
+    if peak_rss_kib <= existing {
         return;
     }
-    let path = project_peak_rss_cache_path(project_dir);
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -1788,17 +1793,19 @@ pub fn record_project_peak_rss_kib(project_dir: &Path, peak_rss_kib: u64) {
     }
 }
 
-/// Resolve the live historical peak RSS in MiB for pre-flight checking, in priority order:
-/// 1. `TURBO_LEAN_HISTORICAL_PEAK_RSS_MB` env var (explicit override)
-/// 2. Existing JSON receipt at `receipt_path` (`peak_rss_kib / 1024`)
-/// 3. Persisted per-project peak RSS under `cache_root()/peak_rss/`
+/// Resolve the live historical peak RSS in MiB for pre-flight checking: the explicit
+/// `TURBO_LEAN_HISTORICAL_PEAK_RSS_MB` override, else the larger of the prior JSON receipt at
+/// `receipt_path` (rewritten every run, so it may hold a small cache-hit peak) and the persisted
+/// per-project high-water mark under `cache_root()/peak_rss/`.
 pub fn resolve_historical_peak_rss_mb(
     project_dir: Option<&Path>,
     receipt_path: Option<&Path>,
 ) -> Option<u64> {
-    historical_peak_rss_mb_from_env()
-        .or_else(|| receipt_path.and_then(read_receipt_peak_rss_mb))
-        .or_else(|| project_dir.and_then(read_project_peak_rss_mb))
+    historical_peak_rss_mb_from_env().or_else(|| {
+        receipt_path
+            .and_then(read_receipt_peak_rss_mb)
+            .max(project_dir.and_then(read_project_peak_rss_mb))
+    })
 }
 
 /// Live pre-flight guard: `TURBO_LEAN_MAX_MEMORY_MB` (`--max-memory-mb`) and the optional
@@ -1824,8 +1831,15 @@ pub fn preflight_memory_guard_live(
     )
 }
 
-static LAST_FAILED_CHILD_STATUS: std::sync::Mutex<Option<std::process::ExitStatus>> =
-    std::sync::Mutex::new(None);
+/// Outstanding (not yet recovered) failed child `ExitStatus`es of this invocation.
+static FAILED_CHILD_STATUSES: std::sync::Mutex<Vec<std::process::ExitStatus>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn failed_child_statuses() -> std::sync::MutexGuard<'static, Vec<std::process::ExitStatus>> {
+    FAILED_CHILD_STATUSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 fn child_status_severity(status: &std::process::ExitStatus) -> u8 {
     if status.success() {
@@ -1849,38 +1863,33 @@ fn child_status_severity(status: &std::process::ExitStatus) -> u8 {
 }
 
 /// Record a failed child's `ExitStatus` for parent invocation receipt emission.
-/// `SIGKILL` / exit `137` take highest priority, followed by other signals, then non-zero exit
-/// codes, so a subsequent generic error never hides an OOM kill.
 pub fn record_child_exit_status(status: std::process::ExitStatus) {
-    let new_sev = child_status_severity(&status);
-    if new_sev == 0 {
-        return;
-    }
-    let mut guard = LAST_FAILED_CHILD_STATUS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let replace = match guard.as_ref() {
-        None => true,
-        Some(prev) => new_sev >= child_status_severity(prev),
-    };
-    if replace {
-        *guard = Some(status);
+    if child_status_severity(&status) > 0 {
+        failed_child_statuses().push(status);
     }
 }
 
-/// Take the highest-severity failed child `ExitStatus` recorded during this invocation.
+/// Withdraw one recorded failure equal to `status` once the caller has recovered from it (worker
+/// respawn + replay, closure-to-single-module fallback, audit bisection), so a recovered
+/// `SIGKILL` never bleeds into the receipt or exit code of an unrelated later failure.
+pub fn forgive_child_exit_status(status: &std::process::ExitStatus) {
+    let mut guard = failed_child_statuses();
+    if let Some(i) = guard.iter().rposition(|s| s == status) {
+        guard.remove(i);
+    }
+}
+
+/// Take the highest-severity outstanding failed child `ExitStatus` (`SIGKILL` / exit `137`, then
+/// other signals, then non-zero exits; latest wins ties) and clear the ledger.
 pub fn take_recorded_child_exit_status() -> Option<std::process::ExitStatus> {
-    LAST_FAILED_CHILD_STATUS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
+    std::mem::take(&mut *failed_child_statuses())
+        .into_iter()
+        .max_by_key(child_status_severity)
 }
 
 /// Clear any recorded child `ExitStatus` (called at invocation startup and in tests).
 pub fn reset_recorded_child_exit_status() {
-    *LAST_FAILED_CHILD_STATUS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = None;
+    failed_child_statuses().clear();
 }
 
 /// Structured JSON build / OOM receipt, emitted for every child invocation including children
@@ -3589,6 +3598,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_build_receipt_oom_kill_delta_marks_oom() {
         use std::os::unix::process::ExitStatusExt;
@@ -3762,13 +3772,37 @@ mod tests {
         assert!(err.contains("28467"), "{err}");
         assert!(err.contains("8192"), "{err}");
 
-        // Prior receipt takes precedence over project cache.
+        // A later small (cache-hit) run never lowers the recorded high-water peak.
+        record_project_peak_rss_kib(&project, 200 * 1024);
+        assert_eq!(read_project_peak_rss_mb(&project), Some(28_467));
+        record_project_peak_rss_kib(&project, 0);
+        assert_eq!(read_project_peak_rss_mb(&project), Some(28_467));
+        // A larger run raises it.
+        record_project_peak_rss_kib(&project, 30_000 * 1024);
+        assert_eq!(read_project_peak_rss_mb(&project), Some(30_000));
+
+        // A prior receipt rewritten by a small cache-hit run cannot hide the project peak.
+        write_build_receipt_atomic(
+            &receipt_path,
+            &BuildReceipt {
+                exit_code: Some(0),
+                peak_rss_kib: Some(200 * 1024),
+                ..BuildReceipt::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_historical_peak_rss_mb(Some(&project), Some(&receipt_path)),
+            Some(30_000)
+        );
+
+        // A prior receipt with a larger peak (e.g. from another host's cache) wins.
         write_build_receipt_atomic(
             &receipt_path,
             &BuildReceipt {
                 exit_code: Some(137),
                 signal: None,
-                peak_rss_kib: Some(16_384 * 1024),
+                peak_rss_kib: Some(40_000 * 1024),
                 cgroup_oom_kill: Some(1),
                 elapsed_s: 12.0,
                 olean_sha256: None,
@@ -3778,7 +3812,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             resolve_historical_peak_rss_mb(Some(&project), Some(&receipt_path)),
-            Some(16_384)
+            Some(40_000)
         );
 
         // Explicit env override takes highest precedence.
@@ -3867,6 +3901,69 @@ mod tests {
         assert_eq!(r_ok.exit_code, Some(0));
         assert_eq!(r_ok.signal, None);
         assert!(!r_ok.oom_suspected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_recovered_child_sigkill_does_not_bleed_into_later_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_recorded_child_exit_status();
+        let sigkill = std::process::ExitStatus::from_raw(libc::SIGKILL);
+        let exit1 = std::process::ExitStatus::from_raw(1 << 8);
+
+        // A worker is SIGKILLed, respawned and the retry succeeds: the crash is withdrawn.
+        record_child_exit_status(sigkill);
+        forgive_child_exit_status(&sigkill);
+        // Later, an unrelated ordinary elaboration failure terminates the invocation.
+        record_child_exit_status(exit1);
+        let recorded = take_recorded_child_exit_status().expect("exit 1 recorded");
+        assert_eq!(recorded.code(), Some(1));
+        let r = BuildReceipt::for_invocation(
+            false,
+            None,
+            Some(&recorded),
+            None,
+            std::time::Duration::from_millis(10),
+            None,
+            Some(0),
+            None,
+        );
+        assert_eq!(r.exit_code, Some(1));
+        assert_eq!(r.signal, None);
+        assert!(
+            !r.oom_suspected,
+            "a recovered SIGKILL must not mark a later failure as OOM"
+        );
+
+        // Only the recovered instance is withdrawn: an unrecovered second SIGKILL still wins.
+        record_child_exit_status(sigkill);
+        record_child_exit_status(sigkill);
+        forgive_child_exit_status(&sigkill);
+        record_child_exit_status(exit1);
+        assert_eq!(
+            take_recorded_child_exit_status().and_then(|s| s.signal()),
+            Some(libc::SIGKILL)
+        );
+        // `take` drains the ledger; forgiving an unknown status is a no-op.
+        forgive_child_exit_status(&exit1);
+        assert_eq!(take_recorded_child_exit_status(), None);
+
+        // A failure with no recorded child (pure elaboration error) is a plain exit 1.
+        let r = BuildReceipt::for_invocation(
+            false,
+            None,
+            None,
+            None,
+            std::time::Duration::from_millis(10),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(r.exit_code, Some(1));
+        assert!(!r.oom_suspected);
     }
 
     #[test]

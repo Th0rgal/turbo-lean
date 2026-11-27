@@ -498,6 +498,7 @@ impl StderrScan {
 #[derive(Debug, Clone, Default)]
 pub(super) struct WorkerCrashDiagnostics {
     pub(super) message: String,
+    pub(super) status: Option<std::process::ExitStatus>,
     pub(super) exit_code: Option<i32>,
     pub(super) exit_signal: Option<i32>,
     pub(super) stderr_tail: String,
@@ -884,7 +885,9 @@ pub(super) fn mark_runtime_panic(rep: &mut ZygoteEvalReply, stderr_panic: bool) 
     true
 }
 
-pub(super) fn collect_worker_exit_status(child: &mut std::process::Child) -> (Option<i32>, Option<i32>) {
+pub(super) fn collect_worker_exit_status(
+    child: &mut std::process::Child,
+) -> Option<std::process::ExitStatus> {
     let mut status_opt = child.try_wait().ok().flatten();
     if status_opt.is_none() {
         for _ in 0..10 {
@@ -895,21 +898,18 @@ pub(super) fn collect_worker_exit_status(child: &mut std::process::Child) -> (Op
             }
         }
     }
-    let Some(st) = status_opt else {
-        return (None, None);
-    };
-    if !st.success() {
-        crate::shm_cache::record_child_exit_status(st);
+    let st = status_opt?;
+    crate::shm_cache::record_child_exit_status(st);
+    Some(st)
+}
+
+impl WorkerCrashDiagnostics {
+    /// The crash was recovered (respawned worker answered): withdraw its recorded exit status.
+    pub(super) fn forgive(&self) {
+        if let Some(st) = self.status.as_ref() {
+            crate::shm_cache::forgive_child_exit_status(st);
+        }
     }
-    let code = st.code();
-    #[cfg(unix)]
-    let sig = {
-        use std::os::unix::process::ExitStatusExt;
-        st.signal()
-    };
-    #[cfg(not(unix))]
-    let sig: Option<i32> = None;
-    (code, sig)
 }
 
 pub(super) fn snapshot_worker_stderr_tail(buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> String {
@@ -925,7 +925,15 @@ pub(super) fn build_worker_crash_diagnostics(
     peak_rss_mb: u64,
     last_request: &str,
 ) -> WorkerCrashDiagnostics {
-    let (exit_code, exit_signal) = worker.child.as_mut().map(collect_worker_exit_status).unwrap_or((None, None));
+    let status = worker.child.as_mut().and_then(collect_worker_exit_status);
+    let exit_code = status.and_then(|st| st.code());
+    #[cfg(unix)]
+    let exit_signal = {
+        use std::os::unix::process::ExitStatusExt;
+        status.and_then(|st| st.signal())
+    };
+    #[cfg(not(unix))]
+    let exit_signal: Option<i32> = None;
     let stderr_tail = snapshot_worker_stderr_tail(&worker.stderr_tail);
     let mut details: Vec<String> = Vec::new();
     if let Some(code) = exit_code {
@@ -951,6 +959,7 @@ pub(super) fn build_worker_crash_diagnostics(
     }
     WorkerCrashDiagnostics {
         message,
+        status,
         exit_code,
         exit_signal,
         stderr_tail,

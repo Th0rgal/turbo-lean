@@ -1467,12 +1467,16 @@ pub(super) fn eval_with_zygote_pool_attempt(
                     .map(|h| {
                         let (mut w, mut res, rl) =
                             h.join().expect("Zygote parallel eval thread panicked");
-                        if matches!(res, WorkerReqOutcome::Crashed(_))
-                            && std::time::Instant::now() < deadline
-                        {
-                            if let Ok(retry) = spawn_zygote_worker() {
-                                w = retry;
-                                res = run_worker_req(&mut w, &rl, req_id_ref);
+                        if let WorkerReqOutcome::Crashed(ref first_diag) = res {
+                            if std::time::Instant::now() < deadline {
+                                if let Ok(retry) = spawn_zygote_worker() {
+                                    let first_diag = first_diag.clone();
+                                    w = retry;
+                                    res = run_worker_req(&mut w, &rl, req_id_ref);
+                                    if !matches!(res, WorkerReqOutcome::Crashed(_)) {
+                                        first_diag.forgive();
+                                    }
+                                }
                             }
                         }
                         (w, res)
@@ -1887,6 +1891,9 @@ pub(super) fn eval_with_zygote_pool_attempt(
             }
         }
         outcome = run_worker_req(&mut w, &req_line, &request_identity);
+        if !matches!(outcome, WorkerReqOutcome::Crashed(_)) {
+            first_diag.forgive();
+        }
     }
 
     if std::time::Instant::now() >= deadline {

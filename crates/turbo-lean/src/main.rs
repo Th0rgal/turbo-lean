@@ -631,21 +631,23 @@ fn main() -> Result<()> {
     });
     let res = run(cli).map_err(zygote::with_timeout_knob_hint);
     let emitted = finish_invocation_receipt(res.is_ok(), None, None);
-    if let Err(ref err) = res {
-        if let Some(ref receipt) = emitted {
-            #[cfg(unix)]
-            let sigkill_code = (receipt.signal == Some(libc::SIGKILL)
-                || receipt.exit_code == Some(128 + libc::SIGKILL))
-            .then_some(128 + libc::SIGKILL);
-            #[cfg(not(unix))]
-            let sigkill_code = (receipt.exit_code == Some(137)).then_some(137);
-            if let Some(code) = sigkill_code {
-                eprintln!("Error: {err:?}");
-                std::process::exit(code);
-            }
-        }
+    if let (Err(ref err), Some(code)) = (&res, emitted.as_ref().and_then(receipt_sigkill_exit_code))
+    {
+        eprintln!("Error: {err:?}");
+        std::process::exit(code);
     }
     res
+}
+
+/// Exit `137` for a failed invocation whose emitted receipt attributes the terminal failure to an
+/// unrecovered child `SIGKILL` / exit `137` (recovered crashes are withdrawn from the ledger).
+fn receipt_sigkill_exit_code(receipt: &shm_cache::BuildReceipt) -> Option<i32> {
+    #[cfg(unix)]
+    let killed =
+        receipt.signal == Some(libc::SIGKILL) || receipt.exit_code == Some(128 + libc::SIGKILL);
+    #[cfg(not(unix))]
+    let killed = receipt.exit_code == Some(137);
+    killed.then_some(137)
 }
 
 struct InvocationReceiptContext {
@@ -675,9 +677,10 @@ fn mark_invocation_preflight_passed() {
     }
 }
 
-/// `TURBO_LEAN_BUILD_RECEIPT=<path>`: atomically emit a structured JSON receipt for this
-/// invocation using the real child `ExitStatus` (`SIGKILL` / `137` / signal / exit code), peak
-/// RSS, and cgroup `oom_kill` delta, and persist project peak RSS for future pre-flight guards.
+/// Persist this invocation's peak RSS for future pre-flight guards (only once pre-flight passed)
+/// and, under `TURBO_LEAN_BUILD_RECEIPT=<path>`, atomically emit and return a structured JSON
+/// receipt with the real child `ExitStatus` (`SIGKILL` / `137` / signal / exit code), peak RSS,
+/// and cgroup `oom_kill` delta. Returns `None` when no receipt was requested.
 fn finish_invocation_receipt(
     ok: bool,
     fallback_exit_code: Option<i32>,
@@ -700,6 +703,7 @@ fn finish_invocation_receipt(
             shm_cache::record_project_peak_rss_kib(proj, kib);
         }
     }
+    let path = ctx.receipt_path.as_ref()?;
     let cgroup_oom_kill = shm_cache::cgroup_oom_kill_delta(
         ctx.oom_before,
         shm_cache::current_cgroup_oom_kill_count(),
@@ -715,15 +719,58 @@ fn finish_invocation_receipt(
         cgroup_oom_kill,
         olean_path.as_deref(),
     );
-    if let Some(ref path) = ctx.receipt_path {
-        if let Err(e) = shm_cache::write_build_receipt_atomic(path, &receipt) {
-            eprintln!(
-                "[turbo-lean] failed to write build receipt {}: {e}",
-                path.display()
-            );
-        }
+    if let Err(e) = shm_cache::write_build_receipt_atomic(path, &receipt) {
+        eprintln!(
+            "[turbo-lean] failed to write build receipt {}: {e}",
+            path.display()
+        );
     }
     Some(receipt)
+}
+
+#[cfg(all(test, unix))]
+mod invocation_receipt_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn test_sigkill_exit_remap_is_receipt_gated() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ctx = |receipt_path| InvocationReceiptContext {
+            receipt_path,
+            started: std::time::Instant::now(),
+            oom_before: None,
+            project_dir: None,
+            preflight_passed: false,
+        };
+        // No `TURBO_LEAN_BUILD_RECEIPT`: no receipt, so a child SIGKILL never remaps the exit code.
+        shm_cache::reset_recorded_child_exit_status();
+        shm_cache::record_child_exit_status(std::process::ExitStatus::from_raw(libc::SIGKILL));
+        install_invocation_receipt_context(ctx(None));
+        assert!(finish_invocation_receipt(false, None, None).is_none());
+        assert_eq!(
+            shm_cache::take_recorded_child_exit_status(),
+            None,
+            "ledger drained"
+        );
+
+        // With a receipt: an unrecovered SIGKILL exits 137, an ordinary failure does not.
+        let dir = std::env::temp_dir().join(format!("tl-inv-receipt-{}", std::process::id()));
+        let path = dir.join("r.json");
+        shm_cache::record_child_exit_status(std::process::ExitStatus::from_raw(libc::SIGKILL));
+        install_invocation_receipt_context(ctx(Some(path.clone())));
+        let r = finish_invocation_receipt(false, None, None).expect("receipt");
+        assert_eq!(receipt_sigkill_exit_code(&r), Some(137));
+        assert!(path.is_file());
+        shm_cache::record_child_exit_status(std::process::ExitStatus::from_raw(1 << 8));
+        install_invocation_receipt_context(ctx(Some(path.clone())));
+        let r = finish_invocation_receipt(false, None, None).expect("receipt");
+        assert_eq!(receipt_sigkill_exit_code(&r), None);
+        assert_eq!(r.exit_code, Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 fn exit_with_receipt(code: i32, explicit_status: Option<&std::process::ExitStatus>) -> ! {
@@ -762,12 +809,14 @@ fn run(cli: Cli) -> Result<()> {
             .unwrap_or_else(|| format!("turbo-lean {what}"));
         shm_cache::preflight_memory_guard_live(&target_label, historical_peak_mb)?;
         mark_invocation_preflight_passed();
-        let cli_jobs = match &cli.command {
-            Commands::Check { jobs, .. } => *jobs,
-            Commands::SeedOleans { jobs, .. } => Some(*jobs).filter(|&j| j > 0),
-            _ => None,
+        // `check --jobs` is exported command-wide; `seed-oleans --jobs` scopes `TURBO_LEAN_JOBS`
+        // itself and only sizes the memory-bounded replay budget (`TURBO_LEAN_REPLAY_JOBS`).
+        let (export_jobs, budget_jobs) = match &cli.command {
+            Commands::Check { jobs, .. } => (*jobs, None),
+            Commands::SeedOleans { jobs, .. } => (None, Some(*jobs).filter(|&j| j > 0)),
+            _ => (None, None),
         };
-        zygote::export_replay_worker_budget(cli_jobs);
+        zygote::export_replay_worker_budget(export_jobs, budget_jobs);
     }
     if let Commands::Daemon {
         command: DaemonCommands::Stop,

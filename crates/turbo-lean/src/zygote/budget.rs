@@ -398,46 +398,58 @@ pub(crate) fn replay_worker_budget_from(
     }
 }
 
-/// Live replay budget from `TURBO_LEAN_JOBS`, `TURBO_LEAN_MAX_MEMORY_MB` and
+fn positive_env<T: std::str::FromStr + PartialOrd + Default>(key: &str) -> Option<T> {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.trim().parse::<T>().ok())
+        .filter(|v| *v > T::default())
+}
+
+/// Worker count for memory-heavy kernel-replay / audit children: the memory-bounded
+/// `TURBO_LEAN_REPLAY_JOBS` (exported by [`export_replay_worker_budget`]) else `TURBO_LEAN_JOBS`.
+/// The compile scheduler keeps reading `TURBO_LEAN_JOBS` alone, so a replay clamp never
+/// throttles `build` / `seed-oleans` compile parallelism.
+pub(crate) fn replay_jobs_env() -> Option<usize> {
+    positive_env("TURBO_LEAN_REPLAY_JOBS").or_else(|| positive_env("TURBO_LEAN_JOBS"))
+}
+
+/// Live replay budget from `jobs` (else `TURBO_LEAN_JOBS`), `TURBO_LEAN_MAX_MEMORY_MB` and
 /// `TURBO_LEAN_REPLAY_WORKER_RSS_MB`.
-pub(crate) fn replay_worker_budget(is_untrusted: bool) -> ReplayWorkerBudget {
-    let jobs = std::env::var("TURBO_LEAN_JOBS")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0);
-    let max_memory_mb = std::env::var("TURBO_LEAN_MAX_MEMORY_MB")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&mb| mb > 0);
-    let est = std::env::var("TURBO_LEAN_REPLAY_WORKER_RSS_MB")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&mb| mb > 0)
-        .unwrap_or(DEFAULT_REPLAY_WORKER_RSS_MB);
+pub(crate) fn replay_worker_budget_with_jobs(
+    jobs: Option<usize>,
+    is_untrusted: bool,
+) -> ReplayWorkerBudget {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    replay_worker_budget_from(jobs, max_memory_mb, cpus, est, is_untrusted)
+    replay_worker_budget_from(
+        jobs.filter(|&n| n > 0)
+            .or_else(|| positive_env("TURBO_LEAN_JOBS")),
+        positive_env("TURBO_LEAN_MAX_MEMORY_MB"),
+        cpus,
+        positive_env("TURBO_LEAN_REPLAY_WORKER_RSS_MB").unwrap_or(DEFAULT_REPLAY_WORKER_RSS_MB),
+        is_untrusted,
+    )
 }
 
-/// Export the effective `--jobs` / `--max-memory-mb` budget to the environment the kernel-replay
-/// scheduler (`TURBO_LEAN_JOBS`, `TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE`) and the per-worker RSS
-/// governor (`TURBO_LEAN_WORKER_RSS_LIMIT_MB`) read. Explicit user env settings are never
-/// overridden except `TURBO_LEAN_JOBS`, which an explicit `--jobs` replaces. No-op when neither
-/// `--jobs` nor `--max-memory-mb` is in effect.
-pub(crate) fn export_replay_worker_budget(cli_jobs: Option<usize>) {
-    if let Some(jobs) = cli_jobs.filter(|&n| n > 0) {
+/// Export the effective `--jobs` / `--max-memory-mb` budget for kernel replay. `check --jobs`
+/// (`export_jobs`) becomes `TURBO_LEAN_JOBS` for the whole command (#435). Under a memory budget
+/// the clamped replay worker count goes to `TURBO_LEAN_REPLAY_JOBS` only (read via
+/// [`replay_jobs_env`]), and the batch cap / per-worker RSS share to
+/// `TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE` / `TURBO_LEAN_WORKER_RSS_LIMIT_MB`; explicit user values
+/// of those three are never overridden. `budget_jobs` (e.g. `seed-oleans --jobs`, which scopes
+/// `TURBO_LEAN_JOBS` itself) only feeds the replay budget.
+pub(crate) fn export_replay_worker_budget(export_jobs: Option<usize>, budget_jobs: Option<usize>) {
+    if let Some(jobs) = export_jobs.filter(|&n| n > 0) {
         std::env::set_var("TURBO_LEAN_JOBS", jobs.to_string());
     }
-    let has_memory_budget = std::env::var("TURBO_LEAN_MAX_MEMORY_MB")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .is_some_and(|mb| mb > 0);
-    if !has_memory_budget {
+    if positive_env::<u64>("TURBO_LEAN_MAX_MEMORY_MB").is_none() {
         return;
     }
-    let budget = replay_worker_budget(false);
-    std::env::set_var("TURBO_LEAN_JOBS", budget.parallelism.to_string());
+    let budget = replay_worker_budget_with_jobs(export_jobs.or(budget_jobs), false);
+    if std::env::var_os("TURBO_LEAN_REPLAY_JOBS").is_none() {
+        std::env::set_var("TURBO_LEAN_REPLAY_JOBS", budget.parallelism.to_string());
+    }
     if let Some(cap) = budget.batch_cap {
         if std::env::var_os("TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE").is_none() {
             std::env::set_var("TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE", cap.to_string());
@@ -540,34 +552,45 @@ mod tests {
         let _guard = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        const KEYS: [&str; 5] = [
+        const KEYS: [&str; 6] = [
             "TURBO_LEAN_JOBS",
+            "TURBO_LEAN_REPLAY_JOBS",
             "TURBO_LEAN_MAX_MEMORY_MB",
             "TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE",
             "TURBO_LEAN_WORKER_RSS_LIMIT_MB",
             "TURBO_LEAN_REPLAY_WORKER_RSS_MB",
         ];
         let prev: Vec<_> = KEYS.iter().map(|k| (*k, std::env::var_os(k))).collect();
-        for k in KEYS {
-            std::env::remove_var(k);
-        }
+        let clear = || {
+            for k in KEYS {
+                std::env::remove_var(k);
+            }
+        };
+        clear();
 
         // Neither flag: untouched.
-        export_replay_worker_budget(None);
+        export_replay_worker_budget(None, None);
         for k in KEYS {
             assert!(std::env::var_os(k).is_none(), "{k} must stay unset");
         }
 
-        // `--jobs 1`.
-        export_replay_worker_budget(Some(1));
+        // `check --jobs 1` is exported command-wide and reaches replay (#435).
+        export_replay_worker_budget(Some(1), None);
         assert_eq!(std::env::var("TURBO_LEAN_JOBS").as_deref(), Ok("1"));
-        assert_eq!(replay_worker_budget(false).parallelism, 1);
-        std::env::remove_var("TURBO_LEAN_JOBS");
+        assert_eq!(replay_jobs_env(), Some(1));
+        assert_eq!(replay_worker_budget_with_jobs(None, false).parallelism, 1);
+        assert!(std::env::var_os("TURBO_LEAN_REPLAY_JOBS").is_none());
+        clear();
 
-        // `--max-memory-mb 4000` alone.
+        // `--max-memory-mb 4000` alone: replay is clamped, compile `TURBO_LEAN_JOBS` is not.
         std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", "4000");
-        export_replay_worker_budget(None);
-        assert_eq!(std::env::var("TURBO_LEAN_JOBS").as_deref(), Ok("1"));
+        export_replay_worker_budget(None, None);
+        assert!(
+            std::env::var_os("TURBO_LEAN_JOBS").is_none(),
+            "a memory budget must not clamp `build` compile parallelism"
+        );
+        assert_eq!(std::env::var("TURBO_LEAN_REPLAY_JOBS").as_deref(), Ok("1"));
+        assert_eq!(replay_jobs_env(), Some(1));
         assert_eq!(
             std::env::var("TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE").as_deref(),
             Ok("1")
@@ -576,16 +599,34 @@ mod tests {
             std::env::var("TURBO_LEAN_WORKER_RSS_LIMIT_MB").as_deref(),
             Ok("4000")
         );
-        for k in KEYS {
-            std::env::remove_var(k);
-        }
+        clear();
 
-        // Explicit user batch size / RSS limit are preserved.
+        // `seed-oleans --jobs 4 --max-memory-mb 64000`: its own scoped `TURBO_LEAN_JOBS` is left
+        // alone; the replay budget is sized from its `--jobs`.
+        std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", "64000");
+        export_replay_worker_budget(None, Some(4));
+        assert!(std::env::var_os("TURBO_LEAN_JOBS").is_none());
+        assert_eq!(std::env::var("TURBO_LEAN_REPLAY_JOBS").as_deref(), Ok("4"));
+        assert_eq!(
+            std::env::var("TURBO_LEAN_WORKER_RSS_LIMIT_MB").as_deref(),
+            Ok("16000")
+        );
+        assert!(std::env::var_os("TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE").is_none());
+        // A later scoped `TURBO_LEAN_JOBS=4` (seed-oleans) stays the compile width while replay
+        // keeps the memory-bounded count.
+        std::env::set_var("TURBO_LEAN_JOBS", "8");
+        std::env::set_var("TURBO_LEAN_REPLAY_JOBS", "2");
+        assert_eq!(replay_jobs_env(), Some(2));
+        clear();
+
+        // Explicit user batch size / RSS limit / replay jobs are preserved.
         std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", "4000");
         std::env::set_var("TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE", "4");
         std::env::set_var("TURBO_LEAN_WORKER_RSS_LIMIT_MB", "3000");
-        export_replay_worker_budget(Some(2));
-        assert_eq!(std::env::var("TURBO_LEAN_JOBS").as_deref(), Ok("1"));
+        export_replay_worker_budget(Some(2), None);
+        assert_eq!(std::env::var("TURBO_LEAN_JOBS").as_deref(), Ok("2"));
+        assert_eq!(std::env::var("TURBO_LEAN_REPLAY_JOBS").as_deref(), Ok("1"));
+        assert_eq!(replay_jobs_env(), Some(1));
         assert_eq!(
             std::env::var("TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE").as_deref(),
             Ok("4")
@@ -594,6 +635,11 @@ mod tests {
             std::env::var("TURBO_LEAN_WORKER_RSS_LIMIT_MB").as_deref(),
             Ok("3000")
         );
+        clear();
+        std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", "4000");
+        std::env::set_var("TURBO_LEAN_REPLAY_JOBS", "3");
+        export_replay_worker_budget(None, None);
+        assert_eq!(std::env::var("TURBO_LEAN_REPLAY_JOBS").as_deref(), Ok("3"));
 
         for (k, v) in prev {
             match v {
