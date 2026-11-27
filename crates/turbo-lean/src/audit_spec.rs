@@ -5215,6 +5215,67 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
     }
 
     #[test]
+    fn audit_spec_json_sibling_top_level_keys_fail_closed() {
+        for (extra, name) in [
+            ("\"unrelated\": true", "unrelated"),
+            ("\"stray\": {\"allow\": []}", "stray"),
+            ("\"audit_specs\": true", "audit_specs"),
+        ] {
+            let text =
+                format!("{{\"audit_spec\": {{\"policy\": \"default\"}}, {extra}}}");
+            let err = AuditSpecPolicyConfig::try_parse_config_str(&text).expect_err(
+                "a JSON audit-spec config with top-level entries beside the `audit_spec`/`audit-spec` object must fail closed, never be silently ignored",
+            );
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(name),
+                "clear error must name the sibling entry `{name}`: {msg}"
+            );
+        }
+
+        // A near-miss with no exact `audit_spec`/`audit-spec` key already fails
+        // closed at the top level via `deny_unknown_fields`.
+        let near = AuditSpecPolicyConfig::try_parse_config_str(
+            "{\"audit-specs\": {\"policy\": \"default\"}}",
+        )
+        .expect_err("a near-miss `audit-specs` JSON key must fail closed");
+        assert!(
+            format!("{near:#}").contains("audit-specs"),
+            "clear error must name the near-miss key: {near:#}"
+        );
+
+        // The file loader must fail closed on the same typo'd JSON config
+        // instead of silently running the audit with the parsed policy.
+        let root = std::env::temp_dir().join(format!(
+            "turbo_a1j_audit_spec_json_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let spec = root.join("Spec.lean");
+        fs::write(&spec, "theorem good_spec (n : Nat) (h : n > 0) : n >= 1 := by omega\n").unwrap();
+        let cfg_path = root.join("audit-spec.json");
+        fs::write(&cfg_path, "{\"audit_spec\": {\"policy\": \"default\"}, \"reject_identity_stub\": true}\n")
+            .unwrap();
+        let err = AuditSpecPolicyConfig::try_load_for_target(
+            &spec,
+            None,
+            Some(&cfg_path),
+            &[],
+            &[],
+        )
+        .expect_err(
+            "a JSON config whose top level has an entry beside `audit_spec` must fail closed in the loader",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reject_identity_stub"),
+            "fail-closed loader error must name the sibling key, got: {msg}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn audit_spec_path_rules_typo_key_error_names_the_key() {
         for text in [
             "[audit_spec]\n[[audit_spec.path_rules]]\nglob_pattern = \"src/**\"\nforbid_decl_kind = [\"axiom\"]\n",
