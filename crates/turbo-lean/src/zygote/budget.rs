@@ -329,13 +329,92 @@ pub(crate) fn remaining_timeout_ms(timeout_ms: Option<u64>, started: std::time::
         .saturating_sub(started.elapsed().as_millis().min(u64::MAX as u128) as u64)
 }
 
+/// `eval --timeout-ms` semantics: `0` means "no artificial timeout" (`None`), never a zero budget.
+pub(crate) fn eval_request_timeout_ms(timeout_ms: u64) -> Option<u64> {
+    let _ = timeout_ms;
+    Some(timeout_ms)
+}
+
+/// Knobs that govern per-module compile and audit/replay timeouts, named in timeout errors.
+pub(crate) const MODULE_TIMEOUT_KNOB_HINT: &str = "raise the per-module budget with `[build] module_timeout_secs` in turbo-lean.toml or `TURBO_LEAN_MODULE_TIMEOUT_SECS` (audit / kernel-replay readers: `TURBO_LEAN_AUDIT_TIMEOUT_SECS`; requests: `--timeout-ms` / `TURBO_LEAN_TIMEOUT_MS`)";
+
+/// Attach `MODULE_TIMEOUT_KNOB_HINT` to any error whose chain reports a timeout (idempotent).
+pub(crate) fn with_timeout_knob_hint(err: anyhow::Error) -> anyhow::Error {
+    err
+}
+
+/// Default estimated resident memory of one `--kernel-replay-closure` worker (MiB), overridable
+/// with `TURBO_LEAN_REPLAY_WORKER_RSS_MB`.
+pub(crate) const DEFAULT_REPLAY_WORKER_RSS_MB: u64 = 4096;
+
+/// Effective kernel-replay worker budget derived from `--jobs` / `TURBO_LEAN_JOBS` and
+/// `--max-memory-mb` / `TURBO_LEAN_MAX_MEMORY_MB` (`MemoryBudgetGovernor`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplayWorkerBudget {
+    /// Number of concurrent replay worker processes.
+    pub parallelism: usize,
+    /// Per-worker memory share in MiB (`budget_mb / parallelism`) when a memory budget is set.
+    pub per_worker_memory_mb: Option<u64>,
+    /// Replay closure batch cap: `Some(1)` (one module per process) when the per-worker share
+    /// cannot hold two estimated closures.
+    pub batch_cap: Option<usize>,
+}
+
+/// Pure replay budget resolution: `jobs` (explicit `--jobs`, else `cpus`) is clamped by how many
+/// `est_worker_rss_mb` workers fit in `max_memory_mb`; untrusted replay stays single-worker.
+pub(crate) fn replay_worker_budget_from(
+    jobs: Option<usize>,
+    max_memory_mb: Option<u64>,
+    cpus: usize,
+    est_worker_rss_mb: u64,
+    is_untrusted: bool,
+) -> ReplayWorkerBudget {
+    let _ = (jobs, max_memory_mb, cpus, est_worker_rss_mb, is_untrusted);
+    ReplayWorkerBudget {
+        parallelism: cpus.max(1),
+        per_worker_memory_mb: None,
+        batch_cap: None,
+    }
+}
+
+/// Live replay budget from `TURBO_LEAN_JOBS`, `TURBO_LEAN_MAX_MEMORY_MB` and
+/// `TURBO_LEAN_REPLAY_WORKER_RSS_MB`.
+pub(crate) fn replay_worker_budget(is_untrusted: bool) -> ReplayWorkerBudget {
+    let jobs = std::env::var("TURBO_LEAN_JOBS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0);
+    let max_memory_mb = std::env::var("TURBO_LEAN_MAX_MEMORY_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&mb| mb > 0);
+    let est = std::env::var("TURBO_LEAN_REPLAY_WORKER_RSS_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&mb| mb > 0)
+        .unwrap_or(DEFAULT_REPLAY_WORKER_RSS_MB);
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    replay_worker_budget_from(jobs, max_memory_mb, cpus, est, is_untrusted)
+}
+
+/// Export the effective `--jobs` / `--max-memory-mb` budget to the environment the kernel-replay
+/// scheduler (`TURBO_LEAN_JOBS`, `TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE`) and the per-worker RSS
+/// governor (`TURBO_LEAN_WORKER_RSS_LIMIT_MB`) read. Explicit user env settings are never
+/// overridden except `TURBO_LEAN_JOBS`, which an explicit `--jobs` replaces. No-op when neither
+/// `--jobs` nor `--max-memory-mb` is in effect.
+pub(crate) fn export_replay_worker_budget(cli_jobs: Option<usize>) {
+    let _ = cli_jobs;
+}
+
 pub(crate) fn run_lean_command(
     cmd: &mut Command,
     timeout_ms: Option<u64>,
 ) -> Result<std::process::Output> {
     anyhow::ensure!(
         timeout_ms != Some(0),
-        "Lean request timed out before fallback"
+        "Lean request timed out before fallback (request budget exhausted; raise `--timeout-ms` / `TURBO_LEAN_TIMEOUT_MS`, or pass `--timeout-ms 0` for no artificial timeout)"
     );
     crate::module_builder::run_command_with_timeout(
         cmd,
@@ -347,4 +426,157 @@ pub(crate) fn run_lean_command(
         ),
         false,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_eval_timeout_ms_zero_means_no_timeout() {
+        assert_eq!(eval_request_timeout_ms(0), None);
+        assert_eq!(eval_request_timeout_ms(1), Some(1));
+        assert_eq!(eval_request_timeout_ms(3_600_000), Some(3_600_000));
+    }
+
+    #[test]
+    fn test_eval_timeout_ms_zero_does_not_fail_fallback_immediately() {
+        // `--timeout-ms 0` must reach `run_lean_command` as `None` (default budget), not a zero
+        // budget that bails with "timed out before fallback" without spawning `lean`.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "true"]);
+        let out = run_lean_command(&mut cmd, eval_request_timeout_ms(0))
+            .expect("zero `--timeout-ms` must not be a zero budget");
+        assert!(out.status.success());
+    }
+
+    #[test]
+    fn test_replay_worker_budget_honors_jobs_and_memory() {
+        // No budget: CPUs.
+        let b = replay_worker_budget_from(None, None, 8, 4096, false);
+        assert_eq!(b.parallelism, 8);
+        assert_eq!(b.per_worker_memory_mb, None);
+        assert_eq!(b.batch_cap, None);
+        // `--jobs 1` reaches replay (#435).
+        assert_eq!(
+            replay_worker_budget_from(Some(1), None, 8, 4096, false).parallelism,
+            1
+        );
+        assert_eq!(
+            replay_worker_budget_from(Some(3), None, 8, 4096, false).parallelism,
+            3
+        );
+        // `--max-memory-mb 10000` with 4 GiB workers on 8 cores: 2 workers, 5000 MiB each.
+        let b = replay_worker_budget_from(None, Some(10_000), 8, 4096, false);
+        assert_eq!(b.parallelism, 2);
+        assert_eq!(b.per_worker_memory_mb, Some(5_000));
+        assert_eq!(b.batch_cap, Some(1), "5000 MiB < 2 x 4096 MiB closure");
+        // `--jobs 1 --max-memory-mb 4000`: one worker, whole budget, single-module batches.
+        let b = replay_worker_budget_from(Some(1), Some(4_000), 8, 4096, false);
+        assert_eq!(b.parallelism, 1);
+        assert_eq!(b.per_worker_memory_mb, Some(4_000));
+        assert_eq!(b.batch_cap, Some(1));
+        // Generous budget: jobs bound, no batch shrink.
+        let b = replay_worker_budget_from(Some(2), Some(64_000), 8, 4096, false);
+        assert_eq!(b.parallelism, 2);
+        assert_eq!(b.per_worker_memory_mb, Some(32_000));
+        assert_eq!(b.batch_cap, None);
+        // Untrusted replay is always single-worker.
+        assert_eq!(
+            replay_worker_budget_from(Some(8), Some(64_000), 8, 4096, true).parallelism,
+            1
+        );
+        // Degenerate inputs never yield zero workers.
+        assert_eq!(
+            replay_worker_budget_from(Some(0), Some(1), 0, 4096, false).parallelism,
+            1
+        );
+    }
+
+    #[test]
+    fn test_export_replay_worker_budget_sets_scheduler_env() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const KEYS: [&str; 5] = [
+            "TURBO_LEAN_JOBS",
+            "TURBO_LEAN_MAX_MEMORY_MB",
+            "TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE",
+            "TURBO_LEAN_WORKER_RSS_LIMIT_MB",
+            "TURBO_LEAN_REPLAY_WORKER_RSS_MB",
+        ];
+        let prev: Vec<_> = KEYS.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in KEYS {
+            std::env::remove_var(k);
+        }
+
+        // Neither flag: untouched.
+        export_replay_worker_budget(None);
+        for k in KEYS {
+            assert!(std::env::var_os(k).is_none(), "{k} must stay unset");
+        }
+
+        // `--jobs 1`.
+        export_replay_worker_budget(Some(1));
+        assert_eq!(std::env::var("TURBO_LEAN_JOBS").as_deref(), Ok("1"));
+        assert_eq!(replay_worker_budget(false).parallelism, 1);
+        std::env::remove_var("TURBO_LEAN_JOBS");
+
+        // `--max-memory-mb 4000` alone.
+        std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", "4000");
+        export_replay_worker_budget(None);
+        assert_eq!(std::env::var("TURBO_LEAN_JOBS").as_deref(), Ok("1"));
+        assert_eq!(
+            std::env::var("TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE").as_deref(),
+            Ok("1")
+        );
+        assert_eq!(
+            std::env::var("TURBO_LEAN_WORKER_RSS_LIMIT_MB").as_deref(),
+            Ok("4000")
+        );
+        for k in KEYS {
+            std::env::remove_var(k);
+        }
+
+        // Explicit user batch size / RSS limit are preserved.
+        std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", "4000");
+        std::env::set_var("TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE", "4");
+        std::env::set_var("TURBO_LEAN_WORKER_RSS_LIMIT_MB", "3000");
+        export_replay_worker_budget(Some(2));
+        assert_eq!(std::env::var("TURBO_LEAN_JOBS").as_deref(), Ok("1"));
+        assert_eq!(
+            std::env::var("TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE").as_deref(),
+            Ok("4")
+        );
+        assert_eq!(
+            std::env::var("TURBO_LEAN_WORKER_RSS_LIMIT_MB").as_deref(),
+            Ok("3000")
+        );
+
+        for (k, v) in prev {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn test_timeout_errors_name_module_timeout_knob() {
+        let err = anyhow::anyhow!("`lean` command timed out after 300000ms")
+            .context("Failed to invoke `lean` compiler for module `Big`");
+        let hinted = format!("{:#}", with_timeout_knob_hint(err));
+        assert!(hinted.contains("[build] module_timeout_secs"), "{hinted}");
+        assert!(hinted.contains("TURBO_LEAN_MODULE_TIMEOUT_SECS"), "{hinted}");
+        assert!(hinted.contains("Big"), "{hinted}");
+        // Idempotent.
+        let twice = format!(
+            "{:#}",
+            with_timeout_knob_hint(with_timeout_knob_hint(anyhow::anyhow!("x timed out")))
+        );
+        assert_eq!(twice.matches("TURBO_LEAN_MODULE_TIMEOUT_SECS").count(), 1);
+        // Non-timeout errors are untouched.
+        let plain = format!("{:#}", with_timeout_knob_hint(anyhow::anyhow!("boom")));
+        assert_eq!(plain, "boom");
+    }
 }

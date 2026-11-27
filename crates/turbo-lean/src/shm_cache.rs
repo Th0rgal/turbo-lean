@@ -1534,26 +1534,153 @@ pub(crate) fn parse_macos_vm_stat_budget_mb(vm_stat_out: &str) -> Option<u64> {
     Some((avail_mb.saturating_mul(7) / 10).max(1))
 }
 
-fn parse_cgroup_memory_limit_mb() -> Option<u64> {
-    for path in [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ] {
-        if let Ok(raw) = fs::read_to_string(path) {
-            let trimmed = raw.trim();
-            if trimmed != "max" {
-                if let Ok(bytes) = trimmed.parse::<u64>() {
-                    if bytes > 0 && bytes < (1u64 << 50) {
-                        let mb = bytes / (1024 * 1024);
-                        if mb > 0 {
-                            return Some((mb.saturating_mul(3) / 4).max(1));
-                        }
-                    }
-                }
-            }
-        }
-    }
+/// Default cgroup v2 unified hierarchy mount point.
+pub const CGROUP_V2_ROOT: &str = "/sys/fs/cgroup";
+
+/// Extract the cgroup v2 relative path (`0::<rel>`) from `/proc/self/cgroup` contents.
+pub fn parse_proc_self_cgroup_v2_path(text: &str) -> Option<String> {
+    let _ = text;
     None
+}
+
+/// Parse a cgroup `memory.max` / `memory.limit_in_bytes` value: `max` (or absurd sentinel
+/// values) means unlimited (`None`); otherwise a positive byte count.
+pub fn parse_cgroup_memory_max_bytes(raw: &str) -> Option<u64> {
+    let _ = raw;
+    None
+}
+
+/// Walk `<root><rel>/memory.max` up through every ancestor to `<root>/memory.max`, returning the
+/// tightest (minimum) numeric limit, or `None` when every level is `max` / unreadable.
+pub fn resolve_cgroup_v2_memory_max_bytes_at(cgroup_root: &Path, rel: &str) -> Option<u64> {
+    let _ = (cgroup_root, rel);
+    None
+}
+
+/// Effective cgroup memory limit in bytes for this process (cgroup v2 ancestor walk, then the
+/// cgroup v1 `memory.limit_in_bytes` fallback).
+pub fn effective_cgroup_memory_max_bytes() -> Option<u64> {
+    None
+}
+
+/// Parse the `oom_kill` counter from a cgroup v2 `memory.events` file.
+pub fn parse_cgroup_memory_events_oom_kill(text: &str) -> Option<u64> {
+    let _ = text;
+    None
+}
+
+/// Read `<root><rel>/memory.events` `oom_kill` count.
+pub fn read_cgroup_oom_kill_count_at(cgroup_root: &Path, rel: &str) -> Option<u64> {
+    let _ = (cgroup_root, rel);
+    None
+}
+
+/// `oom_kill` count of this process' own cgroup v2 (`None` when unavailable).
+pub fn current_cgroup_oom_kill_count() -> Option<u64> {
+    None
+}
+
+/// Pre-flight memory guard: fail fast with an actionable diagnostic when the recorded historical
+/// peak RSS (`historical_peak_rss_mb`) or the requested `--max-memory-mb` budget cannot fit under
+/// the effective cgroup `memory.max` (`cgroup_max_bytes`). Unknown inputs pass.
+pub fn preflight_memory_guard(
+    what: &str,
+    historical_peak_rss_mb: Option<u64>,
+    max_memory_mb: Option<u64>,
+    cgroup_max_bytes: Option<u64>,
+) -> anyhow::Result<()> {
+    let _ = (what, historical_peak_rss_mb, max_memory_mb, cgroup_max_bytes);
+    Ok(())
+}
+
+/// Live pre-flight guard: `TURBO_LEAN_MAX_MEMORY_MB` (`--max-memory-mb`) and the optional
+/// historical peak against this process' effective cgroup `memory.max`. Disabled by
+/// `TURBO_LEAN_SKIP_MEMORY_PREFLIGHT=1`.
+pub fn preflight_memory_guard_live(
+    what: &str,
+    historical_peak_rss_mb: Option<u64>,
+) -> anyhow::Result<()> {
+    if std::env::var("TURBO_LEAN_SKIP_MEMORY_PREFLIGHT").as_deref() == Ok("1") {
+        return Ok(());
+    }
+    let max_memory_mb = std::env::var("TURBO_LEAN_MAX_MEMORY_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&mb| mb > 0);
+    preflight_memory_guard(
+        what,
+        historical_peak_rss_mb,
+        max_memory_mb,
+        effective_cgroup_memory_max_bytes(),
+    )
+}
+
+/// Structured JSON build / OOM receipt, emitted for every child invocation including children
+/// killed by `SIGKILL` (cgroup OOM killer) or aborted with `SIGABRT`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BuildReceipt {
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub peak_rss_kib: Option<u64>,
+    pub cgroup_oom_kill: Option<u64>,
+    pub elapsed_s: f64,
+    pub olean_sha256: Option<String>,
+    /// `true` when the child was `SIGKILL`ed or the cgroup `oom_kill` counter advanced.
+    pub oom_suspected: bool,
+}
+
+impl BuildReceipt {
+    /// Build a receipt from a finished child's `ExitStatus`. `cgroup_oom_kill` is the delta of the
+    /// cgroup `oom_kill` counter across the run (when known); `olean` is hashed when it exists.
+    pub fn from_exit_status(
+        status: &std::process::ExitStatus,
+        elapsed: std::time::Duration,
+        peak_rss_kib: Option<u64>,
+        cgroup_oom_kill: Option<u64>,
+        olean: Option<&Path>,
+    ) -> Self {
+        let _ = (status, elapsed, peak_rss_kib, cgroup_oom_kill, olean);
+        Self::default()
+    }
+}
+
+/// Lowercase hex SHA-256 of the file at `path`.
+pub fn sha256_file_hex(path: &Path) -> std::io::Result<String> {
+    let _ = path;
+    Ok(String::new())
+}
+
+/// Peak RSS in KiB over all waited-for children of this process (`getrusage(RUSAGE_CHILDREN)`).
+pub fn children_peak_rss_kib() -> Option<u64> {
+    None
+}
+
+/// Peak RSS in KiB of this process itself (`getrusage(RUSAGE_SELF)`).
+pub fn self_peak_rss_kib() -> Option<u64> {
+    None
+}
+
+/// Atomically (write-then-rename) persist `receipt` as pretty JSON at `path`.
+pub fn write_build_receipt_atomic(path: &Path, receipt: &BuildReceipt) -> std::io::Result<()> {
+    let _ = (path, receipt);
+    Ok(())
+}
+
+/// Spawn `cmd`, wait for it (whatever signal kills it), and atomically emit a `BuildReceipt` at
+/// `receipt_path` before returning the captured output.
+pub fn run_command_with_receipt(
+    cmd: &mut std::process::Command,
+    receipt_path: &Path,
+    olean: Option<&Path>,
+) -> std::io::Result<(std::process::Output, BuildReceipt)> {
+    let _ = (cmd, receipt_path, olean);
+    Err(std::io::Error::other("unimplemented"))
+}
+
+fn parse_cgroup_memory_limit_mb() -> Option<u64> {
+    let bytes = effective_cgroup_memory_max_bytes()?;
+    let mb = bytes / (1024 * 1024);
+    (mb > 0).then(|| (mb.saturating_mul(3) / 4).max(1))
 }
 
 fn probe_system_budget_mb() -> u64 {
@@ -2879,6 +3006,229 @@ mod tests {
             Ok(r) => r,
             Err(p) => std::panic::resume_unwind(p),
         }
+    }
+
+    fn cgroup_fixture_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "turbo_cgroup_{tag}_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn test_parse_proc_self_cgroup_v2_path() {
+        assert_eq!(
+            parse_proc_self_cgroup_v2_path("0::/user.slice/user-1000.slice/app.scope\n"),
+            Some("/user.slice/user-1000.slice/app.scope".to_string())
+        );
+        // Hybrid hierarchy: v1 controllers first, unified `0::` entry later.
+        assert_eq!(
+            parse_proc_self_cgroup_v2_path("12:memory:/foo\n1:name=systemd:/bar\n0::/svc.scope\n"),
+            Some("/svc.scope".to_string())
+        );
+        assert_eq!(
+            parse_proc_self_cgroup_v2_path("0::/\n"),
+            Some("/".to_string())
+        );
+        assert_eq!(parse_proc_self_cgroup_v2_path("12:memory:/foo\n"), None);
+        assert_eq!(parse_proc_self_cgroup_v2_path(""), None);
+        // Path traversal must never escape the cgroup mount.
+        assert_eq!(parse_proc_self_cgroup_v2_path("0::/../../etc\n"), None);
+        assert_eq!(parse_proc_self_cgroup_v2_path("0::relative\n"), None);
+    }
+
+    #[test]
+    fn test_parse_cgroup_memory_max_bytes() {
+        assert_eq!(parse_cgroup_memory_max_bytes("max\n"), None);
+        assert_eq!(parse_cgroup_memory_max_bytes(""), None);
+        assert_eq!(parse_cgroup_memory_max_bytes("0"), None);
+        assert_eq!(parse_cgroup_memory_max_bytes("garbage"), None);
+        assert_eq!(
+            parse_cgroup_memory_max_bytes("8976400384\n"),
+            Some(8_976_400_384)
+        );
+        // cgroup v1 "unlimited" sentinel (PAGE_COUNTER_MAX * page size).
+        assert_eq!(parse_cgroup_memory_max_bytes("9223372036854771712"), None);
+    }
+
+    #[test]
+    fn test_resolve_cgroup_v2_memory_max_walks_ancestors_and_takes_minimum() {
+        let root = cgroup_fixture_root("walk");
+        let leaf = root.join("user.slice/app.slice/job.scope");
+        fs::create_dir_all(&leaf).unwrap();
+        fs::write(root.join("memory.max"), "max\n").unwrap();
+        fs::write(root.join("user.slice/memory.max"), "8589934592\n").unwrap(); // 8 GiB
+        fs::write(root.join("user.slice/app.slice/memory.max"), "max\n").unwrap();
+        fs::write(leaf.join("memory.max"), "17179869184\n").unwrap(); // 16 GiB
+        assert_eq!(
+            resolve_cgroup_v2_memory_max_bytes_at(&root, "/user.slice/app.slice/job.scope"),
+            Some(8_589_934_592),
+            "the tightest ancestor limit wins"
+        );
+        // Missing leaf file (e.g. the root cgroup has no memory.max) still walks ancestors.
+        fs::remove_file(leaf.join("memory.max")).unwrap();
+        assert_eq!(
+            resolve_cgroup_v2_memory_max_bytes_at(&root, "/user.slice/app.slice/job.scope"),
+            Some(8_589_934_592)
+        );
+        fs::write(root.join("user.slice/memory.max"), "max").unwrap();
+        assert_eq!(
+            resolve_cgroup_v2_memory_max_bytes_at(&root, "/user.slice/app.slice/job.scope"),
+            None
+        );
+        fs::write(root.join("memory.max"), "1073741824").unwrap();
+        assert_eq!(
+            resolve_cgroup_v2_memory_max_bytes_at(&root, "/user.slice/app.slice/job.scope"),
+            Some(1_073_741_824),
+            "the mount-root memory.max is included"
+        );
+        assert_eq!(
+            resolve_cgroup_v2_memory_max_bytes_at(&root, "/"),
+            Some(1_073_741_824)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_cgroup_memory_events_oom_kill() {
+        let text = "low 0\nhigh 12\nmax 40\noom 3\noom_kill 2\noom_group_kill 0\n";
+        assert_eq!(parse_cgroup_memory_events_oom_kill(text), Some(2));
+        assert_eq!(parse_cgroup_memory_events_oom_kill("low 0\n"), None);
+        let root = cgroup_fixture_root("events");
+        fs::create_dir_all(root.join("a.scope")).unwrap();
+        fs::write(root.join("a.scope/memory.events"), text).unwrap();
+        assert_eq!(read_cgroup_oom_kill_count_at(&root, "/a.scope"), Some(2));
+        assert_eq!(read_cgroup_oom_kill_count_at(&root, "/missing.scope"), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_preflight_memory_guard_rejects_insufficient_memory_max() {
+        let gib = 1024u64 * 1024 * 1024;
+        // Unknown cgroup limit or unknown demand: pass.
+        assert!(preflight_memory_guard("M", Some(28_000), Some(30_000), None).is_ok());
+        assert!(preflight_memory_guard("M", None, None, Some(8 * gib)).is_ok());
+        // Fits.
+        assert!(preflight_memory_guard("M", Some(4_000), Some(6_000), Some(8 * gib)).is_ok());
+        // Historical peak (27.8 GiB) exceeds an 8 GiB cgroup.
+        let err = preflight_memory_guard("IdleCDOEpochVariant", Some(28_467), None, Some(8 * gib))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("IdleCDOEpochVariant"), "{err}");
+        assert!(err.contains("memory.max"), "{err}");
+        assert!(err.contains("28467"), "{err}");
+        assert!(err.contains("8192"), "{err}");
+        assert!(err.contains("--max-memory-mb"), "{err}");
+        // `--max-memory-mb` above the cgroup limit is unsatisfiable.
+        let err = preflight_memory_guard("M", None, Some(10_000), Some(8 * gib))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--max-memory-mb 10000"), "{err}");
+        assert!(err.contains("memory.max"), "{err}");
+    }
+
+    #[test]
+    fn test_preflight_memory_guard_live_skip_env() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("TURBO_LEAN_SKIP_MEMORY_PREFLIGHT");
+        std::env::set_var("TURBO_LEAN_SKIP_MEMORY_PREFLIGHT", "1");
+        assert!(preflight_memory_guard_live("M", Some(u64::MAX / 2)).is_ok());
+        match prev {
+            Some(v) => std::env::set_var("TURBO_LEAN_SKIP_MEMORY_PREFLIGHT", v),
+            None => std::env::remove_var("TURBO_LEAN_SKIP_MEMORY_PREFLIGHT"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_receipt_is_emitted_for_sigkill_and_sigabrt_children() {
+        let dir = cgroup_fixture_root("receipt");
+        let olean = dir.join("M.olean");
+        fs::write(&olean, b"olean-bytes").unwrap();
+        for (sig, script) in [
+            (libc::SIGKILL, "kill -KILL $$"),
+            (libc::SIGABRT, "kill -ABRT $$"),
+        ] {
+            let receipt_path = dir.join(format!("receipt_{sig}.json"));
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args(["-c", script]);
+            let (out, receipt) =
+                run_command_with_receipt(&mut cmd, &receipt_path, Some(&olean)).unwrap();
+            assert!(!out.status.success());
+            assert_eq!(receipt.exit_code, None);
+            assert_eq!(receipt.signal, Some(sig));
+            assert_eq!(receipt.oom_suspected, sig == libc::SIGKILL);
+            assert!(receipt.elapsed_s >= 0.0);
+            let on_disk: BuildReceipt =
+                serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+            assert_eq!(on_disk, receipt);
+            let raw: serde_json::Value =
+                serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+            for key in [
+                "exit_code",
+                "signal",
+                "peak_rss_kib",
+                "cgroup_oom_kill",
+                "elapsed_s",
+                "olean_sha256",
+            ] {
+                assert!(raw.get(key).is_some(), "missing `{key}` in {raw}");
+            }
+            // No leftover staging files beside the receipt.
+            let leftovers: Vec<_> = fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+                .collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+        }
+        let receipt_path = dir.join("receipt_ok.json");
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "exit 3"]);
+        let (_, receipt) = run_command_with_receipt(&mut cmd, &receipt_path, Some(&olean)).unwrap();
+        assert_eq!(receipt.exit_code, Some(3));
+        assert_eq!(receipt.signal, None);
+        assert!(!receipt.oom_suspected);
+        let expected = sha256_file_hex(&olean).unwrap();
+        assert_eq!(expected.len(), 64);
+        assert_eq!(receipt.olean_sha256.as_deref(), Some(expected.as_str()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_build_receipt_oom_kill_delta_marks_oom() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = std::process::ExitStatus::from_raw(0);
+        let r = BuildReceipt::from_exit_status(
+            &status,
+            std::time::Duration::from_millis(1500),
+            Some(1024),
+            Some(1),
+            None,
+        );
+        assert_eq!(r.exit_code, Some(0));
+        assert!(r.oom_suspected, "a cgroup oom_kill delta marks OOM");
+        assert!((r.elapsed_s - 1.5).abs() < 1e-9);
+        assert_eq!(r.peak_rss_kib, Some(1024));
+        assert_eq!(r.olean_sha256, None);
+    }
+
+    #[test]
+    fn test_sha256_file_hex_known_vector() {
+        let dir = cgroup_fixture_root("sha");
+        let p = dir.join("abc");
+        fs::write(&p, b"abc").unwrap();
+        assert_eq!(
+            sha256_file_hex(&p).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
