@@ -2147,6 +2147,14 @@ impl AuditSpecPolicyConfig {
                 !(has_underscore && has_hyphen),
                 "Config cannot specify both `audit_spec` and `audit-spec`"
             );
+            if has_underscore || has_hyphen {
+                for key in obj.keys() {
+                    anyhow::ensure!(
+                        key == "audit_spec" || key == "audit-spec",
+                        "JSON audit-spec config must not contain top-level entries other than the `audit_spec`/`audit-spec` object, found `{key}`"
+                    );
+                }
+            }
             let target_val = if has_underscore {
                 obj["audit_spec"].clone()
             } else if has_hyphen {
