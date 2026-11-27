@@ -1,6 +1,6 @@
 # Sequencing and work graph (`roadmap/HORIZONS.md`)
 
-> **Scope**: the order in which the goals in [`GOALS.md`](./GOALS.md) are worked, as a dependency graph of leaf items that agents can take in parallel. It adds no theorem contract and changes none in [`VALIDATION_CONTRACTS.md`](./VALIDATION_CONTRACTS.md). Facts are from `main` at `94dbd70` (2026-11-15), reconciled to `main` at `fddf22c` (2026-11-16) by R0, then to `main` at `33810f5` (2026-11-16) by R0d (graph–table reconciliation, S3a/HY1 marked done, unresolved parent splits encoded), and from sources linked inline; they are point-in-time.
+> **Scope**: the order in which the goals in [`GOALS.md`](./GOALS.md) are worked, as a dependency graph of leaf items that agents can take in parallel. It adds no theorem contract and changes none in [`VALIDATION_CONTRACTS.md`](./VALIDATION_CONTRACTS.md). Facts are from `main` at `94dbd70` (2026-11-15), reconciled to `main` at `fddf22c` (2026-11-16) by R0, then to `main` at `33810f5` (2026-11-16) by R0d (graph–table reconciliation, S3a/HY1/C4x marked done, unresolved parent splits encoded), and from sources linked inline; they are point-in-time.
 
 Source: Thomas's roadmap note of 2026-11-14 (prove Lean → IR first; build faster, hypothesis: pure-Lean kernel compiled by `LeanNative`, GPU if it pays; accelerator plugins last), then a feasibility review of the code and of published results on 2026-11-15. The review changed two of the three ideas; what changed is said where it applies.
 
@@ -209,10 +209,10 @@ flowchart LR
 | **L3** | Recursion and loops (rung L3) | `IR/AST.lean`, `Proofs/LowerRec.lean` | L2 | same | L |
 | **H1.4** | Mutant kill matrix; coverage number published | `Proofs/LowerRefines.lean` | L3 | mutants in CI | M |
 | **C2x** | `Batteries` as nightly C2 conformance | workflow, packages dir | – | `--tier C2` green | M |
-| **C4x** | 10k-seed nightly alias fuzzing | `fuzz_lcnf_conformance.py` | – | nightly green | M |
+| **C4x** *(done `#472` `64d63bd`)* | 10k-seed nightly alias fuzzing | `fuzz_lcnf_conformance.py` | – | nightly green | M |
 | **C1x** | C1 corpus to 250 programs, chosen by the matrix | corpus manifest | H1.0 | `--tier C1` | L |
 
-**Start width**: R0, H1.0a-V, M1a, S3b-E, A2, A1j, P2, P3, P5, P6, P7, P10, L299, H1.1, C2x, C4x have no unmet dependency and disjoint files (P7 and L299 share `module_builder/dag.rs` — do not run in parallel): sixteen leaves, about eight at once per machine because six need Lean builds.
+**Start width**: R0, H1.0a-V, M1a, S3b-E, A2, A1j, P2, P3, P5, P6, P7, P10, L299, H1.1, C2x have no unmet dependency and disjoint files (P7 and L299 share `module_builder/dag.rs` — do not run in parallel): fifteen leaves, about eight at once per machine because six need Lean builds.
 
 **Critical path**: H1.0a-V → H1.0a-S → H1.0b → H1.0 → L1 → L2 → L3 → H1.4, with H1.1 in parallel into L1. Three large proof items in series; nothing shortens it except starting H1.0a-V and H1.1 now.
 
