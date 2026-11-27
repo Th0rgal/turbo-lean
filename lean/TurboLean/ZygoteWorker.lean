@@ -2026,7 +2026,11 @@ def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name ×
     pure (Except.error (toString e))
   match batchRes with
   | .ok env =>
-    let (vs, _, csimpEntries) ← auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns {} unsafePatterns implByPatterns skipChildReplay allowSorry isImportAudit
+    let (vs, sorryDecls, csimpEntries) ← auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns {} unsafePatterns implByPatterns skipChildReplay allowSorry isImportAudit
+    let vs := if !allowSorry && !sorryDecls.isEmpty then
+      vs ++ [s!"[TurboLean.KernelGate] disallowed sorry declarations: {sorryDecls}"]
+    else
+      vs
     return (vs, csimpEntries)
   | .error errMsg =>
     if slice.size == 1 then
@@ -2047,16 +2051,37 @@ def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name ×
         cmd := app
         args := #["--audit-modules"] ++ importFlags ++ replayFlags ++ sorryFlags ++ ffiFlags ++ modFlags
       }
-      let lastJson? := (child.stdout.splitOn "\n").reverse.find? fun l =>
+      let nonEmptyLines := (child.stdout.splitOn "\n").filterMap fun l =>
         let t := l.trimAscii.toString
-        t.startsWith "{" && t.endsWith "}"
+        if t.isEmpty then none else some t
       if child.exitCode == 0 then
-        let subCSimp : List (String × String × String) := Id.run do
-          let some jl := lastJson? | return []
-          let .ok j := Lean.Json.parse jl | return []
-          let .ok arr := j.getObjValAs? (Array (String × String × String)) "csimp_entries" | return []
-          return arr.toList
-        return ([], subCSimp)
+        let parsedOk : Except String (List (String × String × String)) := Id.run do
+          let [jl] := nonEmptyLines | return .error s!"expected single JSON line on stdout, got {nonEmptyLines.length} lines"
+          if !(jl.startsWith "{" && jl.endsWith "}") then
+            return .error "stdout line is not a JSON object"
+          let .ok j := Lean.Json.parse jl | return .error "invalid JSON reply"
+          let .ok true := j.getObjValAs? Bool "ok" | return .error "reply did not report ok=true"
+          let .ok audited := j.getObjValAs? (Array String) "audited" | return .error "reply missing audited list"
+          if audited != modFlags then
+            return .error s!"reply audited list {audited.toList} did not match requested {modFlags.toList}"
+          let .ok vs := j.getObjValAs? (Array String) "violations" | return .error "reply missing violations list"
+          if !vs.isEmpty then
+            return .error s!"reply reported ok=true with non-empty violations: {vs.toList}"
+          if !allowSorry then
+            if let .ok true := j.getObjValAs? Bool "used_sorry" then
+              return .error "reply reported used_sorry=true"
+            if let .ok sds := j.getObjValAs? (Array String) "sorry_decls" then
+              if !sds.isEmpty then
+                return .error s!"reply reported non-empty sorry_decls: {sds.toList}"
+          let subCSimp := match j.getObjValAs? (Array (String × String × String)) "csimp_entries" with
+            | .ok arr => arr.toList
+            | .error _ => []
+          return .ok subCSimp
+        match parsedOk with
+        | .ok subCSimp => return ([], subCSimp)
+        | .error reason =>
+          return ([s!"[TurboLean.KernelGate] sub-batch audit gave invalid exit-0 reply on {modFlags.toList}: {reason}"], [])
+      let lastJson? := nonEmptyLines.reverse.find? fun t => t.startsWith "{" && t.endsWith "}"
       let detail := (lastJson?.getD child.stdout).trimAscii.toString
       let errTail := child.stderr.trimAscii.toString
       let summary := if detail.isEmpty then errTail else if errTail.isEmpty then detail else s!"{detail} ({errTail})"

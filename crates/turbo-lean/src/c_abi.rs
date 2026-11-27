@@ -188,6 +188,13 @@ extern "C" {
         con_leche_rev_state: u8,
         blake3_matches: u8,
     ) -> u8;
+    pub fn turbo_spec_verify_kernel_audit_admission(
+        olean_state: u8,
+        reader_ok: u8,
+        expected_modules: u32,
+        audited_modules: u32,
+        violation_count: u32,
+    ) -> u8;
     pub fn leansys_verify_slice_bounds(off: u64, len: u64, cap: u64) -> u8;
     pub fn leansys_verify_wal_frame(
         magic: u32,
@@ -849,6 +856,37 @@ pub fn verify_receipt_provenance(
             toolchain_state,
             con_leche_rev_state,
             blake3_matches as u8,
+        ) != 0
+    }
+}
+
+/// `.olean` freshness state passed to [`verify_kernel_audit_admission`].
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelAuditOleanState {
+    Missing = 0,
+    Stale = 1,
+    Tampered = 2,
+    Fresh = 3,
+}
+
+/// Kernel-backed `audit-spec` admission (A2) through the compiled Lean gate
+/// `turbo_spec_verify_kernel_audit_admission`.
+#[inline(always)]
+pub fn verify_kernel_audit_admission(
+    olean_state: KernelAuditOleanState,
+    reader_ok: bool,
+    expected_modules: u32,
+    audited_modules: u32,
+    violation_count: u32,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_kernel_audit_admission(
+            olean_state as u8,
+            reader_ok as u8,
+            expected_modules,
+            audited_modules,
+            violation_count,
         ) != 0
     }
 }
@@ -2102,6 +2140,52 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_verify_kernel_audit_admission_c_abi_gate() {
+        for olean_state in 0u8..=5 {
+            for reader_ok in [false, true] {
+                for expected in [0u32, 1, 2, u32::MAX] {
+                    for audited in [0u32, 1, 2, u32::MAX] {
+                        for violations in [0u32, 1, u32::MAX] {
+                            let expected_ok = olean_state == 3
+                                && reader_ok
+                                && expected != 0
+                                && audited == expected
+                                && violations == 0;
+                            let got = unsafe {
+                                turbo_spec_verify_kernel_audit_admission(
+                                    olean_state,
+                                    reader_ok as u8,
+                                    expected,
+                                    audited,
+                                    violations,
+                                ) != 0
+                            };
+                            assert_eq!(
+                                got, expected_ok,
+                                "state={olean_state} reader_ok={reader_ok} expected={expected} audited={audited} violations={violations}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(verify_kernel_audit_admission(
+            KernelAuditOleanState::Fresh,
+            true,
+            1,
+            1,
+            0
+        ));
+        for st in [
+            KernelAuditOleanState::Missing,
+            KernelAuditOleanState::Stale,
+            KernelAuditOleanState::Tampered,
+        ] {
+            assert!(!verify_kernel_audit_admission(st, true, 1, 1, 0));
         }
     }
 

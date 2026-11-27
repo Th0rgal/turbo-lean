@@ -1654,6 +1654,7 @@ struct RawAuditSpecSection {
     forbid_namespaces: Vec<String>,
     #[serde(alias = "path_overrides")]
     path_rules: Option<RawAuditSpecPathRules>,
+    kernel: Option<bool>,
 }
 
 impl RawAuditSpecSection {
@@ -1676,6 +1677,9 @@ impl RawAuditSpecSection {
         }
         if let Some(v) = self.reject_size_only_parsers {
             cfg.reject_size_only_parsers = v;
+        }
+        if let Some(v) = self.kernel {
+            cfg.kernel = v;
         }
         for item in self.forbid_decl_kinds {
             let trimmed = item.trim();
@@ -1736,6 +1740,10 @@ pub struct AuditSpecPolicyConfig {
     pub forbid_namespaces: Vec<String>,
     #[serde(default)]
     pub path_rules: Vec<AuditSpecPathRule>,
+    /// Kernel-backed mode (`--kernel` / `kernel = true`): also replay each file's compiled
+    /// `.olean` through the in-kernel auditor and fail closed unless the `.olean` is fresh.
+    #[serde(default)]
+    pub kernel: bool,
     #[serde(skip)]
     pub config_root: Option<PathBuf>,
 }
@@ -1802,6 +1810,7 @@ impl AuditSpecPolicyConfig {
                 forbid_decl_kinds: Vec::new(),
                 forbid_namespaces: Vec::new(),
                 path_rules: Vec::new(),
+                kernel: false,
                 config_root: None,
             }),
             "permissive" => Ok(Self {
@@ -1814,6 +1823,7 @@ impl AuditSpecPolicyConfig {
                 forbid_decl_kinds: Vec::new(),
                 forbid_namespaces: Vec::new(),
                 path_rules: Vec::new(),
+                kernel: false,
                 config_root: None,
             }),
             "strict-proofs" | "strict_proofs" | "strict" => Ok(Self {
@@ -1838,6 +1848,7 @@ impl AuditSpecPolicyConfig {
                         "LNSym".to_string(),
                     ],
                 }],
+                kernel: false,
                 config_root: None,
             }),
             other => anyhow::bail!(
@@ -3474,7 +3485,7 @@ pub(super) fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<Ex
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 22;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 23;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -3917,6 +3928,7 @@ pub fn audit_spec_file_or_source_in_project(
             None,
             &[],
             &[],
+            false,
         );
     }
     match AuditSpecPolicyConfig::try_load_for_target_with_project_dir(
@@ -3942,6 +3954,220 @@ pub fn audit_spec_file_or_source_with_policy(
 }
 
 fn audit_spec_file_or_source_with_policy_inner(
+    file: &Path,
+    inline_src: Option<&str>,
+    decl_filter: Option<&str>,
+    policy: &AuditSpecPolicyConfig,
+    expand_umbrella_subdir: bool,
+) -> serde_json::Value {
+    let mut report = audit_spec_file_or_source_lexical(
+        file,
+        inline_src,
+        decl_filter,
+        policy,
+        expand_umbrella_subdir,
+    );
+    // The kernel verdict is recomputed on every run and never read from the lexical cache, so a
+    // stale or tampered `.olean` cannot hide behind a cached source-level report.
+    if policy.kernel && report["status"].as_str() != Some("error") {
+        let kernel = if inline_src.is_some() {
+            KernelAuditOutcome::unresolved("inline source has no compiled `.olean`")
+        } else {
+            kernel_audit_compiled_file(file)
+        };
+        kernel.attach(&mut report);
+    }
+    report
+}
+
+/// Freshness class of a file's compiled `.olean`, as the `PolicyGates.lean` gate sees it.
+fn kernel_olean_state_label(st: crate::c_abi::KernelAuditOleanState) -> &'static str {
+    use crate::c_abi::KernelAuditOleanState as S;
+    match st {
+        S::Missing => "missing",
+        S::Stale => "stale",
+        S::Tampered => "tampered",
+        S::Fresh => "fresh",
+    }
+}
+
+struct KernelAuditOutcome {
+    module: Option<String>,
+    olean: Option<PathBuf>,
+    state: crate::c_abi::KernelAuditOleanState,
+    reader_ok: bool,
+    audited_modules: u32,
+    violations: Vec<String>,
+    error: Option<String>,
+}
+
+impl KernelAuditOutcome {
+    fn unresolved(msg: impl Into<String>) -> Self {
+        Self {
+            module: None,
+            olean: None,
+            state: crate::c_abi::KernelAuditOleanState::Missing,
+            reader_ok: false,
+            audited_modules: 0,
+            violations: Vec::new(),
+            error: Some(msg.into()),
+        }
+    }
+
+    fn apply_reply(&mut self, mod_name: &str, reply: crate::zygote::ZygoteAuditModulesReply) {
+        let exact_audited =
+            reply.audited.as_deref() == Some(std::slice::from_ref(&mod_name.to_string()));
+        let has_sorry = reply.used_sorry || !reply.sorry_decls.is_empty();
+        self.audited_modules = u32::from(exact_audited);
+        self.violations = reply.violations;
+        if has_sorry {
+            let detail = if reply.sorry_decls.is_empty() {
+                format!("[TurboLean.KernelGate] auditor reported `sorry` usage for `{mod_name}`")
+            } else {
+                format!(
+                    "[TurboLean.KernelGate] auditor reported `sorry` declarations for `{mod_name}`: {}",
+                    reply.sorry_decls.join(", ")
+                )
+            };
+            self.violations.push(detail);
+        }
+        if !exact_audited {
+            self.error = Some(format!(
+                "auditor `audited` list {:?} did not match requested `{mod_name}`",
+                reply.audited
+            ));
+        } else if reply.ok && !self.violations.is_empty() {
+            self.error = Some(format!(
+                "auditor returned contradictory `ok: true` with {} violation(s) for `{mod_name}`",
+                self.violations.len()
+            ));
+        }
+        self.reader_ok = reply.ok && exact_audited && !has_sorry && self.violations.is_empty();
+    }
+
+    fn admitted(&self) -> bool {
+        crate::c_abi::verify_kernel_audit_admission(
+            self.state,
+            self.reader_ok,
+            1,
+            self.audited_modules,
+            u32::try_from(self.violations.len()).unwrap_or(u32::MAX),
+        )
+    }
+
+    fn attach(&self, report: &mut serde_json::Value) {
+        let admitted = self.admitted();
+        let mut ka = serde_json::json!({
+            "module": self.module,
+            "olean": self.olean.as_ref().map(|p| p.display().to_string()),
+            "olean_state": kernel_olean_state_label(self.state),
+            "reader_ok": self.reader_ok,
+            "expected_modules": 1,
+            "audited_modules": self.audited_modules,
+            "violations": self.violations,
+            "admitted": admitted,
+        });
+        if let Some(e) = &self.error {
+            ka["error"] = serde_json::json!(e);
+        }
+        report["kernel_audit"] = ka;
+        report["kernel_violations"] = serde_json::json!(self.violations);
+        if !admitted {
+            report["ok"] = serde_json::json!(false);
+        }
+    }
+}
+
+/// Kernel-backed witness for one source file: map it to its Lake module, classify the compiled
+/// `.olean` (missing / tampered: artifact bytes disagree with `.hash` sidecars or trace outputs /
+/// stale: trace source hash differs from the current source / fresh), and only for a fresh
+/// `.olean` replay it through the in-kernel `--audit-modules` reader (axioms incl. `sorryAx`,
+/// `Lean.ofReduceBool`/`Lean.trustCompiler`, `implemented_by`/`extern`, `unsafe`, `csimp`).
+fn kernel_audit_compiled_file(file: &Path) -> KernelAuditOutcome {
+    use crate::c_abi::KernelAuditOleanState as S;
+    let Ok(src_raw) = fs::read_to_string(file) else {
+        return KernelAuditOutcome::unresolved(format!("cannot read {}", file.display()));
+    };
+    let root = crate::lake_build::find_project_root(file);
+    let cfg = match crate::module_builder::resolve_project_config(&root) {
+        Ok(c) => c,
+        Err(e) => {
+            return KernelAuditOutcome::unresolved(format!(
+                "no Lake project for {}: {e:#}",
+                file.display()
+            ))
+        }
+    };
+    let abs = fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    let Some((_, spec)) = crate::module_builder::resolve_lean_file_to_workspace_target(&cfg, &abs)
+    else {
+        return KernelAuditOutcome::unresolved(format!(
+            "{} is not a module of any Lake target",
+            file.display()
+        ));
+    };
+    let rel_slash = crate::module_builder::module_name_to_rel_slash(&spec.module_name);
+    let olean_path = spec.build_lib_lean_dir.join(format!("{rel_slash}.olean"));
+    let mut out = KernelAuditOutcome {
+        module: Some(spec.module_name.clone()),
+        olean: Some(olean_path.clone()),
+        state: S::Missing,
+        reader_ok: false,
+        audited_modules: 0,
+        violations: Vec::new(),
+        error: None,
+    };
+    if !olean_path.is_file() {
+        out.error = Some("compiled `.olean` not found: run `lake build` first".into());
+        return out;
+    }
+    let header = crate::module_builder::parse_header_info(&src_raw);
+    let needs_c = spec.emit_c_default || crate::module_builder::global_emit_c_enabled();
+    let check = |src_hash: bool| {
+        crate::module_builder::verify_module_lake_sidecars_inner_opts_ext(
+            &olean_path,
+            needs_c.then_some(spec.build_ir_dir.as_path()),
+            &rel_slash,
+            &src_raw,
+            header.is_module,
+            needs_c,
+            src_hash,
+            src_hash,
+            !needs_c,
+        )
+    };
+    if let Err(e) = check(false) {
+        out.state = S::Tampered;
+        out.error = Some(format!("{e:#}"));
+        return out;
+    }
+    if let Err(e) = check(true) {
+        out.state = S::Stale;
+        out.error = Some(format!("{e:#}"));
+        return out;
+    }
+    out.state = S::Fresh;
+    let store = match crate::db::TurboStore::open(None) {
+        Ok(s) => s,
+        Err(e) => {
+            out.error = Some(format!("cannot open turbo-lean store: {e:#}"));
+            return out;
+        }
+    };
+    let (lean_path_env, _) = crate::module_builder::build_lean_search_path(&cfg, false);
+    match crate::zygote::read_module_kernel_audit_reply(
+        &store,
+        &cfg,
+        &spec.module_name,
+        &lean_path_env,
+    ) {
+        Ok(reply) => out.apply_reply(&spec.module_name, reply),
+        Err(e) => out.error = Some(format!("{e:#}")),
+    }
+    out
+}
+
+fn audit_spec_file_or_source_lexical(
     file: &Path,
     inline_src: Option<&str>,
     decl_filter: Option<&str>,
@@ -4289,6 +4515,9 @@ fn aggregate_audit_spec_reports(
     let mut file_labels = Vec::new();
     let mut policy_labels: Vec<String> = Vec::new();
     let mut cache_hits = 0usize;
+    let mut kernel_files = 0usize;
+    let mut kernel_rejected = 0usize;
+    let mut kernel_violations: Vec<serde_json::Value> = Vec::new();
 
     let has_decl_filter = decl_filter.is_some_and(|df| !df.trim().is_empty());
     let mut any_report_error = false;
@@ -4313,6 +4542,15 @@ fn aggregate_audit_spec_reports(
         }
         if rep["cache_hit"].as_bool() == Some(true) {
             cache_hits += 1;
+        }
+        if let Some(ka) = rep.get("kernel_audit") {
+            kernel_files += 1;
+            if ka["admitted"].as_bool() != Some(true) {
+                kernel_rejected += 1;
+            }
+            if let Some(arr) = rep["kernel_violations"].as_array() {
+                kernel_violations.extend(arr.iter().cloned());
+            }
         }
         total_specs_audited += rep["total_specs_audited"].as_u64().unwrap_or(0) as usize;
         vacuous_specs += rep["vacuous_specs"].as_u64().unwrap_or(0) as usize;
@@ -4363,6 +4601,7 @@ fn aggregate_audit_spec_reports(
 
     let tier1_clean = !any_report_error
         && !batch_decl_missing
+        && kernel_rejected == 0
         && vacuous_specs == 0
         && trivial_specs == 0
         && shadowed_constants.is_empty()
@@ -4431,6 +4670,14 @@ fn aggregate_audit_spec_reports(
     });
     if !error_messages.is_empty() {
         out["error"] = serde_json::json!(error_messages.join("; "));
+    }
+    if kernel_files > 0 {
+        out["kernel_audit"] = serde_json::json!({
+            "files": kernel_files,
+            "admitted": kernel_files - kernel_rejected,
+            "rejected": kernel_rejected,
+        });
+        out["kernel_violations"] = serde_json::json!(kernel_violations);
     }
     out
 }
@@ -4539,6 +4786,7 @@ fn audit_spec_files_resolving_per_target(
     config_override: Option<&Path>,
     forbid_namespaces: &[String],
     forbid_decl_kinds: &[String],
+    kernel_override: bool,
 ) -> serde_json::Value {
     audit_spec_files_resolving_per_target_in_project(
         files,
@@ -4548,6 +4796,7 @@ fn audit_spec_files_resolving_per_target(
         config_override,
         forbid_namespaces,
         forbid_decl_kinds,
+        kernel_override,
     )
 }
 
@@ -4559,6 +4808,7 @@ fn audit_spec_files_resolving_per_target_in_project(
     config_override: Option<&Path>,
     forbid_namespaces: &[String],
     forbid_decl_kinds: &[String],
+    kernel_override: bool,
 ) -> serde_json::Value {
     run_audit_spec_batch_with(files, decl_filter, policy_override, |f, expand_umbrella| {
         match AuditSpecPolicyConfig::try_load_for_target_with_project_dir(
@@ -4569,13 +4819,16 @@ fn audit_spec_files_resolving_per_target_in_project(
             forbid_namespaces,
             forbid_decl_kinds,
         ) {
-            Ok(pol) => audit_spec_file_or_source_with_policy_inner(
-                f,
-                None,
-                decl_filter,
-                &pol,
-                expand_umbrella,
-            ),
+            Ok(mut pol) => {
+                pol.kernel |= kernel_override;
+                audit_spec_file_or_source_with_policy_inner(
+                    f,
+                    None,
+                    decl_filter,
+                    &pol,
+                    expand_umbrella,
+                )
+            }
             Err(err) => build_audit_spec_error_report(f, decl_filter, format!("{:#}", err)),
         }
     })
@@ -4584,7 +4837,7 @@ fn audit_spec_files_resolving_per_target_in_project(
 /// Audit theorem specifications across multiple `files` concurrently, resolving project/policy
 /// configuration independently for each target file so multi-file batches are permutation-invariant.
 pub fn audit_spec_files(files: &[PathBuf], decl_filter: Option<&str>) -> serde_json::Value {
-    audit_spec_files_resolving_per_target(files, decl_filter, None, None, &[], &[])
+    audit_spec_files_resolving_per_target(files, decl_filter, None, None, &[], &[], false)
 }
 
 pub fn audit_spec_files_with_policy(
@@ -4614,7 +4867,17 @@ pub fn run_audit_spec_command(
     decl_filter: Option<&str>,
     json_mode: bool,
 ) -> Result<()> {
-    run_audit_spec_command_with_options(files, decl_filter, json_mode, None, None, &[], &[], false)
+    run_audit_spec_command_with_options(
+        files,
+        decl_filter,
+        json_mode,
+        None,
+        None,
+        &[],
+        &[],
+        false,
+        false,
+    )
 }
 
 pub fn apply_require_nonempty_to_audit_report(
@@ -4669,6 +4932,7 @@ pub fn run_audit_spec_command_with_options(
     forbid_namespaces: &[String],
     forbid_decl_kinds: &[String],
     require_nonempty: bool,
+    kernel: bool,
 ) -> Result<()> {
     if files.is_empty() {
         let msg = "No files provided to audit-spec";
@@ -4709,6 +4973,7 @@ pub fn run_audit_spec_command_with_options(
         config_override,
         forbid_namespaces,
         forbid_decl_kinds,
+        kernel,
     );
     apply_require_nonempty_to_audit_report(&mut report, require_nonempty);
     let ok_flag = report["ok"].as_bool() == Some(true);
@@ -4791,6 +5056,181 @@ pub fn run_audit_spec_command_with_options(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod kernel_audit_tests {
+    use super::*;
+    use crate::c_abi::KernelAuditOleanState as S;
+
+    fn outcome(state: S, reader_ok: bool, audited: u32, violations: &[&str]) -> KernelAuditOutcome {
+        KernelAuditOutcome {
+            module: Some("App.Main".into()),
+            olean: None,
+            state,
+            reader_ok,
+            audited_modules: audited,
+            violations: violations.iter().map(|v| v.to_string()).collect(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn kernel_audit_outcome_admits_only_a_clean_fresh_audit() {
+        let mut rep = serde_json::json!({"ok": true});
+        outcome(S::Fresh, true, 1, &[]).attach(&mut rep);
+        assert_eq!(rep["ok"], true);
+        assert_eq!(rep["kernel_audit"]["admitted"], true);
+        assert_eq!(rep["kernel_audit"]["olean_state"], "fresh");
+
+        for o in [
+            outcome(S::Missing, true, 1, &[]),
+            outcome(S::Stale, true, 1, &[]),
+            outcome(S::Tampered, true, 1, &[]),
+            outcome(S::Fresh, false, 1, &[]),
+            outcome(S::Fresh, true, 0, &[]),
+            outcome(
+                S::Fresh,
+                true,
+                1,
+                &["[TurboLean.KernelGate] custom axiom `a`"],
+            ),
+            KernelAuditOutcome::unresolved("no project"),
+        ] {
+            let mut rep = serde_json::json!({"ok": true});
+            o.attach(&mut rep);
+            assert_eq!(rep["ok"], false, "{rep}");
+            assert_eq!(rep["kernel_audit"]["admitted"], false, "{rep}");
+            assert_eq!(rep["kernel_violations"], serde_json::json!(o.violations));
+        }
+    }
+
+    #[test]
+    fn kernel_audit_rejection_fails_the_batch_aggregate() {
+        let mut good = serde_json::json!({"ok": true, "status": "ok", "file": "A.lean",
+            "total_specs_audited": 1, "tight_specs": 1});
+        outcome(S::Fresh, true, 1, &[]).attach(&mut good);
+        let mut bad = serde_json::json!({"ok": true, "status": "ok", "file": "B.lean",
+            "total_specs_audited": 1, "tight_specs": 1});
+        outcome(S::Stale, true, 1, &[]).attach(&mut bad);
+        let agg = aggregate_audit_spec_reports(vec![good.clone(), bad], None, None, Instant::now());
+        assert_eq!(agg["ok"], false, "{agg}");
+        assert_eq!(agg["kernel_audit"]["rejected"], 1);
+        let agg_ok =
+            aggregate_audit_spec_reports(vec![good.clone(), good], None, None, Instant::now());
+        assert_eq!(agg_ok["ok"], true, "{agg_ok}");
+        assert_eq!(agg_ok["kernel_audit"]["admitted"], 2);
+    }
+
+    #[test]
+    fn kernel_key_is_strict_toml() {
+        let raw: RawAuditSpecSection = toml::from_str("kernel = true").unwrap();
+        assert!(raw.into_policy_config().unwrap().kernel);
+        assert!(toml::from_str::<RawAuditSpecSection>("kernal = true").is_err());
+        assert!(!AuditSpecPolicyConfig::default().kernel);
+    }
+
+    #[test]
+    fn kernel_audit_apply_reply_rejects_violations_sorry_and_mismatched_audited() {
+        let fresh_outcome = || KernelAuditOutcome {
+            module: Some("App.Main".into()),
+            olean: None,
+            state: S::Fresh,
+            reader_ok: false,
+            audited_modules: 0,
+            violations: Vec::new(),
+            error: None,
+        };
+
+        // Positive control: clean exact reply admits.
+        let mut clean = fresh_outcome();
+        clean.apply_reply(
+            "App.Main",
+            crate::zygote::ZygoteAuditModulesReply {
+                ok: true,
+                audited: Some(vec!["App.Main".into()]),
+                ..Default::default()
+            },
+        );
+        let mut rep = serde_json::json!({"ok": true});
+        clean.attach(&mut rep);
+        assert_eq!(rep["ok"], true);
+        assert_eq!(rep["kernel_audit"]["admitted"], true);
+
+        // Negative controls: `ok: true` with violations, `used_sorry`, `sorry_decls`,
+        // or missing/mismatched/extra `audited` entries must ALL fail closed.
+        let bad_replies = [
+            (
+                "ok:true with non-empty violations",
+                crate::zygote::ZygoteAuditModulesReply {
+                    ok: true,
+                    audited: Some(vec!["App.Main".into()]),
+                    violations: vec!["[TurboLean.KernelGate] custom axiom `a`".into()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "used_sorry:true with ok:true",
+                crate::zygote::ZygoteAuditModulesReply {
+                    ok: true,
+                    audited: Some(vec!["App.Main".into()]),
+                    used_sorry: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "non-empty sorry_decls with ok:true",
+                crate::zygote::ZygoteAuditModulesReply {
+                    ok: true,
+                    audited: Some(vec!["App.Main".into()]),
+                    sorry_decls: vec!["App.Main.t".into()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "mismatched audited module name",
+                crate::zygote::ZygoteAuditModulesReply {
+                    ok: true,
+                    audited: Some(vec!["App.Other".into()]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "extra audited entry alongside requested module",
+                crate::zygote::ZygoteAuditModulesReply {
+                    ok: true,
+                    audited: Some(vec!["App.Main".into(), "App.Other".into()]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "duplicate audited entries",
+                crate::zygote::ZygoteAuditModulesReply {
+                    ok: true,
+                    audited: Some(vec!["App.Main".into(), "App.Main".into()]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "missing audited field",
+                crate::zygote::ZygoteAuditModulesReply {
+                    ok: true,
+                    audited: None,
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (label, reply) in bad_replies {
+            let mut o = fresh_outcome();
+            o.apply_reply("App.Main", reply);
+            let mut rep = serde_json::json!({"ok": true});
+            o.attach(&mut rep);
+            assert!(!o.reader_ok, "{label}: reader_ok must be false");
+            assert_eq!(rep["ok"], false, "{label}: {rep}");
+            assert_eq!(rep["kernel_audit"]["admitted"], false, "{label}: {rep}");
+        }
+    }
 }
 
 #[cfg(test)]

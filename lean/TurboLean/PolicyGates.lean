@@ -138,6 +138,18 @@ def verifyReceiptProvenanceAdmission
           ((engineKind == 2 || engineKind == 3) && conLecheRevState == 2))
     else false
 
+/-- Kernel-backed `audit-spec` witness admission gate (A2). `oleanState`:
+    `0 = missing`, `1 = stale` (source/trace hash mismatch), `2 = tampered`
+    (`.olean`/`.olean.hash`/trace artifact mismatch), `3 = fresh`. A file is admitted only when
+    its compiled `.olean` is fresh, the kernel reader ran to completion, it audited exactly the
+    expected (nonzero) number of modules, and it reported zero violations. -/
+@[inline]
+def verifyKernelAuditAdmission
+    (oleanState : UInt8) (readerOk : Bool)
+    (expectedModules auditedModules violationCount : UInt32) : Bool :=
+  oleanState == 3 && readerOk && expectedModules != 0 &&
+    auditedModules == expectedModules && violationCount == 0
+
 /-- Tier-aware Matryoshka cascade router (`0 = pass`, `1 = prune_stop`, `2 = abstain_escalate`). -/
 @[inline]
 def matryoshkaTierRouterSpec (survPermille pruneFloorPermille escalateBandPermille epsTierPermille : UInt64)
@@ -364,6 +376,12 @@ def verifyPackTrustAdmissionC
 def verifyHygieneItemAdmittedC
     (itemKind : UInt8) (admitsNativeDecide admitsBvDecide allowInteractiveSorry : Bool) : Bool :=
   verifyHygieneItemAdmitted itemKind admitsNativeDecide admitsBvDecide allowInteractiveSorry
+
+@[inline, export turbo_spec_verify_kernel_audit_admission]
+def verifyKernelAuditAdmissionC
+    (oleanState : UInt8) (readerOk : Bool)
+    (expectedModules auditedModules violationCount : UInt32) : Bool :=
+  verifyKernelAuditAdmission oleanState readerOk expectedModules auditedModules violationCount
 
 @[inline, export turbo_spec_route_kernel_engine]
 def routeKernelEngineC (requestedEngine : UInt8) (conLecheSupported : Bool) : UInt8 :=

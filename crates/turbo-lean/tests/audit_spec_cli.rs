@@ -1764,3 +1764,280 @@ name = "CasReplayPkg"
     assert_eq!(warm_json["cas_expr_replayed"].as_u64(), Some(1));
 }
 
+fn lake_available() -> bool {
+    Command::new("lake")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+const KERNEL_LAKEFILE: &str = "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nroots = [\"App.Main\", \"App.Dep\", \"App.Sneaky\"]\n";
+
+/// Every bypass here hides behind a macro or an attribute, so the source-level audit accepts it;
+/// only the kernel reading the compiled `.olean` sees `sorryAx`, the `native_decide` axiom, the
+/// custom axiom and the `implemented_by` swap.
+const KERNEL_SNEAKY: &str = r#"import App.Dep
+
+macro "finish_it" : tactic => `(tactic| exact sorryAx _ false)
+macro "compute_it" : tactic => `(tactic| native_decide)
+
+axiom depVal_spec_ax : ∀ n : Nat, n * depVal ≥ n
+
+def slowSum (n : Nat) : Nat := n + depVal
+def fastSum (n : Nat) : Nat := n
+attribute [implemented_by fastSum] slowSum
+
+theorem sum_bound (n : Nat) (h : n > 0) : slowSum n > depVal := by finish_it
+theorem pow_fact (k : Nat) (h : k = 10) : 2 ^ k = 1024 := by subst h; compute_it
+theorem mul_bound (n : Nat) (h : n > 2) : n * depVal ≥ n := depVal_spec_ax n
+"#;
+
+fn kernel_fixture(name: &str) -> Option<AuditSpecFixture> {
+    if !lake_available() {
+        eprintln!("skipping {name}: `lake` not on PATH");
+        return None;
+    }
+    let fx = AuditSpecFixture::new(name);
+    fx.write("lean-toolchain", "leanprover/lean4:v4.35.0\n");
+    fx.write("lakefile.toml", KERNEL_LAKEFILE);
+    fx.write("App/Dep.lean", "def depVal : Nat := 3\n");
+    fx.write(
+        "App/Main.lean",
+        "import App.Dep\ntheorem t_ok (n : Nat) : n + depVal = depVal + n := Nat.add_comm _ _\n",
+    );
+    fx.write("App/Sneaky.lean", KERNEL_SNEAKY);
+    let built = Command::new("lake")
+        .arg("build")
+        .env("LEAN_NUM_THREADS", "2")
+        .current_dir(&fx.root)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "lake build failed:\n{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    Some(fx)
+}
+
+fn kernel_audit(fx: &AuditSpecFixture, rel: &str, extra: &[&str]) -> Output {
+    fx.cli("kernel")
+        .args(["--json", "audit-spec"])
+        .args(extra)
+        .arg(fx.root.join(rel))
+        .output()
+        .unwrap()
+}
+
+fn assert_kernel_rejects(fx: &AuditSpecFixture, rel: &str, state: &str, ctx: &str) -> Value {
+    let json = assert_cli_fail_json(&kernel_audit(fx, rel, &["--kernel"]), ctx);
+    let ka = &json["kernel_audit"];
+    assert_eq!(ka["olean_state"].as_str(), Some(state), "{ctx}: {json}");
+    assert_eq!(ka["admitted"].as_bool(), Some(false), "{ctx}: {json}");
+    json
+}
+
+#[test]
+fn kernel_mode_catches_obfuscated_bypasses_the_lexical_audit_accepts() {
+    let Some(fx) = kernel_fixture("kernel_sneaky") else {
+        return;
+    };
+    let lexical = assert_cli_ok(&kernel_audit(&fx, "App/Sneaky.lean", &[]), "lexical");
+    assert!(lexical.get("kernel_audit").is_none(), "{lexical}");
+
+    let json = assert_kernel_rejects(&fx, "App/Sneaky.lean", "fresh", "kernel sneaky");
+    assert_eq!(json["kernel_audit"]["module"].as_str(), Some("App.Sneaky"));
+    let violations: Vec<String> = json["kernel_violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    for needle in [
+        "disallowed axiom `sorryAx`",
+        "native_decide",
+        "custom axiom `depVal_spec_ax`",
+        "implemented_by bypass on `slowSum`",
+    ] {
+        assert!(
+            violations.iter().any(|v| v.contains(needle)),
+            "missing kernel violation `{needle}` in {violations:?}"
+        );
+    }
+
+    // `kernel = true` in `[audit_spec]` turns the same witness on without the flag.
+    let cfg = fx.write("kernel.toml", "[audit_spec]\nkernel = true\n");
+    let cfg_out = kernel_audit(&fx, "App/Sneaky.lean", &["--config", cfg.to_str().unwrap()]);
+    let cfg_json = assert_cli_fail_json(&cfg_out, "kernel via TOML");
+    assert_eq!(cfg_json["kernel_audit"]["admitted"].as_bool(), Some(false));
+
+    // Batch: one rejected file fails the aggregate.
+    let batch = fx
+        .cli("kernel")
+        .args(["--json", "audit-spec", "--kernel"])
+        .arg(fx.root.join("App/Main.lean"))
+        .arg(fx.root.join("App/Sneaky.lean"))
+        .output()
+        .unwrap();
+    let batch_json = assert_cli_fail_json(&batch, "kernel batch");
+    assert_eq!(batch_json["kernel_audit"]["files"].as_u64(), Some(2));
+    assert_eq!(batch_json["kernel_audit"]["rejected"].as_u64(), Some(1));
+}
+
+#[test]
+fn kernel_mode_fails_closed_on_missing_stale_or_tampered_olean() {
+    let Some(fx) = kernel_fixture("kernel_fresh") else {
+        return;
+    };
+    let main = "App/Main.lean";
+    let ok = assert_cli_ok(&kernel_audit(&fx, main, &["--kernel"]), "clean kernel");
+    let ka = &ok["kernel_audit"];
+    assert_eq!(ka["olean_state"].as_str(), Some("fresh"), "{ok}");
+    assert_eq!(ka["audited_modules"].as_u64(), Some(1), "{ok}");
+    assert_eq!(ka["admitted"].as_bool(), Some(true), "{ok}");
+    assert_eq!(ok["kernel_violations"].as_array().map(Vec::len), Some(0));
+
+    let olean = fx.root.join(".lake/build/lib/lean/App/Main.olean");
+    let hash = fx.root.join(".lake/build/lib/lean/App/Main.olean.hash");
+    let olean_bytes = fs::read(&olean).unwrap();
+    let hash_bytes = fs::read(&hash).unwrap();
+    let src_bytes = fs::read(fx.root.join(main)).unwrap();
+
+    // Tampered `.olean` bytes: the lexical report for this source is now cached, which must not
+    // mask the kernel verdict.
+    let mut flipped = olean_bytes.clone();
+    let n = flipped.len();
+    flipped[n - 10] ^= 0xff;
+    fs::write(&olean, &flipped).unwrap();
+    assert_kernel_rejects(&fx, main, "tampered", "tampered olean");
+    fs::write(&olean, &olean_bytes).unwrap();
+
+    // Tampered `.olean.hash` sidecar.
+    fs::write(&hash, "0000000000000001").unwrap();
+    assert_kernel_rejects(&fx, main, "tampered", "tampered hash sidecar");
+    fs::write(&hash, &hash_bytes).unwrap();
+
+    // Stale: source edited after the build.
+    let mut edited = src_bytes.clone();
+    edited.extend_from_slice(b"theorem t_new : depVal = 3 := rfl\n");
+    fs::write(fx.root.join(main), &edited).unwrap();
+    assert_kernel_rejects(&fx, main, "stale", "stale olean");
+    fs::write(fx.root.join(main), &src_bytes).unwrap();
+
+    // Missing.
+    fs::remove_file(&olean).unwrap();
+    assert_kernel_rejects(&fx, main, "missing", "missing olean");
+    fs::write(&olean, &olean_bytes).unwrap();
+
+    assert_cli_ok(&kernel_audit(&fx, main, &["--kernel"]), "restored kernel");
+}
+
+#[test]
+fn kernel_mode_fails_closed_outside_a_lake_project() {
+    let fx = AuditSpecFixture::new("kernel_no_lake");
+    let f = fx.write(
+        "Loose.lean",
+        "theorem loose (n : Nat) (h : n > 0) : n ≥ 1 := h\n",
+    );
+    let plain = fx
+        .cli("loose")
+        .args(["--json", "audit-spec"])
+        .arg(&f)
+        .output()
+        .unwrap();
+    assert_cli_ok(&plain, "loose lexical");
+    let out = fx
+        .cli("loose")
+        .args(["--json", "audit-spec", "--kernel"])
+        .arg(&f)
+        .output()
+        .unwrap();
+    let json = assert_cli_fail_json(&out, "loose kernel");
+    assert_eq!(
+        json["kernel_audit"]["admitted"].as_bool(),
+        Some(false),
+        "{json}"
+    );
+    assert_eq!(
+        json["kernel_audit"]["olean_state"].as_str(),
+        Some("missing")
+    );
+}
+
+#[test]
+fn kernel_mode_ignores_caller_allowlist_env_vars() {
+    if !lake_available() {
+        eprintln!("skipping kernel_mode_ignores_caller_allowlist_env_vars: `lake` not on PATH");
+        return;
+    }
+    let fx = AuditSpecFixture::new("kernel_env_override");
+    fx.write("lean-toolchain", "leanprover/lean4:v4.35.0\n");
+    fx.write(
+        "lakefile.toml",
+        "name = \"env_pkg\"\ndefaultTargets = [\"EnvApp\"]\n[[lean_lib]]\nname = \"EnvApp\"\nroots = [\"EnvApp.Bypass\"]\n",
+    );
+    let bypass_src = r#"
+macro "use_sorry_ax" : tactic => `(tactic| exact sorryAx _ false)
+
+axiom custom_env_ax : ∀ n : Nat, n + 1 > n
+
+unsafe def badUnsafe (n : Nat) : Nat := n + 1
+
+def slowFn (n : Nat) : Nat := n + 1
+def fastFn (n : Nat) : Nat := n
+attribute [implemented_by fastFn] slowFn
+
+@[extern "fake_env_c_sym"]
+opaque fakeExtern (n : Nat) : Nat
+
+theorem thm_sorry (n : Nat) : n + 1 > n := by use_sorry_ax
+theorem thm_ax (n : Nat) : n + 1 > n := custom_env_ax n
+"#;
+    fx.write("EnvApp/Bypass.lean", bypass_src);
+    let built = Command::new("lake")
+        .arg("build")
+        .env("LEAN_NUM_THREADS", "2")
+        .current_dir(&fx.root)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "lake build failed:\n{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let out = fx
+        .cli("kernel-env")
+        .env("TURBO_LEAN_ALLOWED_AXIOMS", "*")
+        .env("TURBO_LEAN_ALLOWED_UNSAFE", "*")
+        .env("TURBO_LEAN_ALLOWED_CSIMP", "*")
+        .env("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY", "*")
+        .env("TURBO_LEAN_ALLOWED_FFI", "EnvApp.Bypass=fakeExtern=fake_env_c_sym")
+        .args(["--json", "audit-spec", "--kernel"])
+        .arg(fx.root.join("EnvApp/Bypass.lean"))
+        .output()
+        .unwrap();
+    let json = assert_cli_fail_json(&out, "kernel with allowlist env vars set");
+    assert_eq!(json["kernel_audit"]["olean_state"].as_str(), Some("fresh"), "{json}");
+    assert_eq!(json["kernel_audit"]["admitted"].as_bool(), Some(false), "{json}");
+    let violations: Vec<String> = json["kernel_violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    for needle in [
+        "disallowed axiom `sorryAx`",
+        "custom axiom `custom_env_ax`",
+        "unsafe declaration `badUnsafe`",
+        "implemented_by bypass on `slowFn`",
+        "extern/implemented_by bypass on `fakeExtern`",
+    ] {
+        assert!(
+            violations.iter().any(|v| v.contains(needle)),
+            "expected kernel violation `{needle}` even with TURBO_LEAN_ALLOWED_* env vars set; got: {violations:?}"
+        );
+    }
+}
