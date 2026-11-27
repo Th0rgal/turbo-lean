@@ -887,12 +887,34 @@ impl CsimpImportPolicyDecision {
     }
 }
 
+/// Strip Lean's `_private.<module>.<idx>.` prefix to obtain the user-facing declaration name,
+/// mirroring `Lean.privateToUserName` in `ZygoteWorker.lean`.
+fn private_csimp_user_name(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("_private.")?;
+    let mut offset = 0usize;
+    for seg in rest.split('.') {
+        let next_offset = offset + seg.len();
+        if !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()) {
+            if next_offset < rest.len() {
+                return Some(&rest[next_offset + 1..]);
+            }
+            return None;
+        }
+        offset = next_offset + 1;
+    }
+    None
+}
+
 /// Whether a configured `[csimp] allow` pattern admits `theorem`, with the same `*`-glob
-/// semantics as the zygote worker's `globMatch` over the theorem's name.
+/// semantics as the zygote worker's `nameMatchesPolicy` (matching either the raw kernel name or
+/// `Lean.privateToUserName`).
 pub fn csimp_pattern_allows(configured_allow: &[String], theorem: &str) -> bool {
-    configured_allow
-        .iter()
-        .any(|p| crate::splitter::glob_match(p.trim(), theorem))
+    let user_name = private_csimp_user_name(theorem);
+    configured_allow.iter().any(|p| {
+        let pat = p.trim();
+        crate::splitter::glob_match(pat, theorem)
+            || user_name.is_some_and(|u| crate::splitter::glob_match(pat, u))
+    })
 }
 
 /// Decide the zero-config `csimp` import policy for `entries` — `(owner module, theorem name)`
@@ -1643,6 +1665,20 @@ mod tests {
             "Foo.fast_eq"
         ));
         assert!(!csimp_pattern_allows(&["Foo.fast_?q".into()], "Foo.fast_eq"));
+        // Private declarations match both exact module-scoped private names and user names,
+        // while a different module's private name never matches.
+        assert!(csimp_pattern_allows(
+            &["_private.MyProj.Own.0.Foo.fast_eq".into()],
+            "_private.MyProj.Own.0.Foo.fast_eq"
+        ));
+        assert!(csimp_pattern_allows(
+            &["Foo.fast_eq".into()],
+            "_private.MyProj.Own.0.Foo.fast_eq"
+        ));
+        assert!(!csimp_pattern_allows(
+            &["_private.Batteries.Fast.0.Foo.fast_eq".into()],
+            "_private.MyProj.Own.0.Foo.fast_eq"
+        ));
     }
 
     #[test]

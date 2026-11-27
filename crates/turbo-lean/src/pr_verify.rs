@@ -10017,6 +10017,12 @@ pub fn run_pr_verify_command(
     // Per-shard names and canonical kernel types must be attested by Lean before
     // cache hits or verification can be attributed to them.
     let attest_t0 = Instant::now();
+    let kernel_audit_digest = kernel_prov.shard_cache_digest();
+    let pr_pkg_cfg_for_kernel_keys = if kernel_audit_digest.is_some() && !is_untrusted {
+        crate::module_builder::optional_package_config(&canon_dir)?
+    } else {
+        None
+    };
     let mut all_edited_keys = Vec::new();
     let mut attested_shards_by_file = Vec::with_capacity(shards_by_file.len());
     for (rel_path, file_shards) in shards_by_file {
@@ -10035,8 +10041,29 @@ pub fn run_pr_verify_command(
             &verification_trust.extra_ro_olean_dirs,
             None,
         )?;
+        let file_lean_args_for_kernel = if kernel_audit_digest.is_some() {
+            if let Some(ref cfg) = untrusted_pr_cfg {
+                crate::module_builder::resolve_file_lean_args_in_package(&cfg.root_pkg, &abs_file)
+            } else if let Some(ref pkg) = pr_pkg_cfg_for_kernel_keys {
+                crate::module_builder::resolve_file_lean_args_in_package(pkg, &abs_file)
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
         let mut attested_file_shards = Vec::with_capacity(file_shards.len());
         for ((k, shard, fast_ok), att) in file_shards.into_iter().zip(attested) {
+            let k = if let Some(ref kd) = kernel_audit_digest {
+                compute_shard_key_with_args(
+                    &toolchain,
+                    &shard,
+                    &file_lean_args_for_kernel,
+                    Some(kd.as_str()),
+                )
+            } else {
+                k
+            };
             all_edited_keys.push(k.clone());
             all_edited_keys.push(pack::client_attested_receipt_key(&k));
             attested_file_shards.push((k, shard, fast_ok, att.kernel_type_hash));

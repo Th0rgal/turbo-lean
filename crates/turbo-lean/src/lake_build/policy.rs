@@ -16,8 +16,31 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
+
+/// Records `(effective_allowlist, configured_allowlist)` whenever `apply_env = true` extends
+/// `TURBO_LEAN_ALLOWED_CSIMP` with dependency-scraped entries, so subsequent read-only preflights
+/// (`freshness.rs`) still evaluate project-owned `@[csimp]` theorems against the pre-auto-allow
+/// configured policy rather than treating auto-allowed dependency names as user-configured.
+fn auto_allow_csimp_overlay() -> &'static Mutex<Option<(Vec<String>, Vec<String>)>> {
+    static OVERLAY: OnceLock<Mutex<Option<(Vec<String>, Vec<String>)>>> = OnceLock::new();
+    OVERLAY.get_or_init(|| Mutex::new(None))
+}
+
+fn configured_csimp_allowlist_from_env() -> (Vec<String>, Vec<String>) {
+    let current = crate::splitter::normalized_policy_env_vec("TURBO_LEAN_ALLOWED_CSIMP");
+    let guard = auto_allow_csimp_overlay()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some((ref recorded_effective, ref recorded_configured)) = *guard {
+        if *recorded_effective == current {
+            return (current, recorded_configured.clone());
+        }
+    }
+    (current.clone(), current)
+}
 
 /// What the preflight should scrape.
 pub(crate) enum CsimpPreflightScope {
@@ -29,23 +52,35 @@ pub(crate) enum CsimpPreflightScope {
     AllDependencyPackages,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LeanScope {
+    Namespace(String),
+    Section(Option<String>),
+}
+
 /// Scrape `@[csimp]`-attributed theorem names from Lean source text, fully qualified the way the
 /// worker sees them.
 ///
 /// Comments and string literals are stripped first, so a `@[csimp]` mention in documentation or
 /// a string never scrapes. Names are qualified by the enclosing `namespace` scopes (`_root_.`
-/// opts out), `private` theorems become the `_private.*.0.<name>` glob of Lean's private-name
-/// mangling, and both `@[csimp]` (alone or in an attribute list such as `@[simp, csimp]`) and
-/// the `attribute [csimp] name` command are recognized. Modifiers (`private`, `protected`,
-/// `unsafe`, `noncomputable`, `partial`) between the attribute and `theorem`/`lemma` are skipped.
-/// The result is sorted and de-duplicated.
+/// opts out), `private` theorems become `_private.<module>.0.<name>` (or `_private.*.0.<name>`
+/// when no module name is provided), and both `@[csimp]` (alone, in nested attribute lists such
+/// as `@[simp [bar], csimp]`, or stacked before another `@[...]`) and the `attribute [csimp] name`
+/// command are recognized. Modifiers (`private`, `protected`, `public`, `meta`, `exposed`,
+/// `unsafe`, `noncomputable`, `partial`, `scoped`, `local`) between the attribute and
+/// `theorem`/`lemma` are skipped. The result is sorted and de-duplicated.
+#[cfg(test)]
 pub(crate) fn scrape_csimp_theorems(src: &str) -> Vec<String> {
+    scrape_csimp_theorems_for_module(None, src)
+}
+
+pub(crate) fn scrape_csimp_theorems_for_module(module: Option<&str>, src: &str) -> Vec<String> {
     let comment_free = crate::splitter::strip_lean_comments(src);
     let clean = crate::splitter::strip_string_literals(&comment_free);
     let clean: &str = clean.as_ref();
     let mut out = BTreeSet::new();
-    // One entry per open scope: the namespace components it adds (`section`/`mutual` add none).
-    let mut scopes: Vec<Vec<String>> = Vec::new();
+    let mut scopes: Vec<LeanScope> = Vec::new();
+    let mut private_decls: HashSet<String> = HashSet::new();
     let mut pos = 0usize;
     while let Some((tok, tok_start, tok_end)) = next_token(clean, pos) {
         pos = tok_end;
@@ -53,7 +88,7 @@ pub(crate) fn scrape_csimp_theorems(src: &str) -> Vec<String> {
             let Some(open) = clean[tok_start..].find('[').map(|i| tok_start + i) else {
                 continue;
             };
-            let Some(close) = clean[open..].find(']').map(|i| open + i) else {
+            let Some(close) = find_matching_bracket(clean, open) else {
                 break;
             };
             pos = close + 1;
@@ -63,34 +98,102 @@ pub(crate) fn scrape_csimp_theorems(src: &str) -> Vec<String> {
             if tok == "attribute" {
                 let line_end = clean[pos..].find('\n').map_or(clean.len(), |i| pos + i);
                 for name in clean[pos..line_end].split_whitespace() {
-                    if let Some(full) = qualify_csimp_name(&scopes, name, false) {
-                        out.insert(full);
+                    if let Some(full) = qualify_plain_name(&scopes, name) {
+                        let is_priv = private_decls.contains(&full);
+                        out.insert(format_csimp_name(module, &full, is_priv));
                     }
                 }
                 pos = line_end;
             } else if let Some((name, private)) = theorem_name_after_attribute(&clean[pos..]) {
-                if let Some(full) = qualify_csimp_name(&scopes, &name, private) {
-                    out.insert(full);
+                if let Some(full) = qualify_plain_name(&scopes, &name) {
+                    if private {
+                        private_decls.insert(full.clone());
+                    }
+                    out.insert(format_csimp_name(module, &full, private));
                 }
             }
             continue;
         }
         match tok {
+            "private" => {
+                if let Some((next_tok, _, next_end)) = next_token(clean, pos) {
+                    if matches!(next_tok, "theorem" | "lemma") {
+                        if let Some((name, _, _)) = next_token(clean, next_end) {
+                            if let Some(full) = qualify_plain_name(&scopes, name) {
+                                private_decls.insert(full);
+                            }
+                        }
+                    }
+                }
+            }
             "namespace" => {
                 if let Some((ns, _, ns_end)) = next_token(clean, pos) {
                     pos = ns_end;
+                    let ns = extract_decl_ident(ns);
                     let ns = ns.strip_prefix("_root_.").unwrap_or(ns);
-                    scopes.push(ns.split('.').map(str::to_string).collect());
+                    for seg in ns.split('.').filter(|s| !s.is_empty()) {
+                        scopes.push(LeanScope::Namespace(seg.to_string()));
+                    }
                 }
             }
-            "section" | "mutual" => scopes.push(Vec::new()),
+            "section" => {
+                if let Some((sec_name, _, sec_end)) = next_token_same_line(clean, pos) {
+                    let sec_ident = extract_decl_ident(sec_name);
+                    if !sec_ident.is_empty() && is_lean_ident_start(sec_ident) {
+                        pos = sec_end;
+                        scopes.push(LeanScope::Section(Some(sec_ident.to_string())));
+                    } else {
+                        scopes.push(LeanScope::Section(None));
+                    }
+                } else {
+                    scopes.push(LeanScope::Section(None));
+                }
+            }
+            "mutual" => scopes.push(LeanScope::Section(None)),
             "end" => {
-                scopes.pop();
+                if let Some((end_tok, _, end_end)) = next_token_same_line(clean, pos) {
+                    let end_ident = extract_decl_ident(end_tok);
+                    let end_ident = end_ident.strip_prefix("_root_.").unwrap_or(end_ident);
+                    if !end_ident.is_empty() && is_lean_ident_start(end_ident) {
+                        pos = end_end;
+                        pop_named_end(&mut scopes, end_ident);
+                    } else {
+                        scopes.pop();
+                    }
+                } else {
+                    scopes.pop();
+                }
             }
             _ => {}
         }
     }
     out.into_iter().collect()
+}
+
+/// Pop matching namespace/section frames for `end <ident>` (handling partial closes like
+/// `namespace A.B ... end B ... end A` as well as `section S ... end S`).
+fn pop_named_end(scopes: &mut Vec<LeanScope>, end_ident: &str) {
+    if matches!(scopes.last(), Some(LeanScope::Section(Some(name))) if name == end_ident) {
+        scopes.pop();
+        return;
+    }
+    let segs: Vec<&str> = end_ident.split('.').filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        scopes.pop();
+        return;
+    }
+    let mut popped = 0usize;
+    for seg in segs.iter().rev() {
+        if matches!(scopes.last(), Some(LeanScope::Namespace(ns)) if ns == seg) {
+            scopes.pop();
+            popped += 1;
+        } else {
+            break;
+        }
+    }
+    if popped == 0 {
+        scopes.pop();
+    }
 }
 
 /// The next whitespace-delimited token at or after `pos`, with its byte span.
@@ -102,67 +205,226 @@ fn next_token(s: &str, pos: usize) -> Option<(&str, usize, usize)> {
     Some((&s[start..end], start, end))
 }
 
-/// Whether an attribute list (`simp, csimp`, `local csimp`, ...) contains the `csimp` attribute.
+/// The next whitespace-delimited token on the current line (before `\n`), with its byte span.
+fn next_token_same_line(s: &str, pos: usize) -> Option<(&str, usize, usize)> {
+    let line_end = s[pos..].find('\n').map_or(s.len(), |i| pos + i);
+    let slice = &s[pos..line_end];
+    let rel_start = slice.find(|c: char| !c.is_whitespace())?;
+    let start = pos + rel_start;
+    let end = s[start..line_end]
+        .find(char::is_whitespace)
+        .map_or(line_end, |i| start + i);
+    Some((&s[start..end], start, end))
+}
+
+/// Find the matching `]` for the `[` at byte index `open`, tracking nested `[...]` brackets.
+fn find_matching_bracket(s: &str, open: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.get(open).copied() != Some(b'[') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (i, &b) in bytes[open..].iter().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open + i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether an attribute list (`simp, csimp`, `simp [bar], csimp`, `local csimp`, ...) contains
+/// the `csimp` attribute at top-level comma separation.
 fn attr_list_has_csimp(list: &str) -> bool {
-    list.split(',').any(|attr| {
-        let words: Vec<&str> = attr.split_whitespace().collect();
+    let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut start = 0usize;
+    let bytes = list.as_bytes();
+    let check_item = |item: &str| {
+        let words: Vec<&str> = item.split_whitespace().collect();
         words == ["csimp"] || words == ["local", "csimp"] || words == ["scoped", "csimp"]
-    })
+    };
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b',' if bracket_depth == 0 && paren_depth == 0 => {
+                if check_item(&list[start..i]) {
+                    return true;
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    check_item(&list[start..])
+}
+
+fn is_lean_ident_start(s: &str) -> bool {
+    s.chars()
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '«')
+}
+
+/// Extract the leading Lean identifier from a token, stripping trailing universe params (`.{u}`),
+/// attached binders (`(`, `{`, `[`), or punctuation (`:`, `,`, `;`, `=`), while preserving
+/// guillemet-quoted segments (`«...»`).
+fn extract_decl_ident(raw: &str) -> &str {
+    let mut in_guillemet = false;
+    let mut chars = raw.char_indices().peekable();
+    let mut end = raw.len();
+    while let Some((idx, ch)) = chars.next() {
+        if in_guillemet {
+            if ch == '»' {
+                in_guillemet = false;
+            }
+            continue;
+        }
+        match ch {
+            '«' => in_guillemet = true,
+            '(' | '{' | '[' | ':' | ',' | ';' | '=' => {
+                end = idx;
+                break;
+            }
+            '.' if matches!(chars.peek(), Some(&(_, '{'))) => {
+                end = idx;
+                break;
+            }
+            _ => {}
+        }
+    }
+    &raw[..end]
 }
 
 /// Qualify a declared `@[csimp]` name by the open namespaces, as Lean elaborates it.
-fn qualify_csimp_name(scopes: &[Vec<String>], name: &str, private: bool) -> Option<String> {
-    let name = name.trim_end_matches([':', ',']);
-    if name.is_empty()
-        || !name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_alphabetic() || c == '_')
-    {
+fn qualify_plain_name(scopes: &[LeanScope], name: &str) -> Option<String> {
+    let name = extract_decl_ident(name);
+    if name.is_empty() || !is_lean_ident_start(name) {
         return None;
     }
     let full = match name.strip_prefix("_root_.") {
         Some(rooted) => rooted.to_string(),
         None => scopes
             .iter()
-            .flatten()
-            .map(String::as_str)
+            .filter_map(|s| match s {
+                LeanScope::Namespace(ns) => Some(ns.as_str()),
+                LeanScope::Section(_) => None,
+            })
             .chain(std::iter::once(name))
             .collect::<Vec<_>>()
             .join("."),
     };
-    Some(if private {
-        format!("_private.*.0.{full}")
-    } else {
-        full
-    })
+    Some(full)
+}
+
+/// Format a qualified declaration name, applying Lean's `_private.<module>.0.<name>` mangling
+/// when `private` is set (scoping private dependency entries strictly to their declaring module).
+fn format_csimp_name(module: Option<&str>, full: &str, private: bool) -> String {
+    if !private {
+        return full.to_string();
+    }
+    match module.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(m) => format!("_private.{m}.0.{full}"),
+        None => format!("_private.*.0.{full}"),
+    }
 }
 
 /// The declaration name introduced by the next `theorem`/`lemma` after an attribute, skipping
-/// modifiers, plus whether it is `private`. Returns `None` when the next declaration is not a
-/// theorem.
+/// stacked `@[...]` attributes and modifiers, plus whether it is `private`. Returns `None` when
+/// the next declaration is not a theorem.
 fn theorem_name_after_attribute(rest: &str) -> Option<(String, bool)> {
-    let mut tokens = rest.split_whitespace();
+    let mut pos = 0usize;
     let mut private = false;
     let kw = loop {
-        match tokens.next()? {
+        let (tok, tok_start, tok_end) = next_token(rest, pos)?;
+        if tok.starts_with("@[") {
+            let open = rest[tok_start..].find('[').map(|i| tok_start + i)?;
+            let close = find_matching_bracket(rest, open)?;
+            pos = close + 1;
+            continue;
+        }
+        pos = tok_end;
+        match tok {
             "private" => private = true,
-            "protected" | "unsafe" | "noncomputable" | "partial" => {}
+            "protected" | "public" | "meta" | "exposed" | "unsafe" | "noncomputable" | "partial"
+            | "scoped" | "local" => {}
             kw => break kw,
         }
     };
     if kw != "theorem" && kw != "lemma" {
         return None;
     }
-    Some((tokens.next()?.to_string(), private))
+    let (name, _, _) = next_token(rest, pos)?;
+    Some((name.to_string(), private))
 }
 
 /// One scraped module contribution: the owning module name plus its `@[csimp]` theorem names.
 fn scrape_module_csimp_theorems(module: &str, src: &str) -> Vec<(String, String)> {
-    scrape_csimp_theorems(src)
+    scrape_csimp_theorems_for_module(Some(module), src)
         .into_iter()
         .map(|t| (module.to_string(), t))
         .collect()
+}
+
+/// Derive the dot-separated Lean module name for a project target file.
+fn target_file_module_name(
+    canon_dir: &Path,
+    tf: &Path,
+    root_cfg: Option<&crate::module_builder::ProjectConfig>,
+) -> Option<String> {
+    let canon_tf = tf.canonicalize().ok();
+    let candidates: [&Path; 2] = [tf, canon_tf.as_deref().unwrap_or(tf)];
+    if let Some(cfg) = root_cfg {
+        let src_base = cfg.root_pkg.pkg_root.join(&cfg.root_pkg.src_dir);
+        let canon_src_base = src_base.canonicalize().ok();
+        for base in [Some(src_base.as_path()), canon_src_base.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            for cand in candidates {
+                if let Ok(rel) = cand.strip_prefix(base) {
+                    let mod_dots = rel
+                        .with_extension("")
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                        .trim_matches('/')
+                        .replace('/', ".");
+                    if !mod_dots.is_empty() {
+                        return Some(mod_dots);
+                    }
+                }
+            }
+        }
+    }
+    for cand in candidates {
+        if let Ok(rel) = cand.strip_prefix(canon_dir) {
+            let rel_no_ext = rel.with_extension("");
+            let mut comps = rel_no_ext.components();
+            if let Some(first) = comps.next().and_then(|c| c.as_os_str().to_str()) {
+                let rest: PathBuf = comps.collect();
+                let module = if matches!(first, "submission" | "src" | "lean")
+                    && !rest.as_os_str().is_empty()
+                {
+                    rest.to_string_lossy().replace('\\', "/")
+                } else {
+                    rel_no_ext.to_string_lossy().replace('\\', "/")
+                };
+                let mod_dots = module.trim_matches('/').replace('/', ".");
+                if !mod_dots.is_empty() {
+                    return Some(mod_dots);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Walk the transitive import closure of `target_files`, classifying every reachable module as
@@ -184,40 +446,23 @@ fn collect_target_csimp_entries(
 
     let mut worklist: Vec<String> = Vec::new();
     for tf in target_files {
-        // The target file itself is a project-owned module: derive its module name from the
-        // path relative to the project (same convention as the freshness gate).
-        if let Ok(rel) = tf.strip_prefix(canon_dir) {
-            let rel_no_ext = rel.with_extension("");
-            let mut comps = rel_no_ext.components();
-            if let Some(first) = comps.next().and_then(|c| c.as_os_str().to_str()) {
-                let rest: PathBuf = comps.collect();
-                let module = if matches!(first, "submission" | "src" | "lean")
-                    && !rest.as_os_str().is_empty()
-                {
-                    rest.to_string_lossy().replace('\\', "/")
-                } else {
-                    rel_no_ext.to_string_lossy().replace('\\', "/")
-                };
-                if !module.is_empty() {
-                    owned_modules.insert(module.clone());
-                    visited.insert(module.clone());
-                    let module_dots = module.replace('/', ".");
-                    if let Some(src) = read_scrape_src(&mut src_memo, tf) {
-                        entries.extend(scrape_module_csimp_theorems(&module_dots, &src));
-                        if let Some(hdr) = parse_header(&src) {
-                            worklist.extend(hdr.imports);
-                        }
-                    }
+        // The target file itself is a project-owned module: derive its dot-separated module name
+        // so `owned_modules` and `visited` match `entries` even for nested paths (`Sub/Own.lean`).
+        if let Some(module_dots) = target_file_module_name(canon_dir, tf, root_cfg) {
+            owned_modules.insert(module_dots.clone());
+            visited.insert(module_dots.clone());
+            if let Some(src) = read_scrape_src(&mut src_memo, tf) {
+                entries.extend(scrape_module_csimp_theorems(&module_dots, &src));
+                if let Some(hdr) = parse_header(&src) {
+                    worklist.extend(hdr.imports);
                 }
+            }
+        } else if let Some(src) = read_scrape_src(&mut src_memo, tf) {
+            if let Some(hdr) = parse_header(&src) {
+                worklist.extend(hdr.imports);
             }
         }
     }
-    worklist.extend(
-        target_files
-            .iter()
-            .filter_map(|tf| read_header_imports(tf))
-            .flatten(),
-    );
 
     while let Some(mod_name) = worklist.pop() {
         if !visited.insert(mod_name.clone()) {
@@ -296,11 +541,6 @@ fn parse_header(src: &str) -> Option<crate::module_builder::HeaderInfo> {
     }
 }
 
-fn read_header_imports(path: &Path) -> Option<Vec<String>> {
-    let content = fs::read_to_string(path).ok()?;
-    parse_header(&content).map(|hdr| hdr.imports)
-}
-
 fn read_scrape_src(memo: &mut HashMap<PathBuf, Option<String>>, path: &Path) -> Option<String> {
     if let Some(hit) = memo.get(path) {
         return hit.clone();
@@ -320,7 +560,7 @@ pub(crate) fn preflight_zero_config_csimp_import_policy(
     scope: CsimpPreflightScope,
     apply_env: bool,
 ) -> Result<()> {
-    let configured = crate::splitter::normalized_policy_env_vec("TURBO_LEAN_ALLOWED_CSIMP");
+    let (current_env, configured) = configured_csimp_allowlist_from_env();
     let (owned_modules, entries) = match scope {
         CsimpPreflightScope::Targets(target_files) => {
             let root_cfg = crate::module_builder::resolve_project_config(canon_dir).ok();
@@ -348,22 +588,29 @@ pub(crate) fn preflight_zero_config_csimp_import_policy(
     }
     let effective =
         crate::kernel::effective_csimp_policy_allowlist(&owned_modules, &entries, &configured)?;
-    if apply_env && effective != configured {
+    if apply_env && effective != current_env {
         std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", effective.join(","));
+        let mut guard = auto_allow_csimp_overlay()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = Some((effective, configured));
     }
     Ok(())
 }
 
-/// Every `.lean` source under a dependency package's source directory (stable order).
+/// Every `.lean` source under a dependency package's source directory (stable order), skipping
+/// `.lake`/`.git` metadata directories, root `lakefile.lean`, and symlink cycles.
 ///
 /// `src_dir` is stored relative to the package root, so the walk joins it with `pkg_root`.
 fn dep_package_sources(pkg: &crate::module_builder::PackageConfig) -> Vec<PathBuf> {
     let src_base = pkg.pkg_root.join(&pkg.src_dir);
+    let canon_pkg_root = pkg.pkg_root.canonicalize().ok();
     let mut out = Vec::new();
-    let mut stack = vec![src_base.clone()];
+    let mut stack = vec![src_base];
     let mut seen_dirs: HashSet<PathBuf> = HashSet::new();
     while let Some(dir) = stack.pop() {
-        if !seen_dirs.insert(dir.clone()) {
+        let dir_key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if !seen_dirs.insert(dir_key) {
             continue;
         }
         let Ok(read) = fs::read_dir(&dir) else {
@@ -372,10 +619,20 @@ fn dep_package_sources(pkg: &crate::module_builder::PackageConfig) -> Vec<PathBu
         let mut entries: Vec<_> = read.filter_map(|e| e.ok()).collect();
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+            if name_str == ".lake" || name_str == ".git" {
+                continue;
+            }
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
             } else if path.extension().and_then(|e| e.to_str()) == Some("lean") {
+                if name_str == "lakefile.lean"
+                    && path.parent().and_then(|p| p.canonicalize().ok()) == canon_pkg_root
+                {
+                    continue;
+                }
                 out.push(path);
             }
         }
@@ -504,6 +761,71 @@ end
         assert!(
             entries.contains(&("Main".to_string(), "own_eq".to_string())),
             "own csimp entry must be scraped: {entries:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_scrape_csimp_theorems_adversarial_syntax_and_module_scoped_private() {
+        let src = "\
+@[csimp] public theorem pub_eq : @a = @b := rfl
+@[csimp]
+@[simp [foo, bar]]
+private lemma stacked_eq.{u}(x : Nat) : @c = @d := rfl
+@[simp [baz, qux], csimp] theorem nested_attr_eq{α} : @e = @f := rfl
+namespace A.B
+@[csimp] theorem in_ab[BEq Nat] : @g = @h := rfl
+end B
+@[csimp] theorem in_a : @i = @j := rfl
+end A
+private theorem late_priv : @k = @l := rfl
+attribute [csimp] late_priv
+";
+        let scraped = scrape_csimp_theorems_for_module(Some("Batteries.Fast"), src);
+        assert_eq!(
+            scraped,
+            vec![
+                "A.B.in_ab".to_string(),
+                "A.in_a".to_string(),
+                "_private.Batteries.Fast.0.late_priv".to_string(),
+                "_private.Batteries.Fast.0.stacked_eq".to_string(),
+                "nested_attr_eq".to_string(),
+                "pub_eq".to_string(),
+            ],
+            "scraper must handle Lean 4.35 modifiers, stacked/nested attrs, binders/univs, partial end, and module-scoped private names"
+        );
+    }
+
+    #[test]
+    fn test_collect_target_csimp_entries_nested_target_is_project_owned() {
+        let dir = std::env::temp_dir().join(format!(
+            "tl_csimp_nested_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("Sub")).unwrap();
+        let target = dir.join("Sub/Own.lean");
+        fs::write(
+            &target,
+            "@[csimp] public theorem nested_own_eq : @slow = @fast := rfl\n",
+        )
+        .unwrap();
+
+        let (owned, entries) = collect_target_csimp_entries(&dir, &[target], None);
+        assert!(
+            owned.contains("Sub.Own"),
+            "nested target module must be recorded dot-separated in owned_modules: {owned:?}"
+        );
+        assert!(
+            entries.contains(&("Sub.Own".to_string(), "nested_own_eq".to_string())),
+            "nested target csimp entry must be scraped under Sub.Own: {entries:?}"
+        );
+        let err = crate::kernel::effective_csimp_policy_allowlist(&owned, &entries, &[])
+            .expect_err("nested target project-owned csimp must fail closed");
+        assert!(
+            format!("{err:#}").contains("nested_own_eq"),
+            "error must name nested_own_eq: {err:#}"
         );
         let _ = fs::remove_dir_all(&dir);
     }

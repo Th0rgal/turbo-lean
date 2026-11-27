@@ -939,7 +939,7 @@ fn test_lean_args_digest_isolates_shard_and_fission_cache_keys() {
 
 #[test]
 fn test_shard_key_binds_kernel_audit_digest() {
-    let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+    let _guard = crate::pack::tests::env_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let src = "theorem posture_thm (n : Nat) : n + 0 = n := by\n  simp\n";
