@@ -148,15 +148,18 @@ _BATTERIES_CACHE: dict[str, dict[str, Any]] = {}
 # proofs the `proved` counts rest on. It is not the whole import cone of
 # LeanNative.IR.Bridge: the IR data types and codec (AST, Types, LCNF, Codec),
 # Semantics/, Transform/, Backend/, Frontend/ProofRetention.lean and the
-# SymbolicTV, loop-opt and peephole proofs are unpinned, so an edit there
-# reaches the committed counts only through `--check`'s live re-measure. The
+# SymbolicTV, loop-opt and peephole proofs are unpinned. CI does not compare
+# the in-repo counts, so an edit there reaches the committed counts only
+# through `--check`'s live re-measure, and the `Batteries` counts only where
+# `--check` runs on a built pinned `Batteries` tree. The
 # script itself carries no hard-coded digest: editing a tracked file fails
 # `--check` against the committed results until the measurement is
 # regenerated, and L1-L3 bridge PRs regenerate the JSON instead of hand-editing
 # this script. The same file pins `classifier_source_sha256`,
 # the digest of this script's own audit drivers and facts path
-# (`classifier_source_digest`), and the `commit_sha` each external corpus was
-# measured at (`PINNED_EXTERNAL_REVISIONS`); `--json` gates both too.
+# (`classifier_source_digest`), the toolchain, and the `commit_sha` each
+# external corpus was measured at (`PINNED_EXTERNAL_REVISIONS`); `--json` gates
+# all three too.
 TRACKED_BRIDGE_FILES: tuple[str, ...] = (
     "lean/LeanNative/IR/Bridge.lean",
     "lean/LeanNative/IR/RealLCNFBridge.lean",
@@ -3160,7 +3163,19 @@ class TestLcnfCoverage(unittest.TestCase):
         reexport = (ROOT_DIR / "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean").read_text(
             encoding="utf-8"
         )
-        imported = [line.split()[1] for line in reexport.splitlines() if line.startswith("import LeanNative.")]
+        import re
+
+        # `public import` too, as build_c1_corpus_manifest.py's _IMPORT_RE reads it.
+        import_re = re.compile(r"^\s*(?:public\s+)?import\s+(.+)$", re.M)
+        self.assertEqual(
+            import_re.findall("public import LeanNative.A LeanNative.B\n"), ["LeanNative.A LeanNative.B"]
+        )
+        imported = [
+            mod
+            for line in import_re.findall(reexport)
+            for mod in line.split()
+            if mod.startswith("LeanNative.")
+        ]
         self.assertTrue(imported)
         for mod in imported:
             self.assertIn(f"lean/{mod.replace('.', '/')}.lean", tracked)
