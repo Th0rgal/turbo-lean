@@ -4674,22 +4674,14 @@ pub(super) fn lakefile_lexical_guard(
         if c == '#' && next.is_some_and(|d| d.is_alphabetic() || d == '_') {
             return Err("`#` command".into());
         }
-        if c == '@'
-            && next == Some('[')
-            && !["@[default_target]", "@[test_driver]", "@[lint_driver]"]
-                .iter()
-                .any(|a| src[i..].starts_with(a))
-        {
+        if c == '@' && next == Some('[') && strip_lake_target_attr_block(&src[i..]).is_none() {
             return Err("attribute other than a Lake target attribute".into());
         }
         if c == '«' {
             let pre = &src[line_start..i];
             let mut head = pre.trim_end();
-            for attr in ["@[default_target]", "@[test_driver]", "@[lint_driver]"] {
-                if let Some(rest) = head.strip_prefix(attr) {
-                    head = rest.trim_start();
-                    break;
-                }
+            if let Some((rest, _, _)) = strip_lake_target_attr_block(head) {
+                head = rest.trim_start();
             }
             let in_name_literal = matches!(prev, Some('`' | '.'));
             if !in_name_literal
@@ -4775,6 +4767,27 @@ pub(super) fn lakefile_lexical_guard(
     Ok((out, flat, multiline_lines))
 }
 
+/// Lake's target attributes (`Lake.DSL` registers exactly these three tags for targets).
+const LAKE_TARGET_ATTRS: [&str; 3] = ["default_target", "test_driver", "lint_driver"];
+
+/// Strips one leading Lake target attribute block — `@[default_target]` or a comma list such as
+/// Lake 4.x's `@[default_target, test_driver]` — returning the rest of the line, whether the block
+/// marks a default target, and how many attribute names it held. `None` for any other `@[...]`,
+/// so non-Lake attributes keep failing closed.
+pub(super) fn strip_lake_target_attr_block(s: &str) -> Option<(&str, bool, usize)> {
+    let body = s.strip_prefix("@[")?;
+    let end = body.find(']')?;
+    let names: Vec<&str> = body[..end].split(',').map(str::trim).collect();
+    if names.is_empty() || !names.iter().all(|n| LAKE_TARGET_ATTRS.contains(n)) {
+        return None;
+    }
+    Some((
+        &body[end + 1..],
+        names.contains(&"default_target"),
+        names.len(),
+    ))
+}
+
 /// Identifier-like tokens (plus `#command`s and `;`) of each line of `src`, skipping string
 /// literals, char literals and backtick name literals. The scan runs over the whole file, so a
 /// string spanning lines (Lean string gaps) stays a string on its continuation lines.
@@ -4857,20 +4870,18 @@ pub(super) fn lakefile_is_plain_with_policy(clean: &str, is_root_pkg: bool) -> b
             return tokens.is_empty();
         }
         let indented = line.starts_with(char::is_whitespace);
-        let inline_attr = ["@[default_target]", "@[test_driver]", "@[lint_driver]"]
-            .iter()
-            .any(|a| {
-                t.strip_prefix(a).is_some_and(|rest| {
-                    let rest = rest.trim();
-                    !is_root_pkg
-                        && rest.ends_with('{')
-                        && (rest.starts_with("lean_lib ") || rest.starts_with("lean_exe "))
-                })
-            });
-        let tokens = if inline_attr {
-            &tokens[1..]
-        } else {
-            &tokens[..]
+        // Inline `@[default_target] lean_lib X where` (Lake 4.x `lake new` style, root or
+        // dependency) or a dependency's `... {` structure-instance form: the attribute names are
+        // not part of the header, so the header's trailing `where` stays allowed.
+        let inline_attr = strip_lake_target_attr_block(t).and_then(|(rest, _, n)| {
+            let rest = rest.trim();
+            ((rest.starts_with("lean_lib ") || rest.starts_with("lean_exe "))
+                && (is_root_pkg || rest.ends_with('{') || rest.ends_with(" where")))
+            .then_some(n)
+        });
+        let tokens = match inline_attr {
+            Some(n) if tokens.len() >= n => &tokens[n..],
+            _ => &tokens[..],
         };
         if !indented {
             in_dep_recipe_body = !is_root_pkg
@@ -4934,9 +4945,7 @@ pub(super) fn lakefile_is_plain_with_policy(clean: &str, is_root_pkg: bool) -> b
         }
         PLAIN_LAKEFILE_COMMANDS.iter().any(|c| t.starts_with(c))
             || open_line
-            || ["@[default_target]", "@[test_driver]", "@[lint_driver]"]
-                .iter()
-                .any(|a| t.starts_with(a))
+            || strip_lake_target_attr_block(t).is_some()
             || (!is_root_pkg && t == "}")
             || t.starts_with([']', ')'])
             || (t.starts_with(['}', '⟩']) && t.len() > 1)
@@ -5691,12 +5700,9 @@ pub(super) fn parse_lakefile_lean_inner(
             // `@[test_driver]` / `@[lint_driver]` mark a target like `@[default_target]` does,
             // without making it a default target.
             let mut after = trimmed;
-            while let Some(attr) = ["@[default_target]", "@[test_driver]", "@[lint_driver]"]
-                .into_iter()
-                .find(|a| after.starts_with(a))
-            {
-                pending_default_target |= attr == "@[default_target]";
-                after = after[attr.len()..].trim();
+            while let Some((rest, is_default, _)) = strip_lake_target_attr_block(after) {
+                pending_default_target |= is_default;
+                after = rest.trim();
             }
             if after != trimmed {
                 if after.is_empty() {
