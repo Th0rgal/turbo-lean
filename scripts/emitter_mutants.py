@@ -11,6 +11,12 @@ are SHA-256 hashed before running C3..C7. A failed C1/C2 skips subsequent
 checks; infrastructure signatures in the full output or signal termination
 override all kills.
 
+Durable atomic report checkpoints: a checkpoint JSON is written next to the
+report before work starts and flushed after every check/case (baseline,
+fixtures, mutants). Completed steps keep their exit codes, timings and
+provenance; active and pending steps remain explicitly INCOMPLETE after an
+abrupt death and are never turned into SURVIVED/KILLED/PASSED/CONCLUSIVE.
+
 The non-blocking mutation CI job runs on push/workflow_dispatch, not PRs.
 C5 uses the default 50 fuzz seeds without --tier (keeping C5 runtime bounded
 per mutant), while `c5_flag_check` verifies `--tier` flag parsing and fail-closed
@@ -39,6 +45,7 @@ CHECK_ORDER = ("C1", "C2", "C3", "C4", "C5", "C6", "C7")
 COMPARISON_UNIVERSE = tuple(f"M{i}" for i in range(1, 11))
 BACKENDS = ("llvm", "mlir", "ptx", "metal")
 LOG_TAIL = 4000
+CHECKPOINT_SCHEMA = "emitter-mutants-checkpoint-v1"
 BIN_ARTIFACTS = (
     "lean/.lake/build/bin/lean-native",
     "lean/.lake/build/bin/lean-native-core",
@@ -92,6 +99,90 @@ def purge_built_executables(root: Path) -> None:
         path = root / relative
         if path.is_file() or path.is_symlink():
             path.unlink()
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    """Durably write JSON: fsync a temp file, atomically replace, fsync the dir.
+
+    A crash mid-write can never expose a torn file or erase the previous
+    evidence at `path`: readers only ever see whole files, and a failed write
+    removes its temp file while leaving the old contents intact.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def checkpoint_sibling(path: Path) -> Path:
+    """Durable checkpoint file living beside a report/output path."""
+    return path.with_name(path.name + ".checkpoint.json")
+
+
+class Checkpoint:
+    """Durable per-step journal of a suite/fixtures run (report checkpointing).
+
+    The payload carries the run so far: `steps` maps completed step ids to
+    their full evidence (exit codes, timings, logs, provenance), `pending`
+    lists every step not yet completed, and `complete` stays False with
+    `run_outcome` "INCOMPLETE" until the run finishes normally. An in-flight
+    case is marked {"status": "INCOMPLETE", "complete": False} before its work
+    starts, so an abrupt death is always explicitly incomplete and can never
+    be mistaken for SURVIVED/KILLED/PASSED/CONCLUSIVE.
+    """
+
+    def __init__(self, path: Path, payload: dict):
+        self.path = path
+        self.payload = {**payload, "complete": False, "run_outcome": "INCOMPLETE", "pending": [], "steps": {}}
+        self.flush()
+
+    def declare(self, *steps: str) -> None:
+        """Checkpoint the planned work before any of it starts."""
+        self.payload["pending"] = sorted(set(self.payload["pending"]) | set(steps))
+        self.flush()
+
+    def start(self, step: str) -> None:
+        """Mark an in-flight case explicitly INCOMPLETE before its work starts."""
+        self.note(step, {"started_at": time.time()})
+
+    def note(self, step: str, entry: dict) -> None:
+        """Merge evidence into a not-yet-completed (active) step."""
+        active = self.payload["steps"].setdefault(step, {"status": "INCOMPLETE", "complete": False})
+        for key, value in entry.items():
+            if isinstance(value, dict) and isinstance(active.get(key), dict):
+                active[key].update(value)
+            else:
+                active[key] = value
+        self.flush()
+
+    def record(self, step: str, entry: dict) -> None:
+        """Mark a step completed with its final evidence."""
+        self.payload["steps"][step] = entry
+        self.payload["pending"] = [name for name in self.payload["pending"] if name != step]
+        self.flush()
+
+    def finish(self, run_outcome: str, summary: dict) -> None:
+        self.payload["complete"] = run_outcome != "INCOMPLETE"
+        self.payload["run_outcome"] = run_outcome
+        self.payload["summary"] = summary
+        self.flush()
+
+    def flush(self) -> None:
+        self.payload["updated_at"] = time.time()
+        atomic_write_json(self.path, self.payload)
 
 
 def toolchain(root: Path, env: dict[str, str]) -> dict:
@@ -276,21 +367,8 @@ def revert_worktree(root: Path) -> None:
     git(["clean", "-fd", "--", "lean"], root, check=False)
 
 
-def run_pinned_checks(
-    root: Path,
-    env: dict[str, str],
-    spec: dict,
-    log_dir: Path,
-    check_subset: tuple[str, ...] = CHECK_ORDER,
-    lake_snapshot: Path | None = None,
-) -> tuple[dict, dict, dict]:
-    """Incrementally build modules, re-link purged executables, hash, then check."""
-    if lake_snapshot is not None and lake_snapshot.is_dir():
-        restore_lake_build(root, lake_snapshot)
-    purge_built_executables(root)
-    pre_purge_hashes = hash_builds(root)
-    assert all(pre_purge_hashes[b] is None for b in BIN_ARTIFACTS), pre_purge_hashes
-
+def ordered_checks(check_subset: tuple[str, ...]) -> list[str]:
+    """Execution order: C1/C2 prerequisites first, then the subset in order."""
     needs_downstream = any(c not in ("C1", "C2") for c in check_subset)
     ordered: list[str] = []
     if "C1" in check_subset or needs_downstream:
@@ -300,11 +378,33 @@ def run_pinned_checks(
     for name in check_subset:
         if name not in ordered:
             ordered.append(name)
+    return ordered
+
+
+def run_pinned_checks(
+    root: Path,
+    env: dict[str, str],
+    spec: dict,
+    log_dir: Path,
+    check_subset: tuple[str, ...] = CHECK_ORDER,
+    lake_snapshot: Path | None = None,
+    on_check=None,
+) -> tuple[dict, dict, dict]:
+    """Incrementally build modules, re-link purged executables, hash, then check.
+
+    `on_check(name, report)` fires after each completed check so callers can
+    checkpoint per-check evidence.
+    """
+    if lake_snapshot is not None and lake_snapshot.is_dir():
+        restore_lake_build(root, lake_snapshot)
+    purge_built_executables(root)
+    pre_purge_hashes = hash_builds(root)
+    assert all(pre_purge_hashes[b] is None for b in BIN_ARTIFACTS), pre_purge_hashes
 
     reports: dict[str, dict] = {}
     post_rebuild_hashes: dict[str, str | None] = {}
     failed_prereqs: list[str] = []
-    for name in ordered:
+    for name in ordered_checks(check_subset):
         spec_entry = spec["checks"][name]
         before_hashes = hash_builds(root)
         if failed_prereqs:
@@ -324,6 +424,8 @@ def run_pinned_checks(
             path for path, digest in after_hashes.items() if digest != before_hashes.get(path)
         )
         reports[name] = report
+        if on_check is not None:
+            on_check(name, report)
         if name == "C2":
             post_rebuild_hashes = after_hashes
 
@@ -350,6 +452,7 @@ def evaluate_mutation(
     baseline_hashes: dict[str, str | None],
     lake_snapshot: Path | None = None,
     check_subset: tuple[str, ...] = CHECK_ORDER,
+    on_check=None,
 ) -> dict:
     revert_worktree(root)
     count, diff = apply_patch(root, mutation)
@@ -374,7 +477,7 @@ def evaluate_mutation(
 
     try:
         checks, hashes, rebuild_meta = run_pinned_checks(
-            root, env, spec, log_dir, check_subset=check_subset, lake_snapshot=lake_snapshot
+            root, env, spec, log_dir, check_subset=check_subset, lake_snapshot=lake_snapshot, on_check=on_check
         )
     finally:
         revert_worktree(root)
@@ -460,9 +563,27 @@ def run_suite(
     if logs.exists():
         rmtree_writable(logs)
     logs.mkdir(parents=True, exist_ok=True)
-    parent = Path(tempfile.mkdtemp(prefix="emitter-mutants-", dir=str(ROOT.parent)))
     commit_sha = git(["rev-parse", "HEAD"], ROOT).stdout.strip()
     expected_universe = list(only_ids) if only_ids is not None else list(spec["comparison_universe"])
+    selected_mutations = [
+        m for m in spec["mutations"] if only_ids is None or m["id"] in expected_universe
+    ]
+
+    checkpoint = Checkpoint(checkpoint_sibling(output), {
+        "schema": CHECKPOINT_SCHEMA,
+        "kind": "suite",
+        "commit": commit_sha,
+        "output": str(output),
+        "check_subset": list(check_subset),
+        "evaluated_universe": expected_universe,
+        "targeted": only_ids is not None,
+    })
+    checkpoint.declare(
+        "provenance",
+        *(f"baseline:{name}" for name in ordered_checks(check_subset)),
+        *(f"mutant:{mutation['id']}" for mutation in selected_mutations),
+    )
+    parent = Path(tempfile.mkdtemp(prefix="emitter-mutants-", dir=str(ROOT.parent)))
 
     report: dict = {
         "schema": spec["schema"],
@@ -473,18 +594,25 @@ def run_suite(
         "mutations": [],
     }
     snapshot_seed = ROOT / "lean/.lake/build"
+    completed = False
     try:
         work = make_worktree(parent, "work")
         env = prepare_env(work, parent / "turbo-cache")
         report["toolchain"] = toolchain(work, env)
         report["c5_flag_check"] = c5_flag_check(work, env)
+        checkpoint.record("provenance", {
+            "commit": commit_sha,
+            "toolchain": report["toolchain"],
+            "c5_flag_check": report["c5_flag_check"],
+        })
 
         snapshot = parent / "seed_lake_build"
         if snapshot_seed.is_dir():
             shutil.copytree(snapshot_seed, snapshot, symlinks=True)
 
         baseline_checks, baseline_hashes, baseline_rebuild = run_pinned_checks(
-            work, env, spec, logs / "baseline", check_subset=check_subset
+            work, env, spec, logs / "baseline", check_subset=check_subset,
+            on_check=lambda name, check: checkpoint.record(f"baseline:{name}", check),
         )
         base_outcome, base_killed, base_infra = classify(baseline_checks, order=check_subset)
         baseline_passed = base_outcome == "SURVIVED" and baseline_rebuild["all_default_targets_built"]
@@ -500,6 +628,11 @@ def run_suite(
             "rebuild": baseline_rebuild,
             "failed_checks": failed_baseline,
         }
+        checkpoint.record("baseline:outcome", {
+            "outcome": report["baseline"]["outcome"],
+            "failed_checks": failed_baseline,
+            "build_hashes": baseline_hashes,
+        })
 
         if not baseline_passed:
             report["run_outcome"] = "INFRA_FAILED"
@@ -512,10 +645,10 @@ def run_suite(
         else:
             if not snapshot.is_dir():
                 snapshot_lake_build(work, snapshot)
-            selected_mutations = [
-                m for m in spec["mutations"] if only_ids is None or m["id"] in expected_universe
-            ]
             for mutation in selected_mutations:
+                step = f"mutant:{mutation['id']}"
+                checkpoint.start(step)
+                checkpoint.note(step, {"id": mutation["id"], "backend": mutation["backend"]})
                 rec = evaluate_mutation(
                     work,
                     mutation,
@@ -525,31 +658,117 @@ def run_suite(
                     baseline_hashes,
                     lake_snapshot=snapshot,
                     check_subset=check_subset,
+                    on_check=lambda name, check, step=step: checkpoint.note(step, {"checks": {name: check}}),
                 )
                 report["mutations"].append(rec)
+                checkpoint.record(step, rec)
             summary = summarize(report["mutations"], spec, expected_universe, targeted=only_ids is not None)
             report["summary"] = summary
             report["kill_rate_per_backend"] = summary["kill_rate_per_backend"]
             report["run_outcome"] = summary["run_outcome"]
+        completed = True
         remove_worktree(work)
     finally:
+        if not completed:
+            summary = dict(report.get("summary") or {})
+            summary.update({
+                "conclusive": False,
+                "run_outcome": "INCOMPLETE",
+                "reason": "run interrupted before completion; completed evidence and pending steps are in the checkpoint",
+                "pending": list(checkpoint.payload["pending"]),
+            })
+            report["run_outcome"] = "INCOMPLETE"
+            report["summary"] = summary
+            report["kill_rate_per_backend"] = report.get("kill_rate_per_backend", {})
+        checkpoint.finish(report["run_outcome"], report["summary"])
+        atomic_write_json(output, report)
         git(["worktree", "prune"], ROOT, check=False)
         rmtree_writable(parent)
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return report
 
 
-def run_fixtures(logs: Path, full_checks: bool = False) -> dict:
+def run_fixtures(logs: Path, full_checks: bool = False, checkpoint_path: Path | None = None) -> dict:
     """Run all 4 mechanical self-test fixtures from spec v4 against the real emitter.
 
     With --full-fixtures (used in CI), F2/F4 run full C1..C7; locally without
     --full-fixtures, F2/F4 omit C3 (which has an unrelated 50ms wall-clock
     python plugin budget test that flakes under heavy shared-host CPU load) and
     C4 (covered by the CI suite) while still running C1, C2, C5, C6, C7.
+
+    Progress is checkpointed per baseline check and fixture case; an interrupted
+    run stays explicitly INCOMPLETE in the checkpoint and can never report
+    fixture PASS.
     """
     spec = load_spec()
+    checkpoint_path = checkpoint_path or checkpoint_sibling(logs)
+    comment_subset = CHECK_ORDER if full_checks else ("C1", "C2", "C5", "C6", "C7")
+    c5_runtime_subset = CHECK_ORDER if full_checks else ("C1", "C2", "C5", "C6", "C7")
+
+    fixtures = [
+        (
+            "build_breaking",
+            {
+                "id": "F1_build_breaking",
+                "backend": "llvm",
+                "file": "lean/LeanNative/Backend/LLVM.lean",
+                "search": "emitLine s!\"  {res} = sub{fl} {tyStr} {lVal}, {rVal}\"; return res",
+                "replace": "emitLine (__B0_FIXTURE_BUILD_BREAK__); return res",
+                "expected_match_count": 1,
+            },
+            ("C1",),
+            "KILLED",
+        ),
+        (
+            "comment_only",
+            {
+                "id": "F2_comment_only",
+                "backend": "llvm",
+                "file": "lean/LeanNative/Backend/LLVM.lean",
+                "search": "emitLine s!\"  {res} = sub{fl} {tyStr} {lVal}, {rVal}\"; return res",
+                "replace": "emitLine s!\"  {res} = sub{fl} {tyStr} {lVal}, {rVal}\"; return res -- B0 comment-only fixture",
+                "expected_match_count": 1,
+            },
+            comment_subset,
+            "SURVIVED",
+        ),
+        (
+            "non_matching",
+            {
+                "id": "F3_non_matching",
+                "backend": "llvm",
+                "file": "lean/LeanNative/Backend/LLVM.lean",
+                "search": "__B0_NON_EXISTENT_SEARCH_STRING_DOES_NOT_MATCH__",
+                "replace": "unreachable",
+                "expected_match_count": 1,
+            },
+            ("C1",),
+            "APPLY_FAILED",
+        ),
+        (
+            "runtime_only_c5",
+            {
+                "id": "F4_runtime_only_c5",
+                "backend": "llvm",
+                "file": "lean/LeanNative/Backend/LLVM.lean",
+                "search": "| .shl    => emitShift \"shl\" \"sh\"\n    | .shr    => emitShift \"lshr\" \"sh\"",
+                "replace": "| .shl    => emitShift \"lshr\" \"sh\"\n    | .shr    => emitShift \"shl\" \"sh\"",
+                "expected_match_count": 1,
+            },
+            c5_runtime_subset,
+            "KILLED",
+        ),
+    ]
+
+    checkpoint = Checkpoint(checkpoint_path, {
+        "schema": CHECKPOINT_SCHEMA,
+        "kind": "fixtures",
+        "full_checks": full_checks,
+    })
+    checkpoint.declare(
+        "baseline:C1", "baseline:C2",
+        *(f"fixture:{name}" for name, _, _, _ in fixtures),
+    )
+
     fixture_logs = logs / "fixtures"
     if fixture_logs.exists():
         shutil.rmtree(fixture_logs)
@@ -557,12 +776,15 @@ def run_fixtures(logs: Path, full_checks: bool = False) -> dict:
 
     parent = Path(tempfile.mkdtemp(prefix="emitter-mutant-fixtures-", dir=str(ROOT.parent)))
     results: dict[str, dict] = {}
+    baseline_ok = False
+    completed = False
     try:
         work = make_worktree(parent, "work")
         env = prepare_env(work, parent / "turbo-cache")
 
         base_checks, base_hashes, base_rebuild = run_pinned_checks(
-            work, env, spec, fixture_logs / "baseline", check_subset=("C1", "C2")
+            work, env, spec, fixture_logs / "baseline", check_subset=("C1", "C2"),
+            on_check=lambda name, check: checkpoint.record(f"baseline:{name}", check),
         )
         snapshot = parent / "seed_lake_build"
         snapshot_lake_build(work, snapshot)
@@ -571,66 +793,12 @@ def run_fixtures(logs: Path, full_checks: bool = False) -> dict:
             and base_checks["C2"]["exit"] == 0
             and base_rebuild["all_default_targets_built"]
         )
-
-        comment_subset = CHECK_ORDER if full_checks else ("C1", "C2", "C5", "C6", "C7")
-        c5_runtime_subset = CHECK_ORDER if full_checks else ("C1", "C2", "C5", "C6", "C7")
-
-        fixtures = [
-            (
-                "build_breaking",
-                {
-                    "id": "F1_build_breaking",
-                    "backend": "llvm",
-                    "file": "lean/LeanNative/Backend/LLVM.lean",
-                    "search": "emitLine s!\"  {res} = sub{fl} {tyStr} {lVal}, {rVal}\"; return res",
-                    "replace": "emitLine (__B0_FIXTURE_BUILD_BREAK__); return res",
-                    "expected_match_count": 1,
-                },
-                ("C1",),
-                "KILLED",
-            ),
-            (
-                "comment_only",
-                {
-                    "id": "F2_comment_only",
-                    "backend": "llvm",
-                    "file": "lean/LeanNative/Backend/LLVM.lean",
-                    "search": "emitLine s!\"  {res} = sub{fl} {tyStr} {lVal}, {rVal}\"; return res",
-                    "replace": "emitLine s!\"  {res} = sub{fl} {tyStr} {lVal}, {rVal}\"; return res -- B0 comment-only fixture",
-                    "expected_match_count": 1,
-                },
-                comment_subset,
-                "SURVIVED",
-            ),
-            (
-                "non_matching",
-                {
-                    "id": "F3_non_matching",
-                    "backend": "llvm",
-                    "file": "lean/LeanNative/Backend/LLVM.lean",
-                    "search": "__B0_NON_EXISTENT_SEARCH_STRING_DOES_NOT_MATCH__",
-                    "replace": "unreachable",
-                    "expected_match_count": 1,
-                },
-                ("C1",),
-                "APPLY_FAILED",
-            ),
-            (
-                "runtime_only_c5",
-                {
-                    "id": "F4_runtime_only_c5",
-                    "backend": "llvm",
-                    "file": "lean/LeanNative/Backend/LLVM.lean",
-                    "search": "| .shl    => emitShift \"shl\" \"sh\"\n    | .shr    => emitShift \"lshr\" \"sh\"",
-                    "replace": "| .shl    => emitShift \"lshr\" \"sh\"\n    | .shr    => emitShift \"shl\" \"sh\"",
-                    "expected_match_count": 1,
-                },
-                c5_runtime_subset,
-                "KILLED",
-            ),
-        ]
+        checkpoint.record("baseline:outcome", {"baseline_compile_ok": baseline_ok})
 
         for name, mutation, subset, expected in fixtures:
+            step = f"fixture:{name}"
+            checkpoint.start(step)
+            checkpoint.note(step, {"id": mutation["id"]})
             revert_worktree(work)
             count, diff = apply_patch(work, mutation)
             if count != mutation["expected_match_count"]:
@@ -641,7 +809,8 @@ def run_fixtures(logs: Path, full_checks: bool = False) -> dict:
             else:
                 try:
                     checks, hashes, _ = run_pinned_checks(
-                        work, env, spec, fixture_logs / name, check_subset=subset, lake_snapshot=snapshot
+                        work, env, spec, fixture_logs / name, check_subset=subset, lake_snapshot=snapshot,
+                        on_check=lambda cname, check, step=step: checkpoint.note(step, {"checks": {cname: check}}),
                     )
                 finally:
                     revert_worktree(work)
@@ -685,17 +854,25 @@ def run_fixtures(logs: Path, full_checks: bool = False) -> dict:
                 "passed": passed,
                 **extra,
             }
+            checkpoint.record(step, results[name])
+        completed = True
         remove_worktree(work)
     finally:
+        fixtures_report = {
+            "schema": "emitter-mutants-fixtures-v1",
+            "baseline_compile_ok": baseline_ok,
+            "passed": completed and bool(results) and all(item["passed"] for item in results.values()),
+            "fixtures": results,
+        }
+        if completed:
+            checkpoint.finish("COMPLETED", {"passed": fixtures_report["passed"]})
+        else:
+            fixtures_report["run_outcome"] = "INCOMPLETE"
+            fixtures_report["pending"] = list(checkpoint.payload["pending"])
+            checkpoint.finish("INCOMPLETE", {"passed": False, "pending": list(checkpoint.payload["pending"])})
         git(["worktree", "prune"], ROOT, check=False)
         rmtree_writable(parent)
-
-    return {
-        "schema": "emitter-mutants-fixtures-v1",
-        "baseline_compile_ok": baseline_ok,
-        "passed": all(item["passed"] for item in results.values()),
-        "fixtures": results,
-    }
+    return fixtures_report
 
 
 def run_unit_tests() -> bool:
@@ -808,6 +985,197 @@ def run_unit_tests() -> bool:
                     self.assertFalse(report["summary"]["conclusive"])
                     self.assertEqual(report["kill_rate_per_backend"], {})
                     self.assertEqual(report["mutations"], [])
+
+        # Durable atomic report checkpoints (suite/fixtures, per check/case).
+
+        def synthetic_spec(self) -> dict:
+            return dict(self.spec, checks={
+                name: {"argv": [sys.executable, "-c", "pass"], "depends_on": []}
+                for name in CHECK_ORDER
+            })
+
+        def primed_hash_builds(self) -> Mock:
+            state = {"primed": False}
+
+            def fake(root):
+                if not state["primed"]:
+                    state["primed"] = True
+                    return {path: None for path in ALL_HASH_PATHS}
+                return {path: "primed-sha" for path in ALL_HASH_PATHS}
+
+            return Mock(side_effect=fake)
+
+        def suite_mocks(self, spec: dict, **overrides):
+            mocks = {
+                "load_spec": Mock(return_value=spec),
+                "make_worktree": Mock(return_value=self.root),
+                "remove_worktree": Mock(),
+                "git": Mock(return_value=subprocess.CompletedProcess([], 0, "test-sha\n", "")),
+                "toolchain": Mock(return_value={}),
+                "c5_flag_check": Mock(return_value={}),
+                "snapshot_lake_build": Mock(),
+                "hash_builds": self.primed_hash_builds(),
+            }
+            mocks.update(overrides)
+            return patch.multiple(__name__, **mocks)
+
+        def killed_record(self, mutation: dict) -> dict:
+            return {"id": mutation["id"], "backend": mutation["backend"], "outcome": "KILLED", "killed_by": ["C3"], "checks": {}}
+
+        def clean_check(self) -> dict:
+            return {"exit": 0, "infra_signature": None}
+
+        def fixtures_mocks(self, spec: dict, responses: list) -> object:
+            calls = {"n": 0}
+
+            def runner(root, env, spec, log_dir, check_subset=CHECK_ORDER, lake_snapshot=None, on_check=None):
+                response = responses[calls["n"]]
+                calls["n"] += 1
+                if isinstance(response, BaseException):
+                    raise response
+                if on_check is not None:
+                    for name, check in response[0].items():
+                        on_check(name, dict(check))
+                return response
+
+            return patch.multiple(
+                __name__,
+                load_spec=Mock(return_value=spec),
+                make_worktree=Mock(return_value=self.root),
+                remove_worktree=Mock(),
+                git=Mock(return_value=subprocess.CompletedProcess([], 0, "test-sha\n", "")),
+                snapshot_lake_build=Mock(),
+                revert_worktree=Mock(),
+                apply_patch=Mock(side_effect=lambda work, mutation: (0, "") if mutation["id"] == "F3_non_matching" else (1, "diff")),
+                run_pinned_checks=Mock(side_effect=runner),
+            )
+
+        def test_checkpoint_sibling_lives_beside_its_report(self):
+            self.assertEqual(checkpoint_sibling(Path("/x/report.json")), Path("/x/report.json.checkpoint.json"))
+            self.assertEqual(checkpoint_sibling(Path("/x/logs")), Path("/x/logs.checkpoint.json"))
+
+        def test_atomic_checkpoint_write_never_tears_or_erases_evidence(self):
+            path = self.root / "cp.json"
+            atomic_write_json(path, {"v": 1})
+            self.assertEqual(json.loads(path.read_text()), {"v": 1})
+            with patch(__name__ + ".json.dump", Mock(side_effect=TypeError("no serialization"))):
+                with self.assertRaises(TypeError):
+                    atomic_write_json(path, {"v": 2})
+            self.assertEqual(json.loads(path.read_text()), {"v": 1})
+            self.assertEqual(list(self.root.iterdir()), [path])
+
+        def test_suite_checkpoints_before_work_after_each_check_and_on_completion(self):
+            spec = self.synthetic_spec()
+            output = self.root / "report.json"
+            checkpoint_path = checkpoint_sibling(output)
+            before_work = {}
+
+            def spy_worktree(parent, name):
+                before_work["checkpoint"] = json.loads(checkpoint_path.read_text())
+                return self.root
+
+            with self.suite_mocks(
+                spec,
+                make_worktree=Mock(side_effect=spy_worktree),
+                run_command=Mock(return_value={"exit": 0, "wall_s": 0.25, "log_tail": "ok", "log": "x", "infra_signature": None}),
+                evaluate_mutation=Mock(side_effect=lambda root, mutation, *args, **kwargs: self.killed_record(mutation)),
+            ):
+                report = run_suite(output, self.root / "logs")
+            self.assertEqual(
+                before_work["checkpoint"]["pending"],
+                sorted(["provenance", *(f"baseline:{name}" for name in CHECK_ORDER), *(f"mutant:M{i}" for i in range(1, 11))]),
+            )
+            self.assertEqual(before_work["checkpoint"]["steps"], {})
+            self.assertFalse(before_work["checkpoint"]["complete"])
+            self.assertEqual(before_work["checkpoint"]["run_outcome"], "INCOMPLETE")
+            checkpoint = json.loads(checkpoint_path.read_text())
+            self.assertTrue(checkpoint["complete"])
+            self.assertEqual(checkpoint["run_outcome"], report["run_outcome"])
+            self.assertEqual(checkpoint["pending"], [])
+            self.assertEqual(checkpoint["steps"]["provenance"]["commit"], "test-sha")
+            for name in CHECK_ORDER:
+                step = checkpoint["steps"][f"baseline:{name}"]
+                self.assertEqual((step["exit"], step["wall_s"]), (0, 0.25))
+            self.assertEqual(checkpoint["steps"]["baseline:outcome"]["outcome"], "PASSED")
+            for mid in COMPARISON_UNIVERSE:
+                self.assertEqual(checkpoint["steps"][f"mutant:{mid}"]["outcome"], "KILLED")
+            self.assertEqual(json.loads(output.read_text()), report)
+
+        def test_suite_interruption_keeps_completed_evidence_and_explicit_pending(self):
+            spec = self.synthetic_spec()
+            output = self.root / "report.json"
+            checkpoint_path = checkpoint_sibling(output)
+            with self.suite_mocks(
+                spec,
+                run_command=Mock(return_value={"exit": 0, "wall_s": 0.25, "log_tail": "ok", "log": "x", "infra_signature": None}),
+                evaluate_mutation=Mock(side_effect=KeyboardInterrupt),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    run_suite(output, self.root / "logs", only_ids=["M1"], check_subset=CHECK_ORDER)
+            checkpoint = json.loads(checkpoint_path.read_text())
+            self.assertFalse(checkpoint["complete"])
+            self.assertEqual(checkpoint["run_outcome"], "INCOMPLETE")
+            for name in CHECK_ORDER:
+                step = checkpoint["steps"][f"baseline:{name}"]
+                self.assertEqual((step["exit"], step["wall_s"]), (0, 0.25))
+            self.assertEqual(checkpoint["steps"]["baseline:outcome"]["outcome"], "PASSED")
+            active = checkpoint["steps"]["mutant:M1"]
+            self.assertEqual((active["status"], active["complete"], active["id"]), ("INCOMPLETE", False, "M1"))
+            self.assertIn("mutant:M1", checkpoint["pending"])
+            report = json.loads(output.read_text())
+            self.assertEqual(report["run_outcome"], "INCOMPLETE")
+            self.assertNotIn(report["run_outcome"], ("CONCLUSIVE", "TARGETED", "INFRA_FAILED"))
+            self.assertFalse(report["summary"]["conclusive"])
+            self.assertEqual(report["summary"]["run_outcome"], "INCOMPLETE")
+            self.assertEqual(report["summary"]["pending"], checkpoint["pending"])
+            self.assertEqual(report["kill_rate_per_backend"], {})
+
+        def test_fixture_checkpoints_complete_with_pass_summary(self):
+            spec = self.synthetic_spec()
+            checkpoint_path = self.root / "fixtures.checkpoint.json"
+            hashes = {"lean/.lake/build/bin/lean-native-core": "primed"}
+            baseline = ({"C1": self.clean_check(), "C2": self.clean_check()}, dict(hashes), {"all_default_targets_built": True})
+            responses = [
+                baseline,
+                ({"C1": {"exit": 1, "infra_signature": None}}, dict(hashes), {"all_default_targets_built": True}),
+                ({name: self.clean_check() for name in ("C1", "C2", "C5", "C6", "C7")}, dict(hashes), {"all_default_targets_built": True}),
+                (
+                    {**{name: self.clean_check() for name in ("C1", "C2", "C6", "C7")}, "C5": {"exit": 1, "infra_signature": None}},
+                    {**hashes, "lean/.lake/build/bin/lean-native-core": "mutant"},
+                    {"all_default_targets_built": True},
+                ),
+            ]
+            with self.fixtures_mocks(spec, responses):
+                report = run_fixtures(self.root / "flogs", checkpoint_path=checkpoint_path)
+            self.assertTrue(report["passed"])
+            self.assertNotIn("run_outcome", report)
+            checkpoint = json.loads(checkpoint_path.read_text())
+            self.assertTrue(checkpoint["complete"])
+            self.assertEqual(checkpoint["run_outcome"], "COMPLETED")
+            self.assertEqual(checkpoint["pending"], [])
+            self.assertTrue(checkpoint["summary"]["passed"])
+            self.assertEqual(checkpoint["steps"]["fixture:build_breaking"]["outcome"], "KILLED")
+            self.assertEqual(checkpoint["steps"]["fixture:runtime_only_c5"]["killed_by"], ["C5"])
+            self.assertEqual(checkpoint["steps"]["fixture:non_matching"]["outcome"], "APPLY_FAILED")
+
+        def test_fixture_interruption_marks_cases_incomplete_and_never_passes(self):
+            spec = self.synthetic_spec()
+            checkpoint_path = self.root / "fixtures.checkpoint.json"
+            baseline = ({"C1": self.clean_check(), "C2": self.clean_check()}, {}, {"all_default_targets_built": True})
+            with self.fixtures_mocks(spec, [baseline, KeyboardInterrupt()]):
+                with self.assertRaises(KeyboardInterrupt):
+                    run_fixtures(self.root / "flogs", checkpoint_path=checkpoint_path)
+            checkpoint = json.loads(checkpoint_path.read_text())
+            self.assertFalse(checkpoint["complete"])
+            self.assertEqual(checkpoint["run_outcome"], "INCOMPLETE")
+            self.assertTrue(checkpoint["steps"]["baseline:outcome"]["baseline_compile_ok"])
+            active = checkpoint["steps"]["fixture:build_breaking"]
+            self.assertEqual((active["status"], active["complete"]), ("INCOMPLETE", False))
+            self.assertIn("fixture:build_breaking", checkpoint["pending"])
+            for name in ("comment_only", "non_matching", "runtime_only_c5"):
+                self.assertIn(f"fixture:{name}", checkpoint["pending"])
+                self.assertNotIn(f"fixture:{name}", checkpoint["steps"])
+            self.assertIs(checkpoint["summary"]["passed"], False)
 
         def test_c1_oom_and_c5_missing_engines_is_infra_failed(self):
             checks = {
@@ -941,7 +1309,8 @@ def main() -> int:
         fix_tmp = tempfile.TemporaryDirectory(prefix="emitter-fixtures-logs-") if args.logs is None else None
         try:
             logs_path = args.logs or Path(fix_tmp.name)
-            report = run_fixtures(logs_path, full_checks=args.full_fixtures)
+            anchor = args.fixtures_output or args.logs or (ROOT / "emitter-mutation-fixtures.json")
+            report = run_fixtures(logs_path, full_checks=args.full_fixtures, checkpoint_path=checkpoint_sibling(anchor))
             text = json.dumps(report, indent=2, sort_keys=True) + "\n"
             if args.fixtures_output:
                 args.fixtures_output.parent.mkdir(parents=True, exist_ok=True)
