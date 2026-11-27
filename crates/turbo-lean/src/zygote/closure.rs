@@ -973,25 +973,6 @@ pub(super) const CLOSURE_SNAPSHOT_USAGE_DIR: &str = ".last-used";
 /// Suffix of the `flock` lease file guarding each snapshot (`<label>.lock`).
 pub(super) const LOCK_SUFFIX: &str = ".lock";
 
-#[cfg(unix)]
-fn snapshot_leased(root: &Path, label: &str) -> bool {
-    closure_snapshot_lease_held(root, label)
-}
-
-#[cfg(not(unix))]
-fn snapshot_leased(_root: &Path, _label: &str) -> bool {
-    false
-}
-
-/// Remove the lease file of an already-evicted snapshot. Never removes a held lease: the
-/// caller only gets here after observing the lease uncontended and evicting the snapshot.
-fn remove_snapshot_lease(root: &Path, label: &str) {
-    #[cfg(unix)]
-    let _ = fs::remove_file(closure_snapshot_lease_path(root, label));
-    #[cfg(not(unix))]
-    let _ = (root, label);
-}
-
 thread_local! {
     /// Per-test-thread override for `closure_snapshot_root()` so ancestor-rename tests do not
     /// interfere with parallel tests sharing `TURBO_LEAN_HOME/closure-snapshots`.
@@ -1037,9 +1018,82 @@ pub(super) fn closure_snapshot_lease_path(root: &Path, label: &str) -> PathBuf {
     root.join(format!("{label}.lock"))
 }
 
+/// Verify that the open descriptor `file` (`fstat`) still refers to the exact regular file
+/// currently linked at `path` (`lstat`, never following symlinks). Prevents TOCTOU lock splits
+/// where a collector unlinks `<label>.lock` while an acquirer sits between `open` and `flock`.
+#[cfg(unix)]
+fn file_matches_lstat_inode(file: &fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(fd_meta) = file.metadata() else {
+        return false;
+    };
+    let Ok(path_meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    !path_meta.file_type().is_symlink()
+        && path_meta.file_type().is_file()
+        && fd_meta.dev() == path_meta.dev()
+        && fd_meta.ino() == path_meta.ino()
+}
+
+/// Exclusive eviction lock guard on `<root>/<label>.lock`.
+///
+/// Holds `LOCK_EX` across the entire purge-and-unlink sequence so no concurrent acquirer can
+/// observe an unlocked pre-unlink window; `unlink_and_release` unlinks the lock file while still
+/// holding `LOCK_EX`, then drops the fd to release the lock.
+#[cfg(unix)]
+struct SnapshotEvictionLock {
+    lock_path: PathBuf,
+    _file: fs::File,
+}
+
+#[cfg(unix)]
+impl SnapshotEvictionLock {
+    fn try_acquire(root: &Path, label: &str, create: bool) -> Option<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        if label.is_empty() || !label.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return None;
+        }
+        let lock_path = closure_snapshot_lease_path(root, label);
+        for _ in 0..8u8 {
+            let mut opts = fs::OpenOptions::new();
+            opts.read(true)
+                .write(true)
+                .create(create)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            let file = opts.open(&lock_path).ok()?;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return None;
+            }
+            if file_matches_lstat_inode(&file, &lock_path) {
+                return Some(Self {
+                    lock_path,
+                    _file: file,
+                });
+            }
+            // The lock file was unlinked or replaced between `open` and `flock`; retry against
+            // the current directory entry.
+            drop(file);
+        }
+        None
+    }
+
+    /// Unlink `<label>.lock` while still holding `LOCK_EX`, then release `LOCK_EX` on drop.
+    fn unlink_and_release(self) {
+        let _ = fs::remove_file(&self.lock_path);
+        drop(self._file);
+    }
+}
+
 /// Acquire a shared `flock` lease on snapshot `label` in `root`, held for the lifetime of the
-/// returned fd: `collect_closure_snapshots` refuses to evict any snapshot whose lease file is
-/// locked, so an active run never loses its snapshot to a concurrent worker's collection pass.
+/// returned fd: `collect_closure_snapshots` takes an exclusive `flock` across purge-and-unlink,
+/// so an active run never loses its snapshot to a concurrent worker's collection pass.
+///
+/// After acquiring `LOCK_SH`, compares `fstat(fd)` `(dev, ino)` against `lstat(path)` and
+/// retries if a racing collector unlinked or replaced `<label>.lock` between `open` and `flock`.
 /// Best-effort by design: `None` (no lease) when the lock file cannot be created or is briefly
 /// contended, and the run then relies on the `.last-used` idle window alone.
 #[cfg(unix)]
@@ -1052,23 +1106,38 @@ pub(super) fn acquire_closure_snapshot_lease(
     if label.is_empty() || !label.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return None;
     }
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(closure_snapshot_lease_path(root, label))
-        .ok()?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
-        return None;
+    let lock_path = closure_snapshot_lease_path(root, label);
+    for attempt in 0..16u32 {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&lock_path)
+            .ok()?;
+        run_digest_test_hook("closure_lease_after_open");
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+            return None;
+        }
+        run_digest_test_hook("closure_lease_after_flock");
+        if file_matches_lstat_inode(&file, &lock_path) {
+            return Some(std::os::unix::io::OwnedFd::from(file));
+        }
+        // `<label>.lock` was unlinked or replaced while we were acquiring the shared lock;
+        // drop our fd on the stale inode and retry against the live path.
+        drop(file);
+        if attempt >= 4 {
+            std::thread::yield_now();
+        }
     }
-    Some(std::os::unix::io::OwnedFd::from(file))
+    None
 }
 
-/// Whether snapshot `label` in `root` is currently leased by an active run: a non-blocking
-/// exclusive `flock` on its lease file fails exactly when a shared (or exclusive) lease is open.
+/// Whether snapshot `label` in `root` is currently leased by an active run: opens `<label>.lock`
+/// without `O_CREAT` (never creating stray `.lock` files on a read-only probe) and checks
+/// whether a non-blocking exclusive `flock` is contended on the currently linked inode.
 #[cfg(unix)]
 pub(super) fn closure_snapshot_lease_held(root: &Path, label: &str) -> bool {
     use std::os::unix::fs::OpenOptionsExt;
@@ -1076,23 +1145,27 @@ pub(super) fn closure_snapshot_lease_held(root: &Path, label: &str) -> bool {
     if label.is_empty() || !label.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return false;
     }
-    let Ok(file) = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(closure_snapshot_lease_path(root, label))
-    else {
-        return false;
-    };
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        false
-    } else {
-        true
+    let lock_path = closure_snapshot_lease_path(root, label);
+    for _ in 0..8u8 {
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&lock_path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        };
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return true;
+        }
+        if file_matches_lstat_inode(&file, &lock_path) {
+            return false;
+        }
+        drop(file);
     }
+    true
 }
 
 /// Create `dir` (and any missing parent components) with mode `0o700` from birth, require a
@@ -1798,15 +1871,22 @@ pub(super) fn collect_closure_snapshots(root: &Path, keep: &str) {
         let excess = snaps.len() - CLOSURE_SNAPSHOT_KEEP;
         let mut removed = 0usize;
         // Oldest first; a leased snapshot is skipped, spilling over to the next-oldest, so a
-        // long-lived lease never wedges collection entirely.
+        // long-lived lease never wedges collection entirely. `LOCK_EX` is held across the entire
+        // purge-and-unlink sequence so no concurrent acquirer can lock the snapshot mid-eviction.
         for (age, name, path) in &snaps {
             if removed >= excess {
                 break;
             }
-            if *age > CLOSURE_SNAPSHOT_MIN_IDLE && !snapshot_leased(root, name) {
+            if *age > CLOSURE_SNAPSHOT_MIN_IDLE {
+                #[cfg(unix)]
+                let Some(eviction_lock) = SnapshotEvictionLock::try_acquire(root, name, true) else {
+                    continue;
+                };
+                run_digest_test_hook("closure_eviction_during_purge");
                 purge_snapshot_dir(path);
-                remove_snapshot_lease(root, name);
                 let _ = fs::remove_file(usage_dir.join(name));
+                #[cfg(unix)]
+                eviction_lock.unlink_and_release();
                 removed += 1;
             }
         }
@@ -1830,9 +1910,14 @@ pub(super) fn collect_closure_snapshots(root: &Path, keep: &str) {
             .and_then(|n| n.to_str())
             .map(|n| n.trim_end_matches(LOCK_SUFFIX).to_string())
             .unwrap_or_default();
-        if !snapshot_leased(root, &label) {
-            let _ = fs::remove_file(path);
+        #[cfg(unix)]
+        if let Some(eviction_lock) = SnapshotEvictionLock::try_acquire(root, &label, false) {
+            if !root.join(&label).is_dir() {
+                eviction_lock.unlink_and_release();
+            }
         }
+        #[cfg(not(unix))]
+        let _ = (label, fs::remove_file(path));
     }
 }
 
@@ -2183,6 +2268,185 @@ mod snapshot_tests {
         assert!(
             !root.join("orph2.lock").exists(),
             "released orphan lease file must be collected"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `acquire_closure_snapshot_lease` must compare `fstat(fd)` `(dev, ino)` against `lstat(path)`
+    /// after `flock(LOCK_SH)` and retry whenever a racing collector unlinked or replaced
+    /// `<label>.lock` mid-acquisition; probing with `closure_snapshot_lease_held` must never
+    /// create stray `.lock` files.
+    #[test]
+    fn acquire_closure_snapshot_lease_retries_on_unlinked_and_replaced_inode() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "turbo_snap_lease_retry_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        // Probing a non-existent lease must return false without creating a stray `.lock` file.
+        assert!(!closure_snapshot_lease_held(&root, "missing"));
+        assert!(
+            !root.join("missing.lock").exists(),
+            "probing an unleased snapshot must not create a stray .lock file"
+        );
+
+        let lock_path = closure_snapshot_lease_path(&root, "racy");
+        // Keep the initial inode pinned via an extra hardlink so the filesystem cannot recycle
+        // its inode number when the replacement file is created in the hook.
+        fs::write(&lock_path, b"").unwrap();
+        let pin_path = root.join(".inode-pin-1");
+        fs::hard_link(&lock_path, &pin_path).unwrap();
+        let orig_meta = fs::symlink_metadata(&lock_path).unwrap();
+        let orig_dev_ino = (orig_meta.dev(), orig_meta.ino());
+
+        // Case 1: collector unlinks `<label>.lock` between `open` and `flock` -> acquirer locks
+        // unlinked inode, detects `fstat != lstat`, drops it, and retries onto a fresh inode.
+        let hook_hits = Arc::new(AtomicUsize::new(0));
+        let hook_hits_c = Arc::clone(&hook_hits);
+        let lock_path_c = lock_path.clone();
+        digest_test_hooks::set("closure_lease_after_open", move || {
+            if hook_hits_c.fetch_add(1, Ordering::SeqCst) == 0 {
+                let _ = fs::remove_file(&lock_path_c);
+            }
+        });
+        let lease1 = acquire_closure_snapshot_lease(&root, "racy")
+            .expect("acquirer must retry and succeed after racing unlink");
+        digest_test_hooks::clear();
+        assert_eq!(
+            hook_hits.load(Ordering::SeqCst),
+            2,
+            "acquirer must have retried once after the unlinked-inode mismatch"
+        );
+        let mut st1: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(lease1.as_raw_fd(), &mut st1) }, 0);
+        let live1 = fs::symlink_metadata(&lock_path).unwrap();
+        assert_eq!(
+            (st1.st_dev as u64, st1.st_ino as u64),
+            (live1.dev(), live1.ino()),
+            "acquired lease fd must match live lstat(path) dev/ino"
+        );
+        assert_ne!(
+            (live1.dev(), live1.ino()),
+            orig_dev_ino,
+            "retried lease must be on a new inode, not the unlinked original"
+        );
+        assert!(closure_snapshot_lease_held(&root, "racy"));
+        drop(lease1);
+        assert!(!closure_snapshot_lease_held(&root, "racy"));
+
+        // Case 2: `<label>.lock` is unlinked AND replaced with a brand-new inode after `flock`
+        // -> acquirer detects the dev/ino mismatch against `lstat(path)` and retries onto the
+        // replacement inode.
+        let pin_path2 = root.join(".inode-pin-2");
+        fs::hard_link(&lock_path, &pin_path2).unwrap();
+        let pre_replace_ino = (live1.dev(), live1.ino());
+        let hook_hits2 = Arc::new(AtomicUsize::new(0));
+        let hook_hits2_c = Arc::clone(&hook_hits2);
+        let lock_path_c2 = lock_path.clone();
+        digest_test_hooks::set("closure_lease_after_flock", move || {
+            if hook_hits2_c.fetch_add(1, Ordering::SeqCst) == 0 {
+                let _ = fs::remove_file(&lock_path_c2);
+                let _ = fs::write(&lock_path_c2, b"");
+            }
+        });
+        let lease2 = acquire_closure_snapshot_lease(&root, "racy")
+            .expect("acquirer must retry and succeed after racing unlink+recreate");
+        digest_test_hooks::clear();
+        assert_eq!(
+            hook_hits2.load(Ordering::SeqCst),
+            2,
+            "acquirer must have retried once after the replaced-inode mismatch"
+        );
+        let mut st2: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(lease2.as_raw_fd(), &mut st2) }, 0);
+        let live2 = fs::symlink_metadata(&lock_path).unwrap();
+        assert_eq!(
+            (st2.st_dev as u64, st2.st_ino as u64),
+            (live2.dev(), live2.ino()),
+            "acquired lease fd must match replacement lstat(path) dev/ino"
+        );
+        assert_ne!(
+            (live2.dev(), live2.ino()),
+            pre_replace_ino,
+            "retried lease must lock the replacement inode, not the superseded one"
+        );
+        assert!(closure_snapshot_lease_held(&root, "racy"));
+        drop(lease2);
+        assert!(!closure_snapshot_lease_held(&root, "racy"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `collect_closure_snapshots` must hold `LOCK_EX` across the entire purge-and-unlink
+    /// sequence so no concurrent acquirer can take `LOCK_SH` mid-eviction, and must leave no
+    /// stray `.lock` files behind for evicted snapshots.
+    #[test]
+    fn collect_closure_snapshots_holds_ex_lock_across_purge_and_unlink() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "turbo_snap_collect_ex_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(root.join(CLOSURE_SNAPSHOT_USAGE_DIR)).unwrap();
+        let backdate = |path: &Path, secs: u64| {
+            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+            let f = fs::OpenOptions::new().append(true).open(path).unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(t).set_accessed(t))
+                .unwrap();
+        };
+        let stage = |label: &str, age_secs: u64| {
+            fs::create_dir_all(root.join(label)).unwrap();
+            fs::write(root.join(label).join("P.olean"), b"x").unwrap();
+            let marker = root.join(CLOSURE_SNAPSHOT_USAGE_DIR).join(label);
+            fs::write(&marker, b"").unwrap();
+            backdate(&marker, age_secs);
+        };
+        for i in 0..CLOSURE_SNAPSHOT_KEEP {
+            stage(&format!("keep{i:03}"), 0);
+        }
+        stage("victim", 1900);
+
+        let saw_ex_lock = Arc::new(AtomicBool::new(false));
+        let saw_ex_lock_c = Arc::clone(&saw_ex_lock);
+        let root_c = root.clone();
+        digest_test_hooks::set("closure_eviction_during_purge", move || {
+            // While `collect_closure_snapshots` is about to purge `victim`, `LOCK_EX` must be
+            // held on `victim.lock` (so a shared lease attempt fails immediately) and
+            // `victim.lock` must still be linked until purge finishes.
+            assert!(
+                root_c.join("victim.lock").exists(),
+                "lock file must stay linked while LOCK_EX guards purge"
+            );
+            assert!(
+                acquire_closure_snapshot_lease(&root_c, "victim").is_none(),
+                "concurrent LOCK_SH acquisition must be blocked while LOCK_EX guards purge"
+            );
+            saw_ex_lock_c.store(true, Ordering::SeqCst);
+        });
+        collect_closure_snapshots(&root, "");
+        digest_test_hooks::clear();
+
+        assert!(
+            saw_ex_lock.load(Ordering::SeqCst),
+            "eviction hook must have executed for victim"
+        );
+        assert!(!root.join("victim").exists(), "victim must be purged");
+        assert!(
+            !root.join("victim.lock").exists(),
+            "evicted snapshot's lock file must be unlinked before LOCK_EX release"
         );
         let _ = fs::remove_dir_all(&root);
     }

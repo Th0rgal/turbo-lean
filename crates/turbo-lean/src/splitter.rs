@@ -5778,29 +5778,37 @@ pub(crate) fn declaration_identity_prefix(src: &str, shard: &TheoremShard) -> St
     prefix
 }
 
-/// Stable coarse cache key for declaration-identity probe results: `blake3` over a framed
-/// `(prefix, decl, toolchain, lean_githash)` tuple, where `prefix` is the probe source minus
-/// its trailing stub proof (`header` + suppression options + stubbed earlier declarations +
-/// the target's own signature).
+/// Stable cache key for declaration-identity stub-probe results: `blake3` over a framed
+/// `(prefix, decl, toolchain, lean_githash, elab_context_fingerprint)` tuple, where `prefix`
+/// is the probe source minus its trailing stub proof (`header` + suppression options +
+/// stubbed earlier declarations + the target's own signature), and `elab_context_fingerprint`
+/// commits to the fine-grained elaboration inputs (imported `.olean` closure and source
+/// digests, effective `leanOptions`, `LEAN_PATH` search dirs, compiler, and project dir).
 ///
-/// Every byte of that prefix is invariant under edits *inside* a proof body -- of the target
+/// Every byte of `prefix` is invariant under edits *inside* a proof body -- of the target
 /// or of any earlier declaration -- so repeated `check --decl` runs that differ only in a
-/// proof body resolve to the same key and can reuse the previously confirmed
-/// `(decl_name, kernel_type_hash)` without re-running `lean` on a fresh probe.
+/// proof body under an unchanged elaboration context resolve to the same key and can reuse
+/// the previously confirmed `(decl_name, kernel_type_hash)` without re-running `lean` on a
+/// fresh probe.
 ///
-/// The four parts are length-framed so no concatenation ambiguity can merge two distinct
-/// tuples into one key. Unlike the fine-grained declaration-identity cache this key needs no
-/// walk of the transitive import closure, which is exactly what makes it computable on
-/// workspaces whose dependency `.olean`s ship prebuilt with no readable sources.
+/// All five parts are length-framed so no concatenation ambiguity can merge two distinct
+/// tuples into one key.
 pub(crate) fn declaration_identity_cache_key(
     prefix: &str,
     decl: &str,
     toolchain: &str,
     lean_githash: &str,
+    elab_context_fingerprint: &str,
 ) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean-decl-identity-cache-key:v1:");
-    for part in [prefix, decl, toolchain, lean_githash] {
+    h.update(b"turbo-lean-decl-identity-cache-key:v2:");
+    for part in [
+        prefix,
+        decl,
+        toolchain,
+        lean_githash,
+        elab_context_fingerprint,
+    ] {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part.as_bytes());
     }
@@ -11376,7 +11384,7 @@ mod tests {
     /// editing inside a proof body reuse the previously confirmed identity.
     #[test]
     fn declaration_identity_cache_key_is_invariant_under_proof_body_edits() {
-        let key = |src: &str| {
+        let key = |src: &str, ctx: &str| {
             let split = split_lean_source(src, &[]);
             let shard = &split.shards[1];
             assert_eq!(shard.name, "t2", "{src}");
@@ -11387,7 +11395,7 @@ mod tests {
             let before = format!(
                 "{header}\nset_option warningAsError false\nset_option warn.sorry false\n{prefix_body}\nset_option warningAsError false\nset_option warn.sorry false\n"
             );
-            declaration_identity_cache_key(&format!("{before}{signature}"), "t2", "tc", "gh")
+            declaration_identity_cache_key(&format!("{before}{signature}"), "t2", "tc", "gh", ctx)
         };
         let v1 = "theorem t1 : 1 + 1 = 2 := by\n  rfl\ntheorem t2 : True := True.intro\n";
         // An earlier declaration's proof changes: t2's prefix stubs it out, so the key holds.
@@ -11396,34 +11404,55 @@ mod tests {
         let v3 = "theorem t1 : 1 + 1 = 2 := by\n  rfl\ntheorem t2 : True := by\n  trivial\n";
         // The target's signature changes: a different identity is being confirmed.
         let v4 = "theorem t1 : 1 + 1 = 2 := by\n  rfl\ntheorem t2 : False := True.intro\n";
-        let k1 = key(v1);
-        assert_eq!(k1, key(v2), "earlier proof-body edit must not move the key");
-        assert_eq!(k1, key(v3), "target proof-body edit must not move the key");
-        assert_ne!(k1, key(v4), "target signature edit must move the key");
+        let k1 = key(v1, "ctx1");
+        assert_eq!(
+            k1,
+            key(v2, "ctx1"),
+            "earlier proof-body edit must not move the key"
+        );
+        assert_eq!(
+            k1,
+            key(v3, "ctx1"),
+            "target proof-body edit must not move the key"
+        );
+        assert_ne!(
+            k1,
+            key(v4, "ctx1"),
+            "target signature edit must move the key"
+        );
+        assert_ne!(
+            k1,
+            key(v1, "ctx2"),
+            "elaboration context fingerprint change must move the key"
+        );
     }
 
     #[test]
     fn declaration_identity_cache_key_frames_parts_unambiguously() {
         assert_eq!(
-            declaration_identity_cache_key("a", "b", "c", "d"),
-            declaration_identity_cache_key("a", "b", "c", "d")
+            declaration_identity_cache_key("a", "b", "c", "d", "f"),
+            declaration_identity_cache_key("a", "b", "c", "d", "f")
         );
         // Length framing: no split of one part can forge another tuple's key.
         assert_ne!(
-            declaration_identity_cache_key("ab", "c", "d", "e"),
-            declaration_identity_cache_key("a", "bc", "d", "e")
+            declaration_identity_cache_key("ab", "c", "d", "e", "f"),
+            declaration_identity_cache_key("a", "bc", "d", "e", "f")
         );
         assert_ne!(
-            declaration_identity_cache_key("a", "b", "cd", "e"),
-            declaration_identity_cache_key("a", "b", "c", "de")
+            declaration_identity_cache_key("a", "b", "cd", "e", "f"),
+            declaration_identity_cache_key("a", "b", "c", "de", "f")
         );
         assert_ne!(
-            declaration_identity_cache_key("a", "b", "c", "d"),
-            declaration_identity_cache_key("a", "b", "c", "d ")
+            declaration_identity_cache_key("a", "b", "c", "de", "f"),
+            declaration_identity_cache_key("a", "b", "c", "d", "ef")
         );
         assert_ne!(
-            declaration_identity_cache_key("a", "b", "c", "d"),
-            declaration_identity_cache_key("a", "b2", "c", "d")
+            declaration_identity_cache_key("a", "b", "c", "d", "f"),
+            declaration_identity_cache_key("a", "b", "c", "d", "f ")
+        );
+        assert_ne!(
+            declaration_identity_cache_key("a", "b", "c", "d", "f"),
+            declaration_identity_cache_key("a", "b2", "c", "d", "f")
         );
     }
 

@@ -191,6 +191,127 @@ fn compile_and_read_probe_identities(
     })
 }
 
+/// Verified elaboration-context inputs shared by both the fine-grained (`identity_cache_path`)
+/// and coarse (`decl_identity_coarse_lookup`) declaration-identity caches: toolchain/compiler,
+/// `LEAN_PATH` search dirs, effective `leanOptions` (`filter_allowed_lean_args`), and the sorted
+/// transitive non-toolchain import closure (`(module, olean_path, source_blake3, olean_digest)`).
+///
+/// Fails closed (`None`) whenever the probe or any transitive non-toolchain import has a header
+/// error, may read host state (`source_may_read_host_state`), uses `include_str`/`include_bin`
+/// (`source_uses_include_str`), or cannot resolve its `.olean`/source artifacts.
+struct IdentityElaborationContext {
+    toolchain: String,
+    githash: String,
+    compiler: PathBuf,
+    dirs: Vec<PathBuf>,
+    filtered_lean_args: Vec<String>,
+    pins: Vec<(String, PathBuf, String, String)>,
+}
+
+impl IdentityElaborationContext {
+    fn compute(
+        probe_source: &str,
+        project_dir: &Path,
+        lean_args: &[String],
+        env: &HashMap<String, String>,
+    ) -> Option<Self> {
+        let toolchain = detect_toolchain(project_dir);
+        let (compiler, githash, tc_lib, _) =
+            crate::module_builder::resolve_toolchain_compiler(project_dir, &toolchain).ok()?;
+        let header = crate::module_builder::parse_header_info(probe_source);
+        if header.header_error.is_some()
+            || splitter::source_may_read_host_state(probe_source)
+            || crate::module_builder::source_uses_include_str(probe_source)
+        {
+            return None;
+        }
+        let lean_path = env.get("LEAN_PATH").map(String::as_str).unwrap_or("");
+        let mut dirs: Vec<PathBuf> = std::env::split_paths(lean_path)
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| project_dir.join(p))
+            .collect();
+        dirs.push(tc_lib.clone());
+        let search_dirs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+        let cfg = crate::module_builder::resolve_project_config(project_dir).ok();
+        let mut pending = header.imports;
+        let mut visited = HashSet::new();
+        let mut pins = Vec::new();
+        while let Some(import) = pending.pop() {
+            if !visited.insert(import.clone()) {
+                continue;
+            }
+            let path =
+                crate::module_builder::resolve_olean_along_search_dirs(&search_dirs, &import)?;
+            if crate::module_builder::is_verified_toolchain_olean_file(
+                &tc_lib,
+                Some(&githash),
+                &path,
+            ) {
+                continue;
+            }
+            let src_path = cfg
+                .as_ref()
+                .and_then(|cfg| {
+                    crate::module_builder::resolve_source_spec_for_prebuilt_olean(cfg, &path)
+                        .map(|spec| spec.src_path)
+                })
+                .unwrap_or_else(|| path.with_extension("lean"));
+            let source = fs::read_to_string(&src_path).ok()?;
+            if splitter::source_may_read_host_state(&source)
+                || crate::module_builder::source_uses_include_str(&source)
+            {
+                return None;
+            }
+            let source_header = crate::module_builder::parse_header_info(&source);
+            if source_header.header_error.is_some() {
+                return None;
+            }
+            pending.extend(source_header.imports);
+            pending.extend(
+                crate::module_builder::read_olean_binary_imports_cached(&path)
+                    .ok()?
+                    .0
+                    .into_iter()
+                    .map(|imp| imp.module),
+            );
+            pins.push((
+                import,
+                path.clone(),
+                blake3::hash(source.as_bytes()).to_hex().to_string(),
+                crate::module_builder::compute_olean_artifact_set_digest_with_policy(&path, true)
+                    .ok()?,
+            ));
+        }
+        pins.sort();
+        let filtered_lean_args = crate::module_builder::filter_allowed_lean_args(lean_args);
+        Some(Self {
+            toolchain,
+            githash,
+            compiler,
+            dirs,
+            filtered_lean_args,
+            pins,
+        })
+    }
+
+    fn fingerprint(&self, project_dir: &Path) -> Option<String> {
+        let bytes = serde_json::to_vec(&(
+            2u32,
+            crate::zygote::ZYGOTE_SCANNER_VERSION,
+            crate::zygote::ZYGOTE_REPLAY_VERSION,
+            &self.toolchain,
+            &self.githash,
+            &self.compiler,
+            project_dir,
+            &self.dirs,
+            &self.filtered_lean_args,
+            &self.pins,
+        ))
+        .ok()?;
+        Some(blake3::hash(&bytes).to_hex().to_string())
+    }
+}
+
 fn identity_cache_path(
     probe: &str,
     project_dir: &Path,
@@ -199,80 +320,18 @@ fn identity_cache_path(
     min_line: usize,
     max_line: usize,
 ) -> Option<PathBuf> {
-    let toolchain = detect_toolchain(project_dir);
-    let (compiler, githash, tc_lib, _) =
-        crate::module_builder::resolve_toolchain_compiler(project_dir, &toolchain).ok()?;
-    let header = crate::module_builder::parse_header_info(probe);
-    if header.header_error.is_some()
-        || splitter::source_may_read_host_state(probe)
-        || crate::module_builder::source_uses_include_str(probe)
-    {
-        return None;
-    }
-    let lean_path = env.get("LEAN_PATH").map(String::as_str).unwrap_or("");
-    let mut dirs: Vec<PathBuf> = std::env::split_paths(lean_path)
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| project_dir.join(p))
-        .collect();
-    dirs.push(tc_lib.clone());
-    let search_dirs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
-    let cfg = crate::module_builder::resolve_project_config(project_dir).ok();
-    let mut pending = header.imports;
-    let mut visited = HashSet::new();
-    let mut pins = Vec::new();
-    while let Some(import) = pending.pop() {
-        if !visited.insert(import.clone()) {
-            continue;
-        }
-        let path = crate::module_builder::resolve_olean_along_search_dirs(&search_dirs, &import)?;
-        if crate::module_builder::is_verified_toolchain_olean_file(&tc_lib, Some(&githash), &path) {
-            continue;
-        }
-        let src_path = cfg
-            .as_ref()
-            .and_then(|cfg| {
-                crate::module_builder::resolve_source_spec_for_prebuilt_olean(cfg, &path)
-                    .map(|spec| spec.src_path)
-            })
-            .unwrap_or_else(|| path.with_extension("lean"));
-        let source = fs::read_to_string(&src_path).ok()?;
-        if splitter::source_may_read_host_state(&source)
-            || crate::module_builder::source_uses_include_str(&source)
-        {
-            return None;
-        }
-        let source_header = crate::module_builder::parse_header_info(&source);
-        if source_header.header_error.is_some() {
-            return None;
-        }
-        pending.extend(source_header.imports);
-        pending.extend(
-            crate::module_builder::read_olean_binary_imports_cached(&path)
-                .ok()?
-                .0
-                .into_iter()
-                .map(|imp| imp.module),
-        );
-        pins.push((
-            import,
-            path.clone(),
-            blake3::hash(source.as_bytes()).to_hex().to_string(),
-            crate::module_builder::compute_olean_artifact_set_digest_with_policy(&path, true)
-                .ok()?,
-        ));
-    }
-    pins.sort();
+    let ctx = IdentityElaborationContext::compute(probe, project_dir, lean_args, env)?;
     let bytes = serde_json::to_vec(&(
         2u32,
         crate::zygote::ZYGOTE_SCANNER_VERSION,
         crate::zygote::ZYGOTE_REPLAY_VERSION,
-        toolchain,
-        githash,
-        compiler,
+        ctx.toolchain,
+        ctx.githash,
+        ctx.compiler,
         project_dir,
-        &dirs,
-        crate::module_builder::filter_allowed_lean_args(lean_args),
-        pins,
+        &ctx.dirs,
+        ctx.filtered_lean_args,
+        ctx.pins,
         probe,
         min_line,
         max_line,
@@ -389,12 +448,12 @@ pub(crate) fn confirm_decl_identity_with_budget(
 
 /// Process-wide memo of coarse-keyed declaration identity results.
 ///
-/// Keyed by [`splitter::declaration_identity_cache_key`] plus the per-process resolution
-/// context (project dir, filtered lean args, full probe env): identical probe prefixes in two
-/// different workspaces may still elaborate against different dependency bytes, so the
-/// in-process memo never conflates them. The key needs no walk of the transitive import
-/// closure, so a repeated `check --decl` that only edits inside a proof body resolves from
-/// this memo in microseconds instead of re-running the seconds-long stock-`lean` probe.
+/// Keyed by [`splitter::declaration_identity_cache_key`] (which commits to the stubbed prefix,
+/// target declaration, toolchain, compiler githash, and the full [`IdentityElaborationContext`]
+/// fingerprint covering `project_dir`, filtered `leanOptions`, `LEAN_PATH` search dirs, and the
+/// transitive imported `.olean`/source closure) plus the full probe env. A repeated
+/// `check --decl` that only edits inside a proof body under unchanged elaboration inputs
+/// resolves from this memo instead of re-running the stock-`lean` probe.
 fn decl_identity_coarse_memo() -> &'static std::sync::Mutex<HashMap<String, ConfirmedDeclIdentity>> {
     static MEMO: std::sync::OnceLock<std::sync::Mutex<HashMap<String, ConfirmedDeclIdentity>>> =
         std::sync::OnceLock::new();
@@ -413,8 +472,8 @@ struct DeclIdentityCoarseLookup {
 /// Resolve the coarse cache for one stub-probe identity confirmation: the memory memo first,
 /// then the cross-invocation `coarse-<key>.json` entry under the verified private
 /// `decl_identities` staging dir. `None` when the coarse cache does not apply (untrusted
-/// probes and extra read-only `.olean` dirs always recompile; a toolchain or githash that
-/// cannot be resolved cannot be keyed).
+/// probes, extra read-only `.olean` dirs, missing env, host-state-reading or `include_str`
+/// sources in the probe or any transitive import, or unresolvable toolchain/import closure).
 #[allow(clippy::too_many_arguments)]
 fn decl_identity_coarse_lookup(
     project_dir: &Path,
@@ -428,20 +487,22 @@ fn decl_identity_coarse_lookup(
     if is_untrusted || !extra_ro_olean_dirs.is_empty() {
         return None;
     }
-    let toolchain = detect_toolchain(project_dir);
-    let (_, githash, _, _) =
-        crate::module_builder::resolve_toolchain_compiler(project_dir, &toolchain).ok()?;
-    let key =
-        splitter::declaration_identity_cache_key(coarse_prefix, expected, &toolchain, &githash);
-    // The memo is per-process, so it may safely pin the whole resolution context; every part
-    // is NUL-free (paths, argv, and env values cannot contain NUL on any supported host).
-    let mut env_pairs: Vec<(&String, &String)> =
-        env.map(|e| e.iter().collect()).unwrap_or_default();
+    let env = env?;
+    let ctx = IdentityElaborationContext::compute(coarse_prefix, project_dir, lean_args, env)?;
+    let elab_fingerprint = ctx.fingerprint(project_dir)?;
+    let key = splitter::declaration_identity_cache_key(
+        coarse_prefix,
+        expected,
+        &ctx.toolchain,
+        &ctx.githash,
+        &elab_fingerprint,
+    );
+    // `key` already commits to `project_dir`, filtered lean args, `LEAN_PATH` dirs, and the
+    // transitive imported `.olean`/source closure; pin the remaining env vars in-process as well.
+    let mut env_pairs: Vec<(&String, &String)> = env.iter().collect();
     env_pairs.sort();
     let memo_key = format!(
-        "{key}\u{0}{}\u{0}{}\u{0}{}",
-        project_dir.display(),
-        crate::module_builder::filter_allowed_lean_args(lean_args).join("\u{0}"),
+        "{key}\u{0}{}",
         env_pairs
             .iter()
             .map(|(k, v)| format!("{k}={v}"))
@@ -480,12 +541,12 @@ fn decl_identity_coarse_lookup(
 }
 
 /// Read and validate one coarse entry
-/// (`{"v":1,"key":...,"decl_name":...,"kernel_type_hash":...}`), opened fail-closed through
+/// (`{"v":2,"key":...,"decl_name":...,"kernel_type_hash":...}`), opened fail-closed through
 /// `read_verified_isolated_artifact` and refused unless it echoes the key it was filed under.
 fn read_coarse_decl_identity_entry(path: &Path, key: &str) -> Option<ConfirmedDeclIdentity> {
     let bytes = read_verified_isolated_artifact(path).ok()?;
     let val: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    if val.get("v")?.as_u64()? != 1 || val.get("key")?.as_str()? != key {
+    if val.get("v")?.as_u64()? != 2 || val.get("key")?.as_str()? != key {
         return None;
     }
     Some(ConfirmedDeclIdentity {
@@ -502,7 +563,7 @@ fn store_coarse_decl_identity(lookup: &DeclIdentityCoarseLookup, att: &Confirmed
     }
     if let Some(path) = &lookup.disk_path {
         if let Ok(bytes) = serde_json::to_vec(&serde_json::json!({
-            "v": 1,
+            "v": 2,
             "key": lookup.disk_key,
             "decl_name": att.decl_name,
             "kernel_type_hash": att.kernel_type_hash,
@@ -1256,6 +1317,282 @@ mod memo_tests {
         let attested = confirm_decl_identity(src, shard, &dir, &file).expect("confirmed");
         assert_eq!(attested, sentinel, "memo hit must serve the seeded identity");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn coarse_cache_invalidates_on_dependency_options_lean_path_and_project_dir() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = crate::worktree_test_support::LakeTree::new(
+            "coarse_identity_invalidation",
+            &[
+                ("P/Leaf.lean", "def leaf : Nat := 1\n"),
+                ("P/Middle.lean", "import P.Leaf\ndef middle := leaf\n"),
+            ],
+        )?;
+        let lib_dir = tree
+            .project
+            .join(".lake/build/lib/lean")
+            .to_string_lossy()
+            .into_owned();
+        let env = HashMap::from([("LEAN_PATH".into(), lib_dir.clone())]);
+        let coarse_prefix = "import P.Middle\nset_option warningAsError false\nset_option warn.sorry false\ntheorem target : middle = 1";
+        let base = decl_identity_coarse_lookup(
+            &tree.project,
+            coarse_prefix,
+            "target",
+            false,
+            &[],
+            &[],
+            Some(&env),
+        )
+        .expect("pure imported probe must yield a coarse cache lookup");
+        assert!(base.cached.is_none(), "fresh key must miss");
+
+        // Persist an entry to disk, clear the in-process memo, and confirm disk hit works
+        // only when all elaboration inputs match.
+        let sentinel = ConfirmedDeclIdentity {
+            decl_name: "target".into(),
+            kernel_type_hash: "0".repeat(64),
+        };
+        store_coarse_decl_identity(&base, &sentinel);
+        decl_identity_coarse_memo().lock().unwrap().clear();
+        let disk_hit = decl_identity_coarse_lookup(
+            &tree.project,
+            coarse_prefix,
+            "target",
+            false,
+            &[],
+            &[],
+            Some(&env),
+        )
+        .expect("disk hit lookup");
+        assert_eq!(
+            disk_hit.cached.as_ref(),
+            Some(&sentinel),
+            "unchanged elaboration inputs must hit the persisted coarse entry"
+        );
+        assert_eq!(disk_hit.disk_key, base.disk_key);
+
+        // 1. Changing effective leanOptions (`lean_args`) must invalidate the disk key.
+        decl_identity_coarse_memo().lock().unwrap().clear();
+        let opts_lookup = decl_identity_coarse_lookup(
+            &tree.project,
+            coarse_prefix,
+            "target",
+            false,
+            &[],
+            &["-DmaxRecDepth=2048".into()],
+            Some(&env),
+        )
+        .expect("lookup with different lean_args");
+        assert_ne!(
+            opts_lookup.disk_key, base.disk_key,
+            "changing leanOptions must change the coarse disk key"
+        );
+        assert!(
+            opts_lookup.cached.is_none(),
+            "changing leanOptions must miss the coarse disk cache"
+        );
+
+        // 2. Changing LEAN_PATH must invalidate the disk key.
+        let extra_dir = tree.project.join("extra_lib");
+        fs::create_dir_all(&extra_dir)?;
+        let env_alt_lp = HashMap::from([(
+            "LEAN_PATH".into(),
+            format!("{}:{}", extra_dir.display(), lib_dir),
+        )]);
+        let lp_lookup = decl_identity_coarse_lookup(
+            &tree.project,
+            coarse_prefix,
+            "target",
+            false,
+            &[],
+            &[],
+            Some(&env_alt_lp),
+        )
+        .expect("lookup with different LEAN_PATH");
+        assert_ne!(
+            lp_lookup.disk_key, base.disk_key,
+            "changing LEAN_PATH must change the coarse disk key"
+        );
+        assert!(lp_lookup.cached.is_none());
+
+        // 3. Changing project_dir must invalidate the disk key.
+        let other_dir = std::env::temp_dir().join(format!(
+            "turbo_coarse_other_proj_{}",
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&other_dir)?;
+        fs::write(other_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        let other_proj_lookup = decl_identity_coarse_lookup(
+            &other_dir,
+            "theorem target : True",
+            "target",
+            false,
+            &[],
+            &[],
+            Some(&env),
+        )
+        .expect("lookup in other project_dir");
+        let same_src_orig_proj = decl_identity_coarse_lookup(
+            &tree.project,
+            "theorem target : True",
+            "target",
+            false,
+            &[],
+            &[],
+            Some(&env),
+        )
+        .expect("lookup in original project_dir");
+        assert_ne!(
+            other_proj_lookup.disk_key, same_src_orig_proj.disk_key,
+            "changing project_dir must change the coarse disk key"
+        );
+        let _ = fs::remove_dir_all(&other_dir);
+
+        // 4. Modifying a transitive dependency's `.lean` source must invalidate the disk key.
+        let leaf = tree.project.join("P/Leaf.lean");
+        fs::write(&leaf, "def leaf : Nat := 2\n")?;
+        let dep_src_lookup = decl_identity_coarse_lookup(
+            &tree.project,
+            coarse_prefix,
+            "target",
+            false,
+            &[],
+            &[],
+            Some(&env),
+        )
+        .expect("lookup after dependency source edit");
+        assert_ne!(
+            dep_src_lookup.disk_key, base.disk_key,
+            "editing an imported dependency source must change the coarse disk key"
+        );
+        assert!(dep_src_lookup.cached.is_none());
+
+        // 5. Modifying a transitive dependency's `.olean` artifact must invalidate the disk key.
+        let leaf_olean = tree.project.join(".lake/build/lib/lean/P/Leaf.olean");
+        let mut bytes = fs::read(&leaf_olean)?;
+        bytes.push(0);
+        fs::write(&leaf_olean, bytes)?;
+        let dep_olean_lookup = decl_identity_coarse_lookup(
+            &tree.project,
+            coarse_prefix,
+            "target",
+            false,
+            &[],
+            &[],
+            Some(&env),
+        )
+        .expect("lookup after dependency .olean edit");
+        assert_ne!(
+            dep_olean_lookup.disk_key, dep_src_lookup.disk_key,
+            "modifying an imported dependency .olean must change the coarse disk key"
+        );
+        assert!(dep_olean_lookup.cached.is_none());
+
+        if let Some(p) = base.disk_path {
+            let _ = fs::remove_file(p);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn coarse_cache_bypasses_host_state_and_include_str_sources() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = crate::worktree_test_support::LakeTree::new(
+            "coarse_identity_host_bypass",
+            &[
+                ("P/Leaf.lean", "def leaf : Nat := 1\n"),
+                ("P/Middle.lean", "import P.Leaf\ndef middle := leaf\n"),
+                ("P/data.txt", "hello"),
+            ],
+        )?;
+        let env = HashMap::from([(
+            "LEAN_PATH".into(),
+            tree.project
+                .join(".lake/build/lib/lean")
+                .to_string_lossy()
+                .into_owned(),
+        )]);
+
+        // Direct host-state read (`IO.getEnv`) and `include_str`/`include_bin` in the probe
+        // prefix must bypass the coarse cache completely (return `None` -> neither read nor write).
+        for direct_prefix in [
+            "initialize nonce : Option String ← IO.getEnv \"SECRET\"\ntheorem target : True",
+            "def embedded : String := include_str \"P/data.txt\"\ntheorem target : True",
+            "def embedded : ByteArray := include_bin \"P/data.txt\"\ntheorem target : True",
+        ] {
+            assert!(
+                decl_identity_coarse_lookup(
+                    &tree.project,
+                    direct_prefix,
+                    "target",
+                    false,
+                    &[],
+                    &[],
+                    Some(&env),
+                )
+                .is_none(),
+                "coarse cache must bypass direct host-effect/include source: {direct_prefix}"
+            );
+        }
+
+        // Transitive host-state read or `include_str` in an imported dependency must also bypass.
+        let imported_prefix = "import P.Middle\ntheorem target : middle = 1";
+        assert!(
+            decl_identity_coarse_lookup(
+                &tree.project,
+                imported_prefix,
+                "target",
+                false,
+                &[],
+                &[],
+                Some(&env),
+            )
+            .is_some(),
+            "baseline pure transitive import must be cacheable"
+        );
+        let leaf = tree.project.join("P/Leaf.lean");
+        for dep_source in [
+            "initialize nonce : Option String ← IO.getEnv \"SECRET\"\ndef leaf : Nat := 1\n",
+            "def embedded := include_str \"data.txt\"\ndef leaf : Nat := 1\n",
+        ] {
+            fs::write(&leaf, dep_source)?;
+            assert!(
+                decl_identity_coarse_lookup(
+                    &tree.project,
+                    imported_prefix,
+                    "target",
+                    false,
+                    &[],
+                    &[],
+                    Some(&env),
+                )
+                .is_none(),
+                "coarse cache must bypass transitive host-effect/include import: {dep_source}"
+            );
+        }
+
+        // Missing dependency source must also fail closed (`None`).
+        fs::remove_file(&leaf)?;
+        assert!(
+            decl_identity_coarse_lookup(
+                &tree.project,
+                imported_prefix,
+                "target",
+                false,
+                &[],
+                &[],
+                Some(&env),
+            )
+            .is_none(),
+            "coarse cache must fail closed when a non-toolchain import source is missing"
+        );
+        Ok(())
     }
 
     #[test]
