@@ -2452,11 +2452,7 @@ def validate_results_document(doc: Any) -> list[str]:
             f"Results file schemaVersion must be `{RESULTS_SCHEMA_VERSION}`, "
             f"got {doc.get('schemaVersion')!r}"
         )
-    if doc.get("toolchain") != PINNED_TOOLCHAIN:
-        errors.append(
-            f"Results file toolchain mismatch: file={doc.get('toolchain')!r} "
-            f"live={PINNED_TOOLCHAIN!r}"
-        )
+    _compare_committed_toolchain(doc, errors)
     msc = doc.get("measured_source_commit")
     if not _is_hex_digest(msc, 40):
         errors.append(
@@ -2596,6 +2592,19 @@ def _compare_committed_external_revisions(committed: Any, errors: list[str]) -> 
                 f"{recorded}, not the pinned {pinned}; re-run --write-results on a build of the "
                 "pinned revision"
             )
+
+
+def _compare_committed_toolchain(committed: Any, errors: list[str]) -> None:
+    """Refuse committed counts measured with another toolchain than the pinned one.
+
+    The classifier digest hashes the source that names PINNED_TOOLCHAIN, not
+    its value, so this comparison is what ties the committed counts to it.
+    """
+    recorded = committed.get("toolchain") if isinstance(committed, dict) else None
+    if recorded != PINNED_TOOLCHAIN:
+        errors.append(
+            f"Results file toolchain mismatch: file={recorded!r} live={PINNED_TOOLCHAIN!r}"
+        )
 
 
 def check_coverage_report(
@@ -2881,6 +2890,8 @@ def check_coverage_report(
                     _compare_committed_digests(rep, base_digests, errors)
                 _compare_committed_classifier(rep, committed, errors)
                 _compare_committed_external_revisions(committed, errors)
+                # The --check path gets this from validate_results_document.
+                _compare_committed_toolchain(committed, errors)
         else:
             errors.append(
                 "Missing committed results file scripts/lcnf_coverage_results.json: "
@@ -3234,6 +3245,32 @@ class TestLcnfCoverage(unittest.TestCase):
                     want_gate_error,
                     chk["errors"],
                 )
+
+    def test_json_refuses_counts_measured_with_another_toolchain(self) -> None:
+        # The --check path compares the committed toolchain with
+        # PINNED_TOOLCHAIN in validate_results_document, but the --json path CI
+        # runs did not, and the classifier digest hashes the source that names
+        # PINNED_TOOLCHAIN, not its value. A toolchain bump without a
+        # re-measure left the old toolchain's committed counts passing CI.
+        rep = self._v_fake_live_report()
+        baseline = self._v_committed_baseline()
+        baseline["classifier_source_sha256"] = classifier_source_digest()
+        bumped = dict(baseline, toolchain="leanprover/lean4:v4.36.0")
+
+        def gate_errors(errors: list[str]) -> list[str]:
+            return [e for e in errors if "toolchain mismatch" in e]
+
+        with tempfile.TemporaryDirectory(prefix="lcnf-toolchain-gate-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            committed = root / "scripts" / "lcnf_coverage_results.json"
+            for doc, want_gate_error in ((bumped, True), (baseline, False)):
+                committed.write_text(json.dumps(doc), encoding="utf-8")
+                chk = check_coverage_report(root, rep, compare_results_digests=True)
+                self.assertEqual(bool(gate_errors(chk["errors"])), want_gate_error, chk["errors"])
+        # The --check path still names the mismatch once.
+        chk = check_coverage_report(ROOT_DIR, rep, results=bumped)
+        self.assertEqual(len(gate_errors(chk["errors"])), 1, chk["errors"])
 
     def test_write_results_records_the_external_revision(self) -> None:
         # The live external entry names the revision its measurement verified
