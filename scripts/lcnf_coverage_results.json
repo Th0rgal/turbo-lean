@@ -76,7 +76,7 @@
     }
   },
   "measured_source_commit": "138b287609bc2785e34cfd630b8cdfbd58a09790",
-  "measured_source_commit_note": "`measured_source_commit` is the commit of the tree the measurement was taken from (recorded when `--write-results` ran, i.e. the parent of the commit that updates this file).",
+  "measured_source_commit_note": "`measured_source_commit` is the commit of the tree the measurement was taken from, recorded when `--write-results` ran.",
   "schemaVersion": "turbo-lean-lcnf-coverage-results-v4",
   "toolchain": "leanprover/lean4:v4.35.0"
 }

@@ -192,8 +192,8 @@ MEASUREMENT_INPUT_PATHS: tuple[str, ...] = (
 )
 RESULTS_SCHEMA_VERSION = "turbo-lean-lcnf-coverage-results-v4"
 MEASURED_SOURCE_COMMIT_NOTE = (
-    "`measured_source_commit` is the commit of the tree the measurement was taken from "
-    "(recorded when `--write-results` ran, i.e. the parent of the commit that updates this file)."
+    "`measured_source_commit` is the commit of the tree the measurement was taken from, "
+    "recorded when `--write-results` ran."
 )
 
 LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
