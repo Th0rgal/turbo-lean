@@ -11,11 +11,12 @@
     "lean/LeanNative/IR/RealLCNFSemantics.lean": "82bc8345586d1ecd333a778d7a25091b8938c69dacdffef53a9ff47c61e32c3e",
     "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean": "3f0627ba90ef74acb3093cf4703ee18abf9380ba3752f01b5f9266b846f1bc4b"
   },
+  "classifier_source_sha256": "08e4fde1a4106f753b3b6379b5f118ad625608bf016929b50e071e3163a0bac4",
   "corpora": {
     "c1_corpus": {
       "compiler_aux_decls_excluded": 925,
-      "lowered_unproved": 98,
-      "proved": 782,
+      "lowered_unproved": 0,
+      "proved": 880,
       "rejected": 22,
       "rejected_not_lowered": 2,
       "rejected_not_lowered_reason": "mutual_cycle",
@@ -23,8 +24,8 @@
     },
     "external_batteries": {
       "compiler_aux_decls_excluded": 3472,
-      "lowered_unproved": 1060,
-      "proved": 59,
+      "lowered_unproved": 1066,
+      "proved": 53,
       "rejected": 9539,
       "rejected_not_lowered": 211,
       "rejected_not_lowered_reason": "mutual_cycle",
@@ -32,16 +33,16 @@
     },
     "std_init_and_c2": {
       "compiler_aux_decls_excluded": 817,
-      "lowered_unproved": 84,
-      "proved": 29,
+      "lowered_unproved": 65,
+      "proved": 48,
       "rejected": 1692,
       "rejected_not_lowered": 0,
       "rejected_not_lowered_reason": "mutual_cycle",
       "subcorpora": {
         "c2_lake_packages": {
           "compiler_aux_decls_excluded": 61,
-          "lowered_unproved": 19,
-          "proved": 13,
+          "lowered_unproved": 0,
+          "proved": 32,
           "rejected": 0,
           "rejected_not_lowered": 0,
           "rejected_not_lowered_reason": "mutual_cycle",
@@ -60,8 +61,8 @@
       "total_declarations": 1805
     }
   },
-  "measured_source_commit": "19ae99cd36c4dbe30f71a776f933e9258372081d",
+  "measured_source_commit": "138b287609bc2785e34cfd630b8cdfbd58a09790",
   "measured_source_commit_note": "`measured_source_commit` is the commit of the tree the measurement was taken from (recorded when `--write-results` ran, i.e. the parent of the commit that updates this file).",
-  "schemaVersion": "turbo-lean-lcnf-coverage-results-v3",
+  "schemaVersion": "turbo-lean-lcnf-coverage-results-v4",
   "toolchain": "leanprover/lean4:v4.35.0"
 }
