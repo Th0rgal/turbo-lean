@@ -84,7 +84,10 @@ impl KernelTestFixture {
             .env("TURBO_LEAN_TELEMETRY", "off")
             .env("TURBO_LEAN_NO_REMOTE_TELEMETRY", "1")
             .env_remove("TURBO_LEAN_KERNEL_ENGINE")
-            .env_remove("TURBO_LEAN_KERNEL_ENGINE_FROM_CONFIG");
+            .env_remove("TURBO_LEAN_KERNEL_ENGINE_FROM_CONFIG")
+            // Never inherit an ambient con-leche override; tests that need one set it explicitly
+            // on the spawned `Command` (`.env(kernel::CON_LECHE_BIN_ENV, ..)`).
+            .env_remove(kernel::CON_LECHE_BIN_ENV);
         cmd
     }
 }
@@ -1099,4 +1102,78 @@ fn real_con_leche_binary_verifies_valid_and_rejects_adversarial_olean_if_built()
         &cli_fail,
         "CLI --kernel con-leche remains fail-closed even when binary exists",
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn auto_kernel_routes_to_con_leche_when_pinned_toolchain_binary_is_provisioned() {
+    let f = KernelTestFixture::new("auto_kernel_g1c");
+    let proj = f.root.join("proj_v435");
+    fs::create_dir_all(&proj).unwrap();
+    let fake_bin = f.root.join("external-con-leche.sh");
+    write_executable_script(
+        &fake_bin,
+        "#!/usr/bin/env bash\nif [ \"${1:-}\" = \"--version\" ]; then echo 'con-leche 0.1.0'; exit 0; fi\nexit 0\n",
+    );
+
+    // Inject the `TURBO_CON_LECHE_BIN` value explicitly instead of mutating the process-wide
+    // environment, which would race with other tests spawning commands in parallel.
+    let bin_env = Some(fake_bin.as_os_str());
+    let auto_v435 = kernel::resolve_kernel_engine_in_workspace_with_bin_env(
+        kernel::KernelEngineSelection::Auto,
+        kernel::PINNED_CON_LECHE_TOOLCHAIN,
+        Some(&proj),
+        bin_env,
+    );
+    let auto_other = kernel::resolve_kernel_engine_in_workspace_with_bin_env(
+        kernel::KernelEngineSelection::Auto,
+        "leanprover/lean4:v4.15.0",
+        Some(&proj),
+        bin_env,
+    );
+    let auto_no_ws = kernel::resolve_kernel_engine_in_workspace_with_bin_env(
+        kernel::KernelEngineSelection::Auto,
+        kernel::PINNED_CON_LECHE_TOOLCHAIN,
+        None,
+        bin_env,
+    );
+    let explicit_std = kernel::resolve_kernel_engine_in_workspace_with_bin_env(
+        kernel::KernelEngineSelection::Standard,
+        kernel::PINNED_CON_LECHE_TOOLCHAIN,
+        Some(&proj),
+        bin_env,
+    );
+
+    let auto_v435 = auto_v435.unwrap();
+    assert_eq!(auto_v435.requested_engine, kernel::KernelEngineSelection::Auto);
+    assert_eq!(
+        auto_v435.kernel_engine,
+        kernel::ResolvedKernelEngine::ConLeche
+    );
+    assert_eq!(
+        auto_v435.con_leche_rev.as_deref(),
+        Some(kernel::PINNED_CON_LECHE_REV)
+    );
+    assert_eq!(auto_v435.fallback_reason, None);
+
+    let auto_other = auto_other.unwrap();
+    assert_eq!(
+        auto_other.kernel_engine,
+        kernel::ResolvedKernelEngine::Standard
+    );
+    assert!(auto_other.fallback_reason.is_some());
+
+    let auto_no_ws = auto_no_ws.unwrap();
+    assert_eq!(
+        auto_no_ws.kernel_engine,
+        kernel::ResolvedKernelEngine::Standard
+    );
+    assert!(auto_no_ws.fallback_reason.is_some());
+
+    let explicit_std = explicit_std.unwrap();
+    assert_eq!(
+        explicit_std.kernel_engine,
+        kernel::ResolvedKernelEngine::Standard
+    );
+    assert_eq!(explicit_std.con_leche_rev, None);
 }

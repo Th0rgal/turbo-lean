@@ -214,16 +214,35 @@ pub fn probe_con_leche_support_for_selection(
     lean_toolchain: &str,
     workspace_root: Option<&Path>,
 ) -> Option<String> {
+    probe_con_leche_support_for_selection_with_bin_env(
+        requested,
+        lean_toolchain,
+        workspace_root,
+        std::env::var_os(CON_LECHE_BIN_ENV).as_deref(),
+    )
+}
+
+/// Same as [`probe_con_leche_support_for_selection`], but takes the `TURBO_CON_LECHE_BIN` value
+/// explicitly instead of reading the process environment (so callers/tests never need to mutate
+/// process-wide state).
+pub fn probe_con_leche_support_for_selection_with_bin_env(
+    requested: KernelEngineSelection,
+    lean_toolchain: &str,
+    workspace_root: Option<&Path>,
+    con_leche_bin_env: Option<&OsStr>,
+) -> Option<String> {
     if !matches!(
         requested,
-        KernelEngineSelection::ConLeche | KernelEngineSelection::Both
+        KernelEngineSelection::Auto
+            | KernelEngineSelection::ConLeche
+            | KernelEngineSelection::Both
     ) {
         return probe_con_leche_support(lean_toolchain);
     }
     if normalize_lean_toolchain(lean_toolchain) != PINNED_CON_LECHE_TOOLCHAIN {
         return None;
     }
-    let bin = discover_con_leche_binary(workspace_root).ok()?;
+    let bin = discover_con_leche_binary_with_bin_env(workspace_root, con_leche_bin_env).ok()?;
     if let Some(proj) = workspace_root {
         let canon_proj = proj.canonicalize().ok()?;
         let checkout = canon_proj
@@ -284,10 +303,31 @@ pub fn resolve_kernel_engine_in_workspace(
     lean_toolchain: &str,
     workspace_root: Option<&Path>,
 ) -> Result<KernelProvenance> {
+    resolve_kernel_engine_in_workspace_with_bin_env(
+        requested,
+        lean_toolchain,
+        workspace_root,
+        std::env::var_os(CON_LECHE_BIN_ENV).as_deref(),
+    )
+}
+
+/// Same as [`resolve_kernel_engine_in_workspace`], but takes the `TURBO_CON_LECHE_BIN` value
+/// explicitly instead of reading the process environment.
+pub fn resolve_kernel_engine_in_workspace_with_bin_env(
+    requested: KernelEngineSelection,
+    lean_toolchain: &str,
+    workspace_root: Option<&Path>,
+    con_leche_bin_env: Option<&OsStr>,
+) -> Result<KernelProvenance> {
     let lean_toolchain = normalize_lean_toolchain(lean_toolchain);
     let probed_con_leche_rev = workspace_root
         .and_then(|root| {
-            probe_con_leche_support_for_selection(requested, &lean_toolchain, Some(root))
+            probe_con_leche_support_for_selection_with_bin_env(
+                requested,
+                &lean_toolchain,
+                Some(root),
+                con_leche_bin_env,
+            )
         })
         .or_else(|| probe_con_leche_support(&lean_toolchain));
     let routed_tag =
@@ -388,7 +428,20 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 pub fn discover_con_leche_binary(workspace_root: Option<&Path>) -> Result<PathBuf> {
-    if let Ok(raw) = std::env::var(CON_LECHE_BIN_ENV) {
+    discover_con_leche_binary_with_bin_env(
+        workspace_root,
+        std::env::var_os(CON_LECHE_BIN_ENV).as_deref(),
+    )
+}
+
+/// Same as [`discover_con_leche_binary`], but takes the `TURBO_CON_LECHE_BIN` value explicitly
+/// instead of reading the process environment. Non-UTF-8 values are ignored, matching
+/// `std::env::var` semantics.
+pub fn discover_con_leche_binary_with_bin_env(
+    workspace_root: Option<&Path>,
+    con_leche_bin_env: Option<&OsStr>,
+) -> Result<PathBuf> {
+    if let Some(raw) = con_leche_bin_env.and_then(OsStr::to_str) {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
             let p = PathBuf::from(trimmed);
@@ -723,8 +776,13 @@ where
         entries.sort();
         entries.dedup();
         for import in &observation.imports {
-            let import = import.trim();
-            if !import.is_empty() && !modules.contains_key(import) {
+            let import = canonical_exported_import_module(import).with_context(|| {
+                format!(
+                    "[TurboLean.KernelGate] transitive compiled-import csimp scan of `{root}` \
+                     rejected import `{import}` recorded by module `{module}`"
+                )
+            })?;
+            if !modules.contains_key(import) {
                 frontier.insert(import.to_string());
             }
         }
@@ -778,13 +836,63 @@ pub fn compute_transitive_csimp_posture_digest(
     h.finalize().to_hex().to_string()
 }
 
+/// Canonical module name of one `exported_imports` token.
+///
+/// ZygoteWorker records each import as `Module:e=<bool>:m=<bool>:a=<bool>`. A bare module name
+/// (no `:` at all) is accepted as-is. Any `:` starts the metadata suffix, which must be exactly
+/// `:e=<bool>:m=<bool>:a=<bool>` — strict key order, no duplicate or unknown keys, no empty `::`
+/// segments. Empty, whitespace-only, or malformed tokens fail closed instead of being skipped or
+/// truncated, so a blank or spoofed import can never hide a hole in the closure.
+fn canonical_exported_import_module(raw: &str) -> Result<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!(
+            "[TurboLean.KernelGate] empty or whitespace-only exported import (fail-closed)"
+        );
+    }
+    if trimmed.chars().any(|c| c.is_whitespace()) {
+        anyhow::bail!(
+            "[TurboLean.KernelGate] exported import `{trimmed}` contains whitespace (fail-closed)"
+        );
+    }
+    let (name, meta) = match trimmed.split_once(':') {
+        None => (trimmed, None),
+        Some((name, meta)) => (name, Some(meta)),
+    };
+    if name.is_empty() {
+        anyhow::bail!(
+            "[TurboLean.KernelGate] exported import `{trimmed}` has an empty module name (fail-closed)"
+        );
+    }
+    if let Some(meta) = meta {
+        let fields: Vec<&str> = meta.split(':').collect();
+        let well_formed = fields.len() == 3
+            && fields
+                .iter()
+                .zip(["e", "m", "a"])
+                .all(|(field, expected_key)| {
+                    matches!(
+                        field.split_once('='),
+                        Some((key, "true" | "false")) if key == expected_key
+                    )
+                });
+        if !well_formed {
+            anyhow::bail!(
+                "[TurboLean.KernelGate] malformed exported-import metadata `{trimmed}`: \
+                 expected exactly `Module:e=<bool>:m=<bool>:a=<bool>` (fail-closed)"
+            );
+        }
+    }
+    Ok(name)
+}
+
 /// Parse one `csimp_entries` string from a compiled module's public signature, e.g.
 /// `global:slowGlob->fastGlob:slowGlob_eq` or `scoped:Ns:slowF->fastF:slowF_eq`.
 ///
 /// Malformed entries fail closed instead of being silently dropped, so a truncated or spoofed
 /// signature can never look like a clean posture.
 pub fn parse_public_signature_csimp_entry(raw: &str) -> Result<CompiledCsimpObservation> {
-    let parts = split_lean_csimp_fields(raw);
+    let parts = split_lean_csimp_fields(raw)?;
     let reject = |why: &str| {
         anyhow::anyhow!(
             "[TurboLean.KernelGate] malformed public-signature csimp entry `{raw}`: {why}"
@@ -799,19 +907,39 @@ pub fn parse_public_signature_csimp_entry(raw: &str) -> Result<CompiledCsimpObse
             ))
         }
     };
+    let reject_blank = |field: &str| {
+        if field.chars().all(|c| c.is_whitespace()) {
+            Some("whitespace-only field")
+        } else if field.chars().any(|c| c.is_whitespace()) {
+            Some("field contains whitespace")
+        } else {
+            None
+        }
+    };
     if let Some(scope) = scope {
         if scope.is_empty() {
             return Err(reject("empty scoped namespace"));
         }
+        if let Some(why) = reject_blank(scope) {
+            return Err(reject(why));
+        }
     }
     if theorem.is_empty() {
         return Err(reject("empty replacement theorem name"));
+    }
+    if let Some(why) = reject_blank(theorem) {
+        return Err(reject(why));
     }
     let arrow_split = split_lean_csimp_arrow(pair);
     let (from, to) = match arrow_split.as_slice() {
         [from, to] if !from.is_empty() && !to.is_empty() => (*from, *to),
         _ => return Err(reject("expected exactly one non-empty `<from>-><to>` replacement pair")),
     };
+    for field in [from, to] {
+        if let Some(why) = reject_blank(field) {
+            return Err(reject(why));
+        }
+    }
     Ok(CompiledCsimpObservation {
         theorem: theorem.to_string(),
         from: from.to_string(),
@@ -821,14 +949,26 @@ pub fn parse_public_signature_csimp_entry(raw: &str) -> Result<CompiledCsimpObse
 }
 
 /// Split a public-signature `csimp_entries` field on top-level `:` separators, ignoring separators
-/// inside a guillemet-quoted identifier (`«...»`).
-fn split_lean_csimp_fields(raw: &str) -> Vec<&str> {
+/// inside a guillemet-quoted identifier (`«...»`). An unclosed `«` fails closed.
+fn split_lean_csimp_fields(raw: &str) -> Result<Vec<&str>> {
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut in_guillemet = false;
     for (idx, ch) in raw.char_indices() {
         match ch {
+            '«' if in_guillemet => {
+                anyhow::bail!(
+                    "[TurboLean.KernelGate] malformed public-signature csimp entry `{raw}`: \
+                     nested `«` inside a guillemet-quoted identifier"
+                );
+            }
             '«' => in_guillemet = true,
+            '»' if !in_guillemet => {
+                anyhow::bail!(
+                    "[TurboLean.KernelGate] malformed public-signature csimp entry `{raw}`: \
+                     unmatched `»`"
+                );
+            }
             '»' => in_guillemet = false,
             ':' if !in_guillemet => {
                 out.push(&raw[start..idx]);
@@ -837,8 +977,13 @@ fn split_lean_csimp_fields(raw: &str) -> Vec<&str> {
             _ => {}
         }
     }
+    if in_guillemet {
+        anyhow::bail!(
+            "[TurboLean.KernelGate] malformed public-signature csimp entry `{raw}`: unclosed `«`"
+        );
+    }
     out.push(&raw[start..]);
-    out
+    Ok(out)
 }
 
 /// Split a `csimp` replacement pair on its single top-level `->`, ignoring any `->` inside a
@@ -1199,6 +1344,100 @@ mod tests {
             empty.to_string().contains("empty"),
             "an empty root module must be rejected: {empty}"
         );
+
+        // An empty or whitespace-only import must fail closed, not be skipped.
+        for blank in ["", "   ", "\t"] {
+            let err = scan_transitive_csimp_posture("Root", |m| {
+                if m == "Root" {
+                    Ok(Some(module_obs(&[blank], &[])))
+                } else {
+                    Ok(fixture.get(m).cloned())
+                }
+            })
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("empty") || msg.contains("whitespace") || msg.contains("rejected import"),
+                "blank import `{blank:?}` must fail closed: {msg}"
+            );
+        }
+
+        // Zygote `Module:e=<bool>:m=<bool>:a=<bool>` tags resolve to the bare module name.
+        let tagged = scan_transitive_csimp_posture("Root", |m| match m {
+            "Root" => Ok(Some(module_obs(
+                &["MidA:e=true:m=false:a=false", "MidB:e=false:m=true:a=false"],
+                &[],
+            ))),
+            other => Ok(fixture.get(other).cloned()),
+        })
+        .expect("tagged exported imports resolve to canonical module names");
+        assert!(tagged.modules.contains_key("MidA"));
+        assert!(tagged.modules.contains_key("MidB"));
+
+        for malformed in [
+            "MidA:e=yes:m=false:a=false",
+            "MidA:e=true",
+            ":e=true:m=false:a=false",
+            "Mid A:e=true:m=false:a=false",
+            "MidA:m=false:a=false",
+            "MidA:bogus",
+        ] {
+            let err = scan_transitive_csimp_posture("Root", |m| {
+                if m == "Root" {
+                    Ok(Some(module_obs(&[malformed], &[])))
+                } else {
+                    Ok(fixture.get(m).cloned())
+                }
+            })
+            .unwrap_err();
+            assert!(
+                err.to_string().contains(malformed) || err.to_string().contains("malformed"),
+                "malformed exported import `{malformed}` must fail closed: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_canonical_exported_import_module_requires_exact_metadata_suffix() {
+        assert_eq!(canonical_exported_import_module("MidA").unwrap(), "MidA");
+        assert_eq!(
+            canonical_exported_import_module("Mathlib.Data.Nat").unwrap(),
+            "Mathlib.Data.Nat"
+        );
+        assert_eq!(
+            canonical_exported_import_module(" MidA:e=true:m=false:a=true ").unwrap(),
+            "MidA"
+        );
+        for malformed in [
+            // Missing `e=`: previously parsed as a bare module name `MidA:m=false:a=false`.
+            "MidA:m=false:a=false",
+            "MidA:bogus",
+            "MidA:",
+            // Wrong order, duplicates, unknown keys.
+            "MidA:m=false:e=true:a=false",
+            "MidA:a=false:m=false:e=true",
+            "MidA:e=true:e=true:m=false:a=false",
+            "MidA:e=true:m=false:m=false:a=false",
+            "MidA:e=true:m=false:x=false",
+            // Empty `::` segments anywhere.
+            "MidA::e=true:m=false:a=false",
+            "MidA:e=true::m=false:a=false",
+            "MidA:e=true:m=false::a=false",
+            "MidA:e=true:m=false:a=false:",
+            // Trailing junk or bad values.
+            "MidA:e=true:m=false:a=false:bogus",
+            "MidA:e=true:m=false:a=",
+            "MidA:e=TRUE:m=false:a=false",
+            "MidA:e:m=false:a=false",
+            ":e=true:m=false:a=false",
+        ] {
+            let err = canonical_exported_import_module(malformed).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("malformed") || msg.contains("empty module name"),
+                "malformed exported import `{malformed}` must fail closed: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -1230,6 +1469,13 @@ mod tests {
             "scoped:Ns:slowF->fastF",
             "scoped::slowF->fastF:thm",
             "kind:slowF->fastF:thm",
+            "global:slow Glob->fastGlob:slowGlob_eq",
+            "global:slowGlob->fastGlob:slowGlob eq",
+            "global:slowGlob-> :slowGlob_eq",
+            "scoped:Ns Space:slowF->fastF:slowF_eq",
+            "global:«unclosed->fastGlob:slowGlob_eq",
+            "scoped:«Ns:slowF->fastF:slowF_eq",
+            "global:slowGlob->fastGlob:thm»",
         ] {
             assert!(
                 parse_public_signature_csimp_entry(malformed).is_err(),
