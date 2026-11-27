@@ -91,6 +91,15 @@ pub(crate) struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     no_auto_worktree_link: bool,
 
+    /// Never rebuild upstream dependencies: fail fast naming the missing/stale upstream .olean (leaf workers; alias --frozen-cone; also TURBO_LEAN_NO_REBUILD_UPSTREAM=1)
+    #[arg(
+        long,
+        global = true,
+        visible_alias = "frozen-cone",
+        default_value_t = false
+    )]
+    no_rebuild_upstream: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -583,6 +592,10 @@ enum DaemonCommands {
 fn main() -> Result<()> {
     let process_t0 = std::time::Instant::now();
     let cli = Cli::parse();
+    // Global flags (`--max-memory-mb`, `--no-auto-worktree-link`, `--no-rebuild-upstream` /
+    // `--frozen-cone`) must reach the process env before ANY early return (the `daemon`
+    // short-circuit below) or lifecycle/one-shot setup, not only inside `run`. Idempotent.
+    apply_global_cli_env(&cli);
     let check_phase_timer = matches!(&cli.command, Commands::Check { .. })
         .then(|| phase_timing::PhaseTimer::from_start(process_t0));
     let _check_phase_guard = check_phase_timer
@@ -773,6 +786,51 @@ mod invocation_receipt_tests {
     }
 }
 
+#[cfg(test)]
+mod global_cli_flag_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn no_rebuild_upstream_and_frozen_cone_parse_globally_and_reach_env() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let env = module_builder::NO_REBUILD_UPSTREAM_ENV;
+        let saved = std::env::var(env).ok();
+
+        // Default: off.
+        let cli = Cli::try_parse_from(["turbo-lean", "build"]).expect("plain build parses");
+        assert!(!cli.no_rebuild_upstream);
+
+        // Both spellings, before and after the subcommand (global flag), including the
+        // `daemon` subcommand whose `main` path short-circuits before `run`.
+        for args in [
+            vec!["turbo-lean", "--no-rebuild-upstream", "build"],
+            vec!["turbo-lean", "build", "--no-rebuild-upstream"],
+            vec!["turbo-lean", "--frozen-cone", "build"],
+            vec!["turbo-lean", "check", "--frozen-cone", "Main.lean"],
+            vec!["turbo-lean", "--frozen-cone", "daemon", "stop"],
+            vec!["turbo-lean", "daemon", "stop", "--no-rebuild-upstream"],
+        ] {
+            let cli = Cli::try_parse_from(args.clone())
+                .unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
+            assert!(cli.no_rebuild_upstream, "{args:?} must enable the flag");
+            std::env::remove_var(env);
+            apply_global_cli_env(&cli);
+            assert!(
+                module_builder::no_rebuild_upstream_enabled(),
+                "{args:?} must reach the freshness gates via the env"
+            );
+        }
+
+        match saved {
+            Some(v) => std::env::set_var(env, v),
+            None => std::env::remove_var(env),
+        }
+    }
+}
+
 fn exit_with_receipt(code: i32, explicit_status: Option<&std::process::ExitStatus>) -> ! {
     let _ = finish_invocation_receipt(code == 0, Some(code), explicit_status);
     std::process::exit(code);
@@ -784,6 +842,12 @@ pub(crate) fn apply_global_cli_env(cli: &Cli) {
     }
     if cli.no_auto_worktree_link {
         std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", "1");
+    }
+    // #483.2 / #339 (P10): `--no-rebuild-upstream` / `--frozen-cone` flips the freshness gates
+    // (`module_builder::no_rebuild_upstream_enabled`) so leaf workers fail fast on a missing or
+    // stale upstream `.olean` instead of silently triggering an upstream rebuild.
+    if cli.no_rebuild_upstream {
+        std::env::set_var(module_builder::NO_REBUILD_UPSTREAM_ENV, "1");
     }
 }
 

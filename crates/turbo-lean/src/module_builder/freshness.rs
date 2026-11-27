@@ -1,5 +1,51 @@
 use super::*;
 
+/// #483.2 / #339 (P10): env switch for `--no-rebuild-upstream` (`--frozen-cone`). Leaf workers
+/// building against a frozen upstream cone must fail fast naming the missing upstream `.olean`
+/// instead of silently triggering a multi-hour upstream rebuild.
+pub(crate) const NO_REBUILD_UPSTREAM_ENV: &str = "TURBO_LEAN_NO_REBUILD_UPSTREAM";
+
+/// Pure decision core of [`no_rebuild_upstream_enabled`]: the CLI flag (`--no-rebuild-upstream` /
+/// `--frozen-cone`) or `TURBO_LEAN_NO_REBUILD_UPSTREAM=1` (also `true`) enables it.
+pub(crate) fn no_rebuild_upstream_from_env(cli_flag: bool, raw_env: Option<&str>) -> bool {
+    cli_flag
+        || raw_env.is_some_and(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        })
+}
+
+/// Whether this invocation must never trigger an upstream (dependency / imported-module) rebuild:
+/// stale or missing upstream `.olean`s fail fast with a named error instead.
+pub(crate) fn no_rebuild_upstream_enabled() -> bool {
+    no_rebuild_upstream_from_env(
+        false,
+        std::env::var(NO_REBUILD_UPSTREAM_ENV).ok().as_deref(),
+    )
+}
+
+/// Whether `olean` looks installed by CAS materialization: a regular file sharing its inode with
+/// at least one other link (the machine CAS blob store or a sibling worktree) and sealed
+/// read-only (`0o444`, see `install_blob_to_path_checked`). Its `mtime` carries no local
+/// build-ordering information — it is the CAS blob's, not the worktree's — so freshness callers
+/// must fall back to content hashes (source BLAKE3 + dep `.olean` interface digests) instead of
+/// mtime ordering. Lake-built artifacts are writable single-link files and never match.
+pub(crate) fn olean_installed_as_cas_hardlink(olean: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        match fs::symlink_metadata(olean) {
+            Ok(m) if m.is_file() => m.nlink() > 1 && (m.permissions().mode() & 0o222) == 0,
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = olean;
+        false
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub(crate) struct VerifiedDepModuleEntry {
     pub src_blake3: String,
@@ -7134,3 +7180,83 @@ pub(super) fn probe_warm_on_disk_module_candidate(
     Some(actual_olean_digest)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_rebuild_upstream_env_decision_core() {
+        // Neither the CLI flag nor the env var: off.
+        assert!(!no_rebuild_upstream_from_env(false, None));
+        assert!(!no_rebuild_upstream_from_env(false, Some("")));
+        assert!(!no_rebuild_upstream_from_env(false, Some("0")));
+        assert!(!no_rebuild_upstream_from_env(false, Some("off")));
+        assert!(!no_rebuild_upstream_from_env(false, Some(" yes ")));
+        // `TURBO_LEAN_NO_REBUILD_UPSTREAM=1` (or `true`, any case, trimmed).
+        assert!(no_rebuild_upstream_from_env(false, Some("1")));
+        assert!(no_rebuild_upstream_from_env(false, Some(" true ")));
+        assert!(no_rebuild_upstream_from_env(false, Some("TRUE")));
+        // CLI flag wins regardless of the env var.
+        assert!(no_rebuild_upstream_from_env(true, None));
+        assert!(no_rebuild_upstream_from_env(true, Some("0")));
+    }
+
+    #[test]
+    fn no_rebuild_upstream_enabled_reads_process_env() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var(NO_REBUILD_UPSTREAM_ENV).ok();
+        let restore = |saved: &Option<String>| match saved {
+            Some(v) => std::env::set_var(NO_REBUILD_UPSTREAM_ENV, v),
+            None => std::env::remove_var(NO_REBUILD_UPSTREAM_ENV),
+        };
+        std::env::remove_var(NO_REBUILD_UPSTREAM_ENV);
+        assert!(!no_rebuild_upstream_enabled());
+        std::env::set_var(NO_REBUILD_UPSTREAM_ENV, "1");
+        assert!(no_rebuild_upstream_enabled());
+        std::env::set_var(NO_REBUILD_UPSTREAM_ENV, "0");
+        assert!(!no_rebuild_upstream_enabled());
+        restore(&saved);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cas_hardlink_predicate_matches_only_read_only_multi_link_files() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_cas_hardlink_pred_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        let olean = dir.join("Up.olean");
+        fs::write(&olean, b"fakolean")?;
+        // Plain lake-built artifact: writable, single link.
+        assert!(!olean_installed_as_cas_hardlink(&olean));
+
+        // Second hard link (the CAS blob) alone is not enough while still writable.
+        let cas_blob = dir.join("cas_blob");
+        fs::hard_link(&olean, &cas_blob)?;
+        assert!(!olean_installed_as_cas_hardlink(&olean));
+
+        // CAS-sealed (0444) multi-link artifact: the predicate fires.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&olean, fs::Permissions::from_mode(0o444))?;
+        assert!(olean_installed_as_cas_hardlink(&olean));
+        // ... and is observed identically through the CAS-side link.
+        assert!(olean_installed_as_cas_hardlink(&cas_blob));
+
+        // A read-only single-link file (e.g. reflink/copy fallback) is not a CAS *hardlink*.
+        let lone = dir.join("lone.olean");
+        fs::write(&lone, b"fakolean")?;
+        fs::set_permissions(&lone, fs::Permissions::from_mode(0o444))?;
+        assert!(!olean_installed_as_cas_hardlink(&lone));
+
+        // Directories and missing paths never match.
+        assert!(!olean_installed_as_cas_hardlink(&dir));
+        assert!(!olean_installed_as_cas_hardlink(&dir.join("missing.olean")));
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+}
