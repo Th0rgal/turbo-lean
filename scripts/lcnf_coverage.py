@@ -3180,6 +3180,40 @@ class TestLcnfCoverage(unittest.TestCase):
         for mod in imported:
             self.assertIn(f"lean/{mod.replace('.', '/')}.lean", tracked)
 
+    def test_pinned_digests_are_the_measured_commits_bytes(self) -> None:
+        # The committed counts were measured at measured_source_commit, so each
+        # pinned bridge digest must hash that commit's bytes of its file, not
+        # only this tree's. A pin recorded without a re-measure is honest only
+        # then. Skipped when the commit is not in this clone (a shallow
+        # checkout).
+        baseline = self._v_committed_baseline()
+        commit = baseline["measured_source_commit"]
+        present = subprocess.run(
+            ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+        )
+        if present.returncode != 0:
+            self.skipTest(f"measured_source_commit {commit} is not in this clone")
+
+        def not_at_commit(pins: dict[str, str]) -> list[str]:
+            bad = []
+            for rel, pinned in sorted(pins.items()):
+                blob = subprocess.run(
+                    ["git", "cat-file", "blob", f"{commit}:{rel}"],
+                    cwd=str(ROOT_DIR),
+                    capture_output=True,
+                )
+                if blob.returncode != 0 or hashlib.sha256(blob.stdout).hexdigest() != pinned:
+                    bad.append(rel)
+            return bad
+
+        pins = baseline["bridge_file_sha256"]
+        self.assertEqual(not_at_commit(pins), [])
+        # Control: a pin that is not the commit's bytes is reported.
+        first = sorted(pins)[0]
+        self.assertEqual(not_at_commit({first: "0" * 64}), [first])
+
     def test_check_and_json_refuse_classifier_source_drift(self) -> None:
         # The bridge-file digests pin only Lean sources, so an edit to the audit
         # drivers or the Python facts path in this script passed `--json`
