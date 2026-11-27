@@ -3241,8 +3241,9 @@ class TestLcnfCoverage(unittest.TestCase):
         # The committed counts were measured at measured_source_commit, so each
         # pinned bridge digest must hash that commit's bytes of its file, not
         # only this tree's. A pin recorded without a re-measure is honest only
-        # then. Skipped when the commit is not in this clone (a shallow
-        # checkout).
+        # then. A shallow checkout may not hold the commit and is skipped; a
+        # full clone without it fails, since the results then name a commit
+        # nobody can resolve (a rewritten history re-points the file).
         baseline = self._v_committed_baseline()
         commit = baseline["measured_source_commit"]
         present = subprocess.run(
@@ -3251,7 +3252,19 @@ class TestLcnfCoverage(unittest.TestCase):
             capture_output=True,
         )
         if present.returncode != 0:
-            self.skipTest(f"measured_source_commit {commit} is not in this clone")
+            shallow = subprocess.run(
+                ["git", "rev-parse", "--is-shallow-repository"],
+                cwd=str(ROOT_DIR),
+                capture_output=True,
+                text=True,
+            )
+            if shallow.returncode == 0 and shallow.stdout.strip() == "true":
+                self.skipTest(f"measured_source_commit {commit} is not in this shallow clone")
+            self.fail(
+                f"measured_source_commit {commit} is not in this clone, which is not shallow "
+                f"(git rev-parse --is-shallow-repository: rc={shallow.returncode} "
+                f"out={shallow.stdout.strip()!r} err={shallow.stderr.strip()!r})"
+            )
 
         def not_at_commit(pins: dict[str, str]) -> list[str]:
             bad = []
