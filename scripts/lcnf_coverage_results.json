@@ -23,6 +23,7 @@
       "total_declarations": 902
     },
     "external_batteries": {
+      "commit_sha": "66e469188fe07963e5cf666c7d4433f45b8131c5",
       "compiler_aux_decls_excluded": 3472,
       "lowered_unproved": 1066,
       "proved": 53,

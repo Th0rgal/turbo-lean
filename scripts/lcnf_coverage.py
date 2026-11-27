@@ -125,6 +125,16 @@ BATTERIES_REPO_URL = "https://github.com/leanprover-community/batteries.git"
 BATTERIES_PINNED_MODULE_COUNTS: dict[str, int] = {
     "66e469188fe07963e5cf666c7d4433f45b8131c5": 195,
 }
+# The revision each external corpus is measured at. A measured external entry
+# in the committed results records the `commit_sha` its tree was verified at,
+# and `--check` and `--json` refuse one that names another revision than its
+# pin. The classifier digest hashes the source that names these constants, not
+# their values, so without this a pin bump would leave the old revision's
+# committed counts passing CI, which builds neither tree.
+PINNED_EXTERNAL_REVISIONS: dict[str, str] = {
+    "external_batteries": PINNED_BATTERIES_REV,
+    "con_leche_h3_benchmark": PINNED_CON_LECHE_REV,
+}
 _LIVE_AUDIT_CACHE: dict[str, dict[str, Any]] = {}
 _CON_LECHE_CACHE: dict[str, dict[str, Any]] = {}
 _BATTERIES_CACHE: dict[str, dict[str, Any]] = {}
@@ -137,7 +147,8 @@ _BATTERIES_CACHE: dict[str, dict[str, Any]] = {}
 # measurement is regenerated, and L1-L3 bridge PRs regenerate the JSON instead
 # of hand-editing this script. The same file pins `classifier_source_sha256`,
 # the digest of this script's own audit drivers and facts path
-# (`classifier_source_digest`), which `--json` gates too.
+# (`classifier_source_digest`), and the `commit_sha` each external corpus was
+# measured at (`PINNED_EXTERNAL_REVISIONS`); `--json` gates both too.
 TRACKED_BRIDGE_FILES: tuple[str, ...] = (
     "lean/LeanNative/IR/Bridge.lean",
     "lean/LeanNative/IR/RealLCNFBridge.lean",
@@ -2169,7 +2180,15 @@ def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[
     for cname, corp in report.get("corpora", {}).items():
         if corp.get("status") == "unknown" or corp.get("measurement_source") != "live_invocation":
             continue
+        pinned = PINNED_EXTERNAL_REVISIONS.get(cname)
+        if pinned is not None and corp.get("commit_sha") != pinned:
+            raise RuntimeError(
+                f"refusing to write results: corpus `{cname}` was measured at revision "
+                f"{corp.get('commit_sha')!r}, not the pinned {pinned}"
+            )
         entry: dict[str, Any] = {f: corp[f] for f in MEASURED_INT_FIELDS if f in corp}
+        if pinned is not None:
+            entry["commit_sha"] = pinned
         if "rejected_not_lowered_reason" in corp:
             entry["rejected_not_lowered_reason"] = corp["rejected_not_lowered_reason"]
         if "subcorpora" in corp:
@@ -2226,10 +2245,15 @@ def _validate_measured_entry(path: str, entry: Any, errors: list[str], depth: in
         return
     allowed_keys = set(MEASURED_INT_FIELDS) | {"rejected_not_lowered_reason"}
     if depth == 0:
-        allowed_keys.add("subcorpora")
+        allowed_keys.update(("subcorpora", "commit_sha"))
     unknown = sorted(set(entry) - allowed_keys)
     if unknown:
         errors.append(f"Results file `{path}` carries unknown keys: {', '.join(unknown)}")
+    if depth == 0 and "commit_sha" in entry and not _is_hex_digest(entry["commit_sha"], 40):
+        errors.append(
+            f"Results file `{path}` field `commit_sha` must be a 40-hex commit, "
+            f"got {entry['commit_sha']!r}"
+        )
     for f in MEASURED_INT_FIELDS:
         if f not in entry:
             errors.append(f"Results file `{path}` is missing measured field `{f}`")
@@ -2442,6 +2466,29 @@ def _compare_committed_classifier(rep: dict[str, Any], committed: Any, errors: l
         )
 
 
+def _compare_committed_external_revisions(committed: Any, errors: list[str]) -> None:
+    """Refuse committed external-corpus counts measured at another revision than the pin."""
+    corpora = committed.get("corpora") if isinstance(committed, dict) else None
+    if not isinstance(corpora, dict):
+        return  # named by validate_results_document on the --check path
+    for cname, pinned in PINNED_EXTERNAL_REVISIONS.items():
+        entry = corpora.get(cname)
+        if not isinstance(entry, dict) or entry.get("measurement_source") == "not_measured":
+            continue
+        recorded = entry.get("commit_sha")
+        if recorded is None:
+            errors.append(
+                f"Corpus `{cname}` in scripts/lcnf_coverage_results.json records no `commit_sha`, "
+                "so the revision its counts were measured at cannot be gated (re-run --write-results)"
+            )
+        elif recorded != pinned:
+            errors.append(
+                f"Corpus `{cname}` in scripts/lcnf_coverage_results.json was measured at revision "
+                f"{recorded}, not the pinned {pinned}; re-run --write-results on a build of the "
+                "pinned revision"
+            )
+
+
 def check_coverage_report(
     root_dir: Path = ROOT_DIR,
     report: dict[str, Any] | None = None,
@@ -2582,6 +2629,7 @@ def check_coverage_report(
             base_digests = {}  # already named by validate_results_document
         _compare_committed_digests(rep, base_digests, errors)
         _compare_committed_classifier(rep, baseline_doc, errors)
+        _compare_committed_external_revisions(baseline_doc, errors)
         base_corpora = baseline_doc.get("corpora", {}) if isinstance(baseline_doc, dict) else {}
         if not isinstance(base_corpora, dict):
             base_corpora = {}
@@ -2723,6 +2771,7 @@ def check_coverage_report(
                 else:
                     _compare_committed_digests(rep, base_digests, errors)
                 _compare_committed_classifier(rep, committed, errors)
+                _compare_committed_external_revisions(committed, errors)
         else:
             errors.append(
                 "Missing committed results file scripts/lcnf_coverage_results.json: "
@@ -2990,6 +3039,90 @@ class TestLcnfCoverage(unittest.TestCase):
                 committed.write_text(json.dumps(doc), encoding="utf-8")
                 chk = check_coverage_report(root, rep, compare_results_digests=True)
                 self.assertEqual(bool(gate_errors(chk["errors"])), want_gate_error, chk["errors"])
+
+    def test_check_and_json_refuse_counts_from_another_external_revision(self) -> None:
+        # The classifier digest hashes the source text that names
+        # PINNED_BATTERIES_REV, not its value, so a bumped pin left the old
+        # revision's committed Batteries counts passing `--json`, which builds
+        # no Batteries tree. The committed entry of each external corpus
+        # records the `commit_sha` its measurement verified the tree at: one
+        # naming another revision than the pin, or none, fails both the
+        # `--check` path (`results=`) and the `--json` digest path.
+        rep = self._v_fake_live_report()
+        baseline = self._v_committed_baseline()
+        baseline["classifier_source_sha256"] = classifier_source_digest()
+        baseline["corpora"]["external_batteries"]["commit_sha"] = PINNED_BATTERIES_REV
+        moved = json.loads(json.dumps(baseline))
+        moved["corpora"]["external_batteries"]["commit_sha"] = "1" * 40
+        unrecorded = json.loads(json.dumps(baseline))
+        del unrecorded["corpora"]["external_batteries"]["commit_sha"]
+
+        def gate_errors(errors: list[str], corpus: str = "external_batteries") -> list[str]:
+            return [
+                e
+                for e in errors
+                if f"`{corpus}`" in e and ("measured at revision" in e or "records no `commit_sha`" in e)
+            ]
+
+        for doc in (moved, unrecorded):
+            chk = check_coverage_report(ROOT_DIR, rep, results=doc)
+            self.assertFalse(chk["ok"])
+            self.assertTrue(gate_errors(chk["errors"]), chk["errors"])
+        chk = check_coverage_report(ROOT_DIR, rep, results=baseline)
+        self.assertTrue(chk["ok"], chk["errors"])
+        # con-leche is the other pinned external corpus; it is not committed
+        # today, so its entry is planted here.
+        con_leche = dict(baseline["corpora"]["external_batteries"], commit_sha=PINNED_CON_LECHE_REV)
+        con_leche_moved = dict(con_leche, commit_sha="2" * 40)
+        with tempfile.TemporaryDirectory(prefix="lcnf-revision-gate-") as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            committed = root / "scripts" / "lcnf_coverage_results.json"
+            for doc, want_gate_error in ((moved, True), (unrecorded, True), (baseline, False)):
+                committed.write_text(json.dumps(doc), encoding="utf-8")
+                chk = check_coverage_report(root, rep, compare_results_digests=True)
+                self.assertEqual(bool(gate_errors(chk["errors"])), want_gate_error, chk["errors"])
+            for entry, want_gate_error in ((con_leche_moved, True), (con_leche, False)):
+                doc = json.loads(json.dumps(baseline))
+                doc["corpora"]["con_leche_h3_benchmark"] = entry
+                committed.write_text(json.dumps(doc), encoding="utf-8")
+                chk = check_coverage_report(root, rep, compare_results_digests=True)
+                self.assertEqual(
+                    bool(gate_errors(chk["errors"], "con_leche_h3_benchmark")),
+                    want_gate_error,
+                    chk["errors"],
+                )
+
+    def test_write_results_records_the_external_revision(self) -> None:
+        # The live external entry names the revision its measurement verified
+        # the tree at, and the committed entry keeps it for the revision gate.
+        # A live entry naming another revision than the pin is refused.
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        rel = "lean/LeanNative/IR/Bridge.lean"
+        live = dict(
+            {f: 0 for f in MEASURED_INT_FIELDS},
+            measurement_source="live_invocation",
+            commit_sha=PINNED_BATTERIES_REV,
+        )
+        report = {
+            "bridge_source_digests": {rel: {"actual_sha256": "0" * 64}},
+            "classifier_source_sha256": "1" * 64,
+            "corpora": {"external_batteries": live},
+        }
+        moved = dict(report, corpora={"external_batteries": dict(live, commit_sha="1" * 40)})
+        with mock.patch.object(m, "_git_head", return_value="a" * 40), mock.patch.object(
+            m.subprocess, "run"
+        ) as run:
+            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            with self.assertRaises(RuntimeError) as ctx:
+                results_document(moved, ROOT_DIR)
+            doc = results_document(report, ROOT_DIR)
+        self.assertIn("external_batteries", str(ctx.exception))
+        self.assertIn(PINNED_BATTERIES_REV, str(ctx.exception))
+        self.assertEqual(doc["corpora"]["external_batteries"]["commit_sha"], PINNED_BATTERIES_REV)
+        self.assertEqual([e for e in validate_results_document(doc) if "commit_sha" in e], [])
 
     def test_executes_live_lean_lowerer_on_corpora(self) -> None:
         live = execute_live_lean_audit(ROOT_DIR)
