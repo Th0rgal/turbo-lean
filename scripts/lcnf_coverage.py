@@ -53,6 +53,7 @@ CON_LECHE_OLEANS_ENV = "TURBO_CON_LECHE_OLEANS"
 RESULTS_FILE = ROOT_DIR / "scripts" / "lcnf_coverage_results.json"
 RESULT_FIELDS = ("total_declarations", "proved", "lowered_unproved", "rejected", "rejected_not_lowered")
 REJECTED_NOT_LOWERED_REASON = "mutual_cycle"
+VALID_MATRIX_STATUSES = frozenset({"proved", "lowered_unproved", "rejected"})
 CON_LECHE_MODULE_PREFIXES = ("ConLeche.Kernel", "ConLeche.Cached", "ConLeche.Frontend", "ConLeche.Driver")
 CON_LECHE_EXCLUDED_MODULES = frozenset({"ConLeche.Kernel.NatOpPins"})
 CON_LECHE_EXCLUSION_REASON = (
@@ -693,6 +694,41 @@ def _lean_env() -> dict[str, str]:
     return env
 
 
+def _parse_audit_result_groups(
+    stdout: str, stderr: str, expected_groups: int
+) -> list[tuple[int, int, int, int, int]]:
+    """Parse `AUDIT_RESULT:` output fail-closed, raising RuntimeError on missing/malformed output."""
+    raw_lines = [ln.strip() for ln in stdout.splitlines() if ln.strip().startswith("AUDIT_RESULT:")]
+    if not raw_lines:
+        raise RuntimeError(
+            f"Lean audit driver emitted no AUDIT_RESULT:\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        )
+    payload = raw_lines[-1].split(":", 1)[1]
+    parts = payload.split(";")
+    if len(parts) != expected_groups:
+        raise RuntimeError(
+            f"Lean audit driver emitted malformed AUDIT_RESULT "
+            f"(expected {expected_groups} group(s), got {len(parts)} in {payload!r}):\n"
+            f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        )
+    parsed: list[tuple[int, int, int, int, int]] = []
+    for part in parts:
+        fields = part.split(",")
+        if len(fields) != 5:
+            raise RuntimeError(
+                f"Lean audit driver emitted malformed AUDIT_RESULT group {part!r}:\n"
+                f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+            )
+        try:
+            parsed.append(tuple(int(x) for x in fields))  # type: ignore[arg-type]
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Lean audit driver emitted non-integer AUDIT_RESULT group {part!r}: {exc}\n"
+                f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+            ) from exc
+    return parsed
+
+
 def _run_audit_driver(root_dir: Path, driver_src: str, lib_dirs: list[str]) -> tuple[int, int, int, int, int]:
     """Run one audit driver against `lib_dirs`; return (total, proved, unproved, rejected, rejected_not_lowered)."""
     lean_dir = root_dir / "lean"
@@ -709,10 +745,7 @@ def _run_audit_driver(root_dir: Path, driver_src: str, lib_dirs: list[str]) -> t
         )
     if proc.returncode != 0:
         raise RuntimeError(f"Lean audit driver failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
-    raw_lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip().startswith("AUDIT_RESULT:")]
-    if not raw_lines:
-        raise RuntimeError(f"Lean audit driver emitted no AUDIT_RESULT:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
-    return tuple(int(x) for x in raw_lines[-1].split(":", 1)[1].split(","))  # type: ignore[return-value]
+    return _parse_audit_result_groups(proc.stdout, proc.stderr, expected_groups=1)[0]
 
 
 def measure_fixture_corpus(root_dir: Path, lean_body: str, mod_name: str = "FixtureCorpus") -> dict[str, Any]:
@@ -914,11 +947,9 @@ def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
         )
         if proc.returncode != 0:
             raise RuntimeError(f"Lean audit driver failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
-        raw_lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip().startswith("AUDIT_RESULT:")]
-        parts = raw_lines[-1].split(":", 1)[1].split(";")
-        st, sp, su, sr, sc = (int(x) for x in parts[0].split(","))
-        c2t, c2p, c2u, c2r, c2c = (int(x) for x in parts[1].split(","))
-        c1t, c1p, c1u, c1r, c1c = (int(x) for x in parts[2].split(","))
+        (st, sp, su, sr, sc), (c2t, c2p, c2u, c2r, c2c), (c1t, c1p, c1u, c1r, c1c) = (
+            _parse_audit_result_groups(proc.stdout, proc.stderr, expected_groups=3)
+        )
 
     result = {
         "executed": True,
@@ -1221,6 +1252,13 @@ def build_coverage_report(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
         }
 
     rows = [dict(r) for r in LCNF_CONSTRUCTOR_MATRIX_SPEC]
+    for r in rows:
+        status = r.get("status")
+        if status not in VALID_MATRIX_STATUSES:
+            raise ValueError(
+                f"Matrix row `{r.get('id', '<unknown>')}` has invalid status {status!r}; "
+                f"expected one of {sorted(VALID_MATRIX_STATUSES)}"
+            )
     proved_cnt = sum(1 for r in rows if r["status"] == "proved")
     unproved_cnt = sum(1 for r in rows if r["status"] == "lowered_unproved")
     rejected_cnt = sum(1 for r in rows if r["status"] == "rejected")
@@ -1294,15 +1332,26 @@ def _validate_measured_entry(path: str, entry: Any, errors: list[str], depth: in
     if not isinstance(entry, dict):
         errors.append(f"Results file `{path}` must be a JSON object, got {type(entry).__name__}")
         return
-    if entry.get("measurement_source") == "not_measured":
-        # An explicit `not_measured` stub is honest only with a reason and no counts.
-        if not entry.get("reason"):
-            errors.append(f"Results file `{path}` is marked not_measured but gives no reason")
-        if any(k in entry for k in RESULT_FIELDS):
-            errors.append(f"Results file `{path}` is marked not_measured yet carries declaration counts")
-        if "subcorpora" in entry:
-            errors.append(f"Results file `{path}` is marked not_measured yet carries subcorpora")
-        return
+    status = entry.get("status")
+    if status is not None:
+        errors.append(
+            f"Results file `{path}` has unsupported `status` {status!r} (expected absent or null)"
+        )
+    if "measurement_source" in entry:
+        source = entry["measurement_source"]
+        if source == "not_measured":
+            # An explicit `not_measured` stub is honest only with a reason and no counts.
+            if not isinstance(entry.get("reason"), str) or not entry.get("reason"):
+                errors.append(f"Results file `{path}` is marked not_measured but gives no reason")
+            if any(k in entry for k in RESULT_FIELDS):
+                errors.append(f"Results file `{path}` is marked not_measured yet carries declaration counts")
+            if "subcorpora" in entry:
+                errors.append(f"Results file `{path}` is marked not_measured yet carries subcorpora")
+            return
+        errors.append(
+            f"Results file `{path}` has unsupported `measurement_source` {source!r} "
+            f"(expected absent or 'not_measured')"
+        )
     if depth > 0 and "subcorpora" in entry:
         # The supported schema is corpus -> subcorpora only. A deeper level has
         # no live counterpart to compare against, so accepting it would let a
@@ -1339,9 +1388,12 @@ def _validate_measured_entry(path: str, entry: Any, errors: list[str], depth: in
             errors.append(
                 f"Results file `{path}` rejected_not_lowered({rnl}) must be within 0..rejected({rej})"
             )
-        reason = entry.get("rejected_not_lowered_reason")
-        if not isinstance(reason, str) or not reason:
-            errors.append(f"Results file `{path}` is missing valid `rejected_not_lowered_reason`")
+    reason = entry.get("rejected_not_lowered_reason")
+    if reason != REJECTED_NOT_LOWERED_REASON:
+        errors.append(
+            f"Results file `{path}` field `rejected_not_lowered_reason` must be "
+            f"{REJECTED_NOT_LOWERED_REASON!r}, got {reason!r}"
+        )
     if "subcorpora" not in entry:
         return
     subs = entry["subcorpora"]
@@ -1433,10 +1485,10 @@ def _live_measured_status_error(cname: str, corp: Any) -> str | None:
         )
     for field in RESULT_FIELDS:
         value = corp.get(field)
-        if isinstance(value, bool) or not isinstance(value, int):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             return (
                 f"Corpus `{cname}` is measured in scripts/lcnf_coverage_results.json "
-                f"but the live entry field `{field}` is not an integer "
+                f"but the live entry field `{field}` is not a non-negative integer "
                 f"(got {type(value).__name__} {value!r})"
             )
     return None
@@ -1453,18 +1505,48 @@ def check_coverage_report(
     skipped_corpora: list[str] = []
     rep = report if report is not None else build_coverage_report(root_dir)
 
-    for rel, info in rep.get("bridge_source_digests", {}).items():
-        fpath = root_dir / rel
-        if not fpath.is_file():
-            errors.append(f"Missing tracked bridge file: {rel}")
-            continue
-        if not info.get("matches", False):
-            errors.append(
-                f"Bridge source digest mismatch for {rel}: "
-                f"pinned={info.get('pinned_sha256')} actual={info.get('actual_sha256')}"
-            )
+    digests = rep.get("bridge_source_digests")
+    if not isinstance(digests, dict):
+        errors.append(
+            f"Report `bridge_source_digests` must be a JSON object, got {type(digests).__name__}"
+        )
+    else:
+        for rel, pinned_sha in TRACKED_BRIDGE_FILES.items():
+            if rel not in digests:
+                errors.append(f"Missing bridge source digest entry for {rel}")
+                continue
+            info = digests[rel]
+            if not isinstance(info, dict):
+                errors.append(
+                    f"Bridge source digest entry for {rel} must be a JSON object, "
+                    f"got {type(info).__name__}"
+                )
+                continue
+            fpath = root_dir / rel
+            if not fpath.is_file():
+                errors.append(f"Missing tracked bridge file: {rel}")
+                continue
+            disk_sha = sha256_file(fpath)
+            reported_pinned = info.get("pinned_sha256")
+            reported_actual = info.get("actual_sha256")
+            if (
+                reported_pinned != pinned_sha
+                or reported_actual != disk_sha
+                or disk_sha != pinned_sha
+            ):
+                errors.append(
+                    f"Bridge source digest mismatch for {rel}: "
+                    f"pinned={pinned_sha} reported_pinned={reported_pinned!r} "
+                    f"reported_actual={reported_actual!r} actual={disk_sha}"
+                )
 
     for row in rep["lcnf_constructor_matrix"]["rows"]:
+        status = row.get("status")
+        if status not in VALID_MATRIX_STATUSES:
+            errors.append(
+                f"Matrix row `{row.get('id', '<unknown>')}` has invalid status {status!r}; "
+                f"expected one of {sorted(VALID_MATRIX_STATUSES)}"
+            )
         ev_file = root_dir / row["evidence_file"]
         if ev_file.is_file():
             txt = ev_file.read_text(encoding="utf-8")
@@ -1472,6 +1554,10 @@ def check_coverage_report(
                 errors.append(
                     f"Matrix row `{row['id']}` evidence symbol `{row['evidence_symbol']}` not found in {row['evidence_file']}"
                 )
+        else:
+            errors.append(
+                f"Matrix row `{row['id']}` evidence file not found: {row['evidence_file']}"
+            )
 
     c_matrix = rep["lcnf_constructor_matrix"]
     c_sum = c_matrix["summary"]
@@ -1510,11 +1596,13 @@ def check_coverage_report(
         bad_fields = [
             field
             for field in RESULT_FIELDS
-            if isinstance(corp.get(field), bool) or not isinstance(corp.get(field), int)
+            if isinstance(corp.get(field), bool)
+            or not isinstance(corp.get(field), int)
+            or corp[field] < 0
         ]
         if bad_fields:
             errors.append(
-                f"Corpus `{cname}` live measured entry has non-integer fields: "
+                f"Corpus `{cname}` live measured entry has invalid integer fields: "
                 + ", ".join(bad_fields)
             )
             continue
@@ -1522,7 +1610,11 @@ def check_coverage_report(
         if tot != corp["proved"] + corp["lowered_unproved"] + corp["rejected"]:
             errors.append(f"Corpus `{cname}` declaration counts do not sum to total_declarations")
         rnl = corp.get("rejected_not_lowered")
-        if rnl is None or not (0 <= rnl <= corp["rejected"]) or not corp.get("rejected_not_lowered_reason"):
+        if (
+            rnl is None
+            or not (0 <= rnl <= corp["rejected"])
+            or corp.get("rejected_not_lowered_reason") != REJECTED_NOT_LOWERED_REASON
+        ):
             errors.append(f"Corpus `{cname}` missing valid `rejected_not_lowered` / `rejected_not_lowered_reason`")
         if "subcorpora" in corp:
             subs = corp["subcorpora"]
@@ -1560,9 +1652,9 @@ def check_coverage_report(
                                 f"Corpus `{cname}` subcorpus `{sname}` declaration counts do not sum to total_declarations"
                             )
                         srnl = sc["rejected_not_lowered"]
-                        if not (0 <= srnl <= sc["rejected"]) or not isinstance(
-                            sc.get("rejected_not_lowered_reason"), str
-                        ) or not sc.get("rejected_not_lowered_reason"):
+                        if not (0 <= srnl <= sc["rejected"]) or (
+                            sc.get("rejected_not_lowered_reason") != REJECTED_NOT_LOWERED_REASON
+                        ):
                             errors.append(
                                 f"Corpus `{cname}` subcorpus `{sname}` missing valid `rejected_not_lowered` / `rejected_not_lowered_reason`"
                             )
@@ -2088,7 +2180,10 @@ class TestLcnfCoverage(unittest.TestCase):
             "reason": "no prebuilt pinned con-leche tree (test fixture)",
         }
         return {
-            "bridge_source_digests": {},
+            "bridge_source_digests": {
+                rel: {"pinned_sha256": sha, "actual_sha256": sha, "matches": True}
+                for rel, sha in TRACKED_BRIDGE_FILES.items()
+            },
             "lcnf_constructor_matrix": {
                 "rows": [],
                 "summary": {"total": 0, "proved": 0, "lowered_unproved": 0, "rejected": 0},
@@ -2892,6 +2987,249 @@ unsafe def main (_args : List String) : IO Unit := do
         self.assertEqual(chk_proc.returncode, 0, chk_proc.stderr)
         self.assertIn("rejected_not_lowered", chk_proc.stdout)
         self.assertIn("mutual_cycle", chk_proc.stdout)
+
+    def test_bridge_source_digests_rejects_spoofed_matches_partial_and_non_dict(self) -> None:
+        import shutil
+
+        # Non-dict bridge_source_digests must fail closed.
+        for label, bad_digests in (("missing", None), ("list", []), ("str", "ok")):
+            rep = self._v_fake_live_report()
+            if label == "missing":
+                rep.pop("bridge_source_digests", None)
+            else:
+                rep["bridge_source_digests"] = bad_digests
+            chk = check_coverage_report(ROOT_DIR, rep)
+            self.assertFalse(chk["ok"], f"{label} bridge_source_digests passed check")
+            self.assertTrue(any("bridge_source_digests" in e for e in chk["errors"]), chk["errors"])
+
+        # Empty or partial digest map missing any tracked file must fail closed.
+        first_rel = next(iter(TRACKED_BRIDGE_FILES))
+        for label, mutate in (
+            ("empty", lambda d: d.clear()),
+            ("partial", lambda d: d.pop(first_rel)),
+        ):
+            rep = self._v_fake_live_report()
+            mutate(rep["bridge_source_digests"])
+            chk = check_coverage_report(ROOT_DIR, rep)
+            self.assertFalse(chk["ok"], f"{label} bridge_source_digests passed check")
+            self.assertTrue(any(first_rel in e for e in chk["errors"]), chk["errors"])
+
+        # Non-dict entry for a tracked file must fail closed.
+        for bad_entry in (True, "deadbeef", ["sha"]):
+            rep = self._v_fake_live_report()
+            rep["bridge_source_digests"][first_rel] = bad_entry
+            chk = check_coverage_report(ROOT_DIR, rep)
+            self.assertFalse(chk["ok"], f"non-dict entry {bad_entry!r} passed check")
+            self.assertTrue(any(first_rel in e for e in chk["errors"]), chk["errors"])
+
+        # Spoofed `matches: True` with mismatched actual or pinned digests must fail closed.
+        rep_bad_actual = self._v_fake_live_report()
+        rep_bad_actual["bridge_source_digests"][first_rel] = {
+            "pinned_sha256": TRACKED_BRIDGE_FILES[first_rel],
+            "actual_sha256": "0" * 64,
+            "matches": True,
+        }
+        chk = check_coverage_report(ROOT_DIR, rep_bad_actual)
+        self.assertFalse(chk["ok"], "spoofed matches=True with bad actual_sha256 passed check")
+        self.assertTrue(any("digest mismatch" in e and first_rel in e for e in chk["errors"]), chk["errors"])
+
+        rep_bad_pinned = self._v_fake_live_report()
+        rep_bad_pinned["bridge_source_digests"][first_rel] = {
+            "pinned_sha256": "0" * 64,
+            "actual_sha256": "0" * 64,
+            "matches": True,
+        }
+        chk = check_coverage_report(ROOT_DIR, rep_bad_pinned)
+        self.assertFalse(chk["ok"], "spoofed matches=True with forged pinned/actual passed check")
+        self.assertTrue(any("digest mismatch" in e and first_rel in e for e in chk["errors"]), chk["errors"])
+
+        # Even if caller supplies exact TRACKED_BRIDGE_FILES hashes + matches=True,
+        # disk drift must be caught by recomputing sha256 directly.
+        with tempfile.TemporaryDirectory(prefix="lcnf-cov-spoof-") as tmp:
+            root = Path(tmp)
+            for rel in TRACKED_BRIDGE_FILES:
+                dst = root / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT_DIR / rel, dst)
+            drifted = root / first_rel
+            drifted.write_text(drifted.read_text(encoding="utf-8") + "\n-- spoofed\n", encoding="utf-8")
+            chk_disk = check_coverage_report(root, self._v_fake_live_report())
+            self.assertFalse(chk_disk["ok"], "disk drift passed check when report forged matches=True")
+            self.assertTrue(
+                any("digest mismatch" in e and first_rel in e for e in chk_disk["errors"]),
+                chk_disk["errors"],
+            )
+
+    def test_check_rejects_negative_live_parent_counts(self) -> None:
+        # Self-summing negative parent count (proved=-5, lowered_unproved=5, total=0)
+        # must fail closed even without a baseline results file.
+        rep = self._v_fake_live_report()
+        rep["corpora"]["c1_corpus"].update(
+            {
+                "total_declarations": 0,
+                "proved": -5,
+                "lowered_unproved": 5,
+                "rejected": 0,
+                "rejected_not_lowered": 0,
+            }
+        )
+        chk = check_coverage_report(ROOT_DIR, rep)
+        self.assertFalse(chk["ok"], "self-summing negative live parent count passed check")
+        self.assertTrue(any("c1_corpus" in e and "proved" in e for e in chk["errors"]), chk["errors"])
+
+        # Also rejected when compared against committed baseline.
+        chk_with_base = check_coverage_report(ROOT_DIR, rep, results=self._v_committed_baseline())
+        self.assertFalse(chk_with_base["ok"])
+        self.assertTrue(any("c1_corpus" in e for e in chk_with_base["errors"]), chk_with_base["errors"])
+
+        # Negative rejected_not_lowered or total_declarations must also fail closed.
+        for field in RESULT_FIELDS:
+            rep_neg = self._v_fake_live_report()
+            rep_neg["corpora"]["c1_corpus"][field] = -1
+            chk_neg = check_coverage_report(ROOT_DIR, rep_neg)
+            self.assertFalse(chk_neg["ok"], f"negative live parent field {field} passed check")
+            self.assertTrue(
+                any("c1_corpus" in e and field in e for e in chk_neg["errors"]),
+                chk_neg["errors"],
+            )
+
+    def test_results_entry_allowlists_status_measurement_source_and_reason(self) -> None:
+        baseline = self._v_committed_baseline()
+
+        # status: absent or explicit None is accepted for measured entries.
+        null_status = json.loads(json.dumps(baseline))
+        null_status["corpora"]["c1_corpus"]["status"] = None
+        self.assertEqual(validate_results_document(null_status), [])
+
+        # Any non-null status is rejected on measured entries, subcorpora, and not_measured stubs.
+        for bad_status in ("unknown", "proved", "error", 1, True):
+            mut = json.loads(json.dumps(baseline))
+            mut["corpora"]["c1_corpus"]["status"] = bad_status
+            errs = validate_results_document(mut)
+            self.assertTrue(
+                any("c1_corpus" in e and "status" in e for e in errs),
+                f"status={bad_status!r} was not rejected: {errs}",
+            )
+
+            sub_mut = json.loads(json.dumps(baseline))
+            sub_mut["corpora"]["std_init_and_c2"]["subcorpora"]["std_init_data"]["status"] = bad_status
+            sub_errs = validate_results_document(sub_mut)
+            self.assertTrue(
+                any("std_init_data" in e and "status" in e for e in sub_errs),
+                f"subcorpus status={bad_status!r} was not rejected: {sub_errs}",
+            )
+
+        stub_bad_status = json.loads(json.dumps(baseline))
+        stub_bad_status["corpora"]["con_leche_h3_benchmark"] = {
+            "measurement_source": "not_measured",
+            "reason": "absent",
+            "status": "unknown",
+        }
+        errs = validate_results_document(stub_bad_status)
+        self.assertTrue(any("con_leche_h3_benchmark" in e and "status" in e for e in errs), errs)
+
+        # measurement_source: only absent or "not_measured" is allowed.
+        for bad_source in ("live_invocation", "error", "unknown", "", None, 42):
+            mut = json.loads(json.dumps(baseline))
+            mut["corpora"]["c1_corpus"]["measurement_source"] = bad_source
+            errs = validate_results_document(mut)
+            self.assertTrue(
+                any("c1_corpus" in e and "measurement_source" in e for e in errs),
+                f"measurement_source={bad_source!r} was not rejected: {errs}",
+            )
+
+        # rejected_not_lowered_reason must equal REJECTED_NOT_LOWERED_REASON.
+        for bad_reason in ("other_reason", "", None, 123):
+            mut = json.loads(json.dumps(baseline))
+            mut["corpora"]["c1_corpus"]["rejected_not_lowered_reason"] = bad_reason
+            errs = validate_results_document(mut)
+            self.assertTrue(
+                any("c1_corpus" in e and "rejected_not_lowered_reason" in e for e in errs),
+                f"rejected_not_lowered_reason={bad_reason!r} was not rejected: {errs}",
+            )
+            sub_mut = json.loads(json.dumps(baseline))
+            sub_mut["corpora"]["std_init_and_c2"]["subcorpora"]["std_init_data"][
+                "rejected_not_lowered_reason"
+            ] = bad_reason
+            sub_errs = validate_results_document(sub_mut)
+            self.assertTrue(
+                any("std_init_data" in e and "rejected_not_lowered_reason" in e for e in sub_errs),
+                f"subcorpus rejected_not_lowered_reason={bad_reason!r} was not rejected: {sub_errs}",
+            )
+
+    def test_check_rejects_missing_matrix_evidence_file(self) -> None:
+        rep = self._v_fake_live_report()
+        rep["lcnf_constructor_matrix"] = {
+            "summary": {"total": 1, "proved": 1, "lowered_unproved": 0, "rejected": 0},
+            "rows": [
+                {
+                    "id": "Fake.missing_evidence",
+                    "category": "Code",
+                    "construct": "Fake",
+                    "status": "proved",
+                    "evidence_file": "lean/LeanNative/IR/DoesNotExist.lean",
+                    "evidence_symbol": "anything",
+                    "notes": "test missing evidence file",
+                }
+            ],
+        }
+        chk = check_coverage_report(ROOT_DIR, rep)
+        self.assertFalse(chk["ok"], "missing matrix evidence file silently passed check")
+        self.assertTrue(
+            any("Fake.missing_evidence" in e and "DoesNotExist.lean" in e for e in chk["errors"]),
+            chk["errors"],
+        )
+
+    def test_matrix_row_status_outside_allowlist_is_rejected(self) -> None:
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        for bad_status in ("partial", "unknown", "", None):
+            bad_row = {
+                "id": "Fake.bad_status",
+                "category": "Code",
+                "construct": "Fake",
+                "status": bad_status,
+                "evidence_file": "lean/LeanNative/IR/Bridge.lean",
+                "evidence_symbol": "lowerPureLetValue",
+                "notes": "invalid status test",
+            }
+            with mock.patch.object(m, "LCNF_CONSTRUCTOR_MATRIX_SPEC", (bad_row,)):
+                with self.assertRaises(ValueError) as ctx:
+                    build_coverage_report(ROOT_DIR)
+            self.assertIn("Fake.bad_status", str(ctx.exception))
+            self.assertIn("invalid status", str(ctx.exception).lower())
+
+            rep = self._v_fake_live_report()
+            rep["lcnf_constructor_matrix"] = {
+                "summary": {"total": 1, "proved": 1, "lowered_unproved": 0, "rejected": 0},
+                "rows": [bad_row],
+            }
+            chk = check_coverage_report(ROOT_DIR, rep)
+            self.assertFalse(chk["ok"], f"report row status={bad_status!r} passed check")
+            self.assertTrue(
+                any("Fake.bad_status" in e and "invalid status" in e.lower() for e in chk["errors"]),
+                chk["errors"],
+            )
+
+    def test_audit_driver_missing_or_malformed_result_raises_runtime_error(self) -> None:
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        # _run_audit_driver exiting 0 without AUDIT_RESULT: must raise RuntimeError, not IndexError.
+        with mock.patch.object(
+            m.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="ok without marker\n", stderr="")
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                _run_audit_driver(ROOT_DIR, "def main : IO Unit := pure ()", [])
+        self.assertIn("AUDIT_RESULT", str(ctx.exception))
+
+        # _parse_audit_result_groups (used by execute_live_lean_audit) exiting 0 without AUDIT_RESULT:
+        # or with truncated groups must raise RuntimeError, not IndexError.
+        for bad_stdout in ("completed with no marker\n", "AUDIT_RESULT:1,1,0,0,0\n", "AUDIT_RESULT:1,2;3,4;5,6\n"):
+            with self.assertRaises(RuntimeError) as ctx:
+                _parse_audit_result_groups(bad_stdout, "", expected_groups=3)
+            self.assertIn("AUDIT_RESULT", str(ctx.exception))
 
 
 
