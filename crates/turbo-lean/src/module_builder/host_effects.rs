@@ -76,22 +76,69 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
             to_purge.push(spec);
         }
     }
-    // External package `.olean`s (`.lake/packages/*`, out-of-tree path deps) are never deleted, and
-    // a tainted one is never trusted either: Lake's trace cannot observe the host state (environment,
-    // files) its elaborators read, so bypassing the artifact cache would not make Lake re-elaborate
-    // it. Fail closed instead, naming the module(s). Clean linter-only deps do not taint at all.
+    purge_in_project_or_fail_closed(
+        cfg,
+        &to_purge,
+        "may read host state (environment variables, files) at elaboration or import time",
+    )
+}
+
+/// Two-phase purge shared by every host-effect purge: if *any* spec in `to_purge` lies outside the
+/// root project, fail closed naming those modules *before* deleting anything (so a rejected check
+/// never leaves a half-purged build tree); otherwise delete all their build artifacts.
+///
+/// External package `.olean`s (`.lake/packages/*`, out-of-tree path deps) are never deleted, and a
+/// stale one is never trusted either: Lake's trace cannot observe the host state (environment,
+/// files) its elaborators read or the files it embeds, so bypassing the artifact cache would not make
+/// Lake re-elaborate it. Returns whether anything was purged (i.e. the Lake cache must be bypassed).
+fn purge_in_project_or_fail_closed(
+    cfg: &ProjectConfig,
+    to_purge: &[DiscoveredModuleSpec],
+    why: &str,
+) -> Result<bool> {
     let external: Vec<&DiscoveredModuleSpec> =
         to_purge.iter().filter(|s| !spec_in_project(cfg, s)).collect();
     if !external.is_empty() {
-        return Err(external_host_effect_dependency_error(
-            &external,
-            "may read host state (environment variables, files) at elaboration or import time",
-        ));
+        return Err(external_host_effect_dependency_error(&external, why));
     }
-    for spec in &to_purge {
+    for spec in to_purge {
         crate::lake_build::remove_spec_build_artifacts_checked(spec)?;
     }
     Ok(!to_purge.is_empty())
+}
+
+/// Purge the build artifacts of every module in `mods` that embeds files via `include_str` /
+/// `include_bin` (which Lake does not trace) and is not covered by a Lake `needs` input target.
+/// Unreadable sources count as embedding (fail closed). See [`purge_in_project_or_fail_closed`].
+pub(crate) fn purge_untraced_include_str_artifacts(
+    cfg: &ProjectConfig,
+    mods: &[String],
+) -> Result<bool> {
+    let to_purge: Vec<DiscoveredModuleSpec> = mods
+        .iter()
+        .filter(|m| {
+            input_bearing_libs_for_module(cfg, m).is_empty()
+                && input_bearing_exes_for_module(cfg, m).is_empty()
+        })
+        .filter_map(|m| {
+            resolve_module_in_package(&cfg.root_pkg, true, m).or_else(|| {
+                match resolve_import_site(cfg, m) {
+                    ImportSite::Module(s) => Some(*s),
+                    _ => None,
+                }
+            })
+        })
+        .filter(|spec| {
+            fs::read_to_string(&spec.src_path)
+                .map(|s| source_uses_include_str(&s))
+                .unwrap_or(true)
+        })
+        .collect();
+    purge_in_project_or_fail_closed(
+        cfg,
+        &to_purge,
+        "embeds files via `include_str`/`include_bin` that Lake does not trace",
+    )
 }
 
 /// Fail-closed error for stale or host-state-dependent `.olean`s that live in a dependency checkout

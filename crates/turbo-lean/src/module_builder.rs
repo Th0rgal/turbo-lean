@@ -256,6 +256,79 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_host_effects_include_str_purge_is_two_phase_and_keeps_project_oleans_on_external_bail(
+    ) -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("host_effects_include_str_two_phase");
+        let proj = dir.join("app");
+        let dep = proj.join(".lake/packages/dep");
+        let tc = "leanprover/lean4:v4.35.0\n";
+        let embed = "def embedded : String := include_str \"data.txt\"\n";
+        fs::create_dir_all(proj.join("App"))?;
+        fs::create_dir_all(dep.join("Dep"))?;
+        for root in [&proj, &dep] {
+            fs::write(root.join("lean-toolchain"), tc)?;
+        }
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep\"\npath = \".lake/packages/dep\"\n[[lean_lib]]\nname = \"App\"\n",
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{"version": "1.1.0", "packagesDir": ".lake/packages", "lakeDir": ".lake", "packages": [{"type": "path", "scope": "", "name": "dep", "manifestFile": "lake-manifest.json", "inherited": false, "dir": ".lake/packages/dep", "configFile": "lakefile.toml"}]}"#,
+        )?;
+        fs::write(
+            dep.join("lakefile.toml"),
+            "name = \"dep\"\ndefaultTargets = [\"Dep\"]\n[[lean_lib]]\nname = \"Dep\"\n",
+        )?;
+        fs::write(proj.join("App.lean"), "import App.Embed\n")?;
+        fs::write(proj.join("App/Embed.lean"), embed)?;
+        fs::write(proj.join("App/data.txt"), "app\n")?;
+        fs::write(dep.join("Dep.lean"), "import Dep.Embed\n")?;
+        fs::write(dep.join("Dep/Embed.lean"), embed)?;
+        fs::write(dep.join("Dep/data.txt"), "dep\n")?;
+        let cfg = resolve_project_config(&proj)?;
+        let app_spec = resolve_module_in_package(&cfg.root_pkg, true, "App.Embed")
+            .expect("`App.Embed` must resolve in the root package");
+        let dep_spec = match resolve_import_site(&cfg, "Dep.Embed") {
+            ImportSite::Module(s) => *s,
+            _ => panic!("`Dep.Embed` must resolve to the dependency checkout"),
+        };
+        assert!(spec_in_project(&cfg, &app_spec) && !spec_in_project(&cfg, &dep_spec));
+        let app_olean = app_spec.build_lib_lean_dir.join("App/Embed.olean");
+        let dep_olean = dep_spec.build_lib_lean_dir.join("Dep/Embed.olean");
+        for olean in [&app_olean, &dep_olean] {
+            fs::create_dir_all(olean.parent().unwrap())?;
+            fs::write(olean, b"olean")?;
+        }
+        // The in-project module sorts (and used to be purged) before the external one.
+        let mods: Vec<String> = std::collections::BTreeSet::from(["Dep.Embed", "App.Embed"])
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(mods, ["App.Embed", "Dep.Embed"]);
+        let err = purge_untraced_include_str_artifacts(&cfg, &mods)
+            .expect_err("an external untraced `include_str` module must fail closed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Refusing to trust stale external host-effect dependency")
+                && msg.contains("`Dep.Embed`")
+                && !msg.contains("`App.Embed`"),
+            "error must name only the external module: {msg}"
+        );
+        assert!(
+            app_olean.exists(),
+            "a fail-closed bail must not purge in-project `App.Embed.olean` first"
+        );
+        assert!(dep_olean.exists(), "external package `.olean`s must never be deleted");
+        // Without external embeds, the in-project module is purged and forces a cache bypass.
+        let purged = purge_untraced_include_str_artifacts(&cfg, &mods[..1])?;
+        assert!(purged && !app_olean.exists() && dep_olean.exists());
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_stamp_eligibility_canonical_package_root() -> Result<()> {

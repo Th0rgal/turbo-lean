@@ -1848,58 +1848,145 @@ fn top_level_command_chunks(unquoted: &str) -> Vec<String> {
     chunks
 }
 
-/// Names declared by a chunk (`def foo`, `instance bar : ...`, ...), as their last name component.
-fn chunk_declared_names(chunk: &str) -> Vec<String> {
-    const DECL_WORDS: &[&str] = &[
-        "def", "theorem", "lemma", "abbrev", "instance", "opaque", "structure", "class",
-        "inductive", "irreducible_def", "initialize", "builtin_initialize", "alias",
-    ];
-    // Binder brackets and `:` are kept as their own tokens so that a declaration keyword directly
-    // followed by one (`instance : T := ...`, `instance [C] : T`, `structure : ...`) is recognised
-    // as anonymous rather than mis-naming the type after the colon. Anonymous host readers then set
-    // `unnamed_host_reader` (fail closed) in [`pinned_dep_source_may_read_host_state`].
-    let is_punct = |c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ':');
+/// Tokenize for declaration-header parsing. Binder brackets, `:` and `,` are their own tokens, so a
+/// keyword directly followed by one (`instance : T`, `instance [C] : T`) reads as anonymous rather
+/// than mis-naming the type after the colon.
+fn header_tokens(text: &str) -> Vec<&str> {
+    let is_punct = |c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ':' | ',');
     let mut toks: Vec<&str> = Vec::new();
     let mut start: Option<usize> = None;
-    for (i, c) in chunk.char_indices() {
+    for (i, c) in text.char_indices() {
         if c.is_whitespace() || is_punct(c) {
             if let Some(s) = start.take() {
-                toks.push(&chunk[s..i]);
+                toks.push(&text[s..i]);
             }
             if is_punct(c) {
-                toks.push(&chunk[i..i + c.len_utf8()]);
+                toks.push(&text[i..i + c.len_utf8()]);
             }
         } else if start.is_none() {
             start = Some(i);
         }
     }
     if let Some(s) = start {
-        toks.push(&chunk[s..]);
+        toks.push(&text[s..]);
     }
-    let mut out = Vec::new();
-    // `initialize <name> : T ← e` declares `<name>`; `initialize e` (e.g. `addLinter l`) declares
-    // nothing.
-    let names_initialize = |name: &str| -> bool {
-        chunk.split_whitespace().collect::<Vec<_>>().windows(3).any(|w| {
-            (w[0] == "initialize" || w[0] == "builtin_initialize")
-                && w[1] == name
-                && w[2].starts_with(':')
-        }) || chunk.contains(&format!("initialize {name}:"))
-    };
+    toks
+}
+
+/// Length of the balanced `open`..`close` group starting at `toks[0] == open` (`None` if unbalanced).
+fn balanced_group_len(toks: &[&str], open: &str, close: &str) -> Option<usize> {
+    let mut depth = 0usize;
     for (i, t) in toks.iter().enumerate() {
-        if DECL_WORDS.contains(t) {
-            if let Some(name) = toks.get(i + 1) {
-                if (*t == "initialize" || *t == "builtin_initialize") && !names_initialize(name) {
-                    continue;
-                }
-                let last = name.rsplit('.').next().unwrap_or(name);
-                if last.chars().next().is_some_and(is_lean_id_start) && last != "where" {
-                    out.push(last.to_string());
-                }
+        if *t == open {
+            depth += 1;
+        } else if *t == close {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(i + 1);
             }
         }
     }
+    None
+}
+
+/// Parsed header of one top-level declaration: names it declares (last name component) and whether
+/// it registers a typeclass instance (`instance`, `@[instance]`, `@[default_instance]`,
+/// `attribute [instance] ...`). Only the header (leading `@[...]` attributes, modifiers, keyword and
+/// the name right after it) is inspected: never attribute arguments or the declaration body.
+#[derive(Default)]
+struct DeclHeader {
+    names: Vec<String>,
+    instance: bool,
+}
+
+fn parse_decl_header(text: &str) -> DeclHeader {
+    const DECL_WORDS: &[&str] = &[
+        "def", "theorem", "lemma", "abbrev", "instance", "opaque", "structure", "class",
+        "inductive", "irreducible_def", "initialize", "builtin_initialize", "alias",
+    ];
+    const MODIFIERS: &[&str] = &[
+        "private", "public", "protected", "noncomputable", "partial", "unsafe", "meta", "scoped",
+        "local", "nonrec",
+    ];
+    let is_instance_attr = |t: &&str| matches!(*t, "instance" | "default_instance");
+    let toks = header_tokens(text);
+    let mut out = DeclHeader::default();
+    let mut rest = toks.as_slice();
+    // `attribute [instance] foo` / `attribute [local instance low] foo`.
+    if rest.first() == Some(&"attribute") {
+        let attrs = &rest[1..];
+        out.instance = attrs.first() == Some(&"[")
+            && balanced_group_len(attrs, "[", "]")
+                .is_none_or(|n| attrs[..n].iter().any(is_instance_attr));
+        return out;
+    }
+    while rest.len() >= 2 && rest[0] == "@" && rest[1] == "[" {
+        let Some(n) = balanced_group_len(&rest[1..], "[", "]") else {
+            // Unbalanced attribute bracket: no names (fail closed: an unnamed host reader).
+            out.instance = true;
+            return out;
+        };
+        out.instance |= rest[1..=n].iter().any(is_instance_attr);
+        rest = &rest[n + 1..];
+    }
+    while rest.first().is_some_and(|t| MODIFIERS.contains(t)) {
+        rest = &rest[1..];
+    }
+    let Some((&kw, mut after)) = rest.split_first() else {
+        return out;
+    };
+    if !DECL_WORDS.contains(&kw) {
+        return out;
+    }
+    out.instance |= kw == "instance";
+    if kw == "instance" && after.first() == Some(&"(") {
+        // `instance (priority := low) foo : T`.
+        let Some(n) = balanced_group_len(after, "(", ")") else {
+            return out;
+        };
+        after = &after[n..];
+    }
+    if kw == "class" && after.first().is_some_and(|t| matches!(*t, "inductive" | "abbrev")) {
+        after = &after[1..];
+    }
+    let Some(name) = after.first() else {
+        return out;
+    };
+    // `initialize <name> : T ← e` declares `<name>`; `initialize e` (e.g. `addLinter l`) declares
+    // nothing.
+    if matches!(kw, "initialize" | "builtin_initialize") && after.get(1) != Some(&":") {
+        return out;
+    }
+    // `def foo.{u}` tokenizes as `foo.`: trim the universe-binder dot before taking the last part.
+    let name = name.trim_end_matches('.');
+    let last = name.rsplit('.').next().unwrap_or(name);
+    if last.chars().next().is_some_and(is_lean_id_start) && last != "where" {
+        out.names.push(last.to_string());
+    }
     out
+}
+
+/// [`parse_decl_header`] for a whole top-level chunk. A `mutual` block declares every member whose
+/// header starts a line; any `instance` token inside it counts as an instance (fail closed).
+fn chunk_decl_header(chunk: &str) -> DeclHeader {
+    let mut toks = header_tokens(chunk).into_iter();
+    if toks.next() != Some("mutual") {
+        return parse_decl_header(chunk);
+    }
+    let mut out = DeclHeader {
+        instance: toks.any(|t| t == "instance" || t == "default_instance"),
+        ..Default::default()
+    };
+    for line in chunk.lines().skip(1) {
+        out.names.extend(parse_decl_header(line).names);
+    }
+    out
+}
+
+/// Names declared by a chunk (`def foo`, `instance bar : ...`, ...), as their last name component.
+#[cfg(test)]
+fn chunk_declared_names(chunk: &str) -> Vec<String> {
+    chunk_decl_header(chunk).names
 }
 
 fn is_lean_id_start(c: char) -> bool {
@@ -1935,7 +2022,9 @@ fn chunk_is_pure_linter_registration(chunk: &str) -> bool {
 ///   `initialize addLinter <linter>` registration (see [`chunk_is_pure_linter_registration`]).
 /// * Every chunk is checked independently: a linter or `elab` elsewhere never masks an
 ///   `initialize`/`run_cmd`/`#eval` host read.
-/// * A host-reading declaration whose name cannot be extracted taints any executing chunk.
+/// * A host-reading declaration whose name cannot be extracted, or any host-reading typeclass
+///   instance (named or anonymous: instance resolution invokes it implicitly), taints any executing
+///   chunk.
 /// * Out-of-package `include_str`/`include_bin` and any `#eval` still taint unconditionally.
 pub(crate) fn pinned_dep_source_may_read_host_state(src: &str) -> bool {
     let comment_free = strip_lean_comments(src);
@@ -1998,17 +2087,17 @@ pub(crate) fn pinned_dep_source_may_read_host_state(src: &str) -> bool {
                 .iter()
                 .any(|w| contains_lean_ident_segment(chunk, w))
     };
+    // A host-reading typeclass instance (named or anonymous) is invoked implicitly by instance
+    // resolution, so no executing chunk need ever mention its name: treat it as unnamed.
     let mut host_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut unnamed_host_reader = false;
     let mut host_chunk = vec![false; unq_chunks.len()];
     for (i, chunk) in unq_chunks.iter().enumerate() {
         if reads_directly(i) {
             host_chunk[i] = true;
-            let names = chunk_declared_names(chunk);
-            if names.is_empty() && !executes(chunk) {
-                unnamed_host_reader = true;
-            }
-            host_names.extend(names);
+            let hdr = chunk_decl_header(chunk);
+            unnamed_host_reader |= hdr.instance || (hdr.names.is_empty() && !executes(chunk));
+            host_names.extend(hdr.names);
         }
     }
     // Transitive closure: a declaration referencing a host reader reads host state too.
@@ -2019,16 +2108,15 @@ pub(crate) fn pinned_dep_source_may_read_host_state(src: &str) -> bool {
             if host_chunk[i] {
                 continue;
             }
-            let own = chunk_declared_names(chunk);
+            let hdr = chunk_decl_header(chunk);
             if host_names
                 .iter()
-                .any(|n| !own.contains(n) && contains_lean_ident_segment(chunk, n))
+                .any(|n| !hdr.names.contains(n) && contains_lean_ident_segment(chunk, n))
             {
                 host_chunk[i] = true;
-                if own.is_empty() && !executes(chunk) {
-                    unnamed_host_reader = true;
-                }
-                for n in own {
+                unnamed_host_reader |=
+                    hdr.instance || (hdr.names.is_empty() && !executes(chunk));
+                for n in hdr.names {
                     changed |= host_names.insert(n);
                 }
             }
@@ -15078,15 +15166,62 @@ public def api := by
         assert_eq!(chunk_declared_names("instance foo : T := x\n"), vec!["foo"]);
         assert_eq!(chunk_declared_names("def bar (n : Nat) : Nat := n\n"), vec!["bar"]);
         assert_eq!(chunk_declared_names("structure S where\n  x : Nat\n"), vec!["S"]);
+        // Only the header is inspected: never attribute arguments or the body.
+        assert_eq!(chunk_declared_names("@[simp, instance low] def foo : T := x\n"), vec!["foo"]);
+        assert_eq!(chunk_declared_names("@[implemented_by def] def foo : T := x\n"), vec!["foo"]);
+        assert_eq!(
+            chunk_declared_names("def foo : Nat :=\n  let x := 1\n  have instance : True := trivial\n  x\n"),
+            vec!["foo"]
+        );
+        assert_eq!(
+            chunk_declared_names("@[instance]\nprivate noncomputable def Ns.qux : T := x\n"),
+            vec!["qux"]
+        );
+        // Universe-polymorphic names keep their name (no empty `""` component).
+        assert_eq!(chunk_declared_names("def foo.{u} (α : Sort u) : Sort u := α\n"), vec!["foo"]);
+        assert_eq!(chunk_declared_names("def Ns.bar.{u, v} : Nat := 0\n"), vec!["bar"]);
+        assert_eq!(chunk_declared_names("instance (priority := low) baz : T := x\n"), vec!["baz"]);
+        assert_eq!(chunk_declared_names("class inductive C where\n  | a\n"), vec!["C"]);
+        assert_eq!(chunk_declared_names("initialize r : IO.Ref Nat ← IO.mkRef 0\n"), vec!["r"]);
+        assert!(chunk_declared_names("initialize addLinter l\n").is_empty());
+        assert_eq!(chunk_declared_names("mutual\n  def a : Nat := b\n  def b : Nat := 0\nend\n"), vec!["a", "b"]);
+        for (chunk, inst) in [
+            ("instance foo : T := x\n", true),
+            ("@[instance low] def foo : T := x\n", true),
+            ("@[default_instance] instance : T := x\n", true),
+            ("attribute [instance] foo\n", true),
+            ("attribute [local instance 100] foo\n", true),
+            ("attribute [simp] foo\n", false),
+            ("def foo : Nat := instance\n", false),
+            ("@[simp] def foo : T := x\n", false),
+        ] {
+            assert_eq!(chunk_decl_header(chunk).instance, inst, "{chunk}");
+        }
         // An anonymous host reader is unnamed, so any executing (non-linter) chunk taints, even one
         // that never names `T`: fail closed.
         let anon = "class T where\n  v : IO String\ninstance : T := ⟨IO.FS.readFile \"/x\"⟩\nrun_cmd do\n  let _ ← (T.v : IO String)\n";
         assert!(pinned_dep_source_may_read_host_state(anon), "{anon}");
         let anon_plain = "instance : T := IO.FS.readFile \"/x\"\nrun_cmd pure ()\n";
         assert!(pinned_dep_source_may_read_host_state(anon_plain), "{anon_plain}");
-        // Contrast: a *named* host-reading instance that no executing chunk references stays clean.
-        let named = "instance fooInst : T := IO.FS.readFile \"/x\"\nrun_cmd pure ()\n";
+        // Typeclass instances are invoked implicitly by instance resolution, so a host-reading
+        // instance taints any executing chunk even when *named* and never referenced by name.
+        for src in [
+            "instance fooInst : T := IO.FS.readFile \"/x\"\nrun_cmd pure ()\n",
+            "instance myNamedInst : T := ⟨IO.FS.readFile \"/x\"⟩\nrun_cmd pure ()\n",
+            "@[instance low] instance : T := ⟨IO.FS.readFile \"/x\"⟩\nrun_cmd pure ()\n",
+            "@[instance] def hostInst : T := ⟨IO.FS.readFile \"/x\"⟩\nrun_cmd pure ()\n",
+            "@[default_instance] instance hostDefault : T := ⟨IO.FS.readFile \"/x\"⟩\nrun_cmd pure ()\n",
+            "def hostImpl : T := ⟨IO.FS.readFile \"/x\"⟩\nattribute [instance] hostImpl\nrun_cmd pure ()\n",
+        ] {
+            assert!(pinned_dep_source_may_read_host_state(src), "{src}");
+        }
+        // Contrast: a named, non-instance host reader no executing chunk references stays clean.
+        let named = "def fooDef : IO String := IO.FS.readFile \"/x\"\nrun_cmd pure ()\n";
         assert!(!pinned_dep_source_may_read_host_state(named), "{named}");
+        // Attribute arguments never yield names: `@[implemented_by hostRead] def` declares only
+        // `safe`, so a run_cmd calling `safe` taints through `hostRead` being referenced.
+        let attr = "def hostRead : IO String := IO.FS.readFile \"/x\"\n@[implemented_by hostRead] opaque safe : IO String\nrun_cmd do\n  let _ ← safe\n";
+        assert!(pinned_dep_source_may_read_host_state(attr), "{attr}");
     }
 
     #[test]

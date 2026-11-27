@@ -19387,9 +19387,13 @@ end ParityNs
                     ),
                     "writable dep build dir",
                 )?;
+                // `depWitness true = true` only elaborates against the stale `beta` `Dep.olean`
+                // (`dep_env_ty := Bool`); under the current `alpha` host state it is `Nat`. A check
+                // that silently trusted the stale external artifact would therefore succeed: it must
+                // instead fail closed with the actionable external-dep error naming `Dep`.
                 fs::write(
                     &canon_app_lean,
-                    "import Dep\ntheorem app_check_thm : depWitness 0 = 0 := rfl\n",
+                    "import Dep\ntheorem app_check_thm : depWitness true = true := rfl\n",
                 )?;
                 let check_res = crate::check::run_check_command_value(
                     &mut dep_store,
@@ -19401,13 +19405,17 @@ end ParityNs
                     false,
                     None,
                 );
-                if let Ok(check_val) = &check_res {
-                    assert_ne!(
-                        check_val.get("status").and_then(|v| v.as_str()),
-                        Some("file_verified"),
-                        "turbo-lean check must not verify App.lean against a stale external host-effect Dep.olean (git={use_git_pin}), got: {check_val}"
-                    );
-                }
+                let check_msg = format!(
+                    "{:#}",
+                    check_res.expect_err(&format!(
+                        "turbo-lean check must not trust a stale external host-effect Dep.olean (git={use_git_pin})"
+                    ))
+                );
+                assert!(
+                    check_msg.contains("Refusing to trust stale external host-effect dependency")
+                        && check_msg.contains("`Dep`"),
+                    "turbo-lean check must fail closed naming `Dep` (git={use_git_pin}), got: {check_msg}"
+                );
                 assert_eq!(
                     fs::read(&dep_olean)?,
                     dep_beta_bytes,
