@@ -898,6 +898,9 @@ pub(super) fn collect_worker_exit_status(child: &mut std::process::Child) -> (Op
     let Some(st) = status_opt else {
         return (None, None);
     };
+    if !st.success() {
+        crate::shm_cache::record_child_exit_status(st);
+    }
     let code = st.code();
     #[cfg(unix)]
     let sig = {

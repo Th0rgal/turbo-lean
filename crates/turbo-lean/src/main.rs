@@ -609,28 +609,85 @@ fn main() -> Result<()> {
         Some(zygote::OneShotGuard::new(cli.no_daemon)?)
     };
     phase_timing::record_active_span_since("cli_startup", process_t0);
+    shm_cache::reset_recorded_child_exit_status();
     let receipt_path = std::env::var_os("TURBO_LEAN_BUILD_RECEIPT").map(PathBuf::from);
     let oom_before = receipt_path
         .as_ref()
         .and_then(|_| shm_cache::current_cgroup_oom_kill_count());
+    let tracked_project_dir = match &cli.command {
+        Commands::Build { project_dir, .. }
+        | Commands::Check { project_dir, .. }
+        | Commands::SeedOleans { project_dir, .. }
+        | Commands::CiVerify { project_dir, .. }
+        | Commands::PrVerify { project_dir, .. } => Some(project_dir.clone()),
+        _ => None,
+    };
+    install_invocation_receipt_context(InvocationReceiptContext {
+        receipt_path,
+        started: process_t0,
+        oom_before,
+        project_dir: tracked_project_dir,
+        preflight_passed: false,
+    });
     let res = run(cli).map_err(zygote::with_timeout_knob_hint);
-    if let Some(path) = receipt_path {
-        write_invocation_receipt(&path, res.is_ok(), process_t0, oom_before);
+    let emitted = finish_invocation_receipt(res.is_ok(), None, None);
+    if let Err(ref err) = res {
+        if let Some(ref receipt) = emitted {
+            #[cfg(unix)]
+            let sigkill_code = (receipt.signal == Some(libc::SIGKILL)
+                || receipt.exit_code == Some(128 + libc::SIGKILL))
+            .then_some(128 + libc::SIGKILL);
+            #[cfg(not(unix))]
+            let sigkill_code = (receipt.exit_code == Some(137)).then_some(137);
+            if let Some(code) = sigkill_code {
+                eprintln!("Error: {err:?}");
+                std::process::exit(code);
+            }
+        }
     }
     res
 }
 
-/// `TURBO_LEAN_BUILD_RECEIPT=<path>`: atomically emit a structured JSON receipt for this
-/// invocation (children killed by `SIGKILL`/`SIGABRT` still contribute their peak RSS and any
-/// cgroup `oom_kill` delta).
-fn write_invocation_receipt(
-    path: &std::path::Path,
-    ok: bool,
+struct InvocationReceiptContext {
+    receipt_path: Option<PathBuf>,
     started: std::time::Instant,
     oom_before: Option<u64>,
-) {
-    let cgroup_oom_kill = shm_cache::current_cgroup_oom_kill_count()
-        .map(|after| after.saturating_sub(oom_before.unwrap_or(after)));
+    project_dir: Option<PathBuf>,
+    preflight_passed: bool,
+}
+
+static INVOCATION_RECEIPT_CTX: std::sync::Mutex<Option<InvocationReceiptContext>> =
+    std::sync::Mutex::new(None);
+
+fn install_invocation_receipt_context(ctx: InvocationReceiptContext) {
+    *INVOCATION_RECEIPT_CTX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(ctx);
+}
+
+fn mark_invocation_preflight_passed() {
+    if let Some(ctx) = INVOCATION_RECEIPT_CTX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        ctx.preflight_passed = true;
+    }
+}
+
+/// `TURBO_LEAN_BUILD_RECEIPT=<path>`: atomically emit a structured JSON receipt for this
+/// invocation using the real child `ExitStatus` (`SIGKILL` / `137` / signal / exit code), peak
+/// RSS, and cgroup `oom_kill` delta, and persist project peak RSS for future pre-flight guards.
+fn finish_invocation_receipt(
+    ok: bool,
+    fallback_exit_code: Option<i32>,
+    explicit_status: Option<&std::process::ExitStatus>,
+) -> Option<shm_cache::BuildReceipt> {
+    let ctx = INVOCATION_RECEIPT_CTX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()?;
+    let recorded_child = shm_cache::take_recorded_child_exit_status();
     let peak_rss_kib = match (
         shm_cache::self_peak_rss_kib(),
         shm_cache::children_peak_rss_kib(),
@@ -638,24 +695,40 @@ fn write_invocation_receipt(
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
     };
-    let receipt = shm_cache::BuildReceipt {
-        exit_code: Some(if ok { 0 } else { 1 }),
-        signal: None,
+    if ctx.preflight_passed {
+        if let (Some(proj), Some(kib)) = (ctx.project_dir.as_deref(), peak_rss_kib) {
+            shm_cache::record_project_peak_rss_kib(proj, kib);
+        }
+    }
+    let cgroup_oom_kill = shm_cache::cgroup_oom_kill_delta(
+        ctx.oom_before,
+        shm_cache::current_cgroup_oom_kill_count(),
+    );
+    let olean_path = std::env::var_os("TURBO_LEAN_BUILD_RECEIPT_OLEAN").map(PathBuf::from);
+    let receipt = shm_cache::BuildReceipt::for_invocation(
+        ok,
+        explicit_status,
+        recorded_child.as_ref(),
+        fallback_exit_code,
+        ctx.started.elapsed(),
         peak_rss_kib,
         cgroup_oom_kill,
-        elapsed_s: started.elapsed().as_secs_f64(),
-        olean_sha256: std::env::var_os("TURBO_LEAN_BUILD_RECEIPT_OLEAN")
-            .map(PathBuf::from)
-            .filter(|p| p.is_file())
-            .and_then(|p| shm_cache::sha256_file_hex(&p).ok()),
-        oom_suspected: cgroup_oom_kill.is_some_and(|n| n > 0),
-    };
-    if let Err(e) = shm_cache::write_build_receipt_atomic(path, &receipt) {
-        eprintln!(
-            "[turbo-lean] failed to write build receipt {}: {e}",
-            path.display()
-        );
+        olean_path.as_deref(),
+    );
+    if let Some(ref path) = ctx.receipt_path {
+        if let Err(e) = shm_cache::write_build_receipt_atomic(path, &receipt) {
+            eprintln!(
+                "[turbo-lean] failed to write build receipt {}: {e}",
+                path.display()
+            );
+        }
     }
+    Some(receipt)
+}
+
+fn exit_with_receipt(code: i32, explicit_status: Option<&std::process::ExitStatus>) -> ! {
+    let _ = finish_invocation_receipt(code == 0, Some(code), explicit_status);
+    std::process::exit(code);
 }
 
 pub(crate) fn apply_global_cli_env(cli: &Cli) {
@@ -670,17 +743,25 @@ pub(crate) fn apply_global_cli_env(cli: &Cli) {
 fn run(cli: Cli) -> Result<()> {
     let run_setup_started = std::time::Instant::now();
     apply_global_cli_env(&cli);
-    if matches!(
-        &cli.command,
-        Commands::Build { .. }
-            | Commands::Check { .. }
-            | Commands::SeedOleans { .. }
-            | Commands::CiVerify { .. }
-            | Commands::PrVerify { .. }
-    ) {
-        if cli.max_memory_mb.is_some() {
-            shm_cache::preflight_memory_guard_live("turbo-lean", None)?;
-        }
+    if let Some((what, project_dir)) = match &cli.command {
+        Commands::Build { project_dir, .. } => Some(("build", project_dir.as_path())),
+        Commands::Check { project_dir, .. } => Some(("check", project_dir.as_path())),
+        Commands::SeedOleans { project_dir, .. } => Some(("seed-oleans", project_dir.as_path())),
+        Commands::CiVerify { project_dir, .. } => Some(("ci-verify", project_dir.as_path())),
+        Commands::PrVerify { project_dir, .. } => Some(("pr-verify", project_dir.as_path())),
+        _ => None,
+    } {
+        let receipt_path = std::env::var_os("TURBO_LEAN_BUILD_RECEIPT").map(PathBuf::from);
+        let historical_peak_mb =
+            shm_cache::resolve_historical_peak_rss_mb(Some(project_dir), receipt_path.as_deref());
+        let target_label = project_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty() && *s != ".")
+            .map(|name| format!("turbo-lean {what} ({name})"))
+            .unwrap_or_else(|| format!("turbo-lean {what}"));
+        shm_cache::preflight_memory_guard_live(&target_label, historical_peak_mb)?;
+        mark_invocation_preflight_passed();
         let cli_jobs = match &cli.command {
             Commands::Check { jobs, .. } => *jobs,
             Commands::SeedOleans { jobs, .. } => Some(*jobs).filter(|&j| j > 0),
@@ -1303,7 +1384,7 @@ fn run(cli: Cli) -> Result<()> {
                 if cli.json {
                     println!("{}", serde_json::to_string_pretty(&reply)?);
                     if !reply.ok {
-                        std::process::exit(1);
+                        exit_with_receipt(1, None);
                     }
                     return Ok(());
                 }
@@ -1331,7 +1412,7 @@ fn run(cli: Cli) -> Result<()> {
                     }
                     print!("{}", rendered_stdout);
                     if !reply.ok {
-                        std::process::exit(1);
+                        exit_with_receipt(1, None);
                     }
                     return Ok(());
                 }
@@ -1712,7 +1793,7 @@ fn run(cli: Cli) -> Result<()> {
                             timeout, file_disp
                         ),
                     }
-                    std::process::exit(124);
+                    exit_with_receipt(124, None);
                 });
             }
             let done_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2090,7 +2171,7 @@ fn run(cli: Cli) -> Result<()> {
             let toolchain = lake_build::detect_toolchain(&proj_dir);
             if !server::is_toolchain_installed(&toolchain) {
                 eprintln!("error: toolchain '{}' is not installed", toolchain);
-                std::process::exit(1);
+                exit_with_receipt(1, None);
             }
             let may_declare_inputs = module_builder::workspace_may_declare_lake_inputs(&proj_dir);
 
@@ -2198,12 +2279,12 @@ fn run(cli: Cli) -> Result<()> {
                 {
                     use std::os::unix::process::ExitStatusExt;
                     if let Some(code) = out.status.code() {
-                        std::process::exit(code);
+                        exit_with_receipt(code, Some(&out.status));
                     } else if let Some(sig) = out.status.signal() {
-                        std::process::exit(128 + sig);
+                        exit_with_receipt(128 + sig, Some(&out.status));
                     }
                 }
-                std::process::exit(out.status.code().unwrap_or(1));
+                exit_with_receipt(out.status.code().unwrap_or(1), Some(&out.status));
             };
 
             if needs_direct_lean && !cli.json {
@@ -2245,7 +2326,7 @@ fn run(cli: Cli) -> Result<()> {
                 } else {
                     eprintln!("[turbo-lean] evaluation timed out after {} ms", timeout_ms);
                 }
-                std::process::exit(124);
+                exit_with_receipt(124, None);
             }
 
             if !reply.import_ok && !reply.crashed && !reply.timed_out && !cli.json {
@@ -2301,21 +2382,21 @@ fn run(cli: Cli) -> Result<()> {
                         lean_out.stdout.len(),
                         lean_out.stderr.len()
                     );
-                    std::process::exit(2);
+                    exit_with_receipt(2, None);
                 }
             }
 
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&reply)?);
                 if !reply.ok {
-                    std::process::exit(1);
+                    exit_with_receipt(1, None);
                 }
                 return Ok(());
             }
 
             print!("{}", rendered_stdout);
             if !reply.ok {
-                std::process::exit(1);
+                exit_with_receipt(1, None);
             }
             Ok(())
         }

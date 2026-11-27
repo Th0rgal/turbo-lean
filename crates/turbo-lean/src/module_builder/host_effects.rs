@@ -338,6 +338,9 @@ pub(crate) fn run_command_with_timeout_pinned_fd(
     let mut poll_iter = 0u32;
     loop {
         if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                crate::shm_cache::record_child_exit_status(status);
+            }
             #[cfg(unix)]
             {
                 let pgid = child.id() as i32;
