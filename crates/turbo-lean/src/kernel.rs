@@ -629,7 +629,7 @@ impl ResolvedConLecheBinary {
     /// are the hashed bytes by construction — even against an in-place `O_TRUNC` rewrite of
     /// the source inode, which a `/proc/self/fd/N` of the SOURCE would not stop, since that
     /// path pins the inode, not its bytes. Elsewhere the canonical path
-    /// is spawned after the fd hash, the pre-U3 behavior with its small open-to-exec window.
+    /// is spawned after the fd hash, the earlier behavior with its small open-to-exec window.
     fn open_execution_verified(&self) -> Result<VerifiedConLecheBinary> {
         let (file, now) = open_hash_and_seal_for_exec(&self.path)?;
         anyhow::ensure!(
