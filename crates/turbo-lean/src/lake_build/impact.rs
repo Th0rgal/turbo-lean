@@ -410,7 +410,12 @@ pub fn compute_impact_report(
 
     if affected_files.is_empty() && !affected_modules.is_empty() {
         for m in &affected_modules {
-            if let Some(p) = mod_to_path.get(m) {
+            // Dependency checkouts (`.lake/packages/*`, out-of-tree paths) are never project
+            // files to rebuild or purge: they stay in `affected_modules` only.
+            if let Some(p) = mod_to_path
+                .get(m)
+                .filter(|p| crate::module_builder::path_in_project(&canon_dir, p))
+            {
                 let rel = p
                     .strip_prefix(&canon_dir)
                     .map(|r| r.to_string_lossy().replace('\\', "/"))

@@ -3909,7 +3909,7 @@ pub(crate) fn recheck_dependents_if_nonlocal_for_check(
                                 || spec_has_include_str
                                 || fs::read_to_string(&n.src_path)
                                     .map(|s| crate::module_builder::source_uses_include_str(&s))
-                                    .unwrap_or(false)
+                                    .unwrap_or(true)
                             {
                                 Some(m.clone())
                             } else {
@@ -3934,33 +3934,13 @@ pub(crate) fn recheck_dependents_if_nonlocal_for_check(
                         .filter_map(|m| dag.nodes.get(m).map(|n| n.src_path.clone()))
                         .collect();
                     closure_mods = closure.into_iter().collect();
-                    for m in &closure_mods {
-                        if let Some(spec) =
-                            crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, m)
-                                .or_else(|| {
-                                    match crate::module_builder::resolve_import_site(&cfg, m) {
-                                        crate::module_builder::ImportSite::Module(s) => Some(*s),
-                                        _ => None,
-                                    }
-                                })
-                        {
-                            let has_target_needs =
-                                !crate::module_builder::input_bearing_libs_for_module(&cfg, m)
-                                    .is_empty()
-                                    || !crate::module_builder::input_bearing_exes_for_module(
-                                        &cfg, m,
-                                    )
-                                    .is_empty();
-                            if !has_target_needs
-                                && fs::read_to_string(&spec.src_path)
-                                    .map(|s| crate::module_builder::source_uses_include_str(&s))
-                                    .unwrap_or(false)
-                            {
-                                remove_spec_build_artifacts_checked(&spec)?;
-                                bypass_lake_cache = true;
-                            }
-                        }
-                    }
+                    // Two-phase: every untraced `include_str` module is collected first, and an
+                    // external one fails closed before anything is deleted.
+                    bypass_lake_cache |=
+                        crate::module_builder::purge_untraced_include_str_artifacts(
+                            &cfg,
+                            &closure_mods,
+                        )?;
                     let all_fresh_on_disk = !bypass_lake_cache
                         && {
                             let mut fresh_cache =

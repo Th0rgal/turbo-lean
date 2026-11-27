@@ -1793,6 +1793,346 @@ pub(crate) fn source_may_read_host_state(src: &str) -> bool {
     {
         return true;
     }
+    include_escapes_package(&comment_free, &unquoted)
+}
+
+/// Top-level command keywords that begin a new command chunk at column 0. A column-0 line that does
+/// not start with one of these is treated as a continuation of the previous chunk (fail closed: a
+/// continuation can never escape the block whose body it belongs to).
+const COMMAND_START_WORDS: &[&str] = &[
+    "def", "theorem", "lemma", "abbrev", "instance", "opaque", "axiom", "example", "structure",
+    "class", "inductive", "coinductive", "mutual", "private", "public", "protected", "noncomputable",
+    "partial", "unsafe", "meta", "scoped", "local", "nonrec", "open", "namespace", "section", "end",
+    "variable", "universe", "set_option", "attribute", "export", "import", "module", "prelude",
+    "initialize", "builtin_initialize", "run_cmd", "run_elab", "run_meta", "drun_elab", "elab",
+    "elab_rules", "macro", "macro_rules", "syntax", "declare_syntax_cat", "notation", "infix",
+    "infixl", "infixr", "prefix", "postfix", "simproc", "dsimproc", "simproc_decl", "dsimproc_decl",
+    "register_option", "register_linter_set", "register_simp_attr", "register_label_attr",
+    "deriving", "add_decl_doc", "alias", "irreducible_def", "omit", "include", "in",
+];
+
+/// Split comment- and string-stripped Lean source into top-level command chunks.
+fn top_level_command_chunks(unquoted: &str) -> Vec<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut pending_prefix = String::new();
+    for line in unquoted.split_inclusive('\n') {
+        let starts_command = line.chars().next().is_some_and(|c| !c.is_whitespace()) && {
+            let t = line.trim_start();
+            t.starts_with('@')
+                || t.starts_with('#')
+                || COMMAND_START_WORDS.iter().any(|w| {
+                    t.strip_prefix(w)
+                        .is_some_and(|r| !r.chars().next().is_some_and(is_lean_id_rest))
+                })
+        };
+        let attribute_only = {
+            let t = line.trim();
+            t.starts_with("@[") && t.ends_with(']')
+        };
+        if starts_command && attribute_only {
+            // `@[attr]` on its own line belongs to the following declaration.
+            pending_prefix.push_str(line);
+            continue;
+        }
+        if starts_command || chunks.is_empty() {
+            chunks.push(std::mem::take(&mut pending_prefix));
+        }
+        let last = chunks.last_mut().expect("chunk pushed above");
+        last.push_str(&pending_prefix);
+        pending_prefix.clear();
+        last.push_str(line);
+    }
+    if !pending_prefix.is_empty() {
+        chunks.push(pending_prefix);
+    }
+    chunks
+}
+
+/// Tokenize for declaration-header parsing. Binder brackets, `:` and `,` are their own tokens, so a
+/// keyword directly followed by one (`instance : T`, `instance [C] : T`) reads as anonymous rather
+/// than mis-naming the type after the colon.
+fn header_tokens(text: &str) -> Vec<&str> {
+    let is_punct = |c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ':' | ',');
+    let mut toks: Vec<&str> = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() || is_punct(c) {
+            if let Some(s) = start.take() {
+                toks.push(&text[s..i]);
+            }
+            if is_punct(c) {
+                toks.push(&text[i..i + c.len_utf8()]);
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        toks.push(&text[s..]);
+    }
+    toks
+}
+
+/// Length of the balanced `open`..`close` group starting at `toks[0] == open` (`None` if unbalanced).
+fn balanced_group_len(toks: &[&str], open: &str, close: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, t) in toks.iter().enumerate() {
+        if *t == open {
+            depth += 1;
+        } else if *t == close {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(i + 1);
+            }
+        }
+    }
+    None
+}
+
+/// Parsed header of one top-level declaration: names it declares (last name component) and whether
+/// it registers a typeclass instance (`instance`, `@[instance]`, `@[default_instance]`,
+/// `attribute [instance] ...`). Only the header (leading `@[...]` attributes, modifiers, keyword and
+/// the name right after it) is inspected: never attribute arguments or the declaration body.
+#[derive(Default)]
+struct DeclHeader {
+    names: Vec<String>,
+    instance: bool,
+}
+
+fn parse_decl_header(text: &str) -> DeclHeader {
+    const DECL_WORDS: &[&str] = &[
+        "def", "theorem", "lemma", "abbrev", "instance", "opaque", "structure", "class",
+        "inductive", "irreducible_def", "initialize", "builtin_initialize", "alias",
+    ];
+    const MODIFIERS: &[&str] = &[
+        "private", "public", "protected", "noncomputable", "partial", "unsafe", "meta", "scoped",
+        "local", "nonrec",
+    ];
+    let is_instance_attr = |t: &&str| matches!(*t, "instance" | "default_instance");
+    let toks = header_tokens(text);
+    let mut out = DeclHeader::default();
+    let mut rest = toks.as_slice();
+    // `attribute [instance] foo` / `attribute [local instance low] foo`.
+    if rest.first() == Some(&"attribute") {
+        let attrs = &rest[1..];
+        out.instance = attrs.first() == Some(&"[")
+            && balanced_group_len(attrs, "[", "]")
+                .is_none_or(|n| attrs[..n].iter().any(is_instance_attr));
+        return out;
+    }
+    while rest.len() >= 2 && rest[0] == "@" && rest[1] == "[" {
+        let Some(n) = balanced_group_len(&rest[1..], "[", "]") else {
+            // Unbalanced attribute bracket: no names (fail closed: an unnamed host reader).
+            out.instance = true;
+            return out;
+        };
+        out.instance |= rest[1..=n].iter().any(is_instance_attr);
+        rest = &rest[n + 1..];
+    }
+    while rest.first().is_some_and(|t| MODIFIERS.contains(t)) {
+        rest = &rest[1..];
+    }
+    let Some((&kw, mut after)) = rest.split_first() else {
+        return out;
+    };
+    if !DECL_WORDS.contains(&kw) {
+        return out;
+    }
+    out.instance |= kw == "instance";
+    if kw == "instance" && after.first() == Some(&"(") {
+        // `instance (priority := low) foo : T`.
+        let Some(n) = balanced_group_len(after, "(", ")") else {
+            return out;
+        };
+        after = &after[n..];
+    }
+    if kw == "class" && after.first().is_some_and(|t| matches!(*t, "inductive" | "abbrev")) {
+        after = &after[1..];
+    }
+    let Some(name) = after.first() else {
+        return out;
+    };
+    // `initialize <name> : T ← e` declares `<name>`; `initialize e` (e.g. `addLinter l`) declares
+    // nothing.
+    if matches!(kw, "initialize" | "builtin_initialize") && after.get(1) != Some(&":") {
+        return out;
+    }
+    // `def foo.{u}` tokenizes as `foo.`: trim the universe-binder dot before taking the last part.
+    let name = name.trim_end_matches('.');
+    let last = name.rsplit('.').next().unwrap_or(name);
+    if last.chars().next().is_some_and(is_lean_id_start) && last != "where" {
+        out.names.push(last.to_string());
+    }
+    out
+}
+
+/// [`parse_decl_header`] for a whole top-level chunk. A `mutual` block declares every member whose
+/// header starts a line; any `instance` token inside it counts as an instance (fail closed).
+fn chunk_decl_header(chunk: &str) -> DeclHeader {
+    let mut toks = header_tokens(chunk).into_iter();
+    if toks.next() != Some("mutual") {
+        return parse_decl_header(chunk);
+    }
+    let mut out = DeclHeader {
+        instance: toks.any(|t| t == "instance" || t == "default_instance"),
+        ..Default::default()
+    };
+    for line in chunk.lines().skip(1) {
+        out.names.extend(parse_decl_header(line).names);
+    }
+    out
+}
+
+/// Names declared by a chunk (`def foo`, `instance bar : ...`, ...), as their last name component.
+#[cfg(test)]
+fn chunk_declared_names(chunk: &str) -> Vec<String> {
+    chunk_decl_header(chunk).names
+}
+
+fn is_lean_id_start(c: char) -> bool {
+    c.is_alphabetic() || c == '_'
+}
+
+/// Is this chunk exactly `initialize addLinter <ident>` (optionally namespace-qualified)?
+///
+/// Linters only report messages: Lean's `runLinters` restores the command state after every linter
+/// (keeping messages and traces only), so a linter body cannot change the `.olean` an importer
+/// writes; a failing lint can only fail the build. A host read reachable only through a registered
+/// linter therefore cannot make an importer's artifact depend on host state.
+fn chunk_is_pure_linter_registration(chunk: &str) -> bool {
+    let toks: Vec<&str> = chunk.split_whitespace().collect();
+    matches!(toks.as_slice(),
+        [kw, add, name]
+            if (*kw == "initialize" || *kw == "builtin_initialize")
+                && (*add == "addLinter" || add.ends_with(".addLinter"))
+                && name.chars().all(|c| is_lean_id_rest(c) || c == '.'))
+}
+
+/// Host-read detector for **clean git-pinned dependency packages** (e.g. Mathlib's linters).
+///
+/// Unlike [`source_may_read_host_state`], which taints a file as soon as *any* elaboration trigger and
+/// *any* host-read token co-occur anywhere, this checks every top-level command chunk on its own:
+///
+/// * A chunk *executes at elaboration or import time* when it contains an elaboration trigger
+///   (`initialize`, `run_cmd`, `#eval`, `elab`, `elab_rules`, `simproc`, `@[command_elab]`,
+///   `@[tactic]`, `evalConst`, `run_tac`, ...). Elaborator bodies count too (fail closed), so
+///   `elab_rules` that read `IO.getEnv` still taint.
+/// * An executing chunk taints when it reads host state itself, or references a declaration of
+///   this file that (transitively) reads host state, unless it is a pure
+///   `initialize addLinter <linter>` registration (see [`chunk_is_pure_linter_registration`]).
+/// * Every chunk is checked independently: a linter or `elab` elsewhere never masks an
+///   `initialize`/`run_cmd`/`#eval` host read.
+/// * A host-reading declaration whose name cannot be extracted, or any host-reading typeclass
+///   instance (named or anonymous: instance resolution invokes it implicitly), taints any executing
+///   chunk.
+/// * Out-of-package `include_str`/`include_bin` and any `#eval` still taint unconditionally.
+pub(crate) fn pinned_dep_source_may_read_host_state(src: &str) -> bool {
+    let comment_free = strip_lean_comments(src);
+    let clean = strip_string_literals_inner(&comment_free, true);
+    let unquoted = clean.replace(['«', '»'], "");
+    // `#eval` can run imported host readers this single-file scan cannot see: always fail closed.
+    if include_escapes_package(&comment_free, &unquoted)
+        || ["#eval", "#eval!"]
+            .iter()
+            .any(|w| contains_lean_word(&unquoted, w))
+    {
+        return true;
+    }
+    if !unquoted_has_elab_exec_trigger(&unquoted)
+        && ![
+            "unsafeCast",
+            "unsafeIO",
+            "unsafeBaseIO",
+            "unsafePerformIO",
+        ]
+        .iter()
+        .any(|w| contains_lean_ident_segment(&unquoted, w))
+    {
+        return false;
+    }
+    // `open IO` / `namespace IO` anywhere widens the unqualified host-read segments for every chunk.
+    let open_io_header: String = unquoted
+        .lines()
+        .filter(|line| {
+            let t = line.trim_start();
+            (t.starts_with("open ")
+                || t.contains(" open ")
+                || t.starts_with("namespace ")
+                || t.contains(" namespace "))
+                && (contains_lean_ident_segment(t, "IO")
+                    || contains_lean_ident_segment(t, "System")
+                    || contains_lean_ident_segment(t, "DateTime"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // `getEnv "X"` detection needs the string-preserving view: recover each chunk's span there.
+    let cf_chunks = top_level_command_chunks(&comment_free);
+    let unq_chunks = top_level_command_chunks(&unquoted);
+    if cf_chunks.len() != unq_chunks.len() {
+        // Chunking diverged between views: fall back to the whole-file detector (fail closed).
+        return source_may_read_host_state(src);
+    }
+    let reads_directly = |i: usize| -> bool {
+        let unq = &unq_chunks[i];
+        let with_open = if open_io_header.is_empty() {
+            std::borrow::Cow::Borrowed(unq.as_str())
+        } else {
+            std::borrow::Cow::Owned(format!("{open_io_header}\n{unq}"))
+        };
+        unquoted_has_host_read_tokens(&cf_chunks[i], &with_open)
+    };
+    let executes = |chunk: &str| -> bool {
+        unquoted_has_elab_exec_trigger(chunk)
+            || ["unsafeCast", "unsafeIO", "unsafeBaseIO", "unsafePerformIO"]
+                .iter()
+                .any(|w| contains_lean_ident_segment(chunk, w))
+    };
+    // A host-reading typeclass instance (named or anonymous) is invoked implicitly by instance
+    // resolution, so no executing chunk need ever mention its name: treat it as unnamed.
+    let mut host_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut unnamed_host_reader = false;
+    let mut host_chunk = vec![false; unq_chunks.len()];
+    for (i, chunk) in unq_chunks.iter().enumerate() {
+        if reads_directly(i) {
+            host_chunk[i] = true;
+            let hdr = chunk_decl_header(chunk);
+            unnamed_host_reader |= hdr.instance || (hdr.names.is_empty() && !executes(chunk));
+            host_names.extend(hdr.names);
+        }
+    }
+    // Transitive closure: a declaration referencing a host reader reads host state too.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (i, chunk) in unq_chunks.iter().enumerate() {
+            if host_chunk[i] {
+                continue;
+            }
+            let hdr = chunk_decl_header(chunk);
+            if host_names
+                .iter()
+                .any(|n| !hdr.names.contains(n) && contains_lean_ident_segment(chunk, n))
+            {
+                host_chunk[i] = true;
+                unnamed_host_reader |=
+                    hdr.instance || (hdr.names.is_empty() && !executes(chunk));
+                for n in hdr.names {
+                    changed |= host_names.insert(n);
+                }
+            }
+        }
+    }
+    unq_chunks.iter().enumerate().any(|(i, chunk)| {
+        executes(chunk)
+            && (reads_directly(i)
+                || (!chunk_is_pure_linter_registration(chunk)
+                    && (unnamed_host_reader || host_chunk[i])))
+    })
+}
+
+/// True if an `include_str` / `include_bin` argument is non-literal, absolute, or climbs more than
+/// two directories above the including file.
+fn include_escapes_package(comment_free: &str, unquoted: &str) -> bool {
     for kw in ["include_str?", "include_str", "include_bin?", "include_bin"] {
         if !contains_lean_ident_segment(&unquoted, kw) {
             continue;
@@ -14778,6 +15118,110 @@ public def api := by
             .is_none(),
             "build_fast_olean_shard_source_with_split must return None for retroactive `attribute [simp] foo`"
         );
+    }
+
+    #[test]
+    fn test_host_effects_pinned_dep_per_block_host_read_detection() {
+        // Positive: Mathlib-shaped linters (read in a `def` called only by a registered linter).
+        for src in [
+            "import Lean\nopen Lean Elab Command Linter\ndef isInRoot (n : Name) : IO Bool := do\n  let s ← IO.FS.readFile \"Mathlib.lean\"\n  return s.length > 0\ninitialize inRootMutex : Std.Mutex (Option Bool) ← Std.Mutex.new none\ndef headerLinter : Linter where run := fun _ => do\n  let _ ← isInRoot `X\n  pure ()\ninitialize addLinter headerLinter\n",
+            "import Lean\nopen Lean Elab Linter\ndef docPrimeLinter : Linter where run := fun _ => do\n  let _ ← IO.FS.lines \"x\"\n  pure ()\ninitialize addLinter docPrimeLinter\n",
+            "open Lean Elab.Command\nrun_cmd liftTermElabM do\n  let env ← getEnv\n  pure ()\n",
+            "initialize forbiddenCache : IO.Ref (Option Nat) ← IO.mkRef none\ndef readDirs : IO Unit := do\n  let _ ← IO.FS.readFile \"scripts/x\"\n",
+        ] {
+            assert!(!pinned_dep_source_may_read_host_state(src), "{src}");
+            assert!(source_may_read_host_state(src) || !src.contains("readFile"));
+        }
+        // Negative (Gap 1): an `elab`/linter elsewhere never masks an executing host read.
+        for src in [
+            "elab \"t\" : term => return Lean.mkNatLit 0\ninitialize shadow : String ← IO.FS.readFile \"/etc/shadow\"\n",
+            "def l : Linter where run := fun _ => pure ()\ninitialize addLinter l\nrun_cmd do\n  let _ ← IO.getEnv \"SECRET\"\n",
+            "@[tactic foo] def evalFoo : Tactic := fun _ => pure ()\nrun_meta do\n  let _ ← IO.FS.readFile \"/etc/hostname\"\n",
+            "def readIt : IO String := IO.FS.readFile \"/etc/shadow\"\ninitialize cached : String ← readIt\n",
+            "def a : IO String := IO.FS.readFile \"/x\"\ndef b : IO String := a\nrun_elab do\n  let _ ← b\n",
+            "def l : Linter where run := fun _ => pure ()\ninitialize addLinter l\n#eval (pure 1 : IO Nat)\n",
+            // Stricter option: host reads inside elaborator bodies still taint (Mathlib `Says`).
+            "elab_rules : tactic\n  | `(tactic| foo) => do\n  let v := (← IO.getEnv \"CI\").isSome\n  pure ()\n",
+            "elab \"rd\" : term => do\n  let _ ← IO.FS.readFile \"/x\"\n  return Lean.mkNatLit 0\n",
+            "open IO in\nelab \"env\" : term => do\n  let _ ← getEnv \"X\"\n  return Lean.mkNatLit 0\n",
+            "def bad : String := include_str \"/etc/hostname\"\n",
+            // An `initialize` that registers something other than a linter calling a host reader.
+            "def r : IO Unit := do let _ ← IO.FS.readFile \"/x\"\ninitialize r\n",
+        ] {
+            assert!(pinned_dep_source_may_read_host_state(src), "{src}");
+        }
+    }
+
+    #[test]
+    fn test_host_effects_pinned_dep_anonymous_instance_host_reader_is_unnamed() {
+        // `instance : T := ...` declares no name: the type after `:` must not be mistaken for one.
+        for chunk in [
+            "instance : T := IO.FS.readFile \"/x\"\n",
+            "instance [Inhabited α] : T α := IO.FS.readFile \"/x\"\n",
+            "instance (priority := low) : T := IO.FS.readFile \"/x\"\n",
+            "structure : Type\n",
+        ] {
+            assert!(chunk_declared_names(chunk).is_empty(), "{chunk}");
+        }
+        assert_eq!(chunk_declared_names("instance foo : T := x\n"), vec!["foo"]);
+        assert_eq!(chunk_declared_names("def bar (n : Nat) : Nat := n\n"), vec!["bar"]);
+        assert_eq!(chunk_declared_names("structure S where\n  x : Nat\n"), vec!["S"]);
+        // Only the header is inspected: never attribute arguments or the body.
+        assert_eq!(chunk_declared_names("@[simp, instance low] def foo : T := x\n"), vec!["foo"]);
+        assert_eq!(chunk_declared_names("@[implemented_by def] def foo : T := x\n"), vec!["foo"]);
+        assert_eq!(
+            chunk_declared_names("def foo : Nat :=\n  let x := 1\n  have instance : True := trivial\n  x\n"),
+            vec!["foo"]
+        );
+        assert_eq!(
+            chunk_declared_names("@[instance]\nprivate noncomputable def Ns.qux : T := x\n"),
+            vec!["qux"]
+        );
+        // Universe-polymorphic names keep their name (no empty `""` component).
+        assert_eq!(chunk_declared_names("def foo.{u} (α : Sort u) : Sort u := α\n"), vec!["foo"]);
+        assert_eq!(chunk_declared_names("def Ns.bar.{u, v} : Nat := 0\n"), vec!["bar"]);
+        assert_eq!(chunk_declared_names("instance (priority := low) baz : T := x\n"), vec!["baz"]);
+        assert_eq!(chunk_declared_names("class inductive C where\n  | a\n"), vec!["C"]);
+        assert_eq!(chunk_declared_names("initialize r : IO.Ref Nat ← IO.mkRef 0\n"), vec!["r"]);
+        assert!(chunk_declared_names("initialize addLinter l\n").is_empty());
+        assert_eq!(chunk_declared_names("mutual\n  def a : Nat := b\n  def b : Nat := 0\nend\n"), vec!["a", "b"]);
+        for (chunk, inst) in [
+            ("instance foo : T := x\n", true),
+            ("@[instance low] def foo : T := x\n", true),
+            ("@[default_instance] instance : T := x\n", true),
+            ("attribute [instance] foo\n", true),
+            ("attribute [local instance 100] foo\n", true),
+            ("attribute [simp] foo\n", false),
+            ("def foo : Nat := instance\n", false),
+            ("@[simp] def foo : T := x\n", false),
+        ] {
+            assert_eq!(chunk_decl_header(chunk).instance, inst, "{chunk}");
+        }
+        // An anonymous host reader is unnamed, so any executing (non-linter) chunk taints, even one
+        // that never names `T`: fail closed.
+        let anon = "class T where\n  v : IO String\ninstance : T := ⟨IO.FS.readFile \"/x\"⟩\nrun_cmd do\n  let _ ← (T.v : IO String)\n";
+        assert!(pinned_dep_source_may_read_host_state(anon), "{anon}");
+        let anon_plain = "instance : T := IO.FS.readFile \"/x\"\nrun_cmd pure ()\n";
+        assert!(pinned_dep_source_may_read_host_state(anon_plain), "{anon_plain}");
+        // Typeclass instances are invoked implicitly by instance resolution, so a host-reading
+        // instance taints any executing chunk even when *named* and never referenced by name.
+        for src in [
+            "instance fooInst : T := IO.FS.readFile \"/x\"\nrun_cmd pure ()\n",
+            "instance myNamedInst : T := ⟨IO.FS.readFile \"/x\"⟩\nrun_cmd pure ()\n",
+            "@[instance low] instance : T := ⟨IO.FS.readFile \"/x\"⟩\nrun_cmd pure ()\n",
+            "@[instance] def hostInst : T := ⟨IO.FS.readFile \"/x\"⟩\nrun_cmd pure ()\n",
+            "@[default_instance] instance hostDefault : T := ⟨IO.FS.readFile \"/x\"⟩\nrun_cmd pure ()\n",
+            "def hostImpl : T := ⟨IO.FS.readFile \"/x\"⟩\nattribute [instance] hostImpl\nrun_cmd pure ()\n",
+        ] {
+            assert!(pinned_dep_source_may_read_host_state(src), "{src}");
+        }
+        // Contrast: a named, non-instance host reader no executing chunk references stays clean.
+        let named = "def fooDef : IO String := IO.FS.readFile \"/x\"\nrun_cmd pure ()\n";
+        assert!(!pinned_dep_source_may_read_host_state(named), "{named}");
+        // Attribute arguments never yield names: `@[implemented_by hostRead] def` declares only
+        // `safe`, so a run_cmd calling `safe` taints through `hostRead` being referenced.
+        let attr = "def hostRead : IO String := IO.FS.readFile \"/x\"\n@[implemented_by hostRead] opaque safe : IO String\nrun_cmd do\n  let _ ← safe\n";
+        assert!(pinned_dep_source_may_read_host_state(attr), "{attr}");
     }
 
     #[test]

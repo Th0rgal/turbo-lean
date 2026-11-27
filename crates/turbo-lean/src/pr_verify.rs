@@ -19357,24 +19357,45 @@ end ParityNs
                 let dep_beta_bytes = fs::read(&dep_olean)?;
                 std::env::set_var(ENV_KEY, "alpha");
                 fs::write(&flag_file, "alpha\n")?;
-                let refreshed = crate::lake_build::ensure_project_imports_fresh_for_check(
-                    &canon_app,
-                    std::slice::from_ref(&canon_app_lean),
+                // `Dep` lives in a dependency checkout (`.lake/packages/dep`) and its elaborator reads
+                // untracked host state. turbo-lean must neither delete that external `.olean` nor
+                // trust it (Lake's trace cannot see the env/file rotation, so a cache bypass would
+                // silently keep the stale `beta` artifact): it fails closed, naming the module.
+                let assert_external_fail_closed = |res: Result<usize>, what: &str| -> Result<()> {
+                    let err_msg = format!(
+                        "{:#}",
+                        res.expect_err(&format!(
+                            "{what}: tainted external host-effect dep must fail closed (git={use_git_pin})"
+                        ))
+                    );
+                    assert!(
+                        err_msg.contains("Refusing to trust stale external host-effect dependency")
+                            && err_msg.contains("`Dep`"),
+                        "{what}: expected actionable external-dep error naming `Dep` (git={use_git_pin}), got: {err_msg}"
+                    );
+                    assert_eq!(
+                        fs::read(&dep_olean)?,
+                        dep_beta_bytes,
+                        "{what}: external Dep.olean must never be deleted or rewritten (git={use_git_pin})"
+                    );
+                    Ok(())
+                };
+                assert_external_fail_closed(
+                    crate::lake_build::ensure_project_imports_fresh_for_check(
+                        &canon_app,
+                        std::slice::from_ref(&canon_app_lean),
+                    ),
+                    "writable dep build dir",
                 )?;
-                assert!(
-                    refreshed >= 1,
-                    "ensure_project_imports_fresh_for_check must refresh host-effect dep via Lake and verify post-refresh (git={use_git_pin})"
-                );
-                assert_ne!(
-                    fs::read(&dep_olean)?,
-                    dep_beta_bytes,
-                    "ensure_project_imports_fresh_for_check must purge and force Lake to re-elaborate Dep.olean across untracked env/file rotation (git={use_git_pin})"
-                );
+                // `depWitness true = true` only elaborates against the stale `beta` `Dep.olean`
+                // (`dep_env_ty := Bool`); under the current `alpha` host state it is `Nat`. A check
+                // that silently trusted the stale external artifact would therefore succeed: it must
+                // instead fail closed with the actionable external-dep error naming `Dep`.
                 fs::write(
                     &canon_app_lean,
-                    "import Dep\ntheorem app_check_thm : depWitness 0 = 0 := rfl\n",
+                    "import Dep\ntheorem app_check_thm : depWitness true = true := rfl\n",
                 )?;
-                let check_val = crate::check::run_check_command_value(
+                let check_res = crate::check::run_check_command_value(
                     &mut dep_store,
                     true,
                     canon_app_lean.clone(),
@@ -19383,11 +19404,22 @@ end ParityNs
                     Some(1),
                     false,
                     None,
-                )?;
+                );
+                let check_msg = format!(
+                    "{:#}",
+                    check_res.expect_err(&format!(
+                        "turbo-lean check must not trust a stale external host-effect Dep.olean (git={use_git_pin})"
+                    ))
+                );
+                assert!(
+                    check_msg.contains("Refusing to trust stale external host-effect dependency")
+                        && check_msg.contains("`Dep`"),
+                    "turbo-lean check must fail closed naming `Dep` (git={use_git_pin}), got: {check_msg}"
+                );
                 assert_eq!(
-                    check_val.get("status").and_then(|v| v.as_str()),
-                    Some("file_verified"),
-                    "turbo-lean check must elaborate App.lean against refreshed alpha Dep.olean (Nat), got: {check_val}"
+                    fs::read(&dep_olean)?,
+                    dep_beta_bytes,
+                    "turbo-lean check must never delete or rewrite the external Dep.olean (git={use_git_pin})"
                 );
                 #[cfg(unix)]
                 if unsafe { libc::geteuid() } != 0 {
@@ -19395,22 +19427,14 @@ end ParityNs
                     let dep_lib_dir = dep_in_pkgs.join(".lake/build/lib/lean");
                     let orig_mode = fs::metadata(&dep_lib_dir)?.permissions().mode();
                     fs::set_permissions(&dep_lib_dir, fs::Permissions::from_mode(0o555))?;
-                    let purge_err = crate::lake_build::ensure_project_imports_fresh_for_check(
+                    let purge_res = crate::lake_build::ensure_project_imports_fresh_for_check(
                         &canon_app,
                         std::slice::from_ref(&canon_app_lean),
                     );
                     let _ =
                         fs::set_permissions(&dep_lib_dir, fs::Permissions::from_mode(orig_mode));
-                    let err_msg = format!(
-                        "{:#}",
-                        purge_err.expect_err(
-                            "non-writable dep build dir must fail closed instead of silently skipping purge"
-                        )
-                    );
-                    assert!(
-                        err_msg.contains("Failed to purge stale build artifact"),
-                        "expected purge error message, got: {err_msg}"
-                    );
+                    // Non-writable dep build dir must fail closed instead of silently skipping purge.
+                    assert_external_fail_closed(purge_res, "non-writable dep build dir")?;
                 }
                 let _ = fs::remove_dir_all(&dep_case_root);
             }

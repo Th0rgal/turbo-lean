@@ -48,12 +48,13 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
         }
     }
     let mut tainted: HashSet<(PathBuf, String)> = HashSet::new();
-    let mut purged_any = false;
+    // Taint is computed for the whole closure before anything is deleted, so a fail-closed bail on
+    // an external module never leaves a half-purged build tree behind.
+    let mut to_purge: Vec<DiscoveredModuleSpec> = Vec::new();
     for spec in postorder {
         let Ok(src_raw) = fs::read_to_string(&spec.src_path) else {
             tainted.insert((spec.pkg_root.clone(), spec.module_name.clone()));
-            crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
-            purged_any = true;
+            to_purge.push(spec);
             continue;
         };
         let hdr = parse_header_info(&src_raw);
@@ -72,11 +73,94 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
             });
         if imp_tainted || spec_source_has_disallowed_elab_host_effects(cfg, &spec, &src_raw) {
             tainted.insert((spec.pkg_root.clone(), spec.module_name.clone()));
-            crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
-            purged_any = true;
+            to_purge.push(spec);
         }
     }
-    Ok(purged_any)
+    purge_in_project_or_fail_closed(
+        cfg,
+        &to_purge,
+        "may read host state (environment variables, files) at elaboration or import time",
+    )
+}
+
+/// Two-phase purge shared by every host-effect purge: if *any* spec in `to_purge` lies outside the
+/// root project, fail closed naming those modules *before* deleting anything (so a rejected check
+/// never leaves a half-purged build tree); otherwise delete all their build artifacts.
+///
+/// External package `.olean`s (`.lake/packages/*`, out-of-tree path deps) are never deleted, and a
+/// stale one is never trusted either: Lake's trace cannot observe the host state (environment,
+/// files) its elaborators read or the files it embeds, so bypassing the artifact cache would not make
+/// Lake re-elaborate it. Returns whether anything was purged (i.e. the Lake cache must be bypassed).
+fn purge_in_project_or_fail_closed(
+    cfg: &ProjectConfig,
+    to_purge: &[DiscoveredModuleSpec],
+    why: &str,
+) -> Result<bool> {
+    let external: Vec<&DiscoveredModuleSpec> =
+        to_purge.iter().filter(|s| !spec_in_project(cfg, s)).collect();
+    if !external.is_empty() {
+        return Err(external_host_effect_dependency_error(&external, why));
+    }
+    for spec in to_purge {
+        crate::lake_build::remove_spec_build_artifacts_checked(spec)?;
+    }
+    Ok(!to_purge.is_empty())
+}
+
+/// Purge the build artifacts of every module in `mods` that embeds files via `include_str` /
+/// `include_bin` (which Lake does not trace) and is not covered by a Lake `needs` input target.
+/// Unreadable sources count as embedding (fail closed). See [`purge_in_project_or_fail_closed`].
+pub(crate) fn purge_untraced_include_str_artifacts(
+    cfg: &ProjectConfig,
+    mods: &[String],
+) -> Result<bool> {
+    let to_purge: Vec<DiscoveredModuleSpec> = mods
+        .iter()
+        .filter(|m| {
+            input_bearing_libs_for_module(cfg, m).is_empty()
+                && input_bearing_exes_for_module(cfg, m).is_empty()
+        })
+        .filter_map(|m| {
+            resolve_module_in_package(&cfg.root_pkg, true, m).or_else(|| {
+                match resolve_import_site(cfg, m) {
+                    ImportSite::Module(s) => Some(*s),
+                    _ => None,
+                }
+            })
+        })
+        .filter(|spec| {
+            fs::read_to_string(&spec.src_path)
+                .map(|s| source_uses_include_str(&s))
+                .unwrap_or(true)
+        })
+        .collect();
+    purge_in_project_or_fail_closed(
+        cfg,
+        &to_purge,
+        "embeds files via `include_str`/`include_bin` that Lake does not trace",
+    )
+}
+
+/// Fail-closed error for stale or host-state-dependent `.olean`s that live in a dependency checkout
+/// (outside the root project). turbo-lean never deletes such artifacts and never trusts them.
+pub(crate) fn external_host_effect_dependency_error(
+    specs: &[&DiscoveredModuleSpec],
+    why: &str,
+) -> anyhow::Error {
+    let mut mods: Vec<String> = specs
+        .iter()
+        .map(|s| format!("`{}` (package `{}`)", s.module_name, s.pkg_root.display()))
+        .collect();
+    mods.sort();
+    mods.dedup();
+    anyhow::anyhow!(
+        "Refusing to trust stale external host-effect dependency module(s) {}: the module {}, so its \
+         `.olean` cannot be proven fresh, and turbo-lean never deletes dependency-checkout artifacts. \
+         Rebuild that dependency package explicitly under the current host state (or remove the host \
+         read from it), then retry.",
+        mods.join(", "),
+        why
+    )
 }
 
 pub(crate) fn source_ineligible_for_stamp_reuse(
@@ -89,13 +173,81 @@ pub(crate) fn source_ineligible_for_stamp_reuse(
     let Ok(pkg_root) = fs::canonicalize(pkg_root) else {
         return true;
     };
-    crate::splitter::source_may_read_host_state(src_raw)
+    let reads_host = if pkg_root_is_clean_git_pinned_dep(cfg, &pkg_root) {
+        crate::splitter::pinned_dep_source_may_read_host_state(src_raw)
+    } else {
+        crate::splitter::source_may_read_host_state(src_raw)
+    };
+    reads_host
         || !std::iter::once(&cfg.root_pkg)
             .chain(cfg.dep_pkgs.iter())
             .find(|pkg| fs::canonicalize(&pkg.pkg_root).is_ok_and(|root| root == pkg_root))
             .is_some_and(|pkg| {
                 module_includes_all_covered_by_lake_inputs(pkg, module_name, src_path, src_raw)
             })
+}
+
+/// `canon_pkg_root` (already canonical) is a non-root dependency whose checkout is a clean Git
+/// checkout of the exact revision pinned in `lake-manifest.json`. Fails closed (`false`).
+pub(crate) fn pkg_root_is_clean_git_pinned_dep(cfg: &ProjectConfig, canon_pkg_root: &Path) -> bool {
+    if fs::canonicalize(&cfg.root_pkg.pkg_root).is_ok_and(|r| r == canon_pkg_root) {
+        return false;
+    }
+    let Some(pkg) = cfg
+        .dep_pkgs
+        .iter()
+        .find(|p| fs::canonicalize(&p.pkg_root).is_ok_and(|r| r == canon_pkg_root))
+    else {
+        return false;
+    };
+    is_clean_git_pinned_pkg(cfg, false, &pkg.name, &pkg.base_name, canon_pkg_root)
+}
+
+/// True iff `path` lies inside the root project's own tree and outside every dependency package
+/// checkout (e.g. `.lake/packages/*`). Only such artifacts may be deleted or reseeded by turbo-lean;
+/// external package `.olean`s belong to their (git-pinned) checkouts and are never touched.
+/// Fails closed (`false`) when either path cannot be canonicalized.
+pub(crate) fn path_in_project(root: &Path, path: &Path) -> bool {
+    let Ok(canon_root) = fs::canonicalize(root) else {
+        return false;
+    };
+    // The path may not exist yet (e.g. a build dir); canonicalize its nearest existing ancestor.
+    let mut existing = path;
+    let mut suffix = Vec::new();
+    let canon_path = loop {
+        match fs::canonicalize(existing) {
+            Ok(c) => break suffix.iter().rev().fold(c, |acc: PathBuf, s| acc.join(s)),
+            Err(_) => match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    if name == ".." {
+                        return false;
+                    }
+                    suffix.push(name.to_os_string());
+                    existing = parent;
+                }
+                _ => return false,
+            },
+        }
+    };
+    if !canon_path.starts_with(&canon_root) {
+        return false;
+    }
+    let rel = canon_path.strip_prefix(&canon_root).unwrap_or(Path::new(""));
+    !rel.starts_with(".lake/packages")
+}
+
+/// [`path_in_project`] for a module spec: the spec's package root must be the root project itself
+/// (not a dependency checkout nested under it).
+pub(crate) fn spec_in_project(cfg: &ProjectConfig, spec: &DiscoveredModuleSpec) -> bool {
+    let root = &cfg.root_pkg.pkg_root;
+    path_in_project(root, &spec.pkg_root)
+        && path_in_project(root, &spec.build_lib_lean_dir)
+        && !cfg.dep_pkgs.iter().any(|dp| {
+            fs::canonicalize(&dp.pkg_root)
+                .ok()
+                .zip(fs::canonicalize(&spec.pkg_root).ok())
+                .is_some_and(|(d, s)| d == s)
+        })
 }
 
 pub(super) fn source_has_disallowed_elab_host_effects_for_module(
