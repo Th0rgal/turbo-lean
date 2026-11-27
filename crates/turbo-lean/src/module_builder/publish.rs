@@ -2954,6 +2954,7 @@ pub(super) fn build_shared_object(
 pub(super) fn build_wave_native_artifacts(
     cfg: &ProjectConfig,
     dag: &ModuleDag,
+    canon_project_dir: &Path,
     wave: &[String],
     preserve_project: bool,
     completed_mods: &HashSet<String>,
@@ -2966,7 +2967,7 @@ pub(super) fn build_wave_native_artifacts(
         let Some(node) = dag.nodes.get(mod_name) else {
             continue;
         };
-        if crate::lake_build::worktree_auto_link_disabled(&node.pkg_root) {
+        if package_is_read_only(canon_project_dir, &node.pkg_root) {
             continue;
         }
         if node.needs_co_export {
@@ -2994,7 +2995,7 @@ pub(super) fn build_wave_native_artifacts(
         else {
             continue;
         };
-        if crate::lake_build::worktree_auto_link_disabled(&pkg.pkg_root) {
+        if package_is_read_only(canon_project_dir, &pkg.pkg_root) {
             built_shared_libs.insert(key);
             continue;
         }
@@ -3012,6 +3013,37 @@ pub(super) fn build_wave_native_artifacts(
 }
 
 pub(super) static PUBLISH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// `#436` / P7: a package outside the project being built (e.g. `require x from "../x"`) or one
+/// that opts out of worktree linking is read-only. Its Lake-built artifacts may be reused, but
+/// nothing is compiled, published, wiped or locked under its `.lake`.
+pub(super) fn package_is_read_only(canon_project_dir: &Path, pkg_root: &Path) -> bool {
+    !pkg_root.starts_with(canon_project_dir)
+        || crate::lake_build::worktree_auto_link_disabled(pkg_root)
+}
+
+/// Error for a module of a read-only package that would need a rebuild.
+pub(super) fn read_only_package_rebuild_error(
+    canon_project_dir: &Path,
+    node: &ModuleNode,
+    what: &str,
+) -> anyhow::Error {
+    if node.pkg_root.starts_with(canon_project_dir) {
+        anyhow::anyhow!(
+            "Worktree opt-out prevents {what} `{}`; build with Lake first",
+            node.module_name
+        )
+    } else {
+        anyhow::anyhow!(
+            "Dependency `{}` at `{}` is outside this project, so turbo-lean never compiles or publishes into it, and its module `{}` is stale or unbuilt: run `lake build {}` in `{}` first",
+            node.pkg_name,
+            node.pkg_root.display(),
+            node.module_name,
+            node.target_name,
+            node.pkg_root.display()
+        )
+    }
+}
 
 pub(super) fn acquire_publish_flock_mode(
     pkg_root: &Path,
@@ -3535,7 +3567,7 @@ pub(super) fn store_module_artifacts_in_cas(
             .lock()
             .map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
         let preserve_lake = crate::lake_build::worktree_auto_link_disabled(canon_project_dir)
-            || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
+            || package_is_read_only(canon_project_dir, &node.pkg_root);
         let _flock_guard = acquire_publish_flock_mode(&node.pkg_root, false, preserve_lake)?;
         let artifact_files = collect_module_artifact_paths(node);
         let paths: Vec<_> = artifact_files.iter().map(|(_, p)| p.clone()).collect();
@@ -4018,13 +4050,10 @@ pub(super) fn try_compute_initial_module_action_keys(
             cached.clone()
         } else {
             let preserve_dep = preserve_project
-                || crate::lake_build::worktree_auto_link_disabled(&dep_node.pkg_root);
+                || package_is_read_only(&cfg.root_pkg.pkg_root, &dep_node.pkg_root);
             let computed = if validate_materialized_module_artifacts(dep_node, preserve_dep) {
-                compute_module_artifact_tier_digests_with_policy(
-                    &dep_node.olean_path,
-                    preserve_project,
-                )
-                .ok()
+                compute_module_artifact_tier_digests_with_policy(&dep_node.olean_path, preserve_dep)
+                    .ok()
             } else {
                 None
             };
@@ -4146,7 +4175,7 @@ pub(super) fn read_consistent_module_cas_blobs_locked(
         .lock()
         .map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
     let preserve_lake = crate::lake_build::worktree_auto_link_disabled(canon_project_dir)
-        || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
+        || package_is_read_only(canon_project_dir, &node.pkg_root);
     let _flock_guard = acquire_publish_flock_mode(&node.pkg_root, false, preserve_lake)?;
     let artifact_files = collect_module_artifact_paths(node);
     let paths: Vec<_> = artifact_files.iter().map(|(_, p)| p.clone()).collect();
@@ -4284,7 +4313,7 @@ pub(crate) fn hydrate_project_traces_with_store(
     for (is_root, pkg) in
         std::iter::once((true, &cfg.root_pkg)).chain(cfg.dep_pkgs.iter().map(|dp| (false, dp)))
     {
-        if crate::lake_build::worktree_auto_link_disabled(&pkg.pkg_root) {
+        if package_is_read_only(&canon_dir, &pkg.pkg_root) {
             continue;
         }
         report.packages_scanned += 1;
@@ -4309,6 +4338,9 @@ pub(crate) fn hydrate_project_traces_with_store(
 
     let write_empty_manifests_with_root_inputs = |pkgs: &[&PackageConfig]| -> Result<()> {
         for pkg in pkgs {
+            if package_is_read_only(&canon_dir, &pkg.pkg_root) {
+                continue;
+            }
             let build_dir = pkg.pkg_root.join(".lake/build");
             let manifest_path = build_dir.join(".turbo_verified_sources.json");
             if pkg.pkg_root == cfg.root_pkg.pkg_root && !expected_lake_inputs.is_empty() {
@@ -4585,6 +4617,9 @@ pub(crate) fn hydrate_project_traces_with_store(
     }
 
     for pkg in &scanned_pkgs {
+        if package_is_read_only(&canon_dir, &pkg.pkg_root) {
+            continue;
+        }
         let build_dir = pkg.pkg_root.join(".lake/build");
         let manifest_path = build_dir.join(".turbo_verified_sources.json");
         let keep_empty_root_inputs =
@@ -4719,7 +4754,7 @@ pub(crate) fn build_project_modules_native_with_options(
     }
     // Opted-out packages must not acquire new build directories either.
     for pkg in std::iter::once(&cfg.root_pkg).chain(&cfg.dep_pkgs) {
-        if !preserve_project && !crate::lake_build::worktree_auto_link_disabled(&pkg.pkg_root) {
+        if !preserve_project && !package_is_read_only(&canon_dir, &pkg.pkg_root) {
             fs::create_dir_all(pkg.pkg_root.join(&pkg.build_dir).join(&pkg.lean_lib_dir))?;
             fs::create_dir_all(pkg.pkg_root.join(&pkg.build_dir).join(&pkg.native_lib_dir))?;
             fs::create_dir_all(pkg.pkg_root.join(&pkg.build_dir).join(&pkg.ir_dir))?;
@@ -4785,6 +4820,7 @@ pub(crate) fn build_project_modules_native_with_options(
             let handles: Vec<_> = (0..workers)
                 .map(|_| {
                     let idx_ref = &next_idx;
+                    let canon_ref = canon_dir.as_path();
                     s.spawn(move || {
                         let mut local = Vec::new();
                         loop {
@@ -4796,7 +4832,7 @@ pub(crate) fn build_project_modules_native_with_options(
                             local.push(
                                 compute_module_artifact_tier_digests_parallel_safe(
                                     p,
-                                    preserve_project,
+                                    preserve_project || !p.starts_with(canon_ref),
                                 )
                                 .map(|td| (m.clone(), td)),
                             );
@@ -4823,7 +4859,10 @@ pub(crate) fn build_project_modules_native_with_options(
         }
     } else {
         for (ext_mod, ext_path) in &unique_ext_paths {
-            let td = compute_module_artifact_tier_digests_with_policy(ext_path, preserve_project)?;
+            let td = compute_module_artifact_tier_digests_with_policy(
+                ext_path,
+                preserve_project || !ext_path.starts_with(&canon_dir),
+            )?;
             olean_digests.insert(ext_mod.clone(), td.full.clone());
             tier_digests.insert(ext_mod.clone(), td);
         }
@@ -4998,9 +5037,10 @@ pub(crate) fn build_project_modules_native_with_options(
                     PendingAuditOrigin::WarmAdopted { .. }
                     | PendingAuditOrigin::Compiled { .. } => {
                         preserve_project
-                            || dag.nodes.get(cand_mod).is_some_and(|n| {
-                                crate::lake_build::worktree_auto_link_disabled(&n.pkg_root)
-                            })
+                            || dag
+                                .nodes
+                                .get(cand_mod)
+                                .is_some_and(|n| package_is_read_only(&canon_dir, &n.pkg_root))
                     }
                 };
                 if !preserve_cand {
@@ -5046,6 +5086,7 @@ pub(crate) fn build_project_modules_native_with_options(
 
         for _ in 0..compile_pool_size {
             let tx = event_tx.clone();
+            let canon_dir_ref = canon_dir.as_path();
             s.spawn(move || loop {
                 let job_opt = {
                     let mut guard = compile_work_queue_ref
@@ -5066,8 +5107,8 @@ pub(crate) fn build_project_modules_native_with_options(
                     break;
                 };
                 let node = dag_ref.nodes.get(&mod_name).expect("node in dag");
-                let preserve_lake = preserve_project
-                    || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
+                let preserve_lake =
+                    preserve_project || package_is_read_only(canon_dir_ref, &node.pkg_root);
                 let res = compile_single_module_staged(
                     cfg_ref,
                     dag_ref,
@@ -5163,8 +5204,8 @@ pub(crate) fn build_project_modules_native_with_options(
                     let eval_res: Result<()> = (|| {
                         let node = dag.nodes.get(&mod_name).expect("ready module in dag");
                         let verified_ready = in_degree.get(&mod_name).copied().unwrap_or(0) == 0;
-                        let preserve_lake = preserve_project
-                            || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
+                        let preserve_lake =
+                            preserve_project || package_is_read_only(&canon_dir, &node.pkg_root);
                         let (dep_digests_vec, raw_imp_dynlibs, dynlib_digests) = {
                             let active_tiers = if verified_ready {
                                 &tier_digests
@@ -5416,10 +5457,13 @@ pub(crate) fn build_project_modules_native_with_options(
                                 parked_for_compile.insert(mod_name);
                                 return Ok(());
                             }
-                            anyhow::ensure!(
-                                !preserve_lake,
-                                "Worktree opt-out prevents rebuilding invalid CAS outputs for `{mod_name}`; build with Lake first"
-                            );
+                            if preserve_lake {
+                                return Err(read_only_package_rebuild_error(
+                                    &canon_dir,
+                                    node,
+                                    "rebuilding invalid CAS outputs for",
+                                ));
+                            }
                         } else {
                             if !is_untrusted && !node_has_elab_host_effects {
                                 let warm_opt = {
@@ -5511,10 +5555,13 @@ pub(crate) fn build_project_modules_native_with_options(
                                 parked_for_compile.insert(mod_name);
                                 return Ok(());
                             }
-                            anyhow::ensure!(
-                                !preserve_lake,
-                                "Worktree opt-out prevents compiling uncached module `{mod_name}`; build with Lake first"
-                            );
+                            if preserve_lake {
+                                return Err(read_only_package_rebuild_error(
+                                    &canon_dir,
+                                    node,
+                                    "compiling uncached module",
+                                ));
+                            }
                             wipe_node_locked(node, preserve_lake)?;
                             shared_exp_memo.remove(&(mod_name.clone(), false));
                             shared_exp_memo.remove(&(mod_name.clone(), true));
@@ -5539,6 +5586,18 @@ pub(crate) fn build_project_modules_native_with_options(
                     let mod_key = compile_keys
                         .remove(&mod_name)
                         .expect("compile_keys contains ready module");
+                    if let Some(node) = dag
+                        .nodes
+                        .get(&mod_name)
+                        .filter(|n| preserve_project || package_is_read_only(&canon_dir, &n.pkg_root))
+                    {
+                        fatal_err = Some(read_only_package_rebuild_error(
+                            &canon_dir,
+                            node,
+                            "compiling",
+                        ));
+                        break;
+                    }
                     if !cfg.lean_bin.is_file() {
                         fatal_err = Some(anyhow::anyhow!(
                             "Cannot compile uncached Lean module `{}` for {} because no `lean` compiler binary is installed on this host (requested toolchain `{}`)",
@@ -5613,7 +5672,7 @@ pub(crate) fn build_project_modules_native_with_options(
                             (expected_origin_dig, dag.nodes.get(&m))
                         {
                             let preserve_lake = preserve_project
-                                || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
+                                || package_is_read_only(&canon_dir, &node.pkg_root);
                             let pre_dig_ok = compute_olean_artifact_set_digest_with_policy(
                                 &node.olean_path,
                                 preserve_lake,
@@ -5855,8 +5914,8 @@ pub(crate) fn build_project_modules_native_with_options(
                             continue;
                         };
                         let node = dag.nodes.get(&mod_name).expect("audited module in dag");
-                        let preserve_lake = preserve_project
-                            || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
+                        let preserve_lake =
+                            preserve_project || package_is_read_only(&canon_dir, &node.pkg_root);
                         let auth_dig_opt = match snap_auth_opt.as_ref() {
                             Some(ModuleAuditAuthority::Snapshot((snap, _, _))) => {
                                 crate::zygote::ensure_bound_audit_closure(
@@ -5991,7 +6050,10 @@ pub(crate) fn build_project_modules_native_with_options(
                                                     _ => {
                                                         preserve_project
                                                             || dag.nodes.get(d).is_some_and(|dn| {
-                                                                crate::lake_build::worktree_auto_link_disabled(&dn.pkg_root)
+                                                                package_is_read_only(
+                                                                    &canon_dir,
+                                                                    &dn.pkg_root,
+                                                                )
                                                             })
                                                     }
                                                 };
@@ -6064,7 +6126,7 @@ pub(crate) fn build_project_modules_native_with_options(
                                         print!("{}", formatted);
                                     }
                                 }
-                                if emit_lake_sidecars {
+                                if emit_lake_sidecars && !preserve_lake {
                                     write_lake_module_hashes_and_trace_with_memo(
                                         &cfg,
                                         &dag,
@@ -6138,7 +6200,7 @@ pub(crate) fn build_project_modules_native_with_options(
                                 if !json_output && !formatted_stdout.trim().is_empty() {
                                     print!("{}", formatted_stdout);
                                 }
-                                if emit_lake_sidecars {
+                                if emit_lake_sidecars && !preserve_lake {
                                     write_lake_module_hashes_and_trace_with_memo(
                                         &cfg,
                                         &dag,
@@ -6269,7 +6331,7 @@ pub(crate) fn build_project_modules_native_with_options(
                                 let accepted_tiers =
                                     match compute_module_artifact_tier_digests_with_policy(
                                         &node.olean_path,
-                                        preserve_project,
+                                        preserve_lake,
                                     ) {
                                         Ok(td) if td.full == accepted_dig => td,
                                         Ok(_) => {
@@ -6298,6 +6360,7 @@ pub(crate) fn build_project_modules_native_with_options(
                                     if let Err(e) = build_wave_native_artifacts(
                                         &cfg,
                                         &dag,
+                                        &canon_dir,
                                         std::slice::from_ref(&mod_name),
                                         preserve_project,
                                         &completed_mods,
@@ -6673,8 +6736,9 @@ pub fn build_cone_export_filter(
         for (ext_mod, ext_path) in &node.external_olean_deps {
             allowed_replay_modules.insert(ext_mod.clone());
             if !tier_digests.contains_key(ext_mod) {
+                let preserve_ext = preserve_project || !ext_path.starts_with(&canon_dir);
                 if let Ok(td) =
-                    compute_module_artifact_tier_digests_with_policy(ext_path, preserve_project)
+                    compute_module_artifact_tier_digests_with_policy(ext_path, preserve_ext)
                 {
                     tier_digests.insert(ext_mod.clone(), td);
                 }
@@ -6690,11 +6754,13 @@ pub fn build_cone_export_filter(
         let Some(node) = dag.nodes.get(mod_name) else {
             continue;
         };
+        let preserve_node =
+            preserve_project || package_is_read_only(&canon_dir, &node.pkg_root);
         let Ok((dep_digests_vec, _, dynlib_digests)) =
             gather_module_dep_digests_and_dynlibs(&cfg, &dag, node, &tier_digests)
         else {
             if let Ok(disk_td) =
-                compute_module_artifact_tier_digests_with_policy(&node.olean_path, preserve_project)
+                compute_module_artifact_tier_digests_with_policy(&node.olean_path, preserve_node)
             {
                 tier_digests.insert(mod_name.clone(), disk_td);
             }
@@ -6736,7 +6802,7 @@ pub fn build_cone_export_filter(
         }
         if resolved_tiers.is_none() {
             if let Ok(disk_td) =
-                compute_module_artifact_tier_digests_with_policy(&node.olean_path, preserve_project)
+                compute_module_artifact_tier_digests_with_policy(&node.olean_path, preserve_node)
             {
                 resolved_tiers = Some(disk_td);
             }
