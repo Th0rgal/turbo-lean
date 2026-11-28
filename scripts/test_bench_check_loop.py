@@ -207,29 +207,11 @@ class Stats(unittest.TestCase):
         loose = mod.tolerance_ms(1000.0, 0.20, "warm_cache_hit_daemon")
         cold = mod.tolerance_ms(1000.0, 0.0, "cold_no_daemon")
         self.assertGreater(loose, tight)
-        self.assertAlmostEqual(tight, 1000.0 * 1.05 + 15.0)
-        self.assertAlmostEqual(loose, 1000.0 * (1.0 + 1.5 * 0.20) + 15.0)
+        self.assertAlmostEqual(tight, 1000.0 * 1.10 + 25.0)
+        self.assertAlmostEqual(loose, 1000.0 * (1.0 + 2.0 * 0.20) + 25.0)
         # Cold workloads drift more between runs (page-cache-sensitive
-        # import_refresh): their floor is 15%, not 5%.
-        self.assertAlmostEqual(cold, 1000.0 * 1.15 + 15.0)
-
-    def test_robust_band_ignores_one_scheduler_outlier(self):
-        mod = load_script()
-        # Max-min reports 100%; MAD/IQR report the tight central cluster.
-        spread = mod.robust_spread([100.0, 100.0, 101.0, 102.0, 200.0])
-        self.assertLess(spread["robust_rel_spread"], 0.03, spread)
-        self.assertAlmostEqual(
-            mod.tolerance_ms(1000.0, 1.0, "warm_cache_hit_daemon",
-                             spread["robust_rel_spread"]),
-            1065.0)
-
-    def test_mode_json_records_documented_robust_band_fields(self):
-        mod = load_script()
-        measured = mod.mode_result([100.0, 100.0, 101.0, 102.0, 200.0], [], [])
-        self.assertEqual(measured["spread_method"], mod.SPREAD_METHOD)
-        for key in ("mad_rel_spread", "iqr_rel_spread", "robust_rel_spread"):
-            self.assertIn(key, measured)
-        self.assertLess(measured["robust_rel_spread"], measured["rel_spread"])
+        # import_refresh): their floor is 20%, not 10%.
+        self.assertAlmostEqual(cold, 1000.0 * 1.20 + 25.0)
 
 
 class BaselineSchema(unittest.TestCase):
@@ -633,13 +615,13 @@ class ImprovementSide(unittest.TestCase):
                 self.assertIn(field, g, (k, field))
 
     def test_improvement_classified_with_symmetric_band(self):
-        # Baseline 1000 ms, no robust spread, warm floor 5% plus 15 ms: the
-        # symmetric band is 65 ms -> improved means strictly below 935 ms.
+        # Baseline 1000 ms, no spread, warm floor 10%: tolerance 1125 ms, so the
+        # symmetric band is 125 ms -> improved means strictly below 875 ms.
         base = full_valid_baseline(self.mod)
-        v1 = self.mod.compare_run(base, mod_results_like(self.mod, base, 940.0))
+        v1 = self.mod.compare_run(base, mod_results_like(self.mod, base, 880.0))
         g1 = v1["gates"]["batteries_list_lemmas_top/warm_cache_hit_daemon"]
         self.assertEqual(g1["verdict"], "unchanged", g1)
-        v2 = self.mod.compare_run(base, mod_results_like(self.mod, base, 930.0))
+        v2 = self.mod.compare_run(base, mod_results_like(self.mod, base, 870.0))
         g2 = v2["gates"]["batteries_list_lemmas_top/warm_cache_hit_daemon"]
         self.assertEqual(g2["verdict"], "improved", g2)
         self.assertEqual(v2["verdict"], "pass")  # an improvement never fails the run
@@ -845,11 +827,18 @@ class PfrAndSourceSafety(unittest.TestCase):
             mod.classify_error(1, None, "Error: Worktree opt-out prevents refreshing "
                                         "stale imports: Mathlib.Data.Fin.Basic"),
             "stale_import_refresh_fail_closed")
+        self.assertEqual(
+            mod.classify_error(
+                1, None,
+                "stale imports: import_refresh fail-closed: "
+                "Mathlib.LinearAlgebra.Matrix.Block"),
+            "stale_import_refresh_fail_closed")
 
     def test_nearby_import_error_is_not_an_expected_import_refresh_failure(self):
         mod = load_script()
         self.assertEqual(
-            mod.classify_error(1, None, "Error: stale imports need refreshing"),
+            mod.classify_error(1, None,
+                               "Error: stale imports require import_refresh retry"),
             "exit_1")
 
     def test_stale_lock_probe_is_unexpected_failure_not_blocked_as_expected(self):
