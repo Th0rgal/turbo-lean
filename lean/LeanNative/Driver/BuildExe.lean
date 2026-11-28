@@ -31,11 +31,20 @@ def resolveStandaloneLinkMode (isDarwin forceStandalone forceDynamic hasStaticLe
   else
     .ok (!isDarwin && !forceDynamic && hasStaticLeanRt && hasStaticInit)
 
-/-- Resolve the Lean 4.35 sysroot path reliably even when `lean` is not on `PATH`. -/
+/-- Resolve the Lean 4.35 sysroot path reliably even when `lean` is not on `PATH`.
+    When running inside the `lean` binary itself (e.g. an `#eval` during a sandboxed module build
+    with a cleared environment), the sysroot is the parent of the running executable's `bin/`. -/
 def resolveLeanSysroot : IO System.FilePath := do
   if let some envRoot ← IO.getEnv "LEAN_SYSROOT" then
     if !envRoot.isEmpty then
       return System.FilePath.mk envRoot
+  try
+    let app ← IO.appPath
+    if app.fileStem == some "lean" then
+      if let some root := app.parent.bind (·.parent) then
+        if ← (root / "lib" / "lean" / "Init.olean").pathExists then
+          return root
+  catch _ => pure ()
   try
     Lean.findSysroot
   catch _ =>
