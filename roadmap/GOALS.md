@@ -34,7 +34,7 @@ In Lean 4 builds, **85–95% of wall-clock time** is spent in `Lean.Elab` (`Meta
 2. **Untrusted Elaboration $\to$ Distilled CAS Kernel Witness (`LNIR_EXPR_V1`)**:
    - Treat `Lean.Elab` strictly as a **cold-path hint generator** for proof bodies.
    - When a declaration is elaborated once, extract and compress its resulting kernel `Expr` proof term (or zero-dependency certificate: `simp only [...]` lemma list, Farkas linear combination witness for `omega`, LRAT witness for `bv_decide`, `MathlibZeroDepCert`) into the content-addressed store (`LeanSys.Store`).
-3. **Warm Build & CI Elaboration Bypass (`turbo-lean build --replay-cas-expr`)**:
+3. **Warm Build & CI Elaboration Bypass**:
    - Whenever a theorem's statement and dependency cone hashes match the CAS, **skip `Lean.Elab` and `MetaM` 100%** and feed the cached `LNIR_EXPR_V1` proof term directly into the `con-leche` kernel checker (`< 1 ms` per module).
 4. **Elaboration Hotspot Accelerators (Cold Path)**:
    - Cache `DiscrTree` and `synthInstance` diamond resolutions in memory-mapped `.olean` sidecars so cold `MetaM` elaboration of algebra/analysis modules (`R1`/`R2`) drops by $\ge 2.5\times$.
