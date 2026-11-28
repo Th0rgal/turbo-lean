@@ -713,6 +713,9 @@ class PfrAndSourceSafety(unittest.TestCase):
          "    if mode == 'unexpected' or (mode == 'unexpected_second' and n == 1):\n"
          "        print(json.dumps({'error': 'Error: Declaration `typo` not found in PFR/MoreRuzsaDist.lean'}))\n"
          "        sys.exit(1)\n"
+         "    if mode == 'unrelated':\n"
+         "        print(json.dumps({'error': 'Error: unrelated failure'}))\n"
+         "        sys.exit(1)\n"
          "    if mode == 'id_unconfirmed':\n"
          "        sys.stderr.write(\"Error: Cannot report a verdict: declaration identity unconfirmed for `rdist_of_neg_le`\\nerror: unknown module prefix 'PFR'\\n\")\n"
          "        sys.exit(1)\n"
@@ -802,12 +805,12 @@ class PfrAndSourceSafety(unittest.TestCase):
             self.assertIn("blocked_workload_unexpected_failure", r.stdout + r.stderr)
             self.assertIn("declaration_not_found", r.stdout + r.stderr)
 
-    def test_generic_stale_lock_failure_is_not_import_refresh_class(self):
-        """DeepSeek2670: 'build lock is stale' matched the broad bare-'stale' rule."""
+    def test_stale_lock_has_its_own_failure_class(self):
+        """A stale lock is not the expected stale-import PFR block."""
         mod = load_script()
         self.assertEqual(
             mod.classify_error(1, None, "Error: build lock is stale, retry later"),
-            "exit_1")
+            "stale_build_lock")
 
     def test_unrelated_stale_text_is_not_import_refresh_class(self):
         mod = load_script()
@@ -824,6 +827,19 @@ class PfrAndSourceSafety(unittest.TestCase):
             mod.classify_error(1, None, "Error: Worktree opt-out prevents refreshing "
                                         "stale imports: Mathlib.Data.Fin.Basic"),
             "stale_import_refresh_fail_closed")
+        self.assertEqual(
+            mod.classify_error(
+                1, None,
+                "stale imports: import_refresh fail-closed: "
+                "Mathlib.LinearAlgebra.Matrix.Block"),
+            "stale_import_refresh_fail_closed")
+
+    def test_nearby_import_error_is_not_an_expected_import_refresh_failure(self):
+        mod = load_script()
+        self.assertEqual(
+            mod.classify_error(1, None,
+                               "Error: stale imports require import_refresh retry"),
+            "exit_1")
 
     def test_stale_lock_probe_is_unexpected_failure_not_blocked_as_expected(self):
         with tempfile.TemporaryDirectory(prefix="m1-pfr-lock-") as td:
@@ -834,7 +850,7 @@ class PfrAndSourceSafety(unittest.TestCase):
             data = json.loads((Path(td) / "o.json").read_text())
             pfr = data["workloads"]["pfr_more_ruzsa_dist"]
             self.assertEqual(pfr["status"], "blocked_unexpected_failure", pfr)
-            self.assertEqual(pfr["error_class"], "exit_1", pfr)
+            self.assertEqual(pfr["error_class"], "stale_build_lock", pfr)
             self.assertNotIn("stale_import_refresh_fail_closed",
                              pfr["probe_error_classes"], pfr)
 
@@ -843,6 +859,14 @@ class PfrAndSourceSafety(unittest.TestCase):
             r = self._run(td, ["--no-baseline"], env_extra={"FAKE_PFR_MODE": "stale_text"})
             self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
             self.assertIn("blocked_workload_unexpected_failure", r.stdout + r.stderr)
+
+    def test_full_stub_unrelated_failure_exits_four(self):
+        """An unrelated PFR stub error is a setup failure, never a pass."""
+        with tempfile.TemporaryDirectory(prefix="m1-pfr-unrelated-") as td:
+            r = self._run(td, ["--no-baseline"], env_extra={"FAKE_PFR_MODE": "unrelated"})
+            self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+            self.assertIn("blocked_workload_unexpected_failure", r.stdout + r.stderr)
+            self.assertIn("exit_1", r.stdout + r.stderr)
 
     def test_mixed_genuine_and_stale_lock_probes_are_rejected(self):
         with tempfile.TemporaryDirectory(prefix="m1-pfr-mixed-lock-") as td:

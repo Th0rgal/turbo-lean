@@ -803,6 +803,12 @@ def classify_error(returncode, parsed, stderr):
         text = str(parsed.get("error", ""))
     text = text + "\n" + (stderr or "")
     low = text.lower()
+    # A stale build lock is transient scheduler state, not evidence that the
+    # PFR import-refresh block remains.  Match lock *words* and their genuine
+    # diagnostics only: module names such as Matrix.Block and Clock are not
+    # lock errors.
+    if re.search(r"\b(?:stale\s+(?:build\s+)?lock|(?:build\s+)?lock\s+is\s+stale)\b", low):
+        return "stale_build_lock"
     if "declaration identity unconfirmed" in low and "unknown module prefix" in low:
         return "declaration_identity_unknown_module_prefix"
     if "declaration identity unconfirmed" in low:
@@ -811,8 +817,10 @@ def classify_error(returncode, parsed, stderr):
         return "declaration_not_found"
     if "failed to read" in low and "no such file" in low:
         return "source_file_not_found"
+    # These exact fail-closed diagnostics are the only expected PFR import
+    # errors.  Do not classify generic stale/cache/import text as the block.
     if ("worktree opt-out prevents refreshing stale imports" in low
-            or ("stale imports" in low and "import_refresh" in low)
+            or "stale imports: import_refresh fail-closed" in low
             or "fail-closed import freshness gate" in low):
         return "stale_import_refresh_fail_closed"
     if "warn.sorry" in low or "sorry" in low:
