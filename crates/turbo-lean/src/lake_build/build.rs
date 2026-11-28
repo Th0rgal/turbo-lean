@@ -64,25 +64,6 @@ pub(crate) fn seed_project_theorem_shards_from_splits(
     Ok((files_seeded, shards_seeded))
 }
 
-pub(crate) fn seed_theorem_shards_for_files(
-    store: &mut TurboStore,
-    canon_dir: &Path,
-    toolchain: &str,
-    trust_domain: &str,
-    lean_files: &[PathBuf],
-) -> Result<(usize, usize, usize)> {
-    let (split_entries, split_cache_hits) = load_and_split_files_cached(store, lean_files)?;
-    let (files_seeded, shards_seeded) = seed_project_theorem_shards_from_splits(
-        store,
-        canon_dir,
-        toolchain,
-        trust_domain,
-        false,
-        &split_entries,
-    )?;
-    Ok((files_seeded, shards_seeded, split_cache_hits))
-}
-
 pub(crate) fn seed_project_theorem_shards(
     store: &mut TurboStore,
     canon_dir: &Path,
@@ -846,172 +827,7 @@ pub fn run_build_command(
     project_dir: PathBuf,
     trust_domain: String,
     pin_level: i64,
-    seed_shards: bool,
-) -> Result<()> {
-    run_build_command_with_cas_replay(
-        store,
-        json_output,
-        targets,
-        project_dir,
-        trust_domain,
-        pin_level,
-        seed_shards,
-        false,
-    )
-}
-
-pub fn validate_lnir_expr_v1_blob(bytes: &[u8]) -> bool {
-    fn parse_lvl(bytes: &[u8]) -> Option<&[u8]> {
-        let (&tag, rest) = bytes.split_first()?;
-        match tag {
-            0x00 => Some(rest),
-            0x01 => parse_lvl(rest),
-            0x02 | 0x03 => {
-                let r1 = parse_lvl(rest)?;
-                parse_lvl(r1)
-            }
-            _ => None,
-        }
-    }
-    fn parse_lvls(mut bytes: &[u8], count: usize) -> Option<&[u8]> {
-        for _ in 0..count {
-            bytes = parse_lvl(bytes)?;
-        }
-        Some(bytes)
-    }
-    fn parse_expr(bytes: &[u8], fuel: usize) -> Option<&[u8]> {
-        if fuel == 0 {
-            return None;
-        }
-        let (&tag, rest) = bytes.split_first()?;
-        match tag {
-            0x00 => {
-                let (_, tail) = rest.split_first()?;
-                Some(tail)
-            }
-            0x01 => parse_lvl(rest),
-            0x02 => {
-                if rest.len() < 2 {
-                    return None;
-                }
-                let name_len = rest[0] as usize;
-                let lvl_count = rest[1] as usize;
-                let after_hdr = &rest[2..];
-                if after_hdr.len() < name_len {
-                    return None;
-                }
-                let name_bytes = &after_hdr[..name_len];
-                if std::str::from_utf8(name_bytes).is_err() {
-                    return None;
-                }
-                parse_lvls(&after_hdr[name_len..], lvl_count)
-            }
-            0x03 | 0x04 | 0x05 => {
-                let r1 = parse_expr(rest, fuel - 1)?;
-                parse_expr(r1, fuel - 1)
-            }
-            0x06 => {
-                let r1 = parse_expr(rest, fuel - 1)?;
-                let r2 = parse_expr(r1, fuel - 1)?;
-                parse_expr(r2, fuel - 1)
-            }
-            _ => None,
-        }
-    }
-    if bytes.len() < 5 || &bytes[..4] != b"LNE1" {
-        return false;
-    }
-    matches!(parse_expr(&bytes[4..], 256), Some(rem) if rem.is_empty())
-}
-
-pub(super) fn verify_cas_expr_shard_payload(bytes: &[u8], expected_decl: &str) -> bool {
-    if validate_lnir_expr_v1_blob(bytes) {
-        return true;
-    }
-    if bytes.starts_with(b"verified:seeded:") && bytes.len() > "verified:seeded:".len() {
-        return true;
-    }
-    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) {
-        if let Some(d) = val["decl"].as_str() {
-            if crate::splitter::canonicalize_lean_name(d)
-                == crate::splitter::canonicalize_lean_name(expected_decl)
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-pub fn replay_project_cas_expr_shards(
-    store: &mut TurboStore,
-    canon_dir: &Path,
-    toolchain: &str,
-    trust_domain: &str,
-    scoped_files: Option<&[PathBuf]>,
-) -> Result<usize> {
-    let lean_files: Vec<PathBuf> = match scoped_files {
-        Some(files) if !files.is_empty() => files.to_vec(),
-        _ => collect_lean_files(canon_dir),
-    };
-    let (split_entries, _) = load_and_split_files_cached(store, &lean_files)?;
-    let _ = crate::module_builder::try_project_lake_inputs_tag(canon_dir)?;
-    let pkg_cfg_opt = crate::module_builder::optional_package_config(canon_dir)?;
-    let mut replayed = 0usize;
-    for (lf, _src, split) in &split_entries {
-        if split.shards.is_empty() || !split.hygiene.is_clean_for_certification() {
-            continue;
-        }
-        let file_lean_args = pkg_cfg_opt
-            .as_ref()
-            .map(|pkg| crate::module_builder::resolve_file_lean_args_in_package(pkg, lf))
-            .unwrap_or_default();
-        let file_has_sorry = split.hygiene.has_sorry;
-        for shard in &split.shards {
-            if file_has_sorry
-                && splitter::audit_hygiene(&splitter::strip_lean_comments(&shard.proof_text))
-                    .has_sorry
-            {
-                continue;
-            }
-            let shard_key = compute_shard_key_with_args(toolchain, shard, &file_lean_args, None);
-            let entries = store
-                .get_cached_action_no_hit_bump(&shard_key, trust_domain)?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--replay-cas-expr failed closed: missing cached expr_shard in CAS for theorem `{}` (key={})",
-                        shard.name,
-                        shard_key
-                    )
-                })?;
-            let valid = entries.iter().any(|entry| {
-                store
-                    .read_verified_blob(&entry.blob_hash)
-                    .is_some_and(|b| verify_cas_expr_shard_payload(&b, &shard.name))
-            });
-            if !valid {
-                anyhow::bail!(
-                    "--replay-cas-expr failed closed: corrupted or invalid CAS expr_shard blob for theorem `{}` (key={})",
-                    shard.name,
-                    shard_key
-                );
-            }
-            replayed += 1;
-        }
-    }
-    Ok(replayed)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn run_build_command_with_cas_replay(
-    store: &mut TurboStore,
-    json_output: bool,
-    targets: Vec<String>,
-    project_dir: PathBuf,
-    trust_domain: String,
-    pin_level: i64,
-    seed_shards: bool,
-    replay_cas_expr: bool,
+    _seed_shards: bool,
 ) -> Result<()> {
     // One top-level command, one Lake-input memo window.
     crate::module_builder::reset_lake_inputs_tag_memo();
@@ -1071,29 +887,6 @@ pub fn run_build_command_with_cas_replay(
                     pack::warm_local_zygote_daemon_nonblocking(store, env_vars);
                 }
             }
-            let seeded_shards = if seed_shards {
-                seed_theorem_shards_for_files(
-                    store,
-                    &canon_dir,
-                    &toolchain,
-                    &trust_domain,
-                    &build_report.cone_source_paths,
-                )?
-                .1
-            } else {
-                0
-            };
-            let cas_expr_replayed = if replay_cas_expr {
-                replay_project_cas_expr_shards(
-                    store,
-                    &canon_dir,
-                    &toolchain,
-                    &trust_domain,
-                    Some(&build_report.cone_source_paths),
-                )?
-            } else {
-                0
-            };
             let dur_ms = t0.elapsed().as_millis() as i64;
             let cache_hit = build_report.modules_compiled == 0
                 && (build_report.modules_cached > 0 || build_report.modules_up_to_date_reused > 0);
@@ -1111,8 +904,6 @@ pub fn run_build_command_with_cas_replay(
                 "modules_up_to_date_reused": build_report.modules_up_to_date_reused,
                 "modules_compiled": build_report.modules_compiled,
                 "modules_cached": build_report.modules_cached,
-                "shards_seeded": seeded_shards,
-                "cas_expr_replayed": cas_expr_replayed,
                 "elapsed_ms": dur_ms,
             }));
             if json_output {
@@ -1127,8 +918,6 @@ pub fn run_build_command_with_cas_replay(
                         "modules_up_to_date_reused": build_report.modules_up_to_date_reused,
                         "modules_compiled": build_report.modules_compiled,
                         "modules_cached": build_report.modules_cached,
-                        "shards_seeded": seeded_shards,
-                        "cas_expr_replayed": cas_expr_replayed,
                         "config_digest": build_report.config_digest,
                         "elapsed_ms": dur_ms
                     }))?
@@ -1243,16 +1032,6 @@ pub fn run_build_command_with_cas_replay(
                 )?;
                 link_resolved_executables(&resolved_exe_targets)?;
             }
-            let seeded_shards = if seed_shards {
-                seed_project_theorem_shards(store, &canon_dir, &toolchain, &trust_domain, false)?.1
-            } else {
-                0
-            };
-            let cas_expr_replayed = if replay_cas_expr {
-                replay_project_cas_expr_shards(store, &canon_dir, &toolchain, &trust_domain, None)?
-            } else {
-                0
-            };
             let elapsed_ms = t0.elapsed().as_millis();
             emit_build_telemetry(serde_json::json!({
                 "schema": "turbo-lean.telemetry.v1",
@@ -1266,8 +1045,6 @@ pub fn run_build_command_with_cas_replay(
                 "action_key": action_key,
                 "interface_hash": interface_hash,
                 "materialized_files": linked,
-                "shards_seeded": seeded_shards,
-                "cas_expr_replayed": cas_expr_replayed,
                 "elapsed_ms": elapsed_ms,
             }));
             if json_output {
@@ -1279,8 +1056,6 @@ pub fn run_build_command_with_cas_replay(
                         "action_key": action_key,
                         "interface_hash": interface_hash,
                         "materialized_files": linked,
-                        "shards_seeded": seeded_shards,
-                        "cas_expr_replayed": cas_expr_replayed,
                         "elapsed_ms": elapsed_ms
                     }))?
                 );
@@ -1406,57 +1181,14 @@ pub fn run_build_command_with_cas_replay(
                     pack::warm_local_zygote_daemon_nonblocking(store, env_vars);
                 }
             }
-            let t_shards = std::time::Instant::now();
-            let seeded_shards = if seed_shards {
-                if !targets.is_empty() && !build_report.cone_source_paths.is_empty() {
-                    seed_theorem_shards_for_files(
-                        store,
-                        &canon_dir,
-                        &toolchain,
-                        &trust_domain,
-                        &build_report.cone_source_paths,
-                    )?
-                    .1
-                } else {
-                    seed_project_theorem_shards(
-                        store,
-                        &canon_dir,
-                        &toolchain,
-                        &trust_domain,
-                        false,
-                    )?
-                    .1
-                }
-            } else {
-                0
-            };
-            let cas_expr_replayed = if replay_cas_expr {
-                let scoped = if !targets.is_empty() && !build_report.cone_source_paths.is_empty() {
-                    Some(build_report.cone_source_paths.as_slice())
-                } else {
-                    None
-                };
-                replay_project_cas_expr_shards(
-                    store,
-                    &canon_dir,
-                    &toolchain,
-                    &trust_domain,
-                    scoped,
-                )?
-            } else {
-                0
-            };
-            let shards_ms = t_shards.elapsed().as_millis();
             if profile_phases {
                 eprintln!(
-                    "[turbo-lean][profile] lake_build: native={}ms link_exe={}ms env={}ms stage_publish={}ms seed_shards={}ms (outputs={} shards={})",
+                    "[turbo-lean][profile] lake_build: native={}ms link_exe={}ms env={}ms stage_publish={}ms (outputs={})",
                     native_ms,
                     link_ms,
                     env_ms,
                     stage_ms,
-                    shards_ms,
-                    outputs.len(),
-                    seeded_shards
+                    outputs.len()
                 );
             }
             emit_build_telemetry(serde_json::json!({
@@ -1472,8 +1204,6 @@ pub fn run_build_command_with_cas_replay(
                 "manifest_hash": manifest_hash,
                 "artifacts_stored": outputs.len(),
                 "materialized_files": linked,
-                "shards_seeded": seeded_shards,
-                "cas_expr_replayed": cas_expr_replayed,
                 "elapsed_ms": dur_ms,
             }));
 
@@ -1488,8 +1218,6 @@ pub fn run_build_command_with_cas_replay(
                         "manifest_hash": manifest_hash,
                         "artifacts_stored": outputs.len(),
                         "materialized_files": linked,
-                        "shards_seeded": seeded_shards,
-                        "cas_expr_replayed": cas_expr_replayed,
                         "modules_total": build_report.modules_total,
                         "modules_up_to_date_reused": build_report.modules_up_to_date_reused,
                         "modules_compiled": build_report.modules_compiled,

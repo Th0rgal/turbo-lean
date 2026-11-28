@@ -4618,13 +4618,7 @@ public def api := by
             as fn(&TurboStore, &Path) -> Result<serde_json::Value>;
         let _ = crate::lake_build::run_build_command
             as fn(&mut TurboStore, bool, Vec<String>, PathBuf, String, i64, bool) -> Result<()>;
-        let _ = crate::lake_build::validate_lnir_expr_v1_blob as fn(&[u8]) -> bool;
-        let _ = crate::lake_build::replay_project_cas_expr_shards
-            as fn(&mut TurboStore, &Path, &str, &str, Option<&[PathBuf]>) -> Result<usize>;
-        let _ = crate::lake_build::run_build_command_with_cas_replay
-            as fn(&mut TurboStore, bool, Vec<String>, PathBuf, String, i64, bool, bool) -> Result<()>;
         let _ = crate::lake_build::run_hydrate_traces_command as fn(bool, PathBuf) -> Result<()>;
-        assert!(!crate::validate_lnir_expr_v1_blob(b""));
     }
 
     #[test]

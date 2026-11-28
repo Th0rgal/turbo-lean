@@ -192,10 +192,10 @@ flowchart LR
 | **G1a** | `csimp` digest in action and cache keys | `db.rs` keys | P9 | key-diff test | S |
 | **G1b** *RO* *(done `#460` `ad54090`, model only)* | The M2 theorems hold over real `.olean`, or the docs say they are about a model. The `#460` proof covers the documented OLEN v1 model only; the proof against real `.olean` files is still open, so this leaf is not finished | `ConLeche.lean` | – | contract script | L |
 | **G1c** | `--kernel auto` selects the bundled `con-leche` when the toolchain matches | `kernel.rs` | P9 | selection test | S |
-| **G2a** *RO* | CAS replay hit rate on recorded edit sequences | bench script | M1 | number recorded | S |
-| **G2b** | Replay on by default for warm `check`, or deleted | `lake_build/build.rs` | G2a S2 | bench delta | M |
+| **G2a** *RO* *(DONE `10a12fca`)* | CAS replay hit rate on recorded edit sequences: build-only replay ran after Lake, skipped no work, and added 6 ms median (125 ms vs 119 ms) | bench script | M1 | number recorded | S |
+| **G2b** *(DONE)* | Replay on by default for warm `check`, or deleted: deleted the dead build-only `--replay-cas-expr` / `--seed-shards` stub | `lake_build/build.rs` | G2a S2 | bench delta: +6 ms, so deleted | M |
 | **H2.3** | Parallel replay under the RAM budget | `zygote/worker.rs` (pool; partly `dispatch.rs`; shared with `S3b-E`/`S3b-M` — do not run in parallel) | P3 | bench scaling | M |
-| **H2.G** *RO* | GPU-addressable share of loop time | doc only | M1 | number against the 10% line | S |
+| **H2.G** *RO* *(CLOSED)* | GPU track closed: `perf -g` on Batteries measured hashing at 5.2% (146 ms / 2792 ms) and closed decidable evaluation at 0% (0–0.5 ms), below the 10% line | doc only | M1 | 5.2% < 10%; closed | S |
 | **A1** *(done `#462` `4e2ba1c`)* | `#367`: strict `[audit_spec]` TOML | `audit_spec.rs` parser | – | typo-key test fails closed | S |
 | **A2** *RO* *(done, branch `a2-audit-spec-kernel`)* | `#367`: kernel-backed witness. `audit-spec --kernel` (or `kernel = true`) replays each file's compiled `.olean` through the in-kernel `--audit-modules` reader and admits it only through `verifyKernelAuditAdmission` (fresh `.olean`, reader ok, every expected module audited, zero violations); a missing, stale or tampered `.olean` fails closed | `PolicyGates.lean`, `audit_spec.rs` | A1 | `audit-spec` JSON `kernel_audit` / `kernel_violations` | L |
 | **A1j** | Strict `[audit_spec]` JSON: a misspelled top-level key beside the `audit_spec` / `audit-spec` object fails closed (A1 closed this for TOML only) | `audit_spec.rs` (JSON path) | A1 | test: JSON config with a misspelled top-level key fails closed | S |

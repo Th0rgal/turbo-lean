@@ -124,12 +124,6 @@ enum Commands {
         /// Pin built artifacts in CAS (0=normal, 1=main_branch, 2=toolchain)
         #[arg(long, default_value_t = 0)]
         pin_level: i64,
-        /// Seed TheoremProofCAS with all verified theorem shards after build completes
-        #[arg(long, default_value_t = false)]
-        seed_shards: bool,
-        /// Replay and verify cached LNIR_EXPR_V1 (`LNE1`) / `expr_shard` CAS proof blobs on warm builds (fail closed on missing or corrupted blobs)
-        #[arg(long, default_value_t = false)]
-        replay_cas_expr: bool,
         /// Exclude project-relative file/directory globs (e.g. `experiments/**`; repeatable)
         #[arg(long = "exclude")]
         exclude: Vec<String>,
@@ -1843,18 +1837,15 @@ fn run(cli: Cli) -> Result<()> {
             project_dir,
             trust_domain,
             pin_level,
-            seed_shards,
-            replay_cas_expr,
             ..
-        } => lake_build::run_build_command_with_cas_replay(
+        } => lake_build::run_build_command(
             &mut store,
             cli.json,
             targets,
             project_dir,
             trust_domain,
             pin_level,
-            seed_shards,
-            replay_cas_expr,
+            false,
         ),
 
         Commands::HydrateTraces { project_dir } => {

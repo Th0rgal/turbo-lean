@@ -1659,18 +1659,7 @@ fn per_target_policy_glob_segments_and_cli_validation() {
 }
 
 #[test]
-fn build_replay_cas_expr_flag_and_elab_audit_contract_v4_m3() {
-    let help = Command::new(env!("CARGO_BIN_EXE_turbo-lean"))
-        .args(["build", "--help"])
-        .output()
-        .unwrap();
-    assert!(help.status.success());
-    let help_stdout = String::from_utf8_lossy(&help.stdout);
-    assert!(
-        help_stdout.contains("--replay-cas-expr"),
-        "expected --replay-cas-expr in `turbo-lean build --help`, got:\n{help_stdout}"
-    );
-
+fn elab_audit_contract_v4_m3() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -1695,73 +1684,6 @@ fn build_replay_cas_expr_flag_and_elab_audit_contract_v4_m3() {
         ) && elab_audit.contains("ConLeche.HasType env proofTerm expectedType"),
         "missing Contract V4 M3 cas_proof_replay_sound signature"
     );
-
-    let fx = AuditSpecFixture::new("replay_cas_expr");
-    fx.write("lean-toolchain", "leanprover/lean4:v4.35.0\n");
-    fx.write(
-        "lakefile.toml",
-        r#"name = "CasReplayPkg"
-defaultTargets = ["CasReplayPkg"]
-
-[[lean_lib]]
-name = "CasReplayPkg"
-"#,
-    );
-    fx.write(
-        "CasReplayPkg.lean",
-        "theorem cas_replay_demo : True := trivial\n",
-    );
-
-    // 1. Without seeded CAS expr_shards, `build --replay-cas-expr` fails closed.
-    let unseeded = fx
-        .cli("cas-replay-unseeded")
-        .args(["--json", "build", "--project-dir"])
-        .arg(&fx.root)
-        .arg("--replay-cas-expr")
-        .output()
-        .unwrap();
-    assert!(
-        !unseeded.status.success(),
-        "expected unseeded `build --replay-cas-expr` to fail closed, stderr:\n{}",
-        String::from_utf8_lossy(&unseeded.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&unseeded.stderr).contains("--replay-cas-expr failed closed"),
-        "unexpected stderr:\n{}",
-        String::from_utf8_lossy(&unseeded.stderr)
-    );
-
-    // 2. With `--seed-shards --replay-cas-expr`, warm CAS expr_shard replay succeeds.
-    let seeded = fx
-        .cli("cas-replay-warm")
-        .args(["--json", "build", "--project-dir"])
-        .arg(&fx.root)
-        .args(["--seed-shards", "--replay-cas-expr"])
-        .output()
-        .unwrap();
-    assert!(
-        seeded.status.success(),
-        "expected seeded `build --seed-shards --replay-cas-expr` to succeed, stderr:\n{}",
-        String::from_utf8_lossy(&seeded.stderr)
-    );
-    let seeded_json = parse_json_stdout(&seeded, "seeded_cas_replay");
-    assert_eq!(seeded_json["cas_expr_replayed"].as_u64(), Some(1));
-
-    // Warm cache-hit replay without `--seed-shards` also succeeds and replays 1 theorem shard.
-    let warm = fx
-        .cli("cas-replay-warm")
-        .args(["--json", "build", "--project-dir"])
-        .arg(&fx.root)
-        .arg("--replay-cas-expr")
-        .output()
-        .unwrap();
-    assert!(
-        warm.status.success(),
-        "expected warm `build --replay-cas-expr` to succeed, stderr:\n{}",
-        String::from_utf8_lossy(&warm.stderr)
-    );
-    let warm_json = parse_json_stdout(&warm, "warm_cas_replay");
-    assert_eq!(warm_json["cas_expr_replayed"].as_u64(), Some(1));
 }
 
 fn lake_available() -> bool {
