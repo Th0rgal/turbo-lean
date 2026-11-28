@@ -109,17 +109,22 @@ def ingestLeanSourceFile (filePath : String) (moduleName : String := "LeanNative
 /-- Elaborate `filePath` with `Lean.Elab.runFrontend`, extracting both the Lean 4.31 C module code
     (`Lean.Compiler.LCNF.emitC modName`) and the lowered `LNIRModule` via `ingestAllLocalDecls`. -/
 def emitLeanCFromSourceFile (filePath : String) (modName : Lean.Name := `Main)
-    (arch : TargetArch := .x86_64) : IO (String × LNIRModule) :=
+    (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : IO (String × LNIRModule) :=
   withElaboratedFrontend filePath modName do
-    let mod ← ingestAllLocalDecls modName.toString arch
+    let mod ← ingestAllLocalDecls modName.toString arch allowRcAdt
     return (← Lean.Compiler.LCNF.emitC modName, mod)
 
-/-- P-cert C4/C5 `build-exe` gate (fail closed, checked before any file is written): the Bridge already refuses
-    RC-ADT decls without `allowRcAdt`, but the LLVM backend accepts no heap code, so `build-exe` re-checks
-    `findRcAdtDecl?` on the lowered module and `findUnsupportedLLVMCall?` on the optimized one explicitly. -/
-def buildExeLLVMGate? (rawMod optMod : LNIRModule) (arch : TargetArch := .x86_64) : Option String :=
-  (rawMod.findRcAdtDecl?.map fun d => s!"[lean-native] build-exe: RC-ADT declaration '{d}' is unsupported by the LLVM backend") <|>
-  ((LeanNative.Backend.LLVM.findUnsupportedLLVMCall? optMod arch).map fun (d, c) =>
+/-- P-cert C4/C5 `build-exe` gate (fail closed, checked before any file is written): the Bridge
+    already refuses RC-ADT decls without `allowRcAdt`, and by default the LLVM backend accepts no
+    heap code, so `build-exe` re-checks `findRcAdtDecl?` on the lowered module and
+    `findUnsupportedLLVMCall?` on the optimized one. H3.1 `--allow-rc-adt-llvm` (`allowRcAdt`)
+    drops the blanket refusal and applies the RC-ADT leaf gate instead. -/
+def buildExeLLVMGate? (rawMod optMod : LNIRModule) (arch : TargetArch := .x86_64)
+    (allowRcAdt : Bool := false) : Option String :=
+  let rcAdt? := if allowRcAdt then none else rawMod.findRcAdtDecl?
+  (rcAdt?.map fun d =>
+    s!"[lean-native] build-exe: RC-ADT declaration '{d}' is unsupported by the LLVM backend") <|>
+  ((LeanNative.Backend.LLVM.findUnsupportedLLVMCallWith? allowRcAdt optMod arch).map fun (d, c) =>
     s!"[lean-native] build-exe: unsupported external or non-scalar call '{c}' in '{d}'")
 
 /-- Full LCNF-to-Executable builder (`buildNativeExecutable` / `buildExecutableFromLeanFile`). -/
@@ -128,9 +133,11 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
   let sysroot ← resolveLeanSysroot
   let hostArch : TargetArch :=
     if System.Platform.target.startsWith "aarch64" || System.Platform.target.startsWith "arm64" then .arm64 else .x86_64
-  let (cCode, rawMod) ← emitLeanCFromSourceFile filePath `Main hostArch
+  let allowRcAdt := LeanNative.Backend.LLVM.rcAdtLLVMOptIn cliArgs
+  let (cCode, rawMod) ← emitLeanCFromSourceFile filePath `Main hostArch allowRcAdt
   let (optMod, _) := LeanNative.Transform.runDefaultPipeline rawMod
-  if let some err := buildExeLLVMGate? rawMod optMod hostArch then throw <| IO.userError err
+  if let some err := buildExeLLVMGate? rawMod optMod hostArch allowRcAdt then
+    throw <| IO.userError err
   let superoptTgt : LeanNative.Transform.SuperoptTarget :=
     match hostArch with
     | .arm64 => .arm64

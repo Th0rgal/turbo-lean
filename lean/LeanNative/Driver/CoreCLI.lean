@@ -226,13 +226,14 @@ def runCompileMode (tag : String) (elaborateHook? : Option (String → TargetArc
   let sel ← resolveInput args
   if opts.emitCABI then rejectLeanSourceWithoutFrontend tag "compile" elaborateHook? args
   let wasmSimd128 := hasFlag args "--wasm-simd128"
-  let baseMod ← loadInputModule elaborateHook? args opts.emitCABI (sel? := some sel)
+  let rcLLVM := rcAdtLLVMOptIn args
+  let baseMod ← loadInputModule elaborateHook? args opts.emitCABI false rcLLVM (some sel)
   if hasTelemetryOptIn args then
     let telCfg ← TelemetryConfig.probe args
     let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
   let (optMod, _) ← if opts.isBaseline then pure (baseMod, []) else runOptPipelineWithArgs args false baseMod
   if !opts.emitCABI && !opts.emitPTX && !opts.emitMetal then
-    if let some (dName, callee) := findUnsupportedLLVMCall? optMod opts.arch then
+    if let some (dName, callee) := findUnsupportedLLVMCallWith? rcLLVM optMod opts.arch then
       throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"
   if ["--emit-header", "--header", "--emit-rust", "--rust", "--emit-swift", "--swift",
       "--emit-modulemap", "--modulemap", "--emit-fixtures", "--fixtures"].any (fun f => !(findFlagValue args f "").isEmpty) then
@@ -258,7 +259,8 @@ def runCompileLLVM (tag : String) (elaborateHook? : Option (String → TargetArc
   let wasmSimd128 := hasFlag args "--wasm-simd128"
   let freestanding := hasFlag args "--freestanding" || arch.isFreestandingEmbedded
   let outPath := findFlagValue args "-o" ""
-  let baseMod ← if hasFlag args "--slot-regression" then pure slotTypeRegressionModule else loadInputModule elaborateHook? args
+  let baseMod ← if hasFlag args "--slot-regression" then pure slotTypeRegressionModule
+    else loadInputModule elaborateHook? args (allowRcAdt := rcAdtLLVMOptIn args)
   if hasTelemetryOptIn args then
     let telCfg ← TelemetryConfig.probe args
     let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
@@ -274,7 +276,8 @@ def runCompileLLVM (tag : String) (elaborateHook? : Option (String → TargetArc
       return (← writeOrPrint outPath irText
         (some s!"[{tag}] Wrote freestanding LLVM 18 IR ({arch.triple}, baseline={isBaseline}, decls={modToEmit.decls.length}) to {outPath}"))
   -- `--slot-regression` is the fixed in-tree slot-typing fixture (its `ptr` slots are the point of the test)
-  if let some (dName, callee) := if hasFlag args "--slot-regression" then none else findUnsupportedLLVMCall? modToEmit arch then
+  if let some (dName, callee) := if hasFlag args "--slot-regression" then none
+      else findUnsupportedLLVMCallWith? (rcAdtLLVMOptIn args) modToEmit arch then
     throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"
   let irText := if isBaseline then emitLLVMBaseline modToEmit arch none wasmSimd128 false else emitLLVMOptimized modToEmit arch none wasmSimd128 false
   writeOrPrint outPath irText (some s!"[{tag}] Wrote LLVM 18 IR ({arch.triple}, baseline={isBaseline}, decls={modToEmit.decls.length}) to {outPath}")
@@ -857,6 +860,7 @@ def printCoreUsage (tag : String) (hasFrontend : Bool) : IO Unit := do
     fe ["  build-exe          Compile a .lean source file directly to a native executable (<file.lean> -o <bin>)"] ++ [
     "  compile-llvm       Emit baseline or optimized LLVM 18 IR (--input <file>, --arch <target>, --freestanding, --baseline, -o <path>)",
     "  emit-llvm          Alias of compile-llvm (--target thumbv6m|thumbv8m.main|riscv32imac, --freestanding, -o <path>)",
+    "  --allow-rc-adt-llvm  Opt in: non-recursive RC-ADT decls through LLVM (compile*, build-exe)",
     "  compile-static-lib Emit C-ABI static library (.a) + C header (.h) (--input <file>, -o <lib.a>, --header <lib.h>)",
     "  emit-freestanding-c-lib Emit verified freestanding .ll + C99 .h + .o/.a + .su (--target thumbv6m|thumbv8m.main|riscv32imac, -o <lib.a>)",
     "  emit-cabi-bindings Emit C/Rust/Swift/modulemap/fixture bindings (--emit-header|--emit-rust|--emit-swift|--emit-modulemap|--emit-fixtures <path>)",
@@ -944,6 +948,7 @@ def rcAdtSupportedCommands : List String := ["emit-lnir", "eval-lnir", "validate
 /-- Shared CLI dispatcher for both `lean-native-core` (`elaborateHook? = none`) and `lean-native` (`elaborateHook? = some ...`). -/
 def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule))
     (args : List String) : IO (Option UInt32) := do
+  if let some err := rcAdtLLVMMisuse? args then throw <| IO.userError err
   if let "superopt-evolve" :: rest := args then return some (← runSuperoptEvolve elaborateHook? rest)
   validateValueTakingFlags args
   let isCabiFallback := !(args.headD "").startsWith "compile" && (hasFlag args "--c-abi" || hasFlag args "--emit-c-abi")
