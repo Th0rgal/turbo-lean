@@ -267,12 +267,18 @@ fn item_allowed(item: &str, allowed: &[String], allow_interactive_sorry: bool) -
         "sorry/admit token" => 4,
         _ => 0,
     };
-    let admits_nd = NATIVE_DECIDE_PROBE_AXIOMS
-        .iter()
-        .any(|ax| axiom_allowed_under(ax, allowed));
-    let admits_bv = BV_DECIDE_PROBE_AXIOMS
-        .iter()
-        .any(|ax| axiom_allowed_under(ax, allowed));
+    // A source line carries no declaration name, so a per-declaration pattern such as
+    // `A.thm._native.bv_decide.ax_*` admits the line here; the kernel gate then matches the
+    // exact axiom names, and rejects any declaration the pattern does not name.
+    let names_family = |family: &str| allowed.iter().any(|p| p.contains(family));
+    let admits_nd = names_family("._native.native_decide.ax_")
+        || NATIVE_DECIDE_PROBE_AXIOMS
+            .iter()
+            .any(|ax| axiom_allowed_under(ax, allowed));
+    let admits_bv = names_family("._native.bv_decide.ax_")
+        || BV_DECIDE_PROBE_AXIOMS
+            .iter()
+            .any(|ax| axiom_allowed_under(ax, allowed));
     unsafe {
         crate::c_abi::turbo_spec_verify_hygiene_item_admitted(
             kind_code,
@@ -11954,6 +11960,21 @@ mod tests {
         );
         assert!(blocking_items_under(&rep.flagged_items, &wildcard, false).is_empty());
         assert!(blocking_items_under(&rep.flagged_items, &native_glob, false).is_empty());
+        // Per-declaration patterns admit their family at source level (the kernel gate is exact).
+        let per_decl_bv = [std3.clone(), vec!["M.b._native.bv_decide.ax_*".to_string()]].concat();
+        assert_eq!(
+            blocking_items_under(&rep.flagged_items, &per_decl_bv, false),
+            ["L1: native_decide/ofReduceBool"]
+        );
+        let per_decl_nd = [
+            std3.clone(),
+            vec!["M.a._native.native_decide.ax_*".to_string()],
+        ]
+        .concat();
+        assert_eq!(
+            blocking_items_under(&rep.flagged_items, &per_decl_nd, false),
+            ["L2: bv_decide"]
+        );
         let sorry_rep = audit_hygiene("theorem bad : False := sorry\n");
         assert_eq!(
             blocking_items_under(&sorry_rep.flagged_items, &wildcard, false).len(),
