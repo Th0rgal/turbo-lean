@@ -83,6 +83,8 @@ def verifiedTheoremRegistry : List String :=
     "superoptDeclCore_sound", "superoptDecl_sound", "superoptModuleCore_sound",
     "superoptModule_sound", "superoptModuleWithProfile_sound",
     "applyExprRules_sound", "applyRewriteTable_sound",
+    "replaySteps_sound", "replayCert_sound", "replaySteps_isSome_iff", "replayCert_isSome_iff",
+    "replayCert_eq_none_of_oob", "rewriteCertRule_sound", "applyRewriteCertCode_sound",
     "certifyScalarPair_sound", "applyCertifiedScalarRewrite_sound", "stochasticProposerGate_sound",
     "applyCertToScalar_sound", "foldCertifiedScalars_sound", "scalarRefines_eval",
     "scalarRefines_of_eval", "applyCertsToScalar_sound",
