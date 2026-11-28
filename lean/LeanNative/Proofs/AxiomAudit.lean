@@ -9,6 +9,7 @@ import LeanNative.Semantics.Refinement
 import LeanNative.Proofs.PeepholeProofs
 import LeanNative.Proofs.LoopOptProofs
 import LeanNative.Proofs.RealLCNFBridgeProofs
+import LeanNative.Proofs.H1.SpecLocked
 import LeanNative.Proofs.BackendProofs
 import LeanNative.Proofs.KernelElabProofs
 import LeanNative.Proofs.SymbolicTV
@@ -679,6 +680,11 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.lowerImpureStepPure_sound
   , ``LeanNative.Proofs.lowerRealLCNFCode_sound
   , ``LeanNative.Proofs.lowerRealLCNFDecl_sound
+  , ``LeanNative.Proofs.H1.specLocked, ``LeanNative.Proofs.H1.posWitness
+  , ``LeanNative.Proofs.H1.negWitnessInvertedBranch_killed
+  , ``LeanNative.Proofs.H1.negWitnessWrongReturn_killed
+  , ``LeanNative.Proofs.H1.negWitnessDroppedParam_killed
+  , ``LeanNative.Proofs.H1.negWitnessWrongScrutinee_killed
   , ``LeanNative.Transform.evalSeqLoop_async_refines
   , ``LeanNative.Transform.optimizeAsyncStateMachine_refines
   , ``LeanNative.Proofs.lowerAsyncPollStep_ready_sound
@@ -824,7 +830,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.LedgerEmbedded32.ledgerBip32Varint_e2e_nonvacuous
   ]
 
-#guard auditedTheoremNames.length == 863
+#guard auditedTheoremNames.length == 869
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/
