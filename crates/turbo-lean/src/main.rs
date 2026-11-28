@@ -124,6 +124,9 @@ enum Commands {
         /// Pin built artifacts in CAS (0=normal, 1=main_branch, 2=toolchain)
         #[arg(long, default_value_t = 0)]
         pin_level: i64,
+        /// Seed TheoremProofCAS with all verified theorem shards after build completes
+        #[arg(long, default_value_t = false)]
+        seed_shards: bool,
         /// Exclude project-relative file/directory globs (e.g. `experiments/**`; repeatable)
         #[arg(long = "exclude")]
         exclude: Vec<String>,
@@ -1837,6 +1840,7 @@ fn run(cli: Cli) -> Result<()> {
             project_dir,
             trust_domain,
             pin_level,
+            seed_shards,
             ..
         } => lake_build::run_build_command(
             &mut store,
@@ -1845,7 +1849,7 @@ fn run(cli: Cli) -> Result<()> {
             project_dir,
             trust_domain,
             pin_level,
-            false,
+            seed_shards,
         ),
 
         Commands::HydrateTraces { project_dir } => {

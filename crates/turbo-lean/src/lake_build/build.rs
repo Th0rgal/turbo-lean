@@ -64,6 +64,25 @@ pub(crate) fn seed_project_theorem_shards_from_splits(
     Ok((files_seeded, shards_seeded))
 }
 
+pub(crate) fn seed_theorem_shards_for_files(
+    store: &mut TurboStore,
+    canon_dir: &Path,
+    toolchain: &str,
+    trust_domain: &str,
+    lean_files: &[PathBuf],
+) -> Result<(usize, usize, usize)> {
+    let (split_entries, split_cache_hits) = load_and_split_files_cached(store, lean_files)?;
+    let (files_seeded, shards_seeded) = seed_project_theorem_shards_from_splits(
+        store,
+        canon_dir,
+        toolchain,
+        trust_domain,
+        false,
+        &split_entries,
+    )?;
+    Ok((files_seeded, shards_seeded, split_cache_hits))
+}
+
 pub(crate) fn seed_project_theorem_shards(
     store: &mut TurboStore,
     canon_dir: &Path,
@@ -827,7 +846,7 @@ pub fn run_build_command(
     project_dir: PathBuf,
     trust_domain: String,
     pin_level: i64,
-    _seed_shards: bool,
+    seed_shards: bool,
 ) -> Result<()> {
     // One top-level command, one Lake-input memo window.
     crate::module_builder::reset_lake_inputs_tag_memo();
@@ -887,6 +906,18 @@ pub fn run_build_command(
                     pack::warm_local_zygote_daemon_nonblocking(store, env_vars);
                 }
             }
+            let seeded_shards = if seed_shards {
+                seed_theorem_shards_for_files(
+                    store,
+                    &canon_dir,
+                    &toolchain,
+                    &trust_domain,
+                    &build_report.cone_source_paths,
+                )?
+                .1
+            } else {
+                0
+            };
             let dur_ms = t0.elapsed().as_millis() as i64;
             let cache_hit = build_report.modules_compiled == 0
                 && (build_report.modules_cached > 0 || build_report.modules_up_to_date_reused > 0);
@@ -904,6 +935,7 @@ pub fn run_build_command(
                 "modules_up_to_date_reused": build_report.modules_up_to_date_reused,
                 "modules_compiled": build_report.modules_compiled,
                 "modules_cached": build_report.modules_cached,
+                "shards_seeded": seeded_shards,
                 "elapsed_ms": dur_ms,
             }));
             if json_output {
@@ -918,6 +950,7 @@ pub fn run_build_command(
                         "modules_up_to_date_reused": build_report.modules_up_to_date_reused,
                         "modules_compiled": build_report.modules_compiled,
                         "modules_cached": build_report.modules_cached,
+                        "shards_seeded": seeded_shards,
                         "config_digest": build_report.config_digest,
                         "elapsed_ms": dur_ms
                     }))?
@@ -1032,6 +1065,11 @@ pub fn run_build_command(
                 )?;
                 link_resolved_executables(&resolved_exe_targets)?;
             }
+            let seeded_shards = if seed_shards {
+                seed_project_theorem_shards(store, &canon_dir, &toolchain, &trust_domain, false)?.1
+            } else {
+                0
+            };
             let elapsed_ms = t0.elapsed().as_millis();
             emit_build_telemetry(serde_json::json!({
                 "schema": "turbo-lean.telemetry.v1",
@@ -1045,6 +1083,7 @@ pub fn run_build_command(
                 "action_key": action_key,
                 "interface_hash": interface_hash,
                 "materialized_files": linked,
+                "shards_seeded": seeded_shards,
                 "elapsed_ms": elapsed_ms,
             }));
             if json_output {
@@ -1056,6 +1095,7 @@ pub fn run_build_command(
                         "action_key": action_key,
                         "interface_hash": interface_hash,
                         "materialized_files": linked,
+                        "shards_seeded": seeded_shards,
                         "elapsed_ms": elapsed_ms
                     }))?
                 );
@@ -1181,14 +1221,41 @@ pub fn run_build_command(
                     pack::warm_local_zygote_daemon_nonblocking(store, env_vars);
                 }
             }
+            let t_shards = std::time::Instant::now();
+            let seeded_shards = if seed_shards {
+                if !targets.is_empty() && !build_report.cone_source_paths.is_empty() {
+                    seed_theorem_shards_for_files(
+                        store,
+                        &canon_dir,
+                        &toolchain,
+                        &trust_domain,
+                        &build_report.cone_source_paths,
+                    )?
+                    .1
+                } else {
+                    seed_project_theorem_shards(
+                        store,
+                        &canon_dir,
+                        &toolchain,
+                        &trust_domain,
+                        false,
+                    )?
+                    .1
+                }
+            } else {
+                0
+            };
+            let shards_ms = t_shards.elapsed().as_millis();
             if profile_phases {
                 eprintln!(
-                    "[turbo-lean][profile] lake_build: native={}ms link_exe={}ms env={}ms stage_publish={}ms (outputs={})",
+                    "[turbo-lean][profile] lake_build: native={}ms link_exe={}ms env={}ms stage_publish={}ms seed_shards={}ms (outputs={} shards={})",
                     native_ms,
                     link_ms,
                     env_ms,
                     stage_ms,
-                    outputs.len()
+                    shards_ms,
+                    outputs.len(),
+                    seeded_shards
                 );
             }
             emit_build_telemetry(serde_json::json!({
@@ -1204,6 +1271,7 @@ pub fn run_build_command(
                 "manifest_hash": manifest_hash,
                 "artifacts_stored": outputs.len(),
                 "materialized_files": linked,
+                "shards_seeded": seeded_shards,
                 "elapsed_ms": dur_ms,
             }));
 
@@ -1218,6 +1286,7 @@ pub fn run_build_command(
                         "manifest_hash": manifest_hash,
                         "artifacts_stored": outputs.len(),
                         "materialized_files": linked,
+                        "shards_seeded": seeded_shards,
                         "modules_total": build_report.modules_total,
                         "modules_up_to_date_reused": build_report.modules_up_to_date_reused,
                         "modules_compiled": build_report.modules_compiled,
