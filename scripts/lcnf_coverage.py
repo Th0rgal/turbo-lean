@@ -75,17 +75,17 @@ _LIVE_AUDIT_CACHE: dict[str, dict[str, Any]] = {}
 _CON_LECHE_CACHE: dict[str, dict[str, Any]] = {}
 
 TRACKED_BRIDGE_FILES: dict[str, str] = {
-    "lean/LeanNative/IR/Bridge.lean": "35bc45aaeaedb10a9e5d5987821f8a6d66592fbe1634ccccdd7175896eb4471d",
-    "lean/LeanNative/IR/RealLCNFBridge.lean": "b6da4f47f73d7ff231908ee9d8531f9231280108a78f6337ce8ec570516724ae",
+    "lean/LeanNative/IR/Bridge.lean": "7b120631a25dbd1ef27bbf41b413488aa364c1ab40d5535ee96e74d02ee5ba93",
+    "lean/LeanNative/IR/RealLCNFBridge.lean": "05c770055da81a9688c9bb2f27ecfc48dd0497d0247a08dfa0107620e3bc021a",
     "lean/LeanNative/IR/RealLCNFSemantics.lean": "3e5729f3aee6d1d993317577549dcb9475ac4b5832f94e54a04fa7d6a0aba0b6",
     "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean": "2b652b961f78656b494c8f45a58293b0fb01f1f44c8d81c409f4201d546a5b16",
     "lean/LeanNative/IR/BridgeHelpers.lean": "223552ea889239dd90f8b8e8ecec17ca6017e482314c05c909b63d5261f28660",
-    "lean/LeanNative/IR/BridgeHelpers/DeclIngestAndValidation.lean": "251a4a5437bcd1327fb3b77eed984ba578a4b0f30020c7d95d711af9a5f401d4",
-    "lean/LeanNative/IR/BridgeHelpers/HeapAndConstructors.lean": "8373c434f4b8716c6c39230239202e493793e8749165a9c4afefae995d729c26",
-    "lean/LeanNative/IR/BridgeHelpers/RealBridgeCtxAndSlices.lean": "5577bb7347139e4d96ee7739dd85e55a5abdf20dc5a8786c6eb5f7a5c3a9a47d",
-    "lean/LeanNative/IR/BridgeHelpers/ScalarDagAndJoinPoints.lean": "42bdac7e56063d12506f9af947f0f7eaf4260374cf74a54a3b2f80665a9af031",
-    "lean/LeanNative/IR/BridgeHelpers/StateAndIntrinsics.lean": "f0a9d71675a70a6e2637b00d264bfa7ed2aafad7b8f7ddf137a781c4aa095b10",
-    "lean/LeanNative/IR/BridgeHelpers/TypesAndSigs.lean": "1e6d6f4c07d6684435c11a64a672f89dc7a0c781271e5a04b45c8250828a2223",
+    "lean/LeanNative/IR/BridgeHelpers/DeclIngestAndValidation.lean": "af99eb1572e6c34f1e39f1ef0414a5e37560961819a33fc48723fb53c91a1795",
+    "lean/LeanNative/IR/BridgeHelpers/HeapAndConstructors.lean": "a84d151736dfdabf17ca52f6c234d0849e3cdedd78ae2a112489817e75f2a818",
+    "lean/LeanNative/IR/BridgeHelpers/RealBridgeCtxAndSlices.lean": "d40652c3d15a56c129b1d84af3278922007d45239dd2c84fedceeaeaf1f63103",
+    "lean/LeanNative/IR/BridgeHelpers/ScalarDagAndJoinPoints.lean": "c126f21a899a002e6b090ccab6dfaf286d0cb704187f8eef618683f9b6077169",
+    "lean/LeanNative/IR/BridgeHelpers/StateAndIntrinsics.lean": "7fd0a5b6453a44953cf8a952f454ad3fcab05e755cd3aecc557e9bf59be27d20",
+    "lean/LeanNative/IR/BridgeHelpers/TypesAndSigs.lean": "0f7fc213fc43984bd2456fa61ef9ce4fc9b0664977f89e0bebd3379512103cd6",
 }
 
 LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
@@ -241,19 +241,19 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "id": "LetValue.proj",
         "category": "LetValue",
         "construct": "Lean.Compiler.LCNF.LetValue.proj (.pure phase)",
-        "status": "lowered_unproved",
-        "evidence_file": "lean/LeanNative/IR/Bridge.lean",
-        "evidence_symbol": "lowerPureLetValue",
-        "notes": "Pure-phase projections lower via unproved lowerPureCode (to be removed in rung L1).",
+        "status": "rejected",
+        "evidence_file": "lean/LeanNative/IR/BridgeHelpers/DeclIngestAndValidation.lean",
+        "evidence_symbol": "has no local impure LCNF",
+        "notes": "Pure-phase projections are not lowered: rung L1 removed lowerPureCode; a declaration without local impure LCNF fails closed.",
     },
     {
         "id": "LetValue.const",
         "category": "LetValue",
         "construct": "Lean.Compiler.LCNF.LetValue.const (.pure phase)",
-        "status": "lowered_unproved",
-        "evidence_file": "lean/LeanNative/IR/Bridge.lean",
-        "evidence_symbol": "lowerPureLetValue",
-        "notes": "Pure-phase constant applications lower via unproved lowerPureCode (to be removed in rung L1).",
+        "status": "rejected",
+        "evidence_file": "lean/LeanNative/IR/BridgeHelpers/DeclIngestAndValidation.lean",
+        "evidence_symbol": "has no local impure LCNF",
+        "notes": "Pure-phase constant applications are not lowered: rung L1 removed lowerPureCode; a declaration without local impure LCNF fails closed.",
     },
     {
         "id": "LetValue.fvar",
@@ -3191,7 +3191,7 @@ unsafe def main (_args : List String) : IO Unit := do
                 "construct": "Fake",
                 "status": bad_status,
                 "evidence_file": "lean/LeanNative/IR/Bridge.lean",
-                "evidence_symbol": "lowerPureLetValue",
+                "evidence_symbol": "ingestLCNFImpureDecl",
                 "notes": "invalid status test",
             }
             with mock.patch.object(m, "LCNF_CONSTRUCTOR_MATRIX_SPEC", (bad_row,)):
