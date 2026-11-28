@@ -166,6 +166,9 @@ theorem lowerLocalCall_sound {tf : FuncTable} (fuel : Nat) (ctx : RealBridgeCtx)
       have hinv2 := bridgeInv_bind_fresh st1 lenv venvZ fvarId (lowerGroundImpureTypeWith ctx declTy) r hinvZ
       have hkEval := evalCode_fuel_mono_step fuel pk.1 _ hst1 v hst'
         (ih _ pk.2 _ _ hst1 hst' v (.inl k) pk.1 hinv2 hkl hk hrel)
-      rw [hwrap]; dsimp only [evalCode]; rw [evalExpr_call_table hb hg hvl, hfg vs hst (r, hst1) hc]; exact hkEval
+      rw [hwrap]
+      dsimp only [evalCode]
+      rw [evalExpr_call_table hb hg hvl, hfg vs hst (r, hst1) hc]
+      exact hkEval
 
 end LeanNative.Proofs
