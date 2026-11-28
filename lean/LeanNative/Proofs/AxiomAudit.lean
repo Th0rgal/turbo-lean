@@ -12,6 +12,7 @@ import LeanNative.Proofs.RealLCNFBridgeProofs
 import LeanNative.Proofs.H1.SpecLocked
 import LeanNative.Proofs.H1.LowerSound
 import LeanNative.Proofs.H1.FirstOrderCalls
+import LeanNative.Proofs.H1.RecursionAndJoinPoints
 import LeanNative.Proofs.BackendProofs
 import LeanNative.Proofs.KernelElabProofs
 import LeanNative.Proofs.SymbolicTV
@@ -695,6 +696,18 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.H1.lowerRealLCNFModule_sound, ``LeanNative.Proofs.H1.f_lowered_body
   , ``LeanNative.Proofs.H1.posWitnessCall, ``LeanNative.Proofs.H1.negWitnessWrongCallTarget_killed
   , ``LeanNative.Proofs.H1.negWitnessSwappedCallArgs_killed
+  , ``LeanNative.Proofs.H1.funcsRel_cons_with, ``LeanNative.Proofs.H1.funcsRel_with
+  , ``LeanNative.Proofs.H1.lowerRealLCNFModule_recRel, ``LeanNative.Proofs.H1.recRefinement
+  , ``LeanNative.Proofs.H1.lowerRealLCNFRecModule_sound, ``LeanNative.Proofs.H1.w3Module_callees
+  , ``LeanNative.Proofs.H1.sumDown_lowered_body, ``LeanNative.Proofs.H1.sumDown_src
+  , ``LeanNative.Proofs.H1.sumDown_tgt, ``LeanNative.Proofs.H1.posWitnessSelfRec
+  , ``LeanNative.Proofs.H1.isEven_src, ``LeanNative.Proofs.H1.isEven_tgt
+  , ``LeanNative.Proofs.H1.posWitnessMutualRec, ``LeanNative.Proofs.H1.jp_lowered_body
+  , ``LeanNative.Proofs.H1.jp_src, ``LeanNative.Proofs.H1.posWitnessJoinPoint
+  , ``LeanNative.Proofs.H1.rec_killed_of_run
+  , ``LeanNative.Proofs.H1.negWitnessBrokenRecStep_killed
+  , ``LeanNative.Proofs.H1.negWitnessSwappedMutualTargets_killed
+  , ``LeanNative.Proofs.H1.negWitnessWrongJoinArg_killed
   , ``LeanNative.Transform.evalSeqLoop_async_refines
   , ``LeanNative.Transform.optimizeAsyncStateMachine_refines
   , ``LeanNative.Proofs.lowerAsyncPollStep_ready_sound
@@ -840,7 +853,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.LedgerEmbedded32.ledgerBip32Varint_e2e_nonvacuous
   ]
 
-#guard auditedTheoremNames.length == 884
+#guard auditedTheoremNames.length == 904
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/

@@ -647,4 +647,17 @@ def moduleFuncTable (fuel : Nat) : List LNIRDecl → FuncTable
   | d :: ds => fun s => if s == d.name then some (evalDeclWith fuel (moduleFuncTable fuel ds) d)
     else moduleFuncTable fuel ds s
 
+/-- Call table of `ds`, keyed by `LNIRDecl.name`, in which every declaration runs under `inner` (W2-L3). -/
+def moduleFuncTableWith (fuel : Nat) (inner : FuncTable) : List LNIRDecl → FuncTable
+  | [] => fun _ => none
+  | d :: ds => fun s => if s == d.name then some (evalDeclWith fuel inner d)
+    else moduleFuncTableWith fuel inner ds s
+
+/-- Fuel-indexed call table of a possibly (mutually) recursive module (W2-L3): at call depth `depth + 1`
+    every declaration of `ds` runs under the depth-`depth` table; depth `0` has no entries, so a run
+    that needs more than `depth` nested calls fails with `unsupportedCall`. -/
+def recFuncTable (fuel : Nat) (ds : List LNIRDecl) : Nat → FuncTable
+  | 0 => fun _ => none
+  | depth + 1 => moduleFuncTableWith fuel (recFuncTable fuel ds depth) ds
+
 end LeanNative.Semantics

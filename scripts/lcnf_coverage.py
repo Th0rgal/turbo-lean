@@ -78,7 +78,7 @@ _CON_LECHE_CACHE: dict[str, dict[str, Any]] = {}
 TRACKED_BRIDGE_FILES: dict[str, str] = {
     "lean/LeanNative/IR/Bridge.lean": "7b120631a25dbd1ef27bbf41b413488aa364c1ab40d5535ee96e74d02ee5ba93",
     "lean/LeanNative/IR/RealLCNFBridge.lean": "49582ec6d309b57980be414ae7f0cb56d7f732c348d3872ffb816860b5f5d3ea",
-    "lean/LeanNative/IR/RealLCNFSemantics.lean": "d0030489c1d30faa000c0299df80fd603b88f797856ffa104d3b90466e18c506",
+    "lean/LeanNative/IR/RealLCNFSemantics.lean": "8ac095d68aac9b389c78d1b0f6c62fcebff8e31ec23e2f684c1e5017bbea097b",
     "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean": "be428a80da2953ec4d55c472df4f50c6f1c36b19031886f88debb9ccb594eab4",
     "lean/LeanNative/IR/BridgeHelpers.lean": "223552ea889239dd90f8b8e8ecec17ca6017e482314c05c909b63d5261f28660",
     "lean/LeanNative/IR/BridgeHelpers/DeclIngestAndValidation.lean": "af99eb1572e6c34f1e39f1ef0414a5e37560961819a33fc48723fb53c91a1795",
@@ -326,7 +326,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "rejected",
         "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
         "evidence_symbol": "Unsupported external or non-scalar call",
-        "notes": "Non-inlined recursive calls and unmodeled external functions fail closed.",
+        "notes": "Non-inlined recursive calls and unmodeled external functions fail closed in the driver (mutual_cycle). A module whose recursive callees are ctx.localCallees entries lowers via lowerRealLCNFModule and is proved under depth-indexed call tables (H1.recRefinement, W2-L3); the driver does not yet emit such modules.",
     },
     {
         "id": "LetValue.pap",
