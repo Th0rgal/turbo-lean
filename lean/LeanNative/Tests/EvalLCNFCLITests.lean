@@ -12,7 +12,8 @@ Verifies:
    (not exposed on the CLI) produces `mismatch_count > 0` and non-zero exit status `1` on the exact same corpus.
 3. Agreed-failure classification: both sides failing in the same failure class increments `agreed_failure_count`
    with `mismatch_count == 0`, while discordant failure classes increment `mismatch_count`.
-4. `--self-test` passes on the stock corpus and its gate rejects the mutated corpus report.
+4. The `--self-test` gate accepts the stock corpus report and rejects the mutated corpus report
+   (the `--self-test` CLI entrypoint itself runs in `EvalLCNFSelfTestCLITests`).
 5. Single-field `structure` wrappers (unboxed by LCNF) and fielded multi-constructor ADTs (tag probe at
    `{keyRoot}_t`) are compared, not skipped, with `mismatch_count == 0`.
 6. Merged multi-report JSON keeps skip accounting, and an all-skipped report is never a pass.
@@ -74,21 +75,21 @@ open LeanNative.Driver.EvalLCNFCLI
   if agreedRep.agreedFailureCount == 0 || agreedRep.mismatchCount != 0 then
     throw <| IO.userError s!"expected agreed_failure_count > 0 and mismatch_count == 0, got agreed={agreedRep.agreedFailureCount}, mismatch={agreedRep.mismatchCount}"
 
-  -- 4. `--self-test` CLI entrypoint passes, and its gate rejects the killing-mutant corpus report.
-  let rc ← LeanNative.Driver.EvalLCNFCLI.run ["--self-test"]
-  if rc != 0 then
-    throw <| IO.userError s!"EvalLCNFCLI --self-test failed with exit code {rc}"
-  let (selfCompiled, selfKernel) ← compiledReferenceSelfProbeIO
-  if !(selfTestFailures rep agreedRep selfCompiled selfKernel).isEmpty then
+  -- 4. The `--self-test` gate rejects the killing-mutant corpus report. Every in-process snippet
+  --    elaboration re-imports `Lean` (~400 MB that is never released), so the probe runs once and is
+  --    shared with section 5, and the `--self-test` CLI entrypoint (which re-runs the corpus and the
+  --    probe) is exercised in its own module, `EvalLCNFSelfTestCLITests`, keeping each module's
+  --    `lean` process under the untrusted-CI `-M 4096` limit.
+  let (compiledRef, kernelRef) ← compiledReferenceSelfProbeIO
+  if !(selfTestFailures rep agreedRep compiledRef kernelRef).isEmpty then
     throw <| IO.userError "self-test gate rejected the stock corpus report"
-  if (selfTestFailures killRep agreedRep selfCompiled selfKernel).isEmpty then
+  if (selfTestFailures killRep agreedRep compiledRef kernelRef).isEmpty then
     throw <| IO.userError "self-test gate accepted the killing-mutant corpus report"
 
   -- 5. Reviewer point B1, evidence half: the compiled-IR reference really executes Lean's
   --    compiled evaluator. `CompiledRefProbe.probeSum` is an `opaque` constant, so kernel
   --    reduction cannot unfold it, while Lean's compiled evaluator computes the exact value
   --    124750 — the reference can be neither kernel reduction nor a stub.
-  let (compiledRef, kernelRef) ← compiledReferenceSelfProbeIO
   match compiledRef, kernelRef with
   | .ok cv, .error _ =>
     if cv != CanonicalVal.uint64 124750 then
