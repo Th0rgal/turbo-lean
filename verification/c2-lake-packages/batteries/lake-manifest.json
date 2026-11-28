@@ -1,0 +1,18 @@
+{
+ "version": "1.3.0",
+ "packagesDir": ".lake/packages",
+ "packages":
+ [{"url": "https://github.com/leanprover-community/batteries.git",
+   "type": "git",
+   "subDir": null,
+   "scope": "leanprover-community",
+   "rev": "66e469188fe07963e5cf666c7d4433f45b8131c5",
+   "name": "«batteries»",
+   "manifestFile": "lake-manifest.json",
+   "inputRev": "66e469188fe07963e5cf666c7d4433f45b8131c5",
+   "inherited": false,
+   "configFile": "lakefile.toml"}],
+ "name": "«c2-batteries»",
+ "lakeDir": ".lake",
+ "fixedToolchain": false
+}

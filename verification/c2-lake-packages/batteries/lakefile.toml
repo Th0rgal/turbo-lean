@@ -1,0 +1,7 @@
+name = "c2-batteries"
+version = "0.1.0"
+
+[[require]]
+name = "batteries"
+git = "https://github.com/leanprover-community/batteries.git"
+rev = "66e469188fe07963e5cf666c7d4433f45b8131c5"
