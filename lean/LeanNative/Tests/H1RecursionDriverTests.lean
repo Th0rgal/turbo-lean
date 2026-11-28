@@ -40,6 +40,12 @@ end
 
 def hasSubstr (s pat : String) : Bool := (s.splitOn pat).length > 1
 
+/-- Body of `define dso_local i64 @{fn}(` up to its closing `\n}`, skipping ABI thunks. -/
+def llvmBody? (ir fn : String) : Option String :=
+  match ir.splitOn s!"define dso_local i64 @{fn}(" with
+  | _ :: rest :: _ => (rest.splitOn "\n}").head?
+  | _ => none
+
 /-- Run the declaration whose symbol contains `pat` in the lowered module's depth-`depth` table. -/
 def runIngested (m : LNIRModule) (pat : String) (depth : Nat) (args : List Val) : Option Val :=
   match m.decls.find? (hasSubstr ·.name pat) with
@@ -66,8 +72,8 @@ def checkRecursiveDriver : CoreM Unit := do
   let (some ev, some od) := (sym "w1dIsEven", sym "w1dIsOdd")
     | throwError "optimized module lost a mutually recursive declaration"
   for (caller, callee) in [(ev, od), (od, ev)] do
-    let defined := hasSubstr ir s!"define dso_local i64 @{caller}("
-    unless defined && hasSubstr ir s!"call i64 @{callee}(" do
+    let body := (llvmBody? ir caller).getD ""
+    unless hasSubstr body s!"call i64 @{callee}(" do
       throwError s!"LLVM module lacks `{caller}` calling `{callee}`"
 
 def checkSelfRecGate : CoreM Unit := do
