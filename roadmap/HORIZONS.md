@@ -18,7 +18,7 @@ Source: Thomas's roadmap note of 2026-11-14 (prove Lean → IR first; build fast
 
 - **What is proved.** `lowerRealLCNFDecl_sound` (`Proofs/RealLCNFBridgeProofs.lean`): if lowering succeeds and the source evaluation succeeds, the `LNIR` evaluation gives the same result at the same fuel. It is about the function the driver calls, not a model of it.
 - **What that covers.** One declaration at a time, no user calls, no recursion, scalars, flat tuples and small non-recursive inductives. A call to another user function is lowered, but the source semantics returns `unsupportedCall`, so the theorem says nothing about any declaration that makes one.
-- **What surrounds it unproved.** About 1,100 LOC of `BridgeHelpers.lean` run before and after the proved function (context building, type lowering, an `LCNF` rewrite, post-passes). A second lowering (`lowerPureCode`, a `partial def`) is taken when a declaration has no impure form and has no proof at all. About 250 LOC of helpers are dead.
+- **What surrounds it unproved.** About 1,100 LOC of `BridgeHelpers.lean` run before and after the proved function (context building, type lowering, an `LCNF` rewrite, post-passes). A second lowering (`lowerPureCode`, a `partial def`) was taken when a declaration had no impure form and had no proof at all; rung L1 deleted it, so `lowerRealLCNFDecl` is now the only lowering callee (the matrix's `lowered_unproved` constructs fell from 4 to 2). About 250 LOC of helpers were dead.
 - **The source semantics is not independent.** `RealLCNFSemantics` imports the lowerer's file and shares its layout and type-lowering definitions.
 - **The IR lacks the concepts, not only the lowering.** `evalCode` has no function environment; `Val` has no closure, big `Nat`, string or array of objects; `LNIRCode` has no join point or general loop. The LLVM driver refuses any reference-counted inductive.
 - **Consequence.** `con-leche` uses recursive inductives, big `Nat`, arrays, hash maps, strings and `IO`. None of its declarations would lower today (its sources are pinned, not vendored, so this is inferred from its README).
@@ -55,6 +55,8 @@ Rules: one lowering function; what the proof does not cover returns `Unsupported
 | **L3 Recursion and loops** | Fuel-indexed calls; `LNIR` gets a join-point / loop construct that replaces inlining a join point at every jump. Self and mutual recursion proved. | Needs the theorem statement redesigned, not one more case. |
 
 **Exit of H1**: L1–L3 merged, the statement hash-pinned, and a generated coverage number (share of `Batteries` declarations that lower through the proved path, and the rejection that stops each of the rest).
+
+**Status (W2-Compiler-H1, 2026-11-28)**: `H1.1`, `H1.F`, `L1`, `L2`, `L3` and `H1.4` are implemented on the W2 branch stack. `SpecLocked.lean` is pinned at sha256 `1139c286dd53ddd9aa63f599f24c6d286836f88e2c2f27fa96d5ce4ec7a93970`; ten lowerer mutants are kernel-refuted (`*_killed` in `Proofs/H1/`) and gated by `scripts/contract.d/35_h1_mutant_matrix.sh`; the coverage ratchet (`H1_COVERAGE_RATCHET` in `scripts/lcnf_coverage.py`) is published as `benchmarks/h1_coverage_ratchet.json`. The exit still waits on the external `Batteries` corpus (`H1.0b`), which stays `unknown`.
 
 Reliability measures that go with it:
 
@@ -207,7 +209,7 @@ flowchart LR
 | **L1** | Single path (rung L1) | `Bridge.lean`, helper split | S3a H1.0 H1.1 | one lowering callee; `ΔLOC < 0` | L |
 | **L2** | Calls (rung L2) | `Semantics/Eval.lean`, `Proofs/LowerCalls.lean` | L1 H1.F | leaf `0 sorryAx`; matrix moves | L |
 | **L3** | Recursion and loops (rung L3) | `IR/AST.lean`, `Proofs/LowerRec.lean` | L2 | same | L |
-| **H1.4** | Mutant kill matrix; coverage number published | `Proofs/LowerRefines.lean` | L3 | mutants in CI | M |
+| **H1.4** *(implemented, W2)* | Mutant kill matrix; coverage number published. Done: `scripts/h1_mutant_matrix.py` (gate `35_h1_mutant_matrix.sh`) checks the `SpecLocked.lean` pin and that ≥ 10 `*_killed` mutants are kernel-clean in the axiom audit; `lcnf_coverage.py --check` enforces the coverage ratchet and `benchmarks/h1_coverage_ratchet.json` | `scripts/h1_mutant_matrix.py`, `scripts/lcnf_coverage.py`, `benchmarks/h1_coverage_ratchet.json` | L3 | mutants in CI | M |
 | **C2x** | `Batteries` as nightly C2 conformance | workflow, packages dir | – | `--tier C2` green | M |
 | **C4x** *(done `#472` `64d63bd`)* | 10k-seed nightly alias fuzzing | `fuzz_lcnf_conformance.py` | – | nightly green | M |
 | **C1x** | C1 corpus to 250 programs, chosen by the matrix | corpus manifest | H1.0 | `--tier C1` | L |
