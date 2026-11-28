@@ -12,6 +12,10 @@ Verifies:
    (not exposed on the CLI) produces `mismatch_count > 0` and non-zero exit status `1` on the exact same corpus.
 3. Agreed-failure classification: both sides failing in the same failure class increments `agreed_failure_count`
    with `mismatch_count == 0`, while discordant failure classes increment `mismatch_count`.
+4. `--self-test` passes on the stock corpus and its gate rejects the mutated corpus report.
+5. Single-field `structure` wrappers (unboxed by LCNF) and fielded multi-constructor ADTs (tag probe at
+   `{keyRoot}_t`) are compared, not skipped, with `mismatch_count == 0`.
+6. Merged multi-report JSON keeps skip accounting, and an all-skipped report is never a pass.
 -/
 
 namespace LeanNative.Tests.EvalLCNFCLITests
@@ -70,10 +74,15 @@ open LeanNative.Driver.EvalLCNFCLI
   if agreedRep.agreedFailureCount == 0 || agreedRep.mismatchCount != 0 then
     throw <| IO.userError s!"expected agreed_failure_count > 0 and mismatch_count == 0, got agreed={agreedRep.agreedFailureCount}, mismatch={agreedRep.mismatchCount}"
 
-  -- 4. Normal CLI entrypoint check
+  -- 4. `--self-test` CLI entrypoint passes, and its gate rejects the killing-mutant corpus report.
   let rc ← LeanNative.Driver.EvalLCNFCLI.run ["--self-test"]
   if rc != 0 then
     throw <| IO.userError s!"EvalLCNFCLI --self-test failed with exit code {rc}"
+  let (selfCompiled, selfKernel) ← compiledReferenceSelfProbeIO
+  if !(selfTestFailures rep agreedRep selfCompiled selfKernel).isEmpty then
+    throw <| IO.userError "self-test gate rejected the stock corpus report"
+  if (selfTestFailures killRep agreedRep selfCompiled selfKernel).isEmpty then
+    throw <| IO.userError "self-test gate accepted the killing-mutant corpus report"
 
   -- 5. Reviewer point B1, evidence half: the compiled-IR reference really executes Lean's
   --    compiled evaluator. `CompiledRefProbe.probeSum` is an `opaque` constant, so kernel
@@ -99,5 +108,66 @@ open LeanNative.Driver.EvalLCNFCLI
     throw <| IO.userError "B1: driver declares `@[implemented_by]` reference wrappers; the hygiene gate refuses them in source files"
   if driverSrc.contains "CompiledUnsafe" then
     throw <| IO.userError "B1: driver declares `unsafe` compiled-reference wrappers; the hygiene gate refuses `unsafe` declarations in source files"
+
+  -- 7. Reviewer points 2 & 4: fielded multi-constructor ADT results (tag probe `{keyRoot}_t`,
+  --    fields `{keyRoot}_c{cidx}f{j}`) and single-field structure wrappers (unboxed to their
+  --    field by LCNF) are compared against the compiled reference without mismatches. A probe
+  --    key-layout drift now surfaces as a `probe_failure` mismatch instead of a silent fallback.
+  let witnessSrc := "namespace EvalLCNFReviewWitness
+
+structure Meters where
+  val : UInt64
+
+inductive Shape where
+  | circle (r : UInt64)
+  | rect (w h : UInt64)
+  | empty
+
+@[noinline] def metersScale (m : Meters) (k : UInt64) : Meters := ⟨m.val * k + 1⟩
+
+@[noinline] def metersVal (m : Meters) : UInt64 := m.val ^^^ 5
+
+@[noinline] def shapeArea (s : Shape) : UInt64 :=
+  match s with
+  | .circle r => 3 * r * r
+  | .rect w h => w * h
+  | .empty => 0
+
+-- `k` keeps every arm input-dependent: a constant arm (`.circle 1`) is hoisted into a
+-- `_closed` aux constant, which the project interpreter refuses as an external call.
+@[noinline] def shapeGrow (s : Shape) (k : UInt64) : Shape :=
+  match s with
+  | .circle r => .rect r (r + k)
+  | .rect w h => .circle (w + h)
+  | .empty => .circle k
+
+end EvalLCNFReviewWitness
+"
+  let tmpBase := (← IO.getEnv "TMPDIR").getD "/tmp"
+  let witnessPath := s!"{tmpBase}/eval-lcnf-review-witness-{← IO.monoMsNow}.lean"
+  IO.FS.writeFile witnessPath witnessSrc
+  let witnessRep ← tryFinally (runDifferentialOnSourceFile witnessPath) (IO.FS.removeFile witnessPath)
+  IO.println witnessRep.formatSummary
+  if witnessRep.mismatchCount != 0 then
+    throw <| IO.userError s!"review witness: expected mismatch_count == 0, got {witnessRep.mismatchCount}"
+  for d in ["metersScale", "metersVal", "shapeArea", "shapeGrow"] do
+    let full := s!"EvalLCNFReviewWitness.{d}"
+    if !witnessRep.comparedDecls.contains full then
+      throw <| IO.userError s!"review witness: `{full}` was not compared (skipped: {witnessRep.skippedDecls.map (·.1)})"
+    match witnessRep.declReferences.find? (·.1 == full) with
+    | some (_, "compiled_ir_and_kernel_reduction") | some (_, "compiled_ir") => pure ()
+    | other => throw <| IO.userError s!"review witness: expected compiled reference for `{full}`, got {other.map (·.2)}"
+
+  -- 8. Reviewer point 5: merged JSON carries skip accounting; an all-skipped report is not a pass.
+  let merged := mergedReportsToJson [rep, witnessRep]
+  match merged.getObjValAs? Nat "skipped_count", merged.getObjValAs? String "verdict" with
+  | .ok n, .ok "pass" =>
+    if n != rep.skippedCount + witnessRep.skippedCount then
+      throw <| IO.userError s!"merged JSON skipped_count={n}, expected {rep.skippedCount + witnessRep.skippedCount}"
+  | _, _ => throw <| IO.userError s!"merged JSON lacks skipped_count or a pass verdict: {merged.compress}"
+  let allSkipped := summarizeOutcomes "AllSkipped"
+    [.skipped "onlyDecl" .io "IO declaration" false]
+  if allSkipped.verdict != "no_comparisons" || exitStatusForReports [allSkipped] == 0 then
+    throw <| IO.userError "all-skipped report must not pass"
 
 end LeanNative.Tests.EvalLCNFCLITests

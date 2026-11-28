@@ -302,6 +302,8 @@ partial def toLNIRType : GroundDomType → LNIRType
   | .usize => .usize
   | .unit => .unit
   | .enumInduct _ _ => .i64
+  -- LCNF represents a single-field structure by its field (`hasTrivialStructure?`).
+  | .tupleStruct _ _ [f] => toLNIRType f
   | .tupleStruct _ _ fs => .tuple (fs.map toLNIRType)
   | .rcAdt _ _ => .objPtr
 
@@ -551,7 +553,10 @@ partial def sampleValuesForDom (ctx : RealBridgeCtx) (dom : GroundDomType) : Lis
             let (v, st') ← fv.mkVal curSt
             curSt := st'
             vs := vs ++ [v]
-          return (.tuple vs, curSt) }
+          -- Single-field wrappers are unboxed to their field in LCNF (see `toLNIRType`).
+          match vs with
+          | [v] => return (v, curSt)
+          | _ => return (.tuple vs, curSt) }
   | .rcAdt indName ctors =>
     ctors.flatMap fun (cn, cidx, fields) =>
       if fields.isEmpty then
@@ -707,10 +712,8 @@ partial def decodeLCNFVal (ctx : RealBridgeCtx) (dom : GroundDomType) (v : Val) 
           .ok (.adtCtor indName cn cidx out)
     | other => .error s!"expected ADT value from LCNF, got {reprStr other}"
 
-/-- Elaborate an in-memory Lean 4 snippet and run `act` inside `CoreM`. -/
-def withElaboratedSnippet {α : Type} (snippetName : String) (sourceText : String)
-    (modName : Lean.Name) (act : Lean.CoreM α) : IO α := do
-  unsafe Lean.enableInitializersExecution
+/-- Project `.olean` directories (relative to the repository or `lean/` root) that exist. -/
+private def snippetExtraSearchPaths : IO Lean.SearchPath := do
   let mut extraPaths : Lean.SearchPath := []
   for cand in [
     ".lake/build/lib/lean",
@@ -722,7 +725,13 @@ def withElaboratedSnippet {α : Type} (snippetName : String) (sourceText : Strin
     let p := System.FilePath.mk cand
     if ← p.pathExists then
       extraPaths := extraPaths ++ [p]
-  Lean.initSearchPath (← LeanNative.IR.resolveLeanSysroot) extraPaths
+  return extraPaths
+
+/-- Elaborate an in-memory Lean 4 snippet and run `act` inside `CoreM`. -/
+def withElaboratedSnippet {α : Type} (snippetName : String) (sourceText : String)
+    (modName : Lean.Name) (act : Lean.CoreM α) : IO α := do
+  unsafe Lean.enableInitializersExecution
+  Lean.initSearchPath (← LeanNative.IR.resolveLeanSysroot) (← snippetExtraSearchPaths)
   let opts : Lean.Options := {}
   let some env ← Lean.Elab.runFrontend sourceText opts snippetName modName
     | throw <| IO.userError s!"Elaboration failed for {snippetName}"
@@ -779,6 +788,8 @@ private partial def collectReferenceProbes (nsPrefix : String) (dom : GroundDomT
     | _ => none
   let mk (key rhs : String) : List RefProbeDef :=
     [{ key := key, nsPrefix := nsPrefix, defName := s!"__ref_{key}", rhs := rhs }]
+  -- Key layout (mirrored by `reassembleCanonicalFromE`): the constructor tag lives at
+  -- `{keyRoot}_t`, field `j` of constructor `cidx` at `{keyRoot}_c{cidx}f{j}`.
   let fieldedAdtProbes (ctors : List (Name × Nat × List GroundDomType)) : Option (List RefProbeDef) := Id.run do
     let tagRhs := "(match (" ++ appText ++ ") with " ++
       String.intercalate " " (ctors.map fun (cn, cidx, fs) =>
@@ -786,6 +797,8 @@ private partial def collectReferenceProbes (nsPrefix : String) (dom : GroundDomT
         else
           let binders := String.intercalate " " ((List.range fs.length).map fun i => s!"b_{i}")
           s!"| {cn} {binders} => {cidx}") ++ ")"
+    -- A catch-all after the only constructor is a redundant-alternative elaboration error.
+    let fallbackAlt := if ctors.length > 1 then " | _ => 0" else ""
     let mut fieldDefs : List RefProbeDef := []
     let mut ok := true
     for (cn, cidx, fs) in ctors do
@@ -795,9 +808,9 @@ private partial def collectReferenceProbes (nsPrefix : String) (dom : GroundDomT
         | some rhs =>
           fieldDefs := fieldDefs ++ [{ key := s!"{keyRoot}_c{cidx}f{j}", nsPrefix := nsPrefix
                                        , defName := s!"__ref_{keyRoot}_c{cidx}f{j}"
-                                       , rhs := s!"(match ({appText}) with | {cn} {binders} => {rhs} | _ => 0)" }]
+                                       , rhs := s!"(match ({appText}) with | {cn} {binders} => {rhs}{fallbackAlt})" }]
         | none => ok := false
-    if ok then some (mk keyRoot tagRhs ++ fieldDefs) else none
+    if ok then some (mk s!"{keyRoot}_t" tagRhs ++ fieldDefs) else none
   match dom with
   | .bool => some (mk keyRoot s!"(if {appText} then 1 else 0)")
   | .uint8 | .uint16 | .uint32 | .usize => some (mk keyRoot s!"({appText}.toUInt64)")
@@ -809,7 +822,9 @@ private partial def collectReferenceProbes (nsPrefix : String) (dom : GroundDomT
       String.intercalate " " (ctors.map fun (cn, cidx) => s!"| {cn} => {cidx}") ++ ")"))
   | .tupleStruct _ ctorName fields =>
     match fields with
-    | [singleDom] => collectReferenceProbes nsPrefix singleDom s!"({appText})" keyRoot
+    | [singleDom] =>
+      -- Project the field out of the wrapper; the probe value is the field, not the structure.
+      collectReferenceProbes nsPrefix singleDom s!"(match ({appText}) with | {ctorName} f_0 => f_0)" keyRoot
     | _ => Id.run do
       let mut fieldDefs : List RefProbeDef := []
       let mut ok := true
@@ -824,20 +839,31 @@ private partial def collectReferenceProbes (nsPrefix : String) (dom : GroundDomT
       if ok then some fieldDefs else none
   | .rcAdt _ ctors => fieldedAdtProbes ctors
 
+/-- Why a compiled-reference value could not be reassembled. A missing probe result means the probe
+    never ran or the key layout drifted from `collectReferenceProbes`; it is a driver failure, never a
+    reference-evaluation outcome, so it must not fall back to kernel reduction. -/
+private inductive ReassembleError where
+  | missingProbe (key : String)
+  | reference (msg : String)
+
+private def ReassembleError.toString : ReassembleError → String
+  | .missingProbe k => s!"missing reference probe result '{k}'"
+  | .reference msg => msg
+
 /-- Reassemble a `CanonicalVal` of type `dom` from compiled-reference probe results
     (mirroring `collectReferenceProbes`'s key layout and `decodeLCNFVal`'s canonical shapes). -/
-private partial def reassembleCanonicalFrom (ctx : RealBridgeCtx) (dom : GroundDomType)
-    (lookup : String → Option (Except String Nat)) (keyRoot : String) : Except String CanonicalVal :=
-  let atKey (k : String) : Except String Nat :=
+private partial def reassembleCanonicalFromE (ctx : RealBridgeCtx) (dom : GroundDomType)
+    (lookup : String → Option (Except String Nat)) (keyRoot : String) : Except ReassembleError CanonicalVal :=
+  let atKey (k : String) : Except ReassembleError Nat :=
     match lookup k with
-    | some r => r
-    | none => .error s!"missing reference probe result '{k}'"
+    | some r => r.mapError .reference
+    | none => .error (.missingProbe k)
   match dom with
   | .bool => do
     let n ← atKey keyRoot
     if n == 1 then .ok (.bool true)
     else if n == 0 then .ok (.bool false)
-    else .error s!"reference Bool probe returned {n}"
+    else .error (.reference s!"reference Bool probe returned {n}")
   | .uint8 => do let n ← atKey keyRoot; .ok (.uint8 (UInt8.ofNat n))
   | .uint16 => do let n ← atKey keyRoot; .ok (.uint16 (UInt16.ofNat n))
   | .uint32 => do let n ← atKey keyRoot; .ok (.uint32 (UInt32.ofNat n))
@@ -852,29 +878,33 @@ private partial def reassembleCanonicalFrom (ctx : RealBridgeCtx) (dom : GroundD
       let n ← atKey keyRoot
       match ctors.find? (fun (_, cidx) => cidx == n) with
       | some (_, cidx) => .ok (.enumTag indName cidx)
-      | none => .error s!"reference enum probe returned unknown tag {n} for {indName}"
+      | none => .error (.reference s!"reference enum probe returned unknown tag {n} for {indName}")
   | .tupleStruct _ _ fields =>
     match fields with
     | [singleDom] => do
-      let c ← reassembleCanonicalFrom ctx singleDom lookup keyRoot
+      let c ← reassembleCanonicalFromE ctx singleDom lookup keyRoot
       .ok (.tuple [c])
     | _ => do
       let mut out : List CanonicalVal := []
       for (fdom, j) in fields.zipIdx do
-        let cv ← reassembleCanonicalFrom ctx fdom lookup s!"{keyRoot}_f{j}"
+        let cv ← reassembleCanonicalFromE ctx fdom lookup s!"{keyRoot}_f{j}"
         out := out ++ [cv]
       .ok (.tuple out)
   | .rcAdt indName ctors =>
     do
       let nT ← atKey s!"{keyRoot}_t"
       match ctors.find? (fun (_, cidx, _) => cidx == nT) with
-      | none => .error s!"reference ADT probe returned unknown tag {nT} for {indName}"
+      | none => .error (.reference s!"reference ADT probe returned unknown tag {nT} for {indName}")
       | some (cn, cidx, fieldDoms) => do
         let mut out : List CanonicalVal := []
         for (fdom, j) in fieldDoms.zipIdx do
-          let cv ← reassembleCanonicalFrom ctx fdom lookup s!"{keyRoot}_c{nT}f{j}"
+          let cv ← reassembleCanonicalFromE ctx fdom lookup s!"{keyRoot}_c{nT}f{j}"
           out := out ++ [cv]
         .ok (.adtCtor indName cn cidx out)
+
+private def reassembleCanonicalFrom (ctx : RealBridgeCtx) (dom : GroundDomType)
+    (lookup : String → Option (Except String Nat)) (keyRoot : String) : Except String CanonicalVal :=
+  (reassembleCanonicalFromE ctx dom lookup keyRoot).mapError ReassembleError.toString
 
 /-- Parse `"<key> ok <nat>"` / `"<key> err <message>"` probe-result lines. -/
 private def parseReferenceProbeResults (text : String) : List (String × Except String Nat) :=
@@ -934,7 +964,22 @@ private def runReferenceProbesIO (baseText : String) (refDefs : List RefProbeDef
     (refDefs.map fun d => s!"def {d.defName} : UInt64 := {d.rhs}") ++
     (skipDefs.map fun d => d.defText)
   let snippet := "import Lean\n" ++ baseText ++ "\n" ++ String.intercalate "\n" defLines ++ "\n\n" ++ evalBlock ++ "\n"
-  withElaboratedSnippet "<CompiledRefProbes>" snippet `CompiledRefProbes do pure ()
+  -- Elaborated by a child `lean` process: re-importing `Lean` and running a nested `#eval` a
+  -- second time in one process deadlocks, so in-process probing would hang every run after the first.
+  let snippetPath := s!"{tmpBase}/.eval-lcnf-refprobes-{ms}-{salt}.lean"
+  IO.FS.writeFile snippetPath snippet
+  let sysroot ← LeanNative.IR.resolveLeanSysroot
+  let searchPath := (sysroot / "lib" / "lean") :: (← snippetExtraSearchPaths)
+  let leanPath := System.SearchPath.separator.toString.intercalate
+    (← searchPath.mapM fun p => return (← IO.FS.realPath p).toString)
+  let out ← IO.Process.output {
+    cmd := (sysroot / "bin" / "lean").toString
+    args := #[snippetPath]
+    env := #[("LEAN_PATH", some leanPath)]
+  }
+  try IO.FS.removeFile snippetPath catch _ => pure ()
+  if out.exitCode != 0 || !(← System.FilePath.pathExists pathStr) then
+    throw <| IO.userError s!"compiled-reference probe snippet failed (exit {out.exitCode}):\n{out.stdout}{out.stderr}"
   let text ← IO.FS.readFile pathStr
   try IO.FS.removeFile pathStr catch _ => pure ()
   return parseReferenceProbeResults text
@@ -1221,7 +1266,8 @@ def buildEvalBridgeCtxM (decl : Decl .impure) (paramDoms : List GroundDomType)
   for (p, dom) in decl.params.toList.zip paramDoms do
     match dom, bodyCode? with
     | .tupleStruct indName ctorName fields, some c =>
-      if indName != ``Prod && (codeHasCasesOnFVar p.fvarId c || codeUsesHeapLayoutOnFVar p.fvarId c) then
+      if indName != ``Prod && fields.length != 1 &&
+          (codeHasCasesOnFVar p.fvarId c || codeUsesHeapLayoutOnFVar p.fvarId c) then
         useHeap := true
         let rcDom := GroundDomType.rcAdt indName [(ctorName, 0, fields)]
         adjustedParamDoms := adjustedParamDoms ++ [rcDom]
@@ -1561,8 +1607,17 @@ private def classifyPreparedDecl (p : PreparedDecl)
     | none =>
       match p.lcnfResults[vIdx]!, p.kernelResults[vIdx]! with
       | some lcnfRes, some kernelRes =>
-        let compiledRes : Except String CanonicalVal :=
-          reassembleCanonicalFrom p.ctx p.retDom lookup s!"p{p.declIdx}v{vIdx}"
+        let compiledE := reassembleCanonicalFromE p.ctx p.retDom lookup s!"p{p.declIdx}v{vIdx}"
+        if let .error e@(.missingProbe _) := compiledE then
+          mismatches := mismatches ++ [{
+            declName := p.name
+            argsRepr := argsRepr
+            referenceUsed := "compiled_ir"
+            lcnfResult := "n/a"
+            referenceResult := s!"probe_failure({e.toString})"
+          }]
+          continue
+        let compiledRes : Except String CanonicalVal := compiledE.mapError ReassembleError.toString
         comparedVecs := comparedVecs + 1
         if compiledRes.isOk then
           usedCompiledCount := usedCompiledCount + 1
@@ -1657,10 +1712,18 @@ def summarizeOutcomes (sourceDescription : String) (outcomes : List DeclEvalOutc
     skippedDecls := skippedDecls
   }
 
+/-- Overall verdict: `fail` on any mismatch, `no_comparisons` when every declaration was skipped
+    (skips are never verified passes), `pass` otherwise. -/
+def DiffReport.verdict (r : DiffReport) : String :=
+  if r.mismatchCount > 0 then "fail"
+  else if r.comparedCount == 0 then "no_comparisons"
+  else "pass"
+
 /-- Render a `DiffReport` as JSON. -/
 def DiffReport.toJson (r : DiffReport) : Json :=
   Json.mkObj [
     ("schema", Lean.toJson r.schema),
+    ("verdict", Json.str r.verdict),
     ("source", Json.str r.sourceDescription),
     ("reference_primary", Json.str r.referencePrimary),
     ("reference_secondary", Json.str r.referenceSecondary),
@@ -1714,6 +1777,7 @@ def DiffReport.formatSummary (r : DiffReport) : String := Id.run do
     else String.intercalate ", " r.referenceEvaluatesProjectRefusesDecls
   let mut lines : List String := [
     s!"[eval-lcnf] source: {r.sourceDescription} (primary_ref={r.referencePrimary}; secondary_ref={r.referenceSecondary})",
+    s!"[eval-lcnf] verdict={r.verdict}: {r.comparedCount}/{r.totalDecls} declarations compared; {r.skippedCount} skipped declarations are NOT verified",
     s!"[eval-lcnf] total_decls={r.totalDecls} compared_count={r.comparedCount} compared_vectors={r.comparedVectors} agreed_failure_count={r.agreedFailureCount} skipped_count={r.skippedCount} reference_evaluates_project_refuses_count={r.referenceEvaluatesProjectRefusesCount} mismatch_count={r.mismatchCount}",
     s!"[eval-lcnf] decl_references ({r.declReferences.length}): {if refParts.isEmpty then "none" else String.intercalate ", " refParts}",
     s!"[eval-lcnf] skipped_by_reason: {if skipParts.isEmpty then "none" else String.intercalate "; " skipParts}",
@@ -2097,6 +2161,28 @@ def exitStatusForReports (reports : List DiffReport) : UInt32 :=
   let totalComparedCount := reports.foldl (fun acc r => acc + r.comparedCount) 0
   if totalMismatchCount == 0 && totalComparedCount > 0 then 0 else 1
 
+/-- Aggregate several `DiffReport`s into one JSON object, carrying the same skip accounting as a
+    single report so that skipped declarations stay visible in multi-file runs. -/
+def mergedReportsToJson (reports : List DiffReport) : Json :=
+  let sumBy (f : DiffReport → Nat) : Nat := reports.foldl (fun acc r => acc + f r) 0
+  let reasonTotals := SkipReason.all.filterMap fun rsn =>
+    let n := sumBy fun r => ((r.skippedByReason.find? (·.1 == rsn.toKey)).map Prod.snd).getD 0
+    if n > 0 then some (rsn.toKey, Lean.toJson n) else none
+  Json.mkObj [
+    ("schema", Lean.toJson (2 : Nat)),
+    ("verdict", Json.str (if exitStatusForReports reports == 0 then "pass"
+      else if sumBy (·.mismatchCount) > 0 then "fail" else "no_comparisons")),
+    ("total_decls", Lean.toJson (sumBy (·.totalDecls))),
+    ("compared_count", Lean.toJson (sumBy (·.comparedCount))),
+    ("compared_vectors", Lean.toJson (sumBy (·.comparedVectors))),
+    ("agreed_failure_count", Lean.toJson (sumBy (·.agreedFailureCount))),
+    ("skipped_count", Lean.toJson (sumBy (·.skippedCount))),
+    ("skipped_by_reason", Json.mkObj reasonTotals),
+    ("reference_evaluates_project_refuses_count", Lean.toJson (sumBy (·.referenceEvaluatesProjectRefusesCount))),
+    ("mismatch_count", Lean.toJson (sumBy (·.mismatchCount))),
+    ("reports", Json.arr (reports.map DiffReport.toJson).toArray)
+  ]
+
 /-- Test-only entrypoint (not reachable from CLI flags): runs the exact `BuiltinCorpus`
     with `fault` applied to the project interpreter (`RealLCNFSemantics`) and returns
     both the resulting `DiffReport` and the CLI exit status. -/
@@ -2131,6 +2217,44 @@ def runFailureClassificationSelfTestIO : IO DiffReport := do
     .compared "agreedFailureWitness" "compiled_ir" 2 ["return"] afs []
   return summarizeOutcomes "FailureClassificationSelfTest" [outcome]
 
+/-- Failures of the `--self-test` gate (empty iff it passes): the built-in corpus must compare at
+    least one declaration with `mismatch_count == 0`, failure classification must agree, and the
+    compiled reference must evaluate the kernel-opaque probe that kernel reduction cannot. -/
+def selfTestFailures (corpus classification : DiffReport)
+    (compiledRef kernelRef : Except String CanonicalVal) : List String := Id.run do
+  let mut failures : List String := []
+  if corpus.mismatchCount != 0 then
+    failures := failures ++ [s!"corpus mismatch_count={corpus.mismatchCount}"]
+  if corpus.comparedCount == 0 then
+    failures := failures ++ ["corpus compared_count=0"]
+  if classification.agreedFailureCount == 0 || classification.mismatchCount != 0 then
+    failures := failures ++ [s!"failure classification agreed={classification.agreedFailureCount} mismatch={classification.mismatchCount}"]
+  match compiledRef, kernelRef with
+  | .ok cv, .error _ =>
+    if cv != CanonicalVal.uint64 124750 then
+      failures := failures ++ [s!"compiled reference self-probe returned {cv.toString}"]
+  | _, _ =>
+    failures := failures ++ ["compiled reference self-probe: expected compiled success and kernel failure"]
+  return failures
+
+/-- `--self-test`: run the built-in corpus, the failure-classification check, and the
+    compiled-reference self-probe; exit `0` iff `selfTestFailures` is empty. -/
+def runSelfTestIO (jsonOut : Bool) (fuel : Nat := 4096) : IO UInt32 := do
+  let corpus ← runBuiltinCorpusIO .x86_64 fuel
+  let classification ← runFailureClassificationSelfTestIO
+  let (compiledRef, kernelRef) ← compiledReferenceSelfProbeIO
+  let failures := selfTestFailures corpus classification compiledRef kernelRef
+  if jsonOut then
+    IO.println (Json.compress (Json.mkObj [
+      ("self_test", Json.str (if failures.isEmpty then "passed" else "failed")),
+      ("failures", Json.arr (failures.map Json.str).toArray),
+      ("corpus", corpus.toJson)
+    ]))
+  else
+    IO.println corpus.formatSummary
+    IO.println s!"[eval-lcnf] self-test: {if failures.isEmpty then "PASSED" else "FAILED: " ++ String.intercalate "; " failures}"
+  return if failures.isEmpty then 0 else 1
+
 /-! ## CLI Entrypoint -/
 
 private def hasFlag (args : List String) (flag : String) : Bool :=
@@ -2159,6 +2283,8 @@ def printUsage : IO Unit := do
   IO.println "  against Lean's compiled IR evaluator (primary) and kernel reduction (secondary),"
   IO.println "  reporting compared_count, agreed_failure_count, skipped_by_reason (with names),"
   IO.println "  reference_evaluates_project_refuses_count, mismatch_count, and constructs_covered."
+  IO.println "  --self-test runs the built-in corpus plus failure-classification and compiled-reference checks."
+  IO.println "  Exit status is 0 only if at least one declaration was compared and mismatch_count == 0."
 
 def run (args : List String) : IO UInt32 := do
   if hasFlag args "--help" || hasFlag args "-h" then
@@ -2167,31 +2293,27 @@ def run (args : List String) : IO UInt32 := do
   let jsonOut := hasFlag args "--json"
   let onlyDecl? := findFlagValue? args "--decl"
   let fuel := (findFlagValue? args "--fuel" >>= String.toNat?).getD 4096
-  let files := positionalSourceFiles args
-  let reports ←
-    if files.isEmpty then
-      let rep ← runBuiltinCorpusIO .x86_64 fuel
-      pure [rep]
+  -- A driver failure (snippet elaboration, probe I/O) is a failed run, never a pass.
+  try
+    if hasFlag args "--self-test" then
+      return ← runSelfTestIO jsonOut fuel
+    let files := positionalSourceFiles args
+    let reports ←
+      if files.isEmpty then
+        let rep ← runBuiltinCorpusIO .x86_64 fuel
+        pure [rep]
+      else
+        files.mapM fun f => runDifferentialOnSourceFile f onlyDecl? .x86_64 fuel
+    if jsonOut then
+      match reports with
+      | [single] => IO.println (Json.compress single.toJson)
+      | many => IO.println (Json.compress (mergedReportsToJson many))
     else
-      files.mapM fun f => runDifferentialOnSourceFile f onlyDecl? .x86_64 fuel
-  let totalMismatchCount := reports.foldl (fun acc r => acc + r.mismatchCount) 0
-  let totalAgreedFailureCount := reports.foldl (fun acc r => acc + r.agreedFailureCount) 0
-  let totalComparedCount := reports.foldl (fun acc r => acc + r.comparedCount) 0
-  if jsonOut then
-    match reports with
-    | [single] => IO.println (Json.compress single.toJson)
-    | many =>
-      let merged := Json.mkObj [
-        ("schema", Lean.toJson (2 : Nat)),
-        ("mismatch_count", Lean.toJson totalMismatchCount),
-        ("agreed_failure_count", Lean.toJson totalAgreedFailureCount),
-        ("compared_count", Lean.toJson totalComparedCount),
-        ("reports", Json.arr (many.map DiffReport.toJson).toArray)
-      ]
-      IO.println (Json.compress merged)
-  else
-    for rep in reports do
-      IO.println rep.formatSummary
-  return exitStatusForReports reports
+      for rep in reports do
+        IO.println rep.formatSummary
+    return exitStatusForReports reports
+  catch e =>
+    IO.eprintln s!"[eval-lcnf] error: {e}"
+    return 1
 
 end LeanNative.Driver.EvalLCNFCLI
