@@ -107,15 +107,15 @@ def expectedPrivateDecls : List Name := [
   `LeanNative.IR.initialSeenVarsForCode,
   `LeanNative.IR.isBuiltinLNIRRuntimeCall,
   `LeanNative.IR.collectDirectCallees,
-  `LeanNative.IR.reachesDeclInCallGraph,
   `LeanNative.IR.collectArgFVarsImpure,
   `LeanNative.IR.collectCodeTypeExprs,
   `LeanNative.IR.collectLetValueCtorAndCalleeNames,
   `LeanNative.IR.collectCodeCtorAndCalleeNames,
   `LeanNative.IR.mkFreshEmbFVarId,
   `LeanNative.IR.collectGetBangIdxUsage,
-  `LeanNative.IR.diamondCallGraphRegMod,
-  `LeanNative.IR.visitedFuelRegMod
+  `LeanNative.IR.u64Param,
+  `LeanNative.IR.recCallGraphRegMod,
+  `LeanNative.IR.gateRejects
 ]
 
 def checkBridgeHelpersSplitPin : CoreM Unit := do

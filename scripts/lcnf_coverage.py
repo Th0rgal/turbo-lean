@@ -99,11 +99,11 @@ _CON_LECHE_CACHE: dict[str, dict[str, Any]] = {}
 
 TRACKED_BRIDGE_FILES: dict[str, str] = {
     "lean/LeanNative/IR/Bridge.lean": "7b120631a25dbd1ef27bbf41b413488aa364c1ab40d5535ee96e74d02ee5ba93",
-    "lean/LeanNative/IR/RealLCNFBridge.lean": "49582ec6d309b57980be414ae7f0cb56d7f732c348d3872ffb816860b5f5d3ea",
-    "lean/LeanNative/IR/RealLCNFSemantics.lean": "8ac095d68aac9b389c78d1b0f6c62fcebff8e31ec23e2f684c1e5017bbea097b",
+    "lean/LeanNative/IR/RealLCNFBridge.lean": "f98f5151cf00d80221840d04950c21ab3cf7c1aadd232e42b3c521a55f8b5985",
+    "lean/LeanNative/IR/RealLCNFSemantics.lean": "8ec9cdb5af0fe534a457e20e7397c7ef2bab76ccb1f4a1825e0633c5759ab1a3",
     "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean": "be428a80da2953ec4d55c472df4f50c6f1c36b19031886f88debb9ccb594eab4",
     "lean/LeanNative/IR/BridgeHelpers.lean": "223552ea889239dd90f8b8e8ecec17ca6017e482314c05c909b63d5261f28660",
-    "lean/LeanNative/IR/BridgeHelpers/DeclIngestAndValidation.lean": "af99eb1572e6c34f1e39f1ef0414a5e37560961819a33fc48723fb53c91a1795",
+    "lean/LeanNative/IR/BridgeHelpers/DeclIngestAndValidation.lean": "f97d9dfec9f690a8ce11e29f1cd533201c144cd03eee8c8248ac69664137d886",
     "lean/LeanNative/IR/BridgeHelpers/HeapAndConstructors.lean": "a84d151736dfdabf17ca52f6c234d0849e3cdedd78ae2a112489817e75f2a818",
     "lean/LeanNative/IR/BridgeHelpers/RealBridgeCtxAndSlices.lean": "d40652c3d15a56c129b1d84af3278922007d45239dd2c84fedceeaeaf1f63103",
     "lean/LeanNative/IR/BridgeHelpers/ScalarDagAndJoinPoints.lean": "c126f21a899a002e6b090ccab6dfaf286d0cb704187f8eef618683f9b6077169",

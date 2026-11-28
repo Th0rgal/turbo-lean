@@ -768,7 +768,6 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
         rejected_snippets = {
             "nat_param": "def bad_nat (n : Nat) : UInt64 := n.toUInt64\n",
             "direct_recursion": "partial def bad_rec (x : UInt64) : UInt64 := if x == 0 then 0 else bad_rec (x - 1)\n",
-            "mutual_recursion": "mutual\npartial def ping (x : UInt64) : UInt64 := if x == 0 then 1 else pong (x - 1)\npartial def pong (x : UInt64) : UInt64 := if x == 0 then 2 else ping (x - 1)\nend\n",
             "closure_param": "def bad_clos (f : UInt64 → UInt64) (x : UInt64) : UInt64 := f x\n",
             "heap_adt": "inductive Boxed where | mk (x : UInt64) (s : String)\ndef bad_adt (b : Boxed) : UInt64 := match b with | .mk x _ => x\n",
             "string_lit": "def bad_str (x : UInt64) : String := if x == 0 then \"zero\" else \"nonzero\"\n",
@@ -790,6 +789,27 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
                     text=True,
                 )
                 self.assertNotEqual(res.returncode, 0, f"Expected fail-closed rejection for {label}, got stdout={res.stdout}")
+
+            # Mutual recursion lowers since W1D H1-WIRE (`H1.recRefinement`); direct recursion above
+            # is still refused per declaration.
+            mutual_src = tmpdir / "mutual_recursion.lean"
+            mutual_src.write_text(
+                "mutual\n"
+                "partial def ping (x : UInt64) : UInt64 := if x == 0 then 1 else pong (x - 1)\n"
+                "partial def pong (x : UInt64) : UInt64 := if x == 0 then 2 else ping (x - 1)\n"
+                "end\n",
+                encoding="utf-8",
+            )
+            mutual_wire = tmpdir / "mutual_recursion.lnir"
+            res = subprocess.run(
+                [full_bin, "emit-lnir", "--wire", str(mutual_src), "-o", str(mutual_wire)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, f"mutual recursion must lower: {res.stdout + res.stderr}")
+            mutual_text = mutual_wire.read_text(encoding="utf-8")
+            for sym in ("l_ping", "l_pong"):  # the wire format hex-encodes declaration names
+                self.assertIn(f"D_decl|{sym.encode().hex()}|", mutual_text)
 
             valid_src = tmpdir / "ValidBatch.lean"
             valid_src.write_text(
