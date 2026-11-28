@@ -18,8 +18,10 @@ Track C4 evaluator over real upstream `Lean.Compiler.LCNF` ASTs (`LitValue`, `Ar
 It does not import `LeanNative.Semantics.Eval` and does not call `lowerRealLCNFCode` /
 `lowerImpureStepPure`. Arithmetic is computed directly over fixed-width `BitVec 64` words masked
 to the operand bitwidth (`1`, `8`, `16`, `32`, or `64`), constructor/projection/mutation layout
-follows `RcCtorLayoutSpec` (`HEAPOBJ_CONTRACT C1.2`), and non-recursive join points (`Code.jp` /
-`Code.jmp`) evaluate the recorded join-point body under bound parameter environments.
+follows `RcCtorLayoutSpec` (`HEAPOBJ_CONTRACT C1.2`), and join points (`Code.jp` / `Code.jmp`)
+evaluate the recorded join-point body under bound parameter environments.
+A join point is bound before its own body runs, so a recursive join point (a loop) unfolds once per
+`Code.jmp` and each unfolding spends one unit of the evaluator's structural `fuel`.
 
 First-order calls (W2-L2): `LEnv.funcs` maps a local callee's name to its semantics. A `.fap` to a
 `RealBridgeCtx.localCallees` entry with a recorded callee and a scalar or tuple result runs that callee;
@@ -854,11 +856,8 @@ def evalStep (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
         match env.vals x with | some v => .ok (v, st) | none => .error (.unboundVar 0)
       | .unreach _ => .error (.typeError "reached unreachable code")
       | .jp decl k =>
-        if hasJmpToPure fuel decl.fvarId (.inl decl.value) then
-          .error (.unsupportedCall "recursive join point")
-        else
-          let env' := env.bindJp decl.fvarId { params := decl.params.toList, code := decl.value }
-          evalStep fuel ctx env' st (.inl k)
+        let env' := env.bindJp decl.fvarId { params := decl.params.toList, code := decl.value }
+        evalStep fuel ctx env' st (.inl k)
       | .jmp fvarId args =>
         match env.jps fvarId with
         | none => .error (.unsupportedCall "unmapped join point")

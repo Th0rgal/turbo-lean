@@ -823,7 +823,11 @@ def lowerRefOpPure (isInc : Bool) (vid : VarId) (vt : LNIRType) (n : Nat) (kCode
   else .error s!"[lean-native] Unsupported heap RC instruction on `{reprStr vt}` in Stage 1B"
 
 /-- Fuel-bounded check whether `targetFVar` appears in a `Code.jmp` inside `code`/`alts`
-    (detects recursive join points without `partial` or mutual well-founded recursion). -/
+    (detects recursive join points without `partial` or mutual well-founded recursion).
+    `Lean.Compiler.LCNF.Check` puts a join point in scope only in its continuation, so compiler
+    output never has one. `lowerImpureStepPure` rejects hand-built ones, since inlining a jump
+    would unfold the loop until fuel runs out. Loops reach the bridge as recursive declarations,
+    which `lowerRealLCNFModule` lowers and `H1.recRefinement` proves at every call depth. -/
 def hasJmpToPure (fuel : Nat) (targetFVar : Lean.FVarId)
     (target : Lean.Compiler.LCNF.Code .impure ⊕ List (Lean.Compiler.LCNF.Alt .impure)) : Bool :=
   match fuel with
@@ -1142,7 +1146,8 @@ def lowerImpureStepPure (fuel : Nat) (ctx : RealBridgeCtx) (st : RealBridgeState
         .error s!"[lean-native] Unsupported local function `{decl.binderName}` in pure core"
       | .jp decl k =>
         if hasJmpToPure fuel decl.fvarId (.inl decl.value) then
-          .error s!"[lean-native] unsupported recursive join point `{decl.fvarId.name}`: no qualified loop lowering"
+          .error <| s!"[lean-native] unsupported recursive join point `{decl.fvarId.name}`: " ++
+            "LCNF scopes a join point only in its continuation and LNIR has no loop"
         else
           let stWithJp := st.setJpDecl decl.fvarId decl.params.toList decl.value
           lowerImpureStepPure fuel ctx stWithJp (.inl k)

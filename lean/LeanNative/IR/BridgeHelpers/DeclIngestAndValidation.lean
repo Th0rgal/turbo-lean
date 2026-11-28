@@ -45,29 +45,18 @@ private partial def collectDirectCallees : LNIRCode → List String
   | .ite _ t e | .seqFor _ _ _ _ _ _ t e => collectDirectCallees t ++ collectDirectCallees e
   | .ret _ | .unreachable => []
 
-private partial def reachesDeclInCallGraph (edges : List (String × List String))
-    (target : String) (fuel : Nat) (visited : List String) (frontier : List String) : Bool :=
-  match fuel, frontier with
-  | 0, _ => true
-  | _, [] => false
-  | fuel + 1, cur :: rest =>
-    if cur == target then true
-    else if visited.contains cur then
-      reachesDeclInCallGraph edges target (fuel + 1) visited rest
-    else
-      let nexts := ((edges.lookup cur).getD []).eraseDups
-      reachesDeclInCallGraph edges target fuel (cur :: visited) (nexts ++ rest)
-
+/-- Module gate before inlining: every direct callee is a module declaration and symbols are
+    unique, the driver side of `H1.ModuleCallees`. Call cycles are accepted: self- and mutually
+    recursive modules lower through `lowerRealLCNFModule` and are proved at every call depth by
+    `H1.recRefinement` (W2-L3). -/
 def validateIngestedModule (mod : LNIRModule) : Lean.CoreM Unit := do
   let knownNames := mod.decls.map (·.name)
-  let edges := mod.decls.map fun d => (d.name, (collectDirectCallees d.body).eraseDups)
+  if knownNames.eraseDups.length != knownNames.length then
+    Lean.throwError s!"[lean-native] Duplicate lowered symbol in `{mod.moduleName}`"
   for d in mod.decls do
-    let callees := (edges.lookup d.name).getD []
-    for c in callees do
+    for c in (collectDirectCallees d.body).eraseDups do
       if !knownNames.contains c then
         Lean.throwError s!"[lean-native] Unsupported unresolved call `{c}` in `{d.name}`"
-    if reachesDeclInCallGraph edges d.name (mod.decls.length + 2) [] callees then
-      Lean.throwError s!"[lean-native] Unsupported self-tail recursion / mutual recursion involving `{d.name}`"
 
 partial def codeHasResidualHeapOrTupleAbiOp : LNIRCode → Bool
   | .letBind _ ty val k =>
@@ -155,75 +144,43 @@ def ingestModuleDeclsWith (ingestImpure : Lean.Compiler.LCNF.Decl .impure → Ar
     (arch : TargetArch := .x86_64) : Lean.CoreM LNIRModule := do
   let declNames ← expandCompilerAuxDecls rawDeclNames
   let env ← getEnv
-  let mut callGraph : Std.HashMap Lean.Name (List Lean.Name) := {}
   let mut decls : List LNIRDecl := []
   let mut rawPairs : List (Lean.Name × String) := []
   for name in declNames do
     if let some impureDecl ← Lean.Compiler.LCNF.getLocalImpureDecl? name then
-      if let .code c := impureDecl.value then
-        callGraph := callGraph.insert name (collectCodeLocalCallees declNames c)
       let d ← ingestImpure impureDecl declNames arch
       decls := decls ++ [d]
       rawPairs := rawPairs ++ [(name, d.name)]
     else if (← Lean.Compiler.LCNF.getMonoDecl? name).isSome then
       Lean.throwError s!"[lean-native] `{name}` has no local impure LCNF: only `Decl .impure` lowers (via the proved `lowerRealLCNFDecl`)"
-  if declsHaveMutualCycle callGraph then
-    Lean.throwError s!"[lean-native] unsupported self-tail recursion / mutual recursion in {moduleName}: no qualified loop lowering"
   let rawMod : LNIRModule := { moduleName := moduleName, decls := decls }
   validateIngestedModule rawMod
   filterNonInternalHelperDecls env rawPairs arch (normalizeAndInlineLocalDefs rawMod)
 
-private def diamondCallGraphRegMod : LNIRModule where
-  moduleName := "diamond_call_graph_regression"
+private def u64Param : LNIRParam := { id := 0, name := "x", ty := .i64 }
+
+/-- `f` calls itself and `g`, and `g` calls `f`: a recursive module passes the gate. -/
+private def recCallGraphRegMod : LNIRModule where
+  moduleName := "rec_call_graph_regression"
   decls := [
-    { name := "f", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
-      body :=
-        .letBind 1 .i64 (.call "g" [0] .i64)
-          (.letBind 2 .i64 (.call "h" [0] .i64)
-            (.letBind 3 .i64 (.call "g" [1] .i64)
-              (.letBind 4 .i64 (.call "h" [2] .i64)
-                (.ret 4)))) },
-    { name := "g", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
-      body :=
-        .letBind 1 .i64 (.call "k" [0] .i64)
-          (.letBind 2 .i64 (.call "k" [1] .i64)
-            (.ret 2)) },
-    { name := "h", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
-      body :=
-        .letBind 1 .i64 (.call "k" [0] .i64)
-          (.letBind 2 .i64 (.call "k" [1] .i64)
-            (.ret 2)) },
-    { name := "k", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
-      body := .ret 0 }
+    { name := "f", params := [u64Param], retTy := .i64,
+      body := .letBind 1 .i64 (.call "f" [0] .i64)
+        (.letBind 2 .i64 (.call "g" [1] .i64) (.ret 2)) },
+    { name := "g", params := [u64Param], retTy := .i64,
+      body := .letBind 1 .i64 (.call "f" [0] .i64) (.ret 1) }
   ]
 
-private def visitedFuelRegMod : LNIRModule where
-  moduleName := "visited_fuel_regression"
-  decls := [
-    { name := "f", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
-      body :=
-        .letBind 1 .i64 (.call "g" [0] .i64)
-          (.letBind 2 .i64 (.call "h" [1] .i64)
-            (.letBind 3 .i64 (.call "k" [2] .i64)
-              (.ret 3))) },
-    { name := "g", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
-      body :=
-        .letBind 1 .i64 (.call "h" [0] .i64)
-          (.letBind 2 .i64 (.call "k" [1] .i64)
-            (.ret 2)) },
-    { name := "h", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
-      body := .letBind 1 .i64 (.call "k" [0] .i64) (.ret 1) },
-    { name := "k", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
-      body := .ret 0 }
-  ]
+#eval validateIngestedModule recCallGraphRegMod
 
-#guard
-  let edges := diamondCallGraphRegMod.decls.map fun d => (d.name, (collectDirectCallees d.body).eraseDups)
-  !(reachesDeclInCallGraph edges "f" (diamondCallGraphRegMod.decls.length + 2) [] ["g", "h"])
-#guard
-  let edges := visitedFuelRegMod.decls.map fun d => (d.name, (collectDirectCallees d.body).eraseDups)
-  !(reachesDeclInCallGraph edges "f" (visitedFuelRegMod.decls.length + 2) [] ((edges.lookup "f").getD []))
-#eval validateIngestedModule diamondCallGraphRegMod
-#eval validateIngestedModule visitedFuelRegMod
+private def gateRejects (m : LNIRModule) : Lean.CoreM Bool :=
+  tryCatch (validateIngestedModule m *> pure false) fun _ => pure true
+
+-- An unresolved callee and a duplicated symbol still fail closed.
+#eval show Lean.CoreM Unit from do
+  let fOnly := { recCallGraphRegMod with decls := recCallGraphRegMod.decls.take 1 }
+  let ds := recCallGraphRegMod.decls
+  let dup := { recCallGraphRegMod with decls := ds ++ ds }
+  unless (← gateRejects fOnly) && (← gateRejects dup) do
+    Lean.throwError "validateIngestedModule accepted an unresolved call or a duplicate symbol"
 
 end LeanNative.IR
