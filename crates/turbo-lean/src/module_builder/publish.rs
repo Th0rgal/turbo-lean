@@ -217,7 +217,7 @@ pub(crate) fn seed_verified_fresh_modules_into_disposable_snapshot(
                 dirty_mods.insert(mod_name.clone());
                 continue;
             }
-            if tv.get("inputs").is_none() {
+            if lake_trace_inputs(&tv).is_none() {
                 let raw_imp_dynlibs = compute_module_raw_import_dynlibs(&dst_dag, node);
                 let actual_dep_h = tv
                     .get("depHash")
@@ -1002,7 +1002,7 @@ pub(super) fn compute_lake_export_info_opts(
         compute_module_arts_traces(&olean_path, is_mod, true)?;
     if !(allow_stale_src_in_dag && is_in_dag) {
         if let Some((_, ref src_raw, _)) = dep_src_info {
-            if tv.get("inputs").is_some() {
+            if lake_trace_inputs(&tv).is_some() {
                 let expected_src_h = format!("{:016x}", lake_hash_text(src_raw));
                 let src_matched = trace_recorded_src_hash(&tv) == Some(expected_src_h.as_str())
                     || tv
@@ -1079,7 +1079,7 @@ pub(super) fn compute_lake_export_info_opts(
                 &sub_exp,
             );
         }
-        if !is_in_dag && tv.get("inputs").is_some() {
+        if !is_in_dag && lake_trace_inputs(&tv).is_some() {
             if let Some(actual_imports_h) = recorded_trace_imports_hash(&tv) {
                 let expected_imports_h = if import_entries.is_empty() {
                     LAKE_NIL_HASH
