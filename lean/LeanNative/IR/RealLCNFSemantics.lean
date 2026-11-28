@@ -20,6 +20,10 @@ It does not import `LeanNative.Semantics.Eval` and does not call `lowerRealLCNFC
 to the operand bitwidth (`1`, `8`, `16`, `32`, or `64`), constructor/projection/mutation layout
 follows `RcCtorLayoutSpec` (`HEAPOBJ_CONTRACT C1.2`), and non-recursive join points (`Code.jp` /
 `Code.jmp`) evaluate the recorded join-point body under bound parameter environments.
+
+First-order calls (W2-L2): `LEnv.funcs` maps a local callee's name to its semantics. A `.fap` to a
+`RealBridgeCtx.localCallees` entry with a recorded callee and a scalar or tuple result runs that callee;
+`moduleFuncEnv` builds the table of an acyclic module, so `evalStep` itself never recurses into a callee.
 -/
 
 structure JpBody where
@@ -32,9 +36,13 @@ structure LEnv where
   tys   : Lean.FVarId → Option LNIRType := fun _ => none
   ctors : Lean.FVarId → Option Lean.Name := fun _ => none
   jps   : Lean.FVarId → Option JpBody := fun _ => none
+  funcs : Lean.Name → Option FnSem := fun _ => none
   deriving Inhabited
 
 def LEnv.empty : LEnv := {}
+
+/-- The empty environment with call table `funcs`. -/
+def LEnv.ofFuncs (funcs : Lean.Name → Option FnSem) : LEnv := { funcs }
 
 def LEnv.bind (env : LEnv) (x : Lean.FVarId) (v : Val) (ctor? : Option Lean.Name := none)
     (ty? : Option LNIRType := none) : LEnv :=
@@ -562,7 +570,13 @@ def evalLetValue (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
     | none => .error (.unboundVar 0)
   | .fap fn args _ =>
     if (ctx.findLocalCallee? fn).isSome then
-      .error (.unsupportedCall fn.toString)
+      match env.funcs fn with
+      | none => .error (.unsupportedCall fn.toString)
+      | some f =>
+        if !isUnboxedScalarOrTuple ty then .error (.unsupportedCall fn.toString)
+        else match evalJpArgs env.vals args.toList with
+          | .error e => .error e
+          | .ok vs => (f vs st).map fun (v, st') => (v, st', none)
     else
     match evalSliceCall? ctx.arch fn env st args.toList ty with
     | some res => res
@@ -861,12 +875,22 @@ def evalRealLCNFCode (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapS
 
 def evalRealLCNFDecl (fuel : Nat) (ctx : RealBridgeCtx)
     (decl : Lean.Compiler.LCNF.Decl .impure) (args : List Val)
-    (st : HeapState := HeapState.empty) : Except UBError (Val × HeapState) :=
+    (st : HeapState := HeapState.empty) (funcs : Lean.Name → Option FnSem := fun _ => none) :
+    Except UBError (Val × HeapState) :=
   match decl.value with
   | .extern _ => .error (.unsupportedCall s!"extern {decl.name}")
   | .code c =>
-    match bindParams ctx true LEnv.empty decl.params.toList args with
+    match bindParams ctx true (LEnv.ofFuncs funcs) decl.params.toList args with
     | .ok env => evalRealLCNFCode fuel ctx env st c
     | .error e => .error e
+
+/-- Call table of an acyclic module, keyed by `Decl.name`: each declaration runs under the table of the
+    declarations after it (callees follow their callers in the list). -/
+def moduleFuncEnv (fuel : Nat) (ctx : RealBridgeCtx) :
+    List (Lean.Compiler.LCNF.Decl .impure) → Lean.Name → Option FnSem
+  | [] => fun _ => none
+  | d :: ds => fun n =>
+    if n == d.name then some (fun args st => evalRealLCNFDecl fuel ctx d args st (moduleFuncEnv fuel ctx ds))
+    else moduleFuncEnv fuel ctx ds n
 
 end LeanNative.IR.RealLCNFSemantics

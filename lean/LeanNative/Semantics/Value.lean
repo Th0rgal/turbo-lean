@@ -554,4 +554,7 @@ end HeapState
 @[simp] theorem maskElemVal_f64_fun : maskElemVal .f64 = id := rfl
 @[simp] theorem maskElemVal_f64 (v : UInt64) : maskElemVal .f64 v = v := rfl
 
+/-- Semantics of a first-order callee: arguments and heap in, result and heap out (W2-L2). -/
+abbrev FnSem := List Val → HeapState → Except UBError (Val × HeapState)
+
 end LeanNative.Semantics

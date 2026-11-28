@@ -7,22 +7,7 @@ open LeanNative.IR.RealLCNFBridge
 open LeanNative.IR.RealLCNFSemantics
 open LeanNative.Semantics
 
-theorem lowerStepInr_sound (fuel : Nat) (ctx : RealBridgeCtx)
-    (ih : ∀ (st st' : RealBridgeState) (lenv : LEnv) (venv : VarEnv) (hst hst' : HeapState) (v : Val)
-      (target : Lean.Compiler.LCNF.Code .impure ⊕
-        (VarId × Bool × Nat × Option Lean.FVarId × List (Lean.Compiler.LCNF.Alt .impure)))
-      (code : LNIRCode),
-      BridgeStateInv st lenv venv →
-      lowerImpureStepPure fuel ctx st target = .ok (code, st') →
-      (match target with
-       | .inl c => evalStep fuel ctx lenv hst (.inl c) = .ok (v, hst')
-       | .inr (condVar, isBool, idx, discr?, alts) =>
-         condVar < st.nextVarId ∧
-         (∀ dx, discr? = some dx → (st.lookupFVar? dx).isSome = true) ∧
-         (lnirTypeEq (st.getVarType condVar) .i1 = true → isBool = true) ∧
-         ∃ cond, venv condVar = some cond ∧
-           evalStep fuel ctx lenv hst (.inr (cond, isBool, idx, discr?, alts)) = .ok (v, hst')) →
-      evalCode fuel venv hst code = .ok (v, hst'))
+theorem lowerStepInr_sound {tf : FuncTable} (fuel : Nat) (ctx : RealBridgeCtx) (ih : StepSimIH fuel ctx tf)
     (st st' : RealBridgeState) (lenv : LEnv) (venv : VarEnv) (hst hst' : HeapState) (v : Val)
     (condVar : VarId) (isBool : Bool) (idx : Nat) (discr? : Option Lean.FVarId)
     (alts : List (Lean.Compiler.LCNF.Alt .impure)) (code : LNIRCode) (cond : Val)
@@ -32,8 +17,9 @@ theorem lowerStepInr_sound (fuel : Nat) (ctx : RealBridgeCtx)
     (hdiscr : ∀ dx, discr? = some dx → (st.lookupFVar? dx).isSome = true)
     (hi1 : lnirTypeEq (st.getVarType condVar) .i1 = true → isBool = true)
     (hcondV : venv condVar = some cond)
-    (h_eval : evalStep (fuel + 1) ctx lenv hst (.inr (cond, isBool, idx, discr?, alts)) = .ok (v, hst')) :
-    evalCode (fuel + 1) venv hst code = .ok (v, hst') := by
+    (h_eval : evalStep (fuel + 1) ctx lenv hst (.inr (cond, isBool, idx, discr?, alts)) = .ok (v, hst'))
+    (hrel : FuncsRel ctx lenv.funcs tf) :
+    evalCode (fuel + 1) venv hst code tf = .ok (v, hst') := by
   dsimp only [lowerImpureStepPure] at h_lower
   dsimp only [evalStep] at h_eval
   cases alts with
@@ -46,7 +32,7 @@ theorem lowerStepInr_sound (fuel : Nat) (ctx : RealBridgeCtx)
         dsimp only at h_lower h_eval
         cases hemp : (!ps.isEmpty) <;> simp only [hemp, ↓reduceIte, Bool.false_eq_true] at h_lower
         · exact evalCode_fuel_mono_step fuel code venv hst v hst'
-            (ih st st' lenv venv hst hst' v (.inl c) code hinv h_lower h_eval)
+            (ih st st' lenv venv hst hst' v (.inl c) code hinv h_lower h_eval hrel)
         · exact nomatch h_lower
       | ctorAlt info c _ =>
         dsimp only at h_lower h_eval
@@ -66,15 +52,15 @@ theorem lowerStepInr_sound (fuel : Nat) (ctx : RealBridgeCtx)
         | ok pr =>
           rw [hc] at h_lower; injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
           exact evalCode_fuel_mono_step fuel pr.1 venv hst v hst'
-            (ih _ pr.2 _ venv hst hst' v (.inl c) pr.1 hinvIn hc h_eval)
+            (ih _ pr.2 _ venv hst hst' v (.inl c) pr.1 hinvIn hc h_eval (funcsRel_envIn discr? info.name hrel))
       | default c =>
         exact evalCode_fuel_mono_step fuel code venv hst v hst'
-          (ih st st' lenv venv hst hst' v (.inl c) code hinv h_lower h_eval)
+          (ih st st' lenv venv hst hst' v (.inl c) code hinv h_lower h_eval hrel)
     | cons alt2 rest2 =>
       cases alt with
       | default c =>
         exact evalCode_fuel_mono_step fuel code venv hst v hst'
-          (ih st st' lenv venv hst hst' v (.inl c) code hinv h_lower h_eval)
+          (ih st st' lenv venv hst hst' v (.inl c) code hinv h_lower h_eval hrel)
       | ctorAlt info c _ =>
         dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure] at h_lower
         dsimp only at h_eval
@@ -107,16 +93,16 @@ theorem lowerStepInr_sound (fuel : Nat) (ctx : RealBridgeCtx)
                      | some dx => if (lenv.vals dx).isSome then lenv.withCtor dx info.name else lenv
                      | none => lenv)
                     hst (.inl c) = .ok (v, hst') →
-                  evalCode (fuel + 1) venvY hst yesCode = .ok (v, hst') := by
+                  evalCode (fuel + 1) venvY hst yesCode tf = .ok (v, hst') := by
                 intro venvY hge hev
                 exact evalCode_fuel_mono_step fuel yesCode venvY hst v hst'
                   (ih st st1 _ venvY hst hst' v (.inl c) yesCode
                     (bridgeInv_venv_agree st _ venv venvY hinvIn
-                      (fun u hu => hge u (Nat.lt_of_lt_of_le hu hgeBase))) h1 hev)
+                      (fun u hu => hge u (Nat.lt_of_lt_of_le hu hgeBase))) h1 hev (funcsRel_envIn discr? info.name hrel))
               have hno : ∀ venvN, (∀ u, u < st2.nextVarId → venvN u = venv u) →
                   evalStep fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, alt2 :: rest2)) =
                     .ok (v, hst') →
-                  evalCode (fuel + 1) venvN hst noCode = .ok (v, hst') := by
+                  evalCode (fuel + 1) venvN hst noCode tf = .ok (v, hst') := by
                 intro venvN hge hev
                 exact evalCode_fuel_mono_step fuel noCode venvN hst v hst'
                   (ih { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
@@ -132,7 +118,7 @@ theorem lowerStepInr_sound (fuel : Nat) (ctx : RealBridgeCtx)
                        have hty1R : st1.getVarType condVar = st.getVarType condVar := ht1 condVar hcondLt
                        change lnirTypeEq (st1.getVarType condVar) .i1 = true at h
                        rw [hty1R] at h; exact h),
-                     cond, by rw [hge condVar (Nat.lt_of_lt_of_le hcondLt hgeBase)]; exact hcondV, hev⟩)
+                     cond, by rw [hge condVar (Nat.lt_of_lt_of_le hcondLt hgeBase)]; exact hcondV, hev⟩ hrel)
               exact tag_branch_sound fuel ctx lenv
                 (match discr? with
                  | some dx => if (lenv.vals dx).isSome then lenv.withCtor dx info.name else lenv
@@ -170,16 +156,16 @@ theorem lowerStepInr_sound (fuel : Nat) (ctx : RealBridgeCtx)
                      | some dx => if (lenv.vals dx).isSome then lenv.withCtor dx info.name else lenv
                      | none => lenv)
                     hst (.inl c) = .ok (v, hst') →
-                  evalCode (fuel + 1) venvY hst yesCode = .ok (v, hst') := by
+                  evalCode (fuel + 1) venvY hst yesCode tf = .ok (v, hst') := by
                 intro venvY hge hev
                 exact evalCode_fuel_mono_step fuel yesCode venvY hst v hst'
                   (ih stIn st1 _ venvY hst hst' v (.inl c) yesCode
                     (bridgeInv_venv_agree stIn _ venv venvY hinvIn
-                      (fun u hu => hge u (Nat.lt_of_lt_of_le hu hgeBase))) h1 hev)
+                      (fun u hu => hge u (Nat.lt_of_lt_of_le hu hgeBase))) h1 hev (funcsRel_envIn discr? info.name hrel))
               have hno : ∀ venvN, (∀ u, u < st2.nextVarId → venvN u = venv u) →
                   evalStep fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, alt2 :: rest2)) =
                     .ok (v, hst') →
-                  evalCode (fuel + 1) venvN hst noCode = .ok (v, hst') := by
+                  evalCode (fuel + 1) venvN hst noCode tf = .ok (v, hst') := by
                 intro venvN hge hev
                 exact evalCode_fuel_mono_step fuel noCode venvN hst v hst'
                   (ih { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
@@ -195,7 +181,7 @@ theorem lowerStepInr_sound (fuel : Nat) (ctx : RealBridgeCtx)
                        have hty1R : st1.getVarType condVar = st.getVarType condVar := ht1 condVar hcondLt
                        change lnirTypeEq (st1.getVarType condVar) .i1 = true at h
                        rw [hty1R] at h; exact h),
-                     cond, by rw [hge condVar (Nat.lt_of_lt_of_le hcondLt hgeBase)]; exact hcondV, hev⟩)
+                     cond, by rw [hge condVar (Nat.lt_of_lt_of_le hcondLt hgeBase)]; exact hcondV, hev⟩ hrel)
               exact tag_branch_sound fuel ctx lenv
                 (match discr? with
                  | some dx => if (lenv.vals dx).isSome then lenv.withCtor dx info.name else lenv
@@ -232,16 +218,16 @@ theorem lowerStepInr_sound (fuel : Nat) (ctx : RealBridgeCtx)
               have hgeBase : st.nextVarId ≤ st2.nextVarId := Nat.le_trans hn1 hn2
               have hyes : ∀ venvY, (∀ u, u < st2.nextVarId → venvY u = venv u) →
                   evalStep fuel ctx lenv hst (.inl c) = .ok (v, hst') →
-                  evalCode (fuel + 1) venvY hst yesCode = .ok (v, hst') := by
+                  evalCode (fuel + 1) venvY hst yesCode tf = .ok (v, hst') := by
                 intro venvY hge hev
                 exact evalCode_fuel_mono_step fuel yesCode venvY hst v hst'
                   (ih st st1 lenv venvY hst hst' v (.inl c) yesCode
                     (bridgeInv_venv_agree st lenv venv venvY hinv
-                      (fun u hu => hge u (Nat.lt_of_lt_of_le hu hgeBase))) h1 hev)
+                      (fun u hu => hge u (Nat.lt_of_lt_of_le hu hgeBase))) h1 hev hrel)
               have hno : ∀ venvN, (∀ u, u < st2.nextVarId → venvN u = venv u) →
                   evalStep fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, alt2 :: rest2)) =
                     .ok (v, hst') →
-                  evalCode (fuel + 1) venvN hst noCode = .ok (v, hst') := by
+                  evalCode (fuel + 1) venvN hst noCode tf = .ok (v, hst') := by
                 intro venvN hge hev
                 exact evalCode_fuel_mono_step fuel noCode venvN hst v hst'
                   (ih { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
@@ -257,14 +243,14 @@ theorem lowerStepInr_sound (fuel : Nat) (ctx : RealBridgeCtx)
                        have hty1R : st1.getVarType condVar = st.getVarType condVar := ht1 condVar hcondLt
                        change lnirTypeEq (st1.getVarType condVar) .i1 = true at h
                        rw [hty1R] at h; exact h),
-                     cond, by rw [hge condVar (Nat.lt_of_lt_of_le hcondLt hgeBase)]; exact hcondV, hev⟩)
+                     cond, by rw [hge condVar (Nat.lt_of_lt_of_le hcondLt hgeBase)]; exact hcondV, hev⟩ hrel)
               exact tag_branch_sound fuel ctx lenv lenv venv hst hst' v cond condVar
                 (st.getVarType condVar) ((ctx.findNullaryCtor? ctorName).getD idx) isBool idx discr?
                 (alt2 :: rest2) c yesCode noCode code st2 st' hi1 hcondV hyes hno
                 h_lower h_eval
         · exact nomatch h_lower
 
-theorem evalCtorWriteStep_sound (fuel : Nat) (st : RealBridgeState) (venv : VarEnv)
+theorem evalCtorWriteStep_sound {tf : FuncTable} (fuel : Nat) (st : RealBridgeState) (venv : VarEnv)
     (hst hst1 hst' : HeapState) (v : Val) (objVid valVid : VarId) (objId : Nat)
     (slot : Nat) (yVal : Val) (isObj : Bool) (kCode : LNIRCode)
     (hobjLt : objVid < st.nextVarId) (hvalLt : valVid < st.nextVarId)
@@ -272,12 +258,12 @@ theorem evalCtorWriteStep_sound (fuel : Nat) (st : RealBridgeState) (venv : VarE
     (hwf : writeField hst objId (slot.toUInt64).toNat yVal isObj = .ok hst1)
     (hkEval : evalCode (fuel + 1)
       ((venv.bind (st.freshVar .i64).1 (.u64 slot.toUInt64)).bind ((st.freshVar .i64).2.freshVar .unit).1 .unit)
-      hst1 kCode = .ok (v, hst')) :
+      hst1 kCode tf = .ok (v, hst')) :
     evalCode (fuel + 1) venv hst
       (.letBind (st.freshVar .i64).1 .i64 (.scalar (.constU64 slot.toUInt64))
         (.letBind ((st.freshVar .i64).2.freshVar .unit).1 .unit
           (.call (if isObj then "lean_native_ctor_set" else "lean_native_ctor_set_scalar")
-            [objVid, (st.freshVar .i64).1, valVid] .unit false) kCode)) =
+            [objVid, (st.freshVar .i64).1, valVid] .unit false) kCode)) tf =
       .ok (v, hst') := by
   have hidxId : (st.freshVar .i64).1 = st.nextVarId := (freshVar_spec st .i64).1
   let venv1 := venv.bind (st.freshVar .i64).1 (.u64 slot.toUInt64)
@@ -310,20 +296,20 @@ theorem evalCtorWriteStep_sound (fuel : Nat) (st : RealBridgeState) (venv : VarE
         .ok (Val.unit, hst1)
       unfold writeField at hwf
       rw [hwf]; rfl
-  change (match evalExpr venv hst (.scalar (.constU64 slot.toUInt64)) with
+  change (match evalExpr venv hst (.scalar (.constU64 slot.toUInt64)) tf with
     | .ok (iv, hst0) => evalCode (fuel + 1) (venv.bind (st.freshVar .i64).1 iv) hst0
         (.letBind ((st.freshVar .i64).2.freshVar .unit).1 .unit
           (.call (if isObj then "lean_native_ctor_set" else "lean_native_ctor_set_scalar")
-            [objVid, (st.freshVar .i64).1, valVid] .unit false) kCode)
+            [objVid, (st.freshVar .i64).1, valVid] .unit false) kCode) tf
     | .error e => .error e) = .ok (v, hst')
   dsimp only [evalExpr, evalScalarExpr]
   dsimp only [evalCode]
   change (match evalExpr venv1 hst
       (.call (if isObj then "lean_native_ctor_set" else "lean_native_ctor_set_scalar")
-        [objVid, (st.freshVar .i64).1, valVid] .unit false) with
-    | .ok (u, hst0) => evalCode (fuel + 1) (venv1.bind ((st.freshVar .i64).2.freshVar .unit).1 u) hst0 kCode
+        [objVid, (st.freshVar .i64).1, valVid] .unit false) tf with
+    | .ok (u, hst0) => evalCode (fuel + 1) (venv1.bind ((st.freshVar .i64).2.freshVar .unit).1 u) hst0 kCode tf
     | .error e => .error e) = .ok (v, hst')
-  rw [hcall]
+  rw [evalExpr_ok_funcs tf hcall]
   exact hkEval
 
 end LeanNative.Proofs
