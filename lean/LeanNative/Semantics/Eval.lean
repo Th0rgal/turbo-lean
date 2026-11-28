@@ -215,8 +215,19 @@ def evalCtorGet (env : VarEnv) (st : HeapState) (ctorVar : VarId) (idx : Nat) (i
   | some _ => .error (.typeError "ctorGet expects heap constructor or constructor tuple")
   | none => .error (.unboundVar ctorVar)
 
-/-- Total evaluator for right-hand side LNIR expressions (`LNIRExpr`). -/
-def evalExpr (env : VarEnv) (st : HeapState) (e : LNIRExpr) : Except UBError (Val × HeapState) :=
+/-- First-order call table (W2-L2): lowered symbol ↦ callee semantics. -/
+abbrev FuncTable := String → Option FnSem
+
+/-- Runtime-intrinsic call names `evalExpr` interprets before it consults the `FuncTable`. -/
+def builtinCallNames : List String :=
+  ["lean_native_box_u64", "lean_native_unbox_u64", "lean_native_ensure_exclusive",
+   "lean_native_sarray_len", "lean_mark_mt", "lean_native_ctor_set", "lean_native_ctor_set_scalar",
+   "lean_native_ctor_set_tag", "lean_native_del_obj", "lean_native_ctor_tag"]
+
+/-- Total evaluator for right-hand side LNIR expressions (`LNIRExpr`). A non-extern `.call` to a
+    name that is not a runtime intrinsic runs the callee recorded in `funcs` (empty by default). -/
+def evalExpr (env : VarEnv) (st : HeapState) (e : LNIRExpr) (funcs : FuncTable := fun _ => none) :
+    Except UBError (Val × HeapState) :=
   match e with
   | .scalar se =>
     match evalScalarExpr env se with
@@ -437,7 +448,9 @@ def evalExpr (env : VarEnv) (st : HeapState) (e : LNIRExpr) : Except UBError (Va
         | [.tuple (.u64 tag :: _)] => .ok (.u64 tag, st)
         | _ => .error (.typeError "lean_native_ctor_tag expects heap object or unboxed tag")
       else
-        .error (.unsupportedCall fnName)
+        match funcs fnName with
+        | some f => f vals st
+        | none => .error (.unsupportedCall fnName)
     | .error err => .error err
 
 /-- Read element `elemIdx` from the `argIdx`-th input buffer/scalar of a `parFor` kernel, propagating UB errors. -/
@@ -557,67 +570,81 @@ def evalSeqLoop (count : Nat) (curIdx : Nat) (idxVar accVar : VarId)
 
 /-- Total operational evaluator for structured `LNIRCode` by direct structural recursion on `code`.
     Because `LNIRCode` is a finite syntax tree and `seqFor` is bounded by `hi - lo`,
-    termination is structural on `code : LNIRCode` with no artificial `fuel = 0` truncation. -/
-def evalCode (fuel : Nat) : VarEnv → HeapState → LNIRCode → Except UBError (Val × HeapState)
-  | env, st, .letBind dst _ty val k =>
-    match evalExpr env st val with
-    | .ok (v, st') => evalCode fuel (env.bind dst v) st' k
+    termination is structural on `code : LNIRCode` with no artificial `fuel = 0` truncation.
+    `funcs` (W2-L2) resolves first-order calls; callees are closures, so recursion stays structural. -/
+def evalCode (fuel : Nat) :
+    VarEnv → HeapState → LNIRCode → optParam FuncTable (fun _ => none) → Except UBError (Val × HeapState)
+  | env, st, .letBind dst _ty val k, funcs =>
+    match evalExpr env st val funcs with
+    | .ok (v, st') => evalCode fuel (env.bind dst v) st' k funcs
     | .error err => .error err
-  | env, st, .rawStore ptrVar idxVar valVar elemTy k =>
+  | env, st, .rawStore ptrVar idxVar valVar elemTy k, funcs =>
     match env ptrVar, env idxVar, env valVar with
     | some (.rawPtrId bufId), some (.u64 idx), some (.u64 val) =>
       match st.writeElemExclusive bufId idx.toNat (maskElemVal elemTy val) with
-      | .ok st' => evalCode fuel env st' k
+      | .ok st' => evalCode fuel env st' k funcs
       | .error err => .error err
     | some (.sarrayId bufId), some (.u64 idx), some (.u64 val) =>
       match st.writeElemExclusive bufId idx.toNat (maskElemVal elemTy val) with
-      | .ok st' => evalCode fuel env st' k
+      | .ok st' => evalCode fuel env st' k funcs
       | .error err => .error err
     | none, _, _ => .error (.unboundVar ptrVar)
     | _, none, _ => .error (.unboundVar idxVar)
     | _, _, none => .error (.unboundVar valVar)
     | _, _, _ => .error (.typeError "rawStore requires rawPtrId/sarrayId and u64 index/value")
-  | env, st, .incRef objVar count k =>
+  | env, st, .incRef objVar count k, funcs =>
     match st.evalIncRef env objVar count with
-    | .ok st' => evalCode fuel env st' k
+    | .ok st' => evalCode fuel env st' k funcs
     | .error err => .error err
-  | env, st, .decRef objVar count k =>
+  | env, st, .decRef objVar count k, funcs =>
     match st.evalDecRef env objVar count with
-    | .ok st' => evalCode fuel env st' k
+    | .ok st' => evalCode fuel env st' k funcs
     | .error err => .error err
-  | env, st, .ite condVar thenBranch elseBranch =>
+  | env, st, .ite condVar thenBranch elseBranch, funcs =>
     match env condVar with
-    | some (.bool true) => evalCode fuel env st thenBranch
-    | some (.bool false) => evalCode fuel env st elseBranch
+    | some (.bool true) => evalCode fuel env st thenBranch funcs
+    | some (.bool false) => evalCode fuel env st elseBranch funcs
     | some (.u64 n) =>
-      if n != 0 then evalCode fuel env st thenBranch
-      else evalCode fuel env st elseBranch
+      if n != 0 then evalCode fuel env st thenBranch funcs
+      else evalCode fuel env st elseBranch funcs
     | some (.u256 w) =>
-      if w != UInt256.zero then evalCode fuel env st thenBranch
-      else evalCode fuel env st elseBranch
+      if w != UInt256.zero then evalCode fuel env st thenBranch funcs
+      else evalCode fuel env st elseBranch funcs
     | some _ => .error (.typeError "ite condition must be bool, u64, or u64")
     | none => .error (.unboundVar condVar)
-  | env, st, .seqFor idxVar loVar hiVar accVar accInit _accTy stepBody k =>
+  | env, st, .seqFor idxVar loVar hiVar accVar accInit _accTy stepBody k, funcs =>
     match env loVar, env hiVar, env accInit with
     | some (.u64 lo), some (.u64 hi), some initVal =>
       let count := hi.toNat - lo.toNat
       match evalSeqLoop count lo.toNat idxVar accVar initVal env st
-          (fun stepEnv stepSt => evalCode fuel stepEnv stepSt stepBody) with
-      | .ok (finalAcc, st') => evalCode fuel (env.bind accVar finalAcc) st' k
+          (fun stepEnv stepSt => evalCode fuel stepEnv stepSt stepBody funcs) with
+      | .ok (finalAcc, st') => evalCode fuel (env.bind accVar finalAcc) st' k funcs
       | .error err => .error err
     | none, _, _ => .error (.unboundVar loVar)
     | _, none, _ => .error (.unboundVar hiVar)
     | _, _, none => .error (.unboundVar accInit)
     | _, _, _ => .error (.typeError "seqFor bounds must be u64")
-  | env, st, .parFor outVar lenVar inputs elemTy kernel k =>
+  | env, st, .parFor outVar lenVar inputs elemTy kernel k, funcs =>
     match evalParFor fuel env st lenVar inputs kernel elemTy with
-    | .ok (outVal, st') => evalCode fuel (env.bind outVar outVal) st' k
+    | .ok (outVal, st') => evalCode fuel (env.bind outVar outVal) st' k funcs
     | .error err => .error err
-  | env, st, .ret v =>
+  | env, st, .ret v, _ =>
     match env v with
     | some val => .ok (val, st)
     | none => .error (.unboundVar v)
-  | _, _, .unreachable =>
+  | _, _, .unreachable, _ =>
     .error (.typeError "reached unreachable code")
+
+/-- Run a lowered declaration under `funcs`: bind `d.params` to `args` left to right, then run `d.body`. -/
+def evalDeclWith (fuel : Nat) (funcs : FuncTable) (d : LNIRDecl) (args : List Val) (hst : HeapState) :
+    Except UBError (Val × HeapState) :=
+  evalCode fuel ((d.params.zip args).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty) hst d.body funcs
+
+/-- Call table of an acyclic module, keyed by `LNIRDecl.name`: each declaration runs under the table of
+    the declarations after it (callees follow their callers in the list). -/
+def moduleFuncTable (fuel : Nat) : List LNIRDecl → FuncTable
+  | [] => fun _ => none
+  | d :: ds => fun s => if s == d.name then some (evalDeclWith fuel (moduleFuncTable fuel ds) d)
+    else moduleFuncTable fuel ds s
 
 end LeanNative.Semantics

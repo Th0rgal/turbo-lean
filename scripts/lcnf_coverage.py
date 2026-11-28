@@ -20,11 +20,12 @@ Methodology & Honesty Rules:
   `lake build` (~1 min, needs the pinned toolchain and the `lean-sys` checkout Lake fetches).
 - No source-pattern heuristic is ever represented as executed lowering.
 - As documented in `roadmap/HORIZONS.md` ("What the review found"), `lowerRealLCNFDecl` lowers a call
-  to another local user function (`LetValue.fap`), but `RealLCNFSemantics.evalLetValue` returns
-  `.error (.unsupportedCall fn.toString)` whenever `(ctx.findLocalCallee? fn).isSome`. Because
-  `lowerRealLCNFDecl_sound` is a forward simulation gated on `evalRealLCNFDecl ... = .ok (v, hst')`,
-  its conclusion is vacuous for any declaration that calls a local helper (`lowered_vacuous_local_call`,
-  classified under `lowered_unproved` until rung **L2** adds a function environment to both semantics).
+  to another local user function (`LetValue.fap`) to an `LNIR` `.call`. Rung **L2** gives both
+  semantics a call table (`LEnv.funcs`, `evalCode`'s `FuncTable`) and proves the call case
+  (`lowerLocalCall_sound`, module theorem `H1.callRefinement`) for callees with a scalar or tuple
+  result. The per-declaration `lowerRealLCNFDecl_sound` that the driver measures runs with empty
+  tables, where a local call still evaluates to `unsupportedCall`; its conclusion stays vacuous for
+  such declarations, so they remain classified `lowered_vacuous_local_call` under `lowered_unproved`.
 - External `Batteries` modules outside the in-toolchain `Init.Data.*` / `Std.Data.*` and the
   `verification/c2-lake-packages/*` `.olean` artifacts are explicitly reported as `unknown` rather
   than extrapolated; measuring them is a later leaf.
@@ -76,9 +77,9 @@ _CON_LECHE_CACHE: dict[str, dict[str, Any]] = {}
 
 TRACKED_BRIDGE_FILES: dict[str, str] = {
     "lean/LeanNative/IR/Bridge.lean": "7b120631a25dbd1ef27bbf41b413488aa364c1ab40d5535ee96e74d02ee5ba93",
-    "lean/LeanNative/IR/RealLCNFBridge.lean": "05c770055da81a9688c9bb2f27ecfc48dd0497d0247a08dfa0107620e3bc021a",
-    "lean/LeanNative/IR/RealLCNFSemantics.lean": "3e5729f3aee6d1d993317577549dcb9475ac4b5832f94e54a04fa7d6a0aba0b6",
-    "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean": "2b652b961f78656b494c8f45a58293b0fb01f1f44c8d81c409f4201d546a5b16",
+    "lean/LeanNative/IR/RealLCNFBridge.lean": "49582ec6d309b57980be414ae7f0cb56d7f732c348d3872ffb816860b5f5d3ea",
+    "lean/LeanNative/IR/RealLCNFSemantics.lean": "d0030489c1d30faa000c0299df80fd603b88f797856ffa104d3b90466e18c506",
+    "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean": "be428a80da2953ec4d55c472df4f50c6f1c36b19031886f88debb9ccb594eab4",
     "lean/LeanNative/IR/BridgeHelpers.lean": "223552ea889239dd90f8b8e8ecec17ca6017e482314c05c909b63d5261f28660",
     "lean/LeanNative/IR/BridgeHelpers/DeclIngestAndValidation.lean": "af99eb1572e6c34f1e39f1ef0414a5e37560961819a33fc48723fb53c91a1795",
     "lean/LeanNative/IR/BridgeHelpers/HeapAndConstructors.lean": "a84d151736dfdabf17ca52f6c234d0849e3cdedd78ae2a112489817e75f2a818",
@@ -307,7 +308,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "lowered_unproved",
         "evidence_file": "lean/LeanNative/IR/RealLCNFSemantics.lean",
         "evidence_symbol": "if (ctx.findLocalCallee? fn).isSome then",
-        "notes": "Lowered to LNIRExpr.call by lowerImpureFapPure, but evalLetValue returns .error (.unsupportedCall fn.toString), making lowerRealLCNFDecl_sound vacuous until rung L2.",
+        "notes": "Lowered to LNIRExpr.call; proved under call tables (lowerLocalCall_sound, H1.callRefinement) for callees with scalar or tuple results. Heap-result callees and the empty-table lowerRealLCNFDecl_sound remain vacuous (evalLetValue returns .error (.unsupportedCall fn.toString)).",
     },
     {
         "id": "LetValue.fap.gf_simd",

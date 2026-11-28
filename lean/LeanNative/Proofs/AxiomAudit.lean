@@ -11,6 +11,7 @@ import LeanNative.Proofs.LoopOptProofs
 import LeanNative.Proofs.RealLCNFBridgeProofs
 import LeanNative.Proofs.H1.SpecLocked
 import LeanNative.Proofs.H1.LowerSound
+import LeanNative.Proofs.H1.FirstOrderCalls
 import LeanNative.Proofs.BackendProofs
 import LeanNative.Proofs.KernelElabProofs
 import LeanNative.Proofs.SymbolicTV
@@ -687,6 +688,13 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.H1.negWitnessDroppedParam_killed
   , ``LeanNative.Proofs.H1.negWitnessWrongScrutinee_killed
   , ``LeanNative.Proofs.H1.letWitness, ``LeanNative.Proofs.H1.negWitnessSwappedArith_killed
+  , ``LeanNative.Proofs.evalExpr_ok_funcs, ``LeanNative.Proofs.evalExpr_call_table
+  , ``LeanNative.Proofs.funcsRel_empty, ``LeanNative.Proofs.callArgsSound
+  , ``LeanNative.Proofs.lowerLocalCall_sound, ``LeanNative.Proofs.lowerRealLCNFDecl_sound_with
+  , ``LeanNative.Proofs.H1.lowerRealLCNFModule_rel, ``LeanNative.Proofs.H1.callRefinement
+  , ``LeanNative.Proofs.H1.lowerRealLCNFModule_sound, ``LeanNative.Proofs.H1.f_lowered_body
+  , ``LeanNative.Proofs.H1.posWitnessCall, ``LeanNative.Proofs.H1.negWitnessWrongCallTarget_killed
+  , ``LeanNative.Proofs.H1.negWitnessSwappedCallArgs_killed
   , ``LeanNative.Transform.evalSeqLoop_async_refines
   , ``LeanNative.Transform.optimizeAsyncStateMachine_refines
   , ``LeanNative.Proofs.lowerAsyncPollStep_ready_sound
@@ -832,7 +840,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.LedgerEmbedded32.ledgerBip32Varint_e2e_nonvacuous
   ]
 
-#guard auditedTheoremNames.length == 871
+#guard auditedTheoremNames.length == 884
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/

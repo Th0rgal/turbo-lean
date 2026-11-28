@@ -1208,4 +1208,14 @@ def lowerRealLCNFDecl (fuel : Nat) (ctx : RealBridgeCtx) (decl : Lean.Compiler.L
       isGpuCand := lnirParams.all (fun p => p.ty.isGpuCompatible) && effRetTy.isGpuCompatible
     }
 
+/-- Lower a module of first-order declarations, each under its mangled symbol (W2-L2). A `.fap` to a
+    `ctx.localCallees` entry lowers to an `LNIR` `.call` of that entry's symbol. -/
+def lowerRealLCNFModule (fuel : Nat) (ctx : RealBridgeCtx) :
+    List (Lean.Compiler.LCNF.Decl .impure × String) → Except String (List LNIRDecl)
+  | [] => .ok []
+  | (decl, sym) :: rest => do
+    let d ← lowerRealLCNFDecl fuel ctx decl sym
+    let ds ← lowerRealLCNFModule fuel ctx rest
+    return d :: ds
+
 end LeanNative.IR.RealLCNFBridge

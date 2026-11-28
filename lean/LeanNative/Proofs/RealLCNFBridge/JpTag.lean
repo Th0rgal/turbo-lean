@@ -1,4 +1,4 @@
-import LeanNative.Proofs.RealLCNFBridge.StepMono
+import LeanNative.Proofs.RealLCNFBridge.CallTable
 
 namespace LeanNative.Proofs
 
@@ -96,7 +96,7 @@ private theorem bridgeInv_applyJpOne (st_m : RealBridgeState) (lenv_m : LEnv) (v
         exact False.elim (Nat.lt_irrefl _ (hfreshGt y2 freshVid hy2))
       · exact (beq_iff_eq.mp hy1x).trans (beq_iff_eq.mp hy2x).symm
 
-theorem bindJpCallArgsPure_rel (ctx : RealBridgeCtx) (venv0 : VarEnv) (base : VarId)
+theorem bindJpCallArgsPure_rel (ctx : RealBridgeCtx) (tf : FuncTable) (venv0 : VarEnv) (base : VarId)
     (ps : List (Lean.Compiler.LCNF.Param .impure)) (as_ : List (Lean.Compiler.LCNF.Arg .impure))
     (st0 st1 : RealBridgeState) (lenv : LEnv)
     (binds : List (Lean.FVarId × VarId × LNIRType × Option VarId))
@@ -117,7 +117,7 @@ theorem bindJpCallArgsPure_rel (ctx : RealBridgeCtx) (venv0 : VarEnv) (base : Va
         ∃ lenv' venv',
           bindJpParams ctx lenv.tys lenv_m ps as_ vs = .ok lenv' ∧
           BridgeStateInv (applyJpParamMapPure st_m binds) lenv' venv' ∧
-          evalCode fuel venv_m hst (wrapJpCallBindsPure binds body) = evalCode fuel venv' hst body) := by
+          evalCode fuel venv_m hst (wrapJpCallBindsPure binds body) tf = evalCode fuel venv' hst body tf) := by
   induction ps generalizing as_ st0 st1 binds with
   | nil =>
     cases as_ with
@@ -281,14 +281,14 @@ theorem lenv_bind_withCtor (lenv : LEnv) (x : Lean.FVarId) (val : Val)
   congr 1; funext y
   cases y == x <;> rfl
 
-theorem lowerRefOpPure_sound (fuel : Nat) (isInc : Bool) (vid : VarId) (vt : LNIRType)
+theorem lowerRefOpPure_sound {tf : FuncTable} (fuel : Nat) (isInc : Bool) (vid : VarId) (vt : LNIRType)
     (n : Nat) (kCode code' : LNIRCode) (lenv : LEnv) (venv : VarEnv) (hst hst1 hst' : HeapState)
     (x : Lean.FVarId) (val v : Val)
     (hty : lenv.tys x = some vt) (hvalL : lenv.vals x = some val) (hvalV : venv vid = some val)
     (hrop : lowerRefOpPure isInc vid vt n kCode = .ok code')
     (hrc : applyRc isInc lenv hst x n = .ok hst1)
-    (hk : evalCode fuel venv hst1 kCode = .ok (v, hst')) :
-    evalCode fuel venv hst code' = .ok (v, hst') := by
+    (hk : evalCode fuel venv hst1 kCode tf = .ok (v, hst')) :
+    evalCode fuel venv hst code' tf = .ok (v, hst') := by
   unfold lowerRefOpPure at hrop; unfold applyRc at hrc
   have hisHeap : lenv.isHeapVar x = isHeapPtrType vt := by dsimp only [LEnv.isHeapVar]; rw [hty]
   cases hunb : isUnboxedScalarOrTuple vt
@@ -300,7 +300,7 @@ theorem lowerRefOpPure_sound (fuel : Nat) (isInc : Bool) (vid : VarId) (vt : LNI
       cases isInc
       · injection hrop with hc; subst code'
         change (match hst.evalDecRef venv vid n with
-          | .ok st' => evalCode fuel venv st' kCode
+          | .ok st' => evalCode fuel venv st' kCode tf
           | .error err => .error err) = .ok (v, hst')
         unfold HeapState.evalDecRef; rw [hvalV]
         cases val with
@@ -311,7 +311,7 @@ theorem lowerRefOpPure_sound (fuel : Nat) (isInc : Bool) (vid : VarId) (vt : LNI
           subst hst1; exact hk
       · injection hrop with hc; subst code'
         change (match hst.evalIncRef venv vid n with
-          | .ok st' => evalCode fuel venv st' kCode
+          | .ok st' => evalCode fuel venv st' kCode tf
           | .error err => .error err) = .ok (v, hst')
         unfold HeapState.evalIncRef; rw [hvalV]
         cases val with
@@ -324,11 +324,11 @@ theorem lowerRefOpPure_sound (fuel : Nat) (isInc : Bool) (vid : VarId) (vt : LNI
     rw [hisHeap, unboxed_not_heap vt hunb] at hrc
     injection hrc with hs; subst hst1; exact hk
 
-private theorem evalCode_ite_asBool (fuel : Nat) (venv : VarEnv) (hst : HeapState)
+private theorem evalCode_ite_asBool {tf : FuncTable} (fuel : Nat) (venv : VarEnv) (hst : HeapState)
     (condVar : VarId) (cond : Val) (b : Bool) (thenB elseB : LNIRCode)
     (hcond : venv condVar = some cond) (hb : asBool cond = .ok b) :
-    evalCode fuel venv hst (.ite condVar thenB elseB) =
-      if b then evalCode fuel venv hst thenB else evalCode fuel venv hst elseB := by
+    evalCode fuel venv hst (.ite condVar thenB elseB) tf =
+      if b then evalCode fuel venv hst thenB tf else evalCode fuel venv hst elseB tf := by
   dsimp only [evalCode]; rw [hcond]
   cases cond with
   | bool b0 =>
@@ -394,7 +394,7 @@ theorem discr_env_inv (st : RealBridgeState) (lenv : LEnv) (venv : VarEnv)
       dsimp only [Option.bind]; rw [hlu, his]; dsimp only [↓reduceIte]
       exact ⟨bridgeInv_setActiveCtor st lenv venv dv cname dx hinv hlu, rfl, fun _ => rfl⟩
 
-theorem tag_branch_sound (fuel : Nat) (ctx : RealBridgeCtx) (lenv envIn : LEnv)
+theorem tag_branch_sound {tf : FuncTable} (fuel : Nat) (ctx : RealBridgeCtx) (lenv envIn : LEnv)
     (venv : VarEnv) (hst hst' : HeapState) (v cond : Val)
     (condVar : VarId) (condTy : LNIRType) (cidx : Nat) (isBool : Bool) (idx : Nat)
     (discr? : Option Lean.FVarId) (rest : List (Lean.Compiler.LCNF.Alt .impure))
@@ -404,10 +404,10 @@ theorem tag_branch_sound (fuel : Nat) (ctx : RealBridgeCtx) (lenv envIn : LEnv)
     (hcondV : venv condVar = some cond)
     (hyes : ∀ venvY, (∀ u, u < st2.nextVarId → venvY u = venv u) →
       evalStep fuel ctx envIn hst (.inl altCode) = .ok (v, hst') →
-      evalCode (fuel + 1) venvY hst yesCode = .ok (v, hst'))
+      evalCode (fuel + 1) venvY hst yesCode tf = .ok (v, hst'))
     (hno : ∀ venvN, (∀ u, u < st2.nextVarId → venvN u = venv u) →
       evalStep fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, rest)) = .ok (v, hst') →
-      evalCode (fuel + 1) venvN hst noCode = .ok (v, hst'))
+      evalCode (fuel + 1) venvN hst noCode tf = .ok (v, hst'))
     (hbr : (if isBool || lnirTypeEq condTy .i1 then
         (Except.ok ((lowerTagBranchPure condVar condTy cidx isBool 0 yesCode noCode).1, st2) :
           Except String (LNIRCode × RealBridgeState))
@@ -431,7 +431,7 @@ theorem tag_branch_sound (fuel : Nat) (ctx : RealBridgeCtx) (lenv envIn : LEnv)
            if n == cidx.toUInt64 then evalStep fuel ctx envIn hst (.inl altCode)
            else evalStep fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, rest))
          | _ => .error (.typeError "evalBinOp: invalid operand types")) = .ok (v, hst')) :
-     evalCode (fuel + 1) venv hst code = .ok (v, hst') := by
+     evalCode (fuel + 1) venv hst code tf = .ok (v, hst') := by
   cases isBool
   · have hnotI1 : lnirTypeEq condTy .i1 = false := by
       cases h : lnirTypeEq condTy .i1
@@ -442,8 +442,8 @@ theorem tag_branch_sound (fuel : Nat) (ctx : RealBridgeCtx) (lenv envIn : LEnv)
     injection hbr with hp; rcases Prod.mk.inj hp with ⟨rfl, rfl⟩
     cases cond with
     | u64 n =>
-      change (match evalExpr venv hst (.scalar (.binOp .eq (.var condVar) (.constU64 cidx.toUInt64))) with
-        | .ok (b, hst1) => evalCode (fuel + 1) (venv.bind (st2.freshVar .i1).1 b) hst1 (.ite (st2.freshVar .i1).1 yesCode noCode)
+      change (match evalExpr venv hst (.scalar (.binOp .eq (.var condVar) (.constU64 cidx.toUInt64))) tf with
+        | .ok (b, hst1) => evalCode (fuel + 1) (venv.bind (st2.freshVar .i1).1 b) hst1 (.ite (st2.freshVar .i1).1 yesCode noCode) tf
         | .error err => .error err) = .ok (v, hst')
       rw [(freshVar_spec st2 .i1).1]
       dsimp only [evalExpr, evalScalarExpr]; rw [hcondV]; dsimp only [evalBinOp, ↓reduceIte]

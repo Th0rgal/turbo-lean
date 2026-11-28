@@ -3,7 +3,7 @@ echo "=== [3/10] In-Kernel Transitive Axiom Gate (Lean.collectAxioms) ==="
 import json, sys
 d = json.load(sys.stdin)
 assert d['passed'] is True, d
-assert d['theoremsAudited'] >= 841, d
+assert d['theoremsAudited'] >= 884, d
 assert d['forbiddenAxiomsFound'] == [], d
 names = {r['theoremName'] for r in d['results']}
 required = [
@@ -19,6 +19,13 @@ required = [
     'LeanNative.Proofs.H1.negWitnessWrongScrutinee_killed',
     'LeanNative.Proofs.H1.letWitness',
     'LeanNative.Proofs.H1.negWitnessSwappedArith_killed',
+    'LeanNative.Proofs.lowerRealLCNFDecl_sound_with',
+    'LeanNative.Proofs.lowerLocalCall_sound',
+    'LeanNative.Proofs.H1.callRefinement',
+    'LeanNative.Proofs.H1.lowerRealLCNFModule_sound',
+    'LeanNative.Proofs.H1.posWitnessCall',
+    'LeanNative.Proofs.H1.negWitnessWrongCallTarget_killed',
+    'LeanNative.Proofs.H1.negWitnessSwappedCallArgs_killed',
     'LeanNative.Transform.optimizeEqSatCode_sound',
     'LeanNative.Transform.scheduleStructuredLoop_sound',
     'LeanNative.Transform.elideAndMutateRC_sound',

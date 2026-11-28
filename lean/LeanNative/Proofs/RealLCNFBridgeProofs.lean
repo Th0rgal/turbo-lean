@@ -7,39 +7,26 @@ open LeanNative.IR.RealLCNFBridge
 open LeanNative.IR.RealLCNFSemantics
 open LeanNative.Semantics
 
-private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx) :
-    ∀ (st st' : RealBridgeState) (lenv : LEnv) (venv : VarEnv) (hst hst' : HeapState) (v : Val)
-      (target : Lean.Compiler.LCNF.Code .impure ⊕
-        (VarId × Bool × Nat × Option Lean.FVarId × List (Lean.Compiler.LCNF.Alt .impure)))
-      (code : LNIRCode),
-      BridgeStateInv st lenv venv →
-      lowerImpureStepPure fuel ctx st target = .ok (code, st') →
-      (match target with
-       | .inl c => evalStep fuel ctx lenv hst (.inl c) = .ok (v, hst')
-       | .inr (condVar, isBool, idx, discr?, alts) =>
-         condVar < st.nextVarId ∧
-         (∀ dx, discr? = some dx → (st.lookupFVar? dx).isSome = true) ∧
-         (lnirTypeEq (st.getVarType condVar) .i1 = true → isBool = true) ∧
-         ∃ cond, venv condVar = some cond ∧
-           evalStep fuel ctx lenv hst (.inr (cond, isBool, idx, discr?, alts)) = .ok (v, hst')) →
-      evalCode fuel venv hst code = .ok (v, hst') := by
+private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx) (tf : FuncTable) :
+    StepSimIH fuel ctx tf := by
+  unfold StepSimIH
   induction fuel with
   | zero => intro _ _ _ _ _ _ _ _ _ _ h; exact nomatch h
   | succ fuel ih =>
-    intro st st' lenv venv hst hst' v target code hinv h_lower h_side
+    intro st st' lenv venv hst hst' v target code hinv h_lower h_side hrel
     cases target with
     | inr t =>
       rcases t with ⟨condVar, isBool, idx, discr?, alts⟩
       rcases h_side with ⟨hcondLt, hdiscr, hi1, cond, hcondV, h_eval⟩
       exact lowerStepInr_sound fuel ctx ih st st' lenv venv hst hst' v
-        condVar isBool idx discr? alts code cond hinv h_lower hcondLt hdiscr hi1 hcondV h_eval
+        condVar isBool idx discr? alts code cond hinv h_lower hcondLt hdiscr hi1 hcondV h_eval hrel
     | inl c =>
       have h_eval : evalStep (fuel + 1) ctx lenv hst (.inl c) = .ok (v, hst') := h_side
       cases c with
       | «let» decl k =>
-        exact lowerLetStep_sound fuel ctx ih st st' lenv venv hst hst' v decl k code hinv h_lower h_eval
+        exact lowerLetStep_sound fuel ctx ih st st' lenv venv hst hst' v decl k code hinv h_lower h_eval hrel
       | setTag x cidx k himp =>
-        exact lowerSetTag_sound fuel ctx ih st st' lenv venv hst hst' v x cidx k himp code hinv h_lower h_eval
+        exact lowerSetTag_sound fuel ctx ih st st' lenv venv hst hst' v x cidx k himp code hinv h_lower h_eval hrel
       | «return» x =>
         dsimp only [lowerImpureStepPure] at h_lower
         dsimp only [evalStep] at h_eval
@@ -73,7 +60,7 @@ private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx)
               · injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
                 exact lowerRefOpPure_sound (fuel + 1) true vid (st.getVarType vid) n pk.1 _ lenv venv hst hst1 hst'
                   x val v htyL hvalL hvalV hrop hrc
-                  (evalCode_fuel_mono_step fuel pk.1 venv hst1 v hst' (ih st pk.2 lenv venv hst1 hst' v (.inl k) pk.1 hinv hk h_eval))
+                  (evalCode_fuel_mono_step fuel pk.1 venv hst1 v hst' (ih st pk.2 lenv venv hst1 hst' v (.inl k) pk.1 hinv hk h_eval hrel))
       | dec x n _ _ _ k _ =>
         dsimp only [lowerImpureStepPure] at h_lower
         dsimp only [evalStep] at h_eval
@@ -95,7 +82,7 @@ private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx)
               · injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
                 exact lowerRefOpPure_sound (fuel + 1) false vid (st.getVarType vid) n pk.1 _ lenv venv hst hst1 hst'
                   x val v htyL hvalL hvalV hrop hrc
-                  (evalCode_fuel_mono_step fuel pk.1 venv hst1 v hst' (ih st pk.2 lenv venv hst1 hst' v (.inl k) pk.1 hinv hk h_eval))
+                  (evalCode_fuel_mono_step fuel pk.1 venv hst1 v hst' (ih st pk.2 lenv venv hst1 hst' v (.inl k) pk.1 hinv hk h_eval hrel))
       | del x k _ =>
         dsimp only [lowerImpureStepPure] at h_lower
         dsimp only [evalStep] at h_eval
@@ -137,7 +124,7 @@ private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx)
                 rcases hrcEq with ⟨hst1, hrc, h_eval1⟩
                 exact lowerRefOpPure_sound (fuel + 1) false objVid (st.getVarType objVid) 1 pk.1 _ lenv venv hst hst1 hst'
                   x val v htyL hvalL hvalV hrop hrc
-                  (evalCode_fuel_mono_step fuel pk.1 venv hst1 v hst' (ih st pk.2 lenv venv hst1 hst' v (.inl k) pk.1 hinv hk h_eval1))
+                  (evalCode_fuel_mono_step fuel pk.1 venv hst1 v hst' (ih st pk.2 lenv venv hst1 hst' v (.inl k) pk.1 hinv hk h_eval1 hrel))
           · cases val with
             | objPtr objId =>
               dsimp only at h_eval
@@ -151,12 +138,12 @@ private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx)
                   rw [hk] at h_lower; injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
                   have hinv2 := bridgeInv_freshVar st lenv venv .unit .unit hinv
                   have hkEval := evalCode_fuel_mono_step fuel pk.1 _ hst1 v hst'
-                    (ih (st.freshVar .unit).2 pk.2 lenv _ hst1 hst' v (.inl k) pk.1 hinv2 hk h_eval)
+                    (ih (st.freshVar .unit).2 pk.2 lenv _ hst1 hst' v (.inl k) pk.1 hinv2 hk h_eval hrel)
                   have hcall : evalExpr venv hst (.call "lean_native_del_obj" [objVid] .unit false) = .ok (.unit, hst1) := by
                     unfold evalExpr; dsimp only [evalVarList]
                     rw [hvalV]; dsimp only [↓reduceIte, Bool.false_eq_true]
                     rw [hdel]; rfl
-                  dsimp only [evalCode]; rw [hcall]; exact hkEval
+                  dsimp only [evalCode]; rw [evalExpr_ok_funcs tf hcall]; exact hkEval
             | _ => exact nomatch h_eval
       | oset x idx y k _ =>
         dsimp only [lowerImpureStepPure] at h_lower
@@ -176,7 +163,7 @@ private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx)
             · rw [hisHeap, unboxed_not_heap _ hunb] at h_eval
               simp only [Bool.not_false, ↓reduceIte] at h_eval
               exact evalCode_fuel_mono_step fuel code venv hst v hst'
-                (ih st st' lenv venv hst hst' v (.inl k) code hinv h_lower h_eval)
+                (ih st st' lenv venv hst hst' v (.inl k) code hinv h_lower h_eval hrel)
           · have hhp2 : isHeapPtrType (st.getVarType objVid) = true := (Bool.and_eq_true _ _).mp hhp |>.2
             rw [hisHeap, hhp2, hvalL] at h_eval
             simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h_eval
@@ -207,7 +194,7 @@ private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx)
                       bridgeInv_freshVar st3 lenv venv1 .unit .unit
                         (bridgeInv_freshVar st lenv venv .i64 (.u64 idx.toUInt64) hinv)
                     have hkEval := evalCode_fuel_mono_step fuel pk.1 venv2 hst1 v hst'
-                      (ih st4 pk.2 lenv venv2 hst1 hst' v (.inl k) pk.1 hinv4 hk h_eval)
+                      (ih st4 pk.2 lenv venv2 hst1 hst' v (.inl k) pk.1 hinv4 hk h_eval hrel)
                     exact evalCtorWriteStep_sound fuel st venv hst hst1 hst' v objVid valVid objId
                       idx yVal true pk.1 hobjLt hvalLt hvalV hyValV hwf hkEval
               | _ => rw [hevalY] at h_eval; exact nomatch h_eval
@@ -259,7 +246,7 @@ private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx)
                             bridgeInv_freshVar st3 lenv venv1 .unit .unit
                               (bridgeInv_freshVar st lenv venv .i64 (.u64 slot.toUInt64) hinv)
                           have hkEval := evalCode_fuel_mono_step fuel pk.1 venv2 hst1 v hst'
-                            (ih st4 pk.2 lenv venv2 hst1 hst' v (.inl k) pk.1 hinv4 hk h_eval)
+                            (ih st4 pk.2 lenv venv2 hst1 hst' v (.inl k) pk.1 hinv4 hk h_eval hrel)
                           exact evalCtorWriteStep_sound fuel st venv hst hst1 hst' v objVid valVid objId
                             slot yVal false pk.1 hobjLt hvalLt hvalV hyValV hwf hkEval
                     | _ => exact nomatch h_eval
@@ -311,7 +298,7 @@ private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx)
                             bridgeInv_freshVar st3 lenv venv1 .unit .unit
                               (bridgeInv_freshVar st lenv venv .i64 (.u64 slot.toUInt64) hinv)
                           have hkEval := evalCode_fuel_mono_step fuel pk.1 venv2 hst1 v hst'
-                            (ih st4 pk.2 lenv venv2 hst1 hst' v (.inl k) pk.1 hinv4 hk h_eval)
+                            (ih st4 pk.2 lenv venv2 hst1 hst' v (.inl k) pk.1 hinv4 hk h_eval hrel)
                           exact evalCtorWriteStep_sound fuel st venv hst hst1 hst' v objVid valVid objId
                             slot yVal false pk.1 hobjLt hvalLt hvalV hyValV hwf hkEval
                     | _ => exact nomatch h_eval
@@ -346,7 +333,7 @@ private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx)
               exact evalCode_fuel_mono_step fuel code venv hst v hst'
                 (ih st st' lenv venv hst hst' v
                   (.inr (condVar, cs.typeName == ``Bool || lnirTypeEq (st.getVarType condVar) .i1, 0, none, orderAltsPure cs.alts.toList))
-                  code hinv h_lower hsideSc)
+                  code hinv h_lower hsideSc hrel)
             · exact nomatch h_lower
           · cases htag : tagOf discrVal hst with
             | error _ => rw [htag] at h_eval; exact nomatch h_eval
@@ -377,7 +364,7 @@ private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx)
                 have hkEval := evalCode_fuel_mono_step fuel pk.1 (venv.bind (st.freshVar .i64).1 tag) hst v hst'
                   (ih (st.freshVar .i64).2 pk.2 lenv (venv.bind (st.freshVar .i64).1 tag) hst hst' v
                     (.inr ((st.freshVar .i64).1, false, 0, some cs.discr, orderAltsPure cs.alts.toList))
-                    pk.1 hinv2 hk hsideHp)
+                    pk.1 hinv2 hk hsideHp hrel)
                 have hcall : evalExpr venv hst (.call "lean_native_ctor_tag" [condVar] .i64 false) = .ok (tag, hst) := by
                   unfold evalExpr; dsimp only [evalVarList]
                   rw [hvalV]; dsimp only [↓reduceIte, Bool.false_eq_true]
@@ -400,7 +387,7 @@ private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx)
                       | u64 n => injection htag with ht; subst tag; rfl
                       | _ => exact nomatch htag
                   | _ => exact nomatch htag
-                dsimp only [evalCode]; rw [hcall]; exact hkEval
+                dsimp only [evalCode]; rw [evalExpr_ok_funcs tf hcall]; exact hkEval
       | jp decl k =>
         dsimp only [lowerImpureStepPure] at h_lower
         dsimp only [evalStep] at h_eval
@@ -410,7 +397,7 @@ private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx)
             (ih (st.setJpDecl decl.fvarId decl.params.toList decl.value) st'
               (lenv.bindJp decl.fvarId { params := decl.params.toList, code := decl.value })
               venv hst hst' v (.inl k) code
-              (bridgeInv_setJp st lenv venv decl.fvarId decl.params.toList decl.value hinv) h_lower h_eval)
+              (bridgeInv_setJp st lenv venv decl.fvarId decl.params.toList decl.value hinv) h_lower h_eval hrel)
         · exact nomatch h_lower
       | jmp fvarId args =>
         dsimp only [lowerImpureStepPure] at h_lower
@@ -424,7 +411,7 @@ private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx)
           | error _ => rw [hb] at h_lower; exact nomatch h_lower
           | ok pb =>
             rw [hb] at h_lower; rcases pb with ⟨binds, st1⟩; dsimp only at h_lower
-            rcases bindJpCallArgsPure_rel ctx venv st.nextVarId jpParams args.toList st st1 lenv binds
+            rcases bindJpCallArgsPure_rel ctx tf venv st.nextVarId jpParams args.toList st st1 lenv binds
                 (Nat.le_refl _) (fun y vid hy => hinv.fvar_lt y vid hy) hinv hb with
               ⟨vs, hevalArgs, hfm1, hac1, hjp1, hnext1, hty1, hstepJp⟩
             rw [hevalArgs] at h_eval; dsimp only at h_eval
@@ -447,10 +434,11 @@ private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx)
               rw [hbody] at h_lower hevalWrap; injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
               rw [hevalWrap]
               exact evalCode_fuel_mono_step fuel pbody.1 venv' hst v hst'
-                (ih (applyJpParamMapPure st1 binds) pbody.2 lenv' venv' hst hst' v (.inl jpBody) pbody.1 hinvIn hbody h_eval)
+                (ih (applyJpParamMapPure st1 binds) pbody.2 lenv' venv' hst hst' v (.inl jpBody) pbody.1 hinvIn hbody h_eval
+                  (by rw [bindJpParams_funcs ctx _ _ _ _ _ _ hbindP]; exact hrel))
 
-theorem lowerImpureStepPure_sound (fuel : Nat) (ctx : RealBridgeCtx) (st st' : RealBridgeState)
-    (lenv : LEnv) (venv : VarEnv) (hst hst' : HeapState) (v : Val)
+theorem lowerImpureStepPure_sound (fuel : Nat) (ctx : RealBridgeCtx) (tf : FuncTable)
+    (st st' : RealBridgeState) (lenv : LEnv) (venv : VarEnv) (hst hst' : HeapState) (v : Val)
     (target : Lean.Compiler.LCNF.Code .impure ⊕
       (VarId × Bool × Nat × Option Lean.FVarId × List (Lean.Compiler.LCNF.Alt .impure)))
     (code : LNIRCode) :
@@ -464,32 +452,45 @@ theorem lowerImpureStepPure_sound (fuel : Nat) (ctx : RealBridgeCtx) (st st' : R
         (lnirTypeEq (st.getVarType condVar) .i1 = true → isBool = true) ∧
         ∃ cond, venv condVar = some cond ∧
           evalStep fuel ctx lenv hst (.inr (cond, isBool, idx, discr?, alts)) = .ok (v, hst')) →
-    evalCode fuel venv hst code = .ok (v, hst') :=
-  lowerImpureStepPure_sound_aux fuel ctx st st' lenv venv hst hst' v target code
+    FuncsRel ctx lenv.funcs tf →
+    evalCode fuel venv hst code tf = .ok (v, hst') :=
+  lowerImpureStepPure_sound_aux fuel ctx tf st st' lenv venv hst hst' v target code
 
-theorem lowerRealLCNFCode_sound (fuel : Nat) (ctx : RealBridgeCtx) (st : RealBridgeState)
+theorem lowerRealLCNFCode_sound (fuel : Nat) (ctx : RealBridgeCtx) (tf : FuncTable) (st : RealBridgeState)
     (lenv : LEnv) (venv : VarEnv) (hst hst' : HeapState) (v : Val)
     (code : Lean.Compiler.LCNF.Code .impure) (lnir : LNIRCode) (st' : RealBridgeState)
     (hinv : BridgeStateInv st lenv venv)
     (h_lower : lowerRealLCNFCode fuel ctx st code = .ok (lnir, st'))
-    (h_eval : evalRealLCNFCode fuel ctx lenv hst code = .ok (v, hst')) :
-    evalCode fuel venv hst lnir = .ok (v, hst') :=
-  lowerImpureStepPure_sound fuel ctx st st' lenv venv hst hst' v (.inl code) lnir hinv h_lower h_eval
+    (h_eval : evalRealLCNFCode fuel ctx lenv hst code = .ok (v, hst'))
+    (hrel : FuncsRel ctx lenv.funcs tf) :
+    evalCode fuel venv hst lnir tf = .ok (v, hst') :=
+  lowerImpureStepPure_sound fuel ctx tf st st' lenv venv hst hst' v (.inl code) lnir hinv h_lower h_eval hrel
 
-theorem lowerRealLCNFDecl_sound (fuel : Nat) (ctx : RealBridgeCtx)
+theorem bridgeInv_ofFuncs (sf : Lean.Name → Option FnSem) :
+    BridgeStateInv {} (LEnv.ofFuncs sf) VarEnv.empty where
+  fvar_lt _ _ h := nomatch h
+  fvar_val _ _ h := nomatch h
+  fvar_ty _ _ h := nomatch h
+  fvar_ctor _ _ h := nomatch h
+  fvar_inj _ _ _ h _ := nomatch h
+  jp_sync _ _ _ h := nomatch h
+
+/-- W2-L2: the declaration theorem under call tables. A declaration whose source run calls callees from
+    `sf` lowers to an `LNIR` declaration that, run under any `tf` refining `sf`, returns the same result. -/
+theorem lowerRealLCNFDecl_sound_with (fuel : Nat) (ctx : RealBridgeCtx)
     (decl : Lean.Compiler.LCNF.Decl .impure) (args : List Val) (hst hst' : HeapState) (v : Val)
-    (d : LNIRDecl) (mangled : String)
+    (d : LNIRDecl) (mangled : String) (sf : Lean.Name → Option FnSem) (tf : FuncTable)
+    (hrel : FuncsRel ctx sf tf)
     (h_lower : lowerRealLCNFDecl fuel ctx decl mangled = .ok d)
-    (h_eval : evalRealLCNFDecl fuel ctx decl args hst = .ok (v, hst')) :
-    evalCode fuel ((d.params.zip args).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty) hst d.body =
-      .ok (v, hst') := by
+    (h_eval : evalRealLCNFDecl fuel ctx decl args hst sf = .ok (v, hst')) :
+    evalDeclWith fuel tf d args hst = .ok (v, hst') := by
   unfold lowerRealLCNFDecl at h_lower; unfold evalRealLCNFDecl at h_eval
   cases hdv : decl.value with
   | extern _ => rw [hdv] at h_eval; exact nomatch h_eval
   | code c =>
     rw [hdv] at h_lower h_eval
     dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure] at h_lower h_eval
-    cases hbp : bindParams ctx true LEnv.empty decl.params.toList args with
+    cases hbp : bindParams ctx true (LEnv.ofFuncs sf) decl.params.toList args with
     | error _ => rw [hbp] at h_eval; exact nomatch h_eval
     | ok lenv =>
       rw [hbp] at h_eval
@@ -497,11 +498,19 @@ theorem lowerRealLCNFDecl_sound (fuel : Nat) (ctx : RealBridgeCtx)
       | error _ => rw [hlc] at h_lower; exact nomatch h_lower
       | ok plc =>
         rw [hlc] at h_lower; injection h_lower with hd
-        subst d; dsimp only
-        exact lowerRealLCNFCode_sound fuel ctx (internRealParams ctx {} decl.params.toList).2 lenv _
+        subst d
+        exact lowerRealLCNFCode_sound fuel ctx tf (internRealParams ctx {} decl.params.toList).2 lenv _
           hst hst' v c plc.1 plc.2
-          (internRealParams_sound ctx decl.params.toList args {} LEnv.empty lenv VarEnv.empty bridgeInv_empty hbp)
-          hlc h_eval
+          (internRealParams_sound ctx decl.params.toList args {} _ lenv VarEnv.empty (bridgeInv_ofFuncs sf) hbp)
+          hlc h_eval (by rw [bindParams_funcs ctx true _ _ _ _ hbp]; exact hrel)
 
+theorem lowerRealLCNFDecl_sound (fuel : Nat) (ctx : RealBridgeCtx)
+    (decl : Lean.Compiler.LCNF.Decl .impure) (args : List Val) (hst hst' : HeapState) (v : Val)
+    (d : LNIRDecl) (mangled : String)
+    (h_lower : lowerRealLCNFDecl fuel ctx decl mangled = .ok d)
+    (h_eval : evalRealLCNFDecl fuel ctx decl args hst = .ok (v, hst')) :
+    evalCode fuel ((d.params.zip args).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty) hst d.body =
+      .ok (v, hst') :=
+  lowerRealLCNFDecl_sound_with fuel ctx decl args hst hst' v d mangled _ _ (funcsRel_empty ctx _) h_lower h_eval
 
 end LeanNative.Proofs

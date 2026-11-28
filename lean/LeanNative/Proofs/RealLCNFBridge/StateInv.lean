@@ -7,11 +7,12 @@ open LeanNative.IR.RealLCNFBridge
 open LeanNative.IR.RealLCNFSemantics
 open LeanNative.Semantics
 
-theorem evalCode_fuel_mono_step (f : Nat) : ∀ (c : LNIRCode) (venv : VarEnv) (hst : HeapState) (v : Val) (hst' : HeapState),
-    evalCode f venv hst c = .ok (v, hst') → evalCode (f + 1) venv hst c = .ok (v, hst')
+theorem evalCode_fuel_mono_step (f : Nat) {funcs : FuncTable} :
+    ∀ (c : LNIRCode) (venv : VarEnv) (hst : HeapState) (v : Val) (hst' : HeapState),
+    evalCode f venv hst c funcs = .ok (v, hst') → evalCode (f + 1) venv hst c funcs = .ok (v, hst')
   | .letBind dst _ val k, venv, hst, v, hst', h => by
     dsimp only [evalCode] at h ⊢
-    cases he : evalExpr venv hst val with
+    cases he : evalExpr venv hst val funcs with
     | error _ => rw [he] at h; exact nomatch h
     | ok p => rw [he] at h; exact evalCode_fuel_mono_step f k (venv.bind dst p.1) p.2 v hst' h
   | .rawStore pv iv vv elemTy k, venv, hst, v, hst', h => by
@@ -56,20 +57,20 @@ theorem evalCode_fuel_mono_step (f : Nat) : ∀ (c : LNIRCode) (venv : VarEnv) (
       simp only at h ⊢ <;> try contradiction
     rename_i lo hi
     have hloop : ∀ cnt cur acc env0 st0 r,
-        evalSeqLoop cnt cur idxVar accVar acc env0 st0 (fun se ss => evalCode f se ss stepBody) = .ok r →
-        evalSeqLoop cnt cur idxVar accVar acc env0 st0 (fun se ss => evalCode (f + 1) se ss stepBody) = .ok r := by
+        evalSeqLoop cnt cur idxVar accVar acc env0 st0 (fun se ss => evalCode f se ss stepBody funcs) = .ok r →
+        evalSeqLoop cnt cur idxVar accVar acc env0 st0 (fun se ss => evalCode (f + 1) se ss stepBody funcs) = .ok r := by
       intro cnt; induction cnt with
       | zero => intro _ _ _ _ _ hr; exact hr
       | succ cnt' ihc =>
         intro cur acc env0 st0 r hr; dsimp only [evalSeqLoop] at hr ⊢
-        cases hs : evalCode f ((env0.bind idxVar (.u64 cur.toUInt64)).bind accVar acc) st0 stepBody with
+        cases hs : evalCode f ((env0.bind idxVar (.u64 cur.toUInt64)).bind accVar acc) st0 stepBody funcs with
         | error _ => rw [hs] at hr; exact nomatch hr
         | ok pr =>
           rw [hs] at hr
           rw [evalCode_fuel_mono_step f stepBody _ st0 pr.1 pr.2 hs]
           exact ihc (cur + 1) pr.1 env0 pr.2 r hr
     cases hl : evalSeqLoop (hi.toNat - lo.toNat) lo.toNat idxVar accVar initVal venv hst
-        (fun se ss => evalCode f se ss stepBody) with
+        (fun se ss => evalCode f se ss stepBody funcs) with
     | error _ => rw [hl] at h; exact nomatch h
     | ok pr =>
       rw [hl] at h; rw [hloop _ _ _ _ _ pr hl]
