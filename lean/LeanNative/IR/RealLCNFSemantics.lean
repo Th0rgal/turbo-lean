@@ -24,6 +24,8 @@ follows `RcCtorLayoutSpec` (`HEAPOBJ_CONTRACT C1.2`), and non-recursive join poi
 First-order calls (W2-L2): `LEnv.funcs` maps a local callee's name to its semantics. A `.fap` to a
 `RealBridgeCtx.localCallees` entry with a recorded callee and a scalar or tuple result runs that callee;
 `moduleFuncEnv` builds the table of an acyclic module, so `evalStep` itself never recurses into a callee.
+Recursion (W2-L3): `recModuleFuncEnv` indexes the table by call depth, so self- and mutually recursive
+modules unfold a bounded number of times and the evaluator stays structural.
 -/
 
 structure JpBody where
@@ -892,5 +894,20 @@ def moduleFuncEnv (fuel : Nat) (ctx : RealBridgeCtx) :
   | d :: ds => fun n =>
     if n == d.name then some (fun args st => evalRealLCNFDecl fuel ctx d args st (moduleFuncEnv fuel ctx ds))
     else moduleFuncEnv fuel ctx ds n
+
+/-- Call table of `ds`, keyed by `Decl.name`, in which every declaration runs under `inner` (W2-L3). -/
+def moduleFuncEnvWith (fuel : Nat) (ctx : RealBridgeCtx) (inner : Lean.Name → Option FnSem) :
+    List (Lean.Compiler.LCNF.Decl .impure) → Lean.Name → Option FnSem
+  | [] => fun _ => none
+  | d :: ds => fun n =>
+    if n == d.name then some (fun args st => evalRealLCNFDecl fuel ctx d args st inner)
+    else moduleFuncEnvWith fuel ctx inner ds n
+
+/-- Fuel-indexed call table of a possibly (mutually) recursive module (W2-L3): at call depth `depth + 1`
+    every declaration of `ds` runs under the depth-`depth` table; depth `0` has no entries. -/
+def recModuleFuncEnv (fuel : Nat) (ctx : RealBridgeCtx) (ds : List (Lean.Compiler.LCNF.Decl .impure)) :
+    Nat → Lean.Name → Option FnSem
+  | 0 => fun _ => none
+  | depth + 1 => moduleFuncEnvWith fuel ctx (recModuleFuncEnv fuel ctx ds depth) ds
 
 end LeanNative.IR.RealLCNFSemantics
