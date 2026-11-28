@@ -54,6 +54,28 @@ CON_LECHE_OLEANS_ENV = "TURBO_CON_LECHE_OLEANS"
 RESULTS_FILE = ROOT_DIR / "scripts" / "lcnf_coverage_results.json"
 RESULT_FIELDS = ("total_declarations", "proved", "lowered_unproved", "rejected", "rejected_not_lowered")
 REJECTED_NOT_LOWERED_REASON = "mutual_cycle"
+RATCHET_FILE = ROOT_DIR / "benchmarks" / "h1_coverage_ratchet.json"
+# W2-H1.4 coverage ratchet, enforced by `--check`. The bounds only move toward more proof: a
+# commit that proves more lowers `max_lowered_unproved` or raises a `proved_share_floor`
+# (proved, total) in the same change. `lowered_unproved` was 4 constructs before L1 deleted
+# `lowerPureCode`. `batteries` is the in-toolchain `Init.Data` / `Std.Data` subcorpus; the
+# external Batteries checkout stays `unknown` (H1.0b).
+H1_COVERAGE_RATCHET: dict[str, Any] = {
+    "matrix": {"min_proved": 32, "max_lowered_unproved": 2},
+    "corpora": {
+        "batteries": {
+            "source": ("std_init_and_c2", "std_init_data"),
+            "proved_share_floor": (16, 1773),
+            "max_lowered_unproved": 65,
+        },
+        "c1": {"source": ("c1_corpus", None), "proved_share_floor": (782, 902), "max_lowered_unproved": 98},
+        "c2": {
+            "source": ("std_init_and_c2", "c2_lake_packages"),
+            "proved_share_floor": (13, 32),
+            "max_lowered_unproved": 19,
+        },
+    },
+}
 VALID_MATRIX_STATUSES = frozenset({"proved", "lowered_unproved", "rejected"})
 CON_LECHE_MODULE_PREFIXES = ("ConLeche.Kernel", "ConLeche.Cached", "ConLeche.Frontend", "ConLeche.Driver")
 CON_LECHE_EXCLUDED_MODULES = frozenset({"ConLeche.Kernel.NatOpPins"})
@@ -1866,6 +1888,135 @@ def check_coverage_report(
     }
 
 
+def _ratchet_counts(rep: dict[str, Any], source: tuple[str, str | None]) -> dict[str, Any] | None:
+    cname, sname = source
+    corp = rep.get("corpora", {}).get(cname)
+    if not isinstance(corp, dict) or corp.get("measurement_source") != "live_invocation":
+        return None
+    if sname is not None:
+        corp = corp.get("subcorpora", {}).get(sname)
+        if not isinstance(corp, dict):
+            return None
+    if any(isinstance(corp.get(f), bool) or not isinstance(corp.get(f), int) for f in RESULT_FIELDS):
+        return None
+    return {f: corp[f] for f in ("total_declarations", "proved", "lowered_unproved", "rejected")}
+
+
+def _share(n: int, total: int) -> float:
+    return round(n / total, 4) if total else 0.0
+
+
+def ratchet_report(rep: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[str, Any]:
+    """Machine-readable H1 coverage summary (`benchmarks/h1_coverage_ratchet.json`).
+
+    Deterministic for a given tree: it carries no date or HEAD, so `--check` compares it
+    byte-for-byte with the committed file.
+    """
+    sys.path.insert(0, str(root_dir / "scripts"))
+    import h1_mutant_matrix as mm
+
+    corpora: dict[str, Any] = {}
+    for label, cfg in H1_COVERAGE_RATCHET["corpora"].items():
+        counts = _ratchet_counts(rep, cfg["source"])
+        cname, sname = cfg["source"]
+        entry: dict[str, Any] = {"source": cname if sname is None else f"{cname}.{sname}"}
+        if counts is None:
+            entry["measurement_source"] = "not_measured"
+        else:
+            tot = counts["total_declarations"]
+            entry.update(counts)
+            entry.update({
+                "proved_share": _share(counts["proved"], tot),
+                "lowered_unproved_share": _share(counts["lowered_unproved"], tot),
+                "rejected_share": _share(counts["rejected"], tot),
+            })
+        floor_p, floor_t = cfg["proved_share_floor"]
+        entry["ratchet"] = {
+            "proved_share_floor": {"proved": floor_p, "total_declarations": floor_t},
+            "max_lowered_unproved": cfg["max_lowered_unproved"],
+        }
+        corpora[label] = entry
+    spec_path = root_dir / mm.SPEC_LOCKED_PATH
+    return {
+        "schemaVersion": "turbo-lean-h1-coverage-ratchet-v1",
+        "leaf_id": "H1.4",
+        "toolchain": PINNED_TOOLCHAIN,
+        "spec_locked": {
+            "path": mm.SPEC_LOCKED_PATH,
+            "pinned_sha256": mm.SPEC_LOCKED_SHA256,
+            "actual_sha256": sha256_file(spec_path) if spec_path.is_file() else "",
+        },
+        "mutant_kill_matrix": {
+            "count": len(mm.H1_KILLED_MUTANTS),
+            "floor": mm.MIN_KILLED_MUTANTS,
+            "theorems": [
+                {"theorem": f"{mm.H1_NAMESPACE}.{name}", "file": rel, "rung": rung, "mutation": what}
+                for name, rel, rung, what in mm.H1_KILLED_MUTANTS
+            ],
+        },
+        "audited_theorem_floor": mm.AUDITED_THEOREM_FLOOR,
+        "lcnf_constructor_matrix": {
+            **rep["lcnf_constructor_matrix"]["summary"],
+            "ratchet": dict(H1_COVERAGE_RATCHET["matrix"]),
+        },
+        "corpora": corpora,
+        "external_batteries": rep.get("corpora", {}).get("external_batteries", {"status": "unknown"}),
+    }
+
+
+def check_coverage_ratchet(doc: dict[str, Any], committed: Any) -> list[str]:
+    """Fail closed when proof coverage regresses or the committed summary is stale."""
+    errors: list[str] = []
+    spec = doc["spec_locked"]
+    if spec["actual_sha256"] != spec["pinned_sha256"]:
+        errors.append(
+            f"{spec['path']} drifted: pinned sha256={spec['pinned_sha256']} actual={spec['actual_sha256']!r}"
+        )
+    mkm = doc["mutant_kill_matrix"]
+    if mkm["count"] < mkm["floor"]:
+        errors.append(f"H1 mutant kill matrix has {mkm['count']} mutants, floor is {mkm['floor']}")
+    m = doc["lcnf_constructor_matrix"]
+    if m["lowered_unproved"] > m["ratchet"]["max_lowered_unproved"]:
+        errors.append(
+            f"Ratchet: matrix lowered_unproved={m['lowered_unproved']} exceeds "
+            f"{m['ratchet']['max_lowered_unproved']}"
+        )
+    if m["proved"] < m["ratchet"]["min_proved"]:
+        errors.append(f"Ratchet: matrix proved={m['proved']} below {m['ratchet']['min_proved']}")
+    for label, entry in doc["corpora"].items():
+        if entry.get("measurement_source") == "not_measured":
+            errors.append(f"Ratchet: corpus `{label}` ({entry['source']}) was not measured live")
+            continue
+        floor = entry["ratchet"]["proved_share_floor"]
+        if entry["proved"] * floor["total_declarations"] < floor["proved"] * entry["total_declarations"]:
+            errors.append(
+                f"Ratchet: corpus `{label}` proved share {entry['proved']}/{entry['total_declarations']} "
+                f"dropped below {floor['proved']}/{floor['total_declarations']}"
+            )
+        if entry["lowered_unproved"] > entry["ratchet"]["max_lowered_unproved"]:
+            errors.append(
+                f"Ratchet: corpus `{label}` lowered_unproved={entry['lowered_unproved']} exceeds "
+                f"{entry['ratchet']['max_lowered_unproved']}"
+            )
+    if committed is None:
+        errors.append(f"Missing committed ratchet summary: {RATCHET_FILE.relative_to(ROOT_DIR)}")
+    elif committed != doc:
+        errors.append(
+            f"{RATCHET_FILE.relative_to(ROOT_DIR)} differs from the live ratchet summary; "
+            "regenerate with `python3 scripts/lcnf_coverage.py --write-results`"
+        )
+    return errors
+
+
+def _load_committed_ratchet(path: Path = RATCHET_FILE) -> Any:
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"malformed": True}
+
+
 class TestLcnfCoverage(unittest.TestCase):
     def test_live_coverage_report_and_invariants(self) -> None:
         chk = check_coverage_report(ROOT_DIR, require_results=True)
@@ -3254,6 +3405,11 @@ def main() -> int:
             "`measured_source_commit` as the commit of the tree the measurement was taken from"
         ),
     )
+    ap.add_argument(
+        "--ratchet-report",
+        action="store_true",
+        help="Emit the H1 coverage ratchet summary JSON (benchmarks/h1_coverage_ratchet.json) to stdout",
+    )
     ap.add_argument("--self-test", action="store_true", help="Run embedded unit tests")
     args = ap.parse_args()
 
@@ -3267,14 +3423,26 @@ def main() -> int:
         return 2
 
     chk = check_coverage_report(ROOT_DIR, require_results=args.check)
+    ratchet = ratchet_report(chk["report"], ROOT_DIR)
+    if args.check:
+        ratchet_errors = check_coverage_ratchet(ratchet, _load_committed_ratchet())
+        chk["errors"].extend(ratchet_errors)
+        chk["ok"] = chk["ok"] and not ratchet_errors
     if args.write_results:
         RESULTS_FILE.write_text(
             json.dumps(results_document(chk["report"], ROOT_DIR), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         print(f"[lcnf-coverage] wrote {RESULTS_FILE.relative_to(ROOT_DIR)}", file=sys.stderr)
+        RATCHET_FILE.parent.mkdir(parents=True, exist_ok=True)
+        RATCHET_FILE.write_text(json.dumps(ratchet, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"[lcnf-coverage] wrote {RATCHET_FILE.relative_to(ROOT_DIR)}", file=sys.stderr)
         if not args.json:
             return 0 if chk["ok"] else 1
+
+    if args.ratchet_report:
+        print(json.dumps(ratchet, indent=2, sort_keys=True))
+        return 0 if chk["ok"] else 1
 
     if args.json or not args.check:
         out = dict(chk["report"])

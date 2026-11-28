@@ -1,0 +1,144 @@
+{
+  "audited_theorem_floor": 904,
+  "corpora": {
+    "batteries": {
+      "lowered_unproved": 65,
+      "lowered_unproved_share": 0.0367,
+      "proved": 16,
+      "proved_share": 0.009,
+      "ratchet": {
+        "max_lowered_unproved": 65,
+        "proved_share_floor": {
+          "proved": 16,
+          "total_declarations": 1773
+        }
+      },
+      "rejected": 1692,
+      "rejected_share": 0.9543,
+      "source": "std_init_and_c2.std_init_data",
+      "total_declarations": 1773
+    },
+    "c1": {
+      "lowered_unproved": 98,
+      "lowered_unproved_share": 0.1086,
+      "proved": 782,
+      "proved_share": 0.867,
+      "ratchet": {
+        "max_lowered_unproved": 98,
+        "proved_share_floor": {
+          "proved": 782,
+          "total_declarations": 902
+        }
+      },
+      "rejected": 22,
+      "rejected_share": 0.0244,
+      "source": "c1_corpus",
+      "total_declarations": 902
+    },
+    "c2": {
+      "lowered_unproved": 19,
+      "lowered_unproved_share": 0.5938,
+      "proved": 13,
+      "proved_share": 0.4062,
+      "ratchet": {
+        "max_lowered_unproved": 19,
+        "proved_share_floor": {
+          "proved": 13,
+          "total_declarations": 32
+        }
+      },
+      "rejected": 0,
+      "rejected_share": 0.0,
+      "source": "std_init_and_c2.c2_lake_packages",
+      "total_declarations": 32
+    }
+  },
+  "external_batteries": {
+    "reason": "External `leanprover-community/batteries` modules beyond `Init.Data.*` and `Std.Data.*` are not measured by this invocation (`C2x` adds the nightly Batteries checkout); reported as unknown rather than estimated.",
+    "status": "unknown"
+  },
+  "lcnf_constructor_matrix": {
+    "lowered_unproved": 2,
+    "proved": 32,
+    "ratchet": {
+      "max_lowered_unproved": 2,
+      "min_proved": 32
+    },
+    "rejected": 12,
+    "total": 46
+  },
+  "leaf_id": "H1.4",
+  "mutant_kill_matrix": {
+    "count": 10,
+    "floor": 10,
+    "theorems": [
+      {
+        "file": "lean/LeanNative/Proofs/H1/SpecLocked.lean",
+        "mutation": "branch arms swapped",
+        "rung": "H1.F",
+        "theorem": "LeanNative.Proofs.H1.negWitnessInvertedBranch_killed"
+      },
+      {
+        "file": "lean/LeanNative/Proofs/H1/SpecLocked.lean",
+        "mutation": "wrong returned variable",
+        "rung": "H1.F",
+        "theorem": "LeanNative.Proofs.H1.negWitnessWrongReturn_killed"
+      },
+      {
+        "file": "lean/LeanNative/Proofs/H1/SpecLocked.lean",
+        "mutation": "parameter dropped",
+        "rung": "H1.F",
+        "theorem": "LeanNative.Proofs.H1.negWitnessDroppedParam_killed"
+      },
+      {
+        "file": "lean/LeanNative/Proofs/H1/SpecLocked.lean",
+        "mutation": "wrong case scrutinee",
+        "rung": "H1.F",
+        "theorem": "LeanNative.Proofs.H1.negWitnessWrongScrutinee_killed"
+      },
+      {
+        "file": "lean/LeanNative/Proofs/H1/LowerSound.lean",
+        "mutation": "arithmetic operands swapped",
+        "rung": "L1",
+        "theorem": "LeanNative.Proofs.H1.negWitnessSwappedArith_killed"
+      },
+      {
+        "file": "lean/LeanNative/Proofs/H1/FirstOrderCalls.lean",
+        "mutation": "call to the wrong callee",
+        "rung": "L2",
+        "theorem": "LeanNative.Proofs.H1.negWitnessWrongCallTarget_killed"
+      },
+      {
+        "file": "lean/LeanNative/Proofs/H1/FirstOrderCalls.lean",
+        "mutation": "call arguments swapped",
+        "rung": "L2",
+        "theorem": "LeanNative.Proofs.H1.negWitnessSwappedCallArgs_killed"
+      },
+      {
+        "file": "lean/LeanNative/Proofs/H1/RecursionAndJoinPoints.lean",
+        "mutation": "broken recursive step",
+        "rung": "L3",
+        "theorem": "LeanNative.Proofs.H1.negWitnessBrokenRecStep_killed"
+      },
+      {
+        "file": "lean/LeanNative/Proofs/H1/RecursionAndJoinPoints.lean",
+        "mutation": "mutual call targets swapped",
+        "rung": "L3",
+        "theorem": "LeanNative.Proofs.H1.negWitnessSwappedMutualTargets_killed"
+      },
+      {
+        "file": "lean/LeanNative/Proofs/H1/RecursionAndJoinPoints.lean",
+        "mutation": "wrong join-point argument",
+        "rung": "L3",
+        "theorem": "LeanNative.Proofs.H1.negWitnessWrongJoinArg_killed"
+      }
+    ]
+  },
+  "schemaVersion": "turbo-lean-h1-coverage-ratchet-v1",
+  "spec_locked": {
+    "actual_sha256": "1139c286dd53ddd9aa63f599f24c6d286836f88e2c2f27fa96d5ce4ec7a93970",
+    "path": "lean/LeanNative/Proofs/H1/SpecLocked.lean",
+    "pinned_sha256": "1139c286dd53ddd9aa63f599f24c6d286836f88e2c2f27fa96d5ce4ec7a93970"
+  },
+  "toolchain": "leanprover/lean4:v4.35.0"
+}
