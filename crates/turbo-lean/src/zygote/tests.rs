@@ -2283,7 +2283,7 @@ use super::*;
                 assert_eq!((m.dev(), m.ino()), (*dev, *ino));
                 assert_eq!(
                     e.hash,
-                    hash(&fs::read(p).unwrap()),
+                    blake3::hash(&fs::read(p).unwrap()),
                     "poisoned memo entry for {p:?}"
                 );
             }
