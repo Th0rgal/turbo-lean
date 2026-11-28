@@ -67,13 +67,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 SCHEMA_VERSION = 1
-NOISE_FLOOR_MS = 25.0
-# Between-run floor for the gate: two runs of one binary on one node drift by
-# up to ~13% on cold workloads (import_refresh is page-cache sensitive), while
-# warm daemon medians stayed within ~2% across runs. The cold floor is 20%.
-MIN_REL_TOLERANCE = {"cold_no_daemon": 0.20, "warm_cache_hit_daemon": 0.10,
-                     "warm_edited_proof_daemon": 0.10}
-SPREAD_SAFETY = 2.0
+# The comparison band is deliberately explicit in both this file and every
+# gate JSON record.  It is a 15 ms absolute floor plus the larger of a
+# per-mode relative floor and 1.5 robust spread estimates.  The robust
+# estimate is max(normalized MAD, normalized IQR sigma), not max-min: one
+# scheduler outlier must not widen a five-trial benchmark's future gate.
+NOISE_FLOOR_MS = 15.0
+# Cold import refresh is page-cache-sensitive; warm daemon paths have a
+# narrower floor.  These are fractional bands around the baseline median.
+MIN_REL_TOLERANCE = {"cold_no_daemon": 0.15, "warm_cache_hit_daemon": 0.05,
+                     "warm_edited_proof_daemon": 0.05}
+SPREAD_SAFETY = 1.5
+SPREAD_METHOD = "max(normalized_mad,normalized_iqr_sigma)"
 COVERAGE_GATE = 0.90
 BUSY_LOAD_THRESHOLD = 1.0  # one 100%-CPU tenant already poisons warm medians
 DEFAULT_TRIALS = 5
@@ -159,15 +164,53 @@ def rel_spread(xs) -> float:
     return (max(xs) - min(xs)) / med
 
 
-def tolerance_ms(baseline_median: float, baseline_rel_spread: float, mode: str) -> float:
-    """Per-workload gate taken from the baseline's measured spread.
+def percentile(xs, fraction: float) -> float:
+    """Linearly interpolated percentile for a small, already measured sample."""
+    ordered = sorted(xs)
+    if not ordered:
+        return float("nan")
+    index = (len(ordered) - 1) * fraction
+    lo, hi = math.floor(index), math.ceil(index)
+    if lo == hi:
+        return ordered[lo]
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * (index - lo)
 
-    A fixed 1.15x gate flags noise on workloads whose observed run-to-run
-    spread reaches 20-40%, so the tolerance grows with the measured spread
-    (SPREAD_SAFETY times) around a per-mode floor, plus NOISE_FLOOR_MS.
+
+def robust_spread(xs) -> dict:
+    """Return MAD/IQR spread ratios used by new baseline JSON records.
+
+    MAD is scaled by 1.4826 and IQR by 1/1.349 to estimate a normal sigma.
+    With fewer than three observations neither estimate is meaningful, so the
+    legacy max-min value is retained as a conservative fallback.
     """
+    med = median(xs)
+    if not isinstance(med, (int, float)) or not math.isfinite(med) or med <= 0:
+        return {"mad_rel_spread": None, "iqr_rel_spread": None,
+                "robust_rel_spread": None}
+    if len(xs) < 3:
+        legacy = rel_spread(xs)
+        return {"mad_rel_spread": legacy, "iqr_rel_spread": legacy,
+                "robust_rel_spread": legacy}
+    mad = median([abs(x - med) for x in xs]) / med * 1.4826
+    iqr = (percentile(xs, 0.75) - percentile(xs, 0.25)) / med / 1.349
+    return {"mad_rel_spread": mad, "iqr_rel_spread": iqr,
+            "robust_rel_spread": max(mad, iqr)}
+
+
+def tolerance_ms(baseline_median: float, baseline_rel_spread: float, mode: str,
+                 robust_rel_spread=None) -> float:
+    """Return the documented one-sided comparison limit for a baseline cell.
+
+    Old baseline JSON has only ``rel_spread`` and remains comparable.  New
+    baselines pass their MAD/IQR-derived ``robust_rel_spread`` here, which
+    narrows the band without letting a single outlier define it.
+    """
+    spread = robust_rel_spread
+    if (not isinstance(spread, (int, float)) or isinstance(spread, bool)
+            or not math.isfinite(spread) or spread < 0):
+        spread = baseline_rel_spread
     factor = 1.0 + max(MIN_REL_TOLERANCE.get(mode, 0.20),
-                       SPREAD_SAFETY * baseline_rel_spread)
+                       SPREAD_SAFETY * spread)
     return baseline_median * factor + NOISE_FLOOR_MS
 
 
@@ -207,6 +250,7 @@ def empty_run_result(workloads, trials):
 def mode_result(runs_ms, coverage_ratios, statuses, extra=None, phase_dicts=None,
                 psi_lists=None, failed_trials=0, tool_coverage=None):
     xs = list(runs_ms)
+    spread = robust_spread(xs)
     out = {
         "runs_ms": [round(x, 1) for x in xs],
         "trials": len(xs),
@@ -214,6 +258,13 @@ def mode_result(runs_ms, coverage_ratios, statuses, extra=None, phase_dicts=None
         "median_ms": round(median(xs), 1) if xs else None,
         "spread_ms": round(max(xs) - min(xs), 1) if len(xs) > 1 else 0.0,
         "rel_spread": round(rel_spread(xs), 4) if len(xs) > 1 else 0.0,
+        "spread_method": SPREAD_METHOD,
+        "mad_rel_spread": (round(spread["mad_rel_spread"], 4)
+                           if spread["mad_rel_spread"] is not None else None),
+        "iqr_rel_spread": (round(spread["iqr_rel_spread"], 4)
+                           if spread["iqr_rel_spread"] is not None else None),
+        "robust_rel_spread": (round(spread["robust_rel_spread"], 4)
+                              if spread["robust_rel_spread"] is not None else None),
         "coverage_ratio_min": round(min(tool_coverage), 4) if tool_coverage else None,
         "coverage_ratio_external_min": round(min(coverage_ratios), 4) if coverage_ratios else None,
         "statuses_observed": sorted(set(statuses)),
@@ -510,7 +561,8 @@ def compare_run(baseline, res):
                 verdict["measured_nothing"].append(f"{wid}/{mode}")
                 verdict["gates"][f"{wid}/{mode}"] = {"verdict": "measured_nothing"}
                 continue
-            tol = tolerance_ms(b["median_ms"], b.get("rel_spread", 0.0), mode)
+            tol = tolerance_ms(b["median_ms"], b.get("rel_spread", 0.0), mode,
+                               b.get("robust_rel_spread"))
             band = tol - b["median_ms"]  # noise band, applied in BOTH directions
             new = r["median_ms"]
             delta = new - b["median_ms"]
@@ -521,9 +573,15 @@ def compare_run(baseline, res):
             else:
                 cls = "unchanged"
             gate = {"baseline_median_ms": b["median_ms"], "baseline_rel_spread": b.get("rel_spread"),
+                    "baseline_robust_rel_spread": b.get("robust_rel_spread"),
                     "new_median_ms": new, "delta_ms": round(delta, 1),
                     "delta_pct": round(100.0 * delta / b["median_ms"], 2),
-                    "noise_band_ms": round(band, 1), "verdict": cls}
+                    "noise_band_ms": round(band, 1),
+                    "noise_floor_ms": NOISE_FLOOR_MS,
+                    "relative_floor": MIN_REL_TOLERANCE.get(mode, 0.20),
+                    "spread_multiplier": SPREAD_SAFETY,
+                    "spread_method": SPREAD_METHOD,
+                    "verdict": cls}
             if cls == "regressed":
                 gate["over_by_ms"] = round(new - tol, 1)
                 verdict["regressions"].append(f"{wid}/{mode}")
@@ -803,6 +861,10 @@ def classify_error(returncode, parsed, stderr):
         text = str(parsed.get("error", ""))
     text = text + "\n" + (stderr or "")
     low = text.lower()
+    # Keep this before stale-import matching.  A stale build lock is transient
+    # scheduler state, not evidence that the PFR import-refresh block remains.
+    if "lock" in low and "stale" in low:
+        return "stale_build_lock"
     if "declaration identity unconfirmed" in low and "unknown module prefix" in low:
         return "declaration_identity_unknown_module_prefix"
     if "declaration identity unconfirmed" in low:
@@ -811,8 +873,10 @@ def classify_error(returncode, parsed, stderr):
         return "declaration_not_found"
     if "failed to read" in low and "no such file" in low:
         return "source_file_not_found"
+    # These exact fail-closed diagnostics are the only expected PFR import
+    # errors.  Do not classify generic stale/cache/import text as the block.
     if ("worktree opt-out prevents refreshing stale imports" in low
-            or ("stale imports" in low and "import_refresh" in low)
+            or "stale imports: import_refresh fail-closed" in low
             or "fail-closed import freshness gate" in low):
         return "stale_import_refresh_fail_closed"
     if "warn.sorry" in low or "sorry" in low:
