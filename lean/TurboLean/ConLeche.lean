@@ -4,13 +4,20 @@
   and `TurboLean.Kernel.ConLeche`) with universe levels (`zero`, `succ`, `max`, `imax`, `param`),
   de Bruijn lifting & capture-avoiding substitution (`lift`, `subst`, `inst0`), fuel-bounded
   WHNF & definitional equality (`whnf`, `isDefEq`), inductive typing judgment (`HasType`),
-  bidirectional typechecker (`inferType`, `verifyDecl`, `checkDecl`), and binary `"OLEN"` v1
-  (`0x4F4C454E`) declaration shard model parser/encoder (`parseOleanShard`, `encodeOleanShard`).
+  bidirectional typechecker (`inferType`, `verifyDecl`, `checkDecl`), binary `"OLEN"` v1
+  (`0x4F4C454E`) declaration shard model parser/encoder (`parseOleanShard`, `encodeOleanShard`),
+  and a validator for the 96-byte header and root pointer of real Lean 4 v4.35.0 `.olean` files
+  (`parseRealOleanHeader`, `parseRealOlean`, `checkRealOleanDecl`).
 
   Explicit Model Limitation & H1/H3 Scope (`roadmap/HORIZONS.md` G1b):
   - `parseOleanShard` / `encodeOleanShard` in this module operate on the in-repo self-contained
     `"OLEN"` v1 (`0x4F4C454E`) binary shard model format, NOT raw Lean 4 `.olean` compacted
     memory-region files.
+  - `parseRealOleanHeader` reads real `.olean` files, but only their 96-byte header and root
+    pointer bounds. Decoding the compacted object region into declarations is left to Lean's C
+    reader `lean_compacted_region_read`, which is trusted (`docs/TRUSTED_BASE.md` item 4).
+    `real_olean_bridge_sound` / `real_olean_checkDecl_sound` hold for whatever declarations that
+    reader hands over; they do not prove the reader correct.
   - Real Lean 4 `.olean` region files and `lean4export` streams are verified out-of-process by
     the external `leanprover/con-leche` binary (whose upstream ZFC soundness and `.olean` sparse
     region reader theorems are bridged in `verification/con-leche-bridge/`), while H1 proves the
@@ -742,5 +749,274 @@ def mutant3CircularSelfRefDecl : ConLeche.Decl :=
 #guard (checkDecl validKernelEnv validKernelDecl).isOk == false
 #guard (checkDecl { decls := [], headerMagic := 0x4F4C454E } mutant3CircularSelfRefDecl).isOk == false
 #guard (parseOleanShard (encodeOleanShard { decls := [mutant3CircularSelfRefDecl], headerMagic := 0x4F4C454E })).isOk == false
+
+
+/-! ## Real Lean 4 v4.35.0 `.olean` Header & Root-Bounds Validator (`roadmap/HORIZONS.md` G1b)
+
+Unlike the `"OLEN"` v1 model codec above, this section reads the header of *real* Lean 4
+v4.35.0 `.olean` compacted-region files. The 96-byte layout below was checked against all
+2,546 `.olean` files shipped with the `leanprover/lean4:v4.35.0` toolchain:
+
+| bytes   | field                                                         |
+|---------|---------------------------------------------------------------|
+| `0–4`   | magic `"olean"` (`0x6F 0x6C 0x65 0x61 0x6E`)                   |
+| `5`     | format version (`2` by default, `3` with `allowClosures`)     |
+| `6`     | flags byte (recorded, not interpreted)                        |
+| `7–39`  | Lean version `"4.35.0"`, NUL-padded to 33 bytes               |
+| `40–79` | toolchain githash `eb6cafb7290e8bd5f2937522d8d804f58f02bafc`  |
+| `80–87` | `base_addr`, little-endian `u64`                              |
+| `88–95` | root object pointer, little-endian `u64`                      |
+| `96–`   | compacted object region                                       |
+
+Trusted boundary, stated honestly: this module validates the header and that the root
+pointer lands 8-aligned inside the object region (`base_addr + 96 ≤ root`,
+`root + 8 ≤ base_addr + size`). It does NOT decode the compacted object graph. Turning the
+region into `Lean.Environment` declarations is done by Lean's C runtime
+(`lean_compacted_region_read` / `readModuleData`), which stays in the trusted base
+(`docs/TRUSTED_BASE.md` item 4). The declaration list `decoded` taken by `parseRealOlean`
+is that reader's output; the theorems below say that once those declarations and the
+header pass this checker, they are CIC-valid in the `ConLeche` kernel model. -/
+
+/-- Read `len` bytes of `bytes` starting at `off` (out-of-range bytes read as `0`). -/
+def bytesSlice (bytes : ByteArray) (off len : Nat) : List UInt8 :=
+  (List.range len).map (fun i => bytes.get! (off + i))
+
+/-- Read a little-endian unsigned 64-bit integer from `bytes` at `off`. -/
+def readU64LE (bytes : ByteArray) (off : Nat) : Nat :=
+  (List.range 8).foldr (fun i acc => acc * 256 + (bytes.get! (off + i)).toNat) 0
+
+/-- ASCII bytes of a string literal. -/
+def asciiBytes (s : String) : List UInt8 :=
+  s.toList.map (fun c => c.toNat.toUInt8)
+
+/-- Real `.olean` magic: `"olean"`. -/
+def realOleanMagic : List UInt8 := [0x6F, 0x6C, 0x65, 0x61, 0x6E]
+
+/-- Size of the fixed real `.olean` header; objects start at this offset. -/
+def realOleanHeaderSize : Nat := 96
+
+/-- Pinned Lean version field: `"4.35.0"` NUL-padded to 33 bytes (bytes `7–39`). -/
+def realOleanLeanVersion : List UInt8 :=
+  asciiBytes "4.35.0" ++ List.replicate 27 0
+
+/-- Pinned toolchain githash field (bytes `40–79`). -/
+def realOleanGithash : List UInt8 :=
+  asciiBytes "eb6cafb7290e8bd5f2937522d8d804f58f02bafc"
+
+/-- Decoded fields of a real `.olean` header. -/
+structure RealOleanHeader where
+  version  : UInt8
+  flags    : UInt8
+  baseAddr : Nat
+  rootPtr  : Nat
+  deriving Repr, DecidableEq, Inhabited
+
+/-- Declarative specification of a valid real v4.35.0 `.olean` header `h` for `bytes`. -/
+def RealOleanHeaderSpec (bytes : ByteArray) (h : RealOleanHeader) : Prop :=
+  realOleanHeaderSize ≤ bytes.size ∧
+  bytesSlice bytes 0 5 = realOleanMagic ∧
+  h.version = bytes.get! 5 ∧ (h.version = 2 ∨ h.version = 3) ∧
+  h.flags = bytes.get! 6 ∧
+  bytesSlice bytes 7 33 = realOleanLeanVersion ∧
+  bytesSlice bytes 40 40 = realOleanGithash ∧
+  h.baseAddr = readU64LE bytes 80 ∧
+  h.rootPtr = readU64LE bytes 88 ∧
+  h.baseAddr + realOleanHeaderSize ≤ h.rootPtr ∧
+  h.rootPtr + 8 ≤ h.baseAddr + bytes.size ∧
+  (h.rootPtr - h.baseAddr) % 8 = 0
+
+/-- Executable check of the real `.olean` header and root-pointer bounds. -/
+def realOleanHeaderOk (bytes : ByteArray) (h : RealOleanHeader) : Bool :=
+  decide (realOleanHeaderSize ≤ bytes.size) &&
+  bytesSlice bytes 0 5 == realOleanMagic &&
+  (h.version == 2 || h.version == 3) &&
+  bytesSlice bytes 7 33 == realOleanLeanVersion &&
+  bytesSlice bytes 40 40 == realOleanGithash &&
+  decide (h.baseAddr + realOleanHeaderSize ≤ h.rootPtr) &&
+  decide (h.rootPtr + 8 ≤ h.baseAddr + bytes.size) &&
+  (h.rootPtr - h.baseAddr) % 8 == 0
+
+/-- Parse the 96-byte header of a real Lean 4 v4.35.0 `.olean` file. -/
+def parseRealOleanHeader (bytes : ByteArray) : Option RealOleanHeader :=
+  let h : RealOleanHeader :=
+    { version := bytes.get! 5
+      flags := bytes.get! 6
+      baseAddr := readU64LE bytes 80
+      rootPtr := readU64LE bytes 88 }
+  if realOleanHeaderOk bytes h then some h else none
+
+/-- A real `.olean` module: validated header plus kernel-checked declarations. -/
+structure RealOleanModule where
+  header : RealOleanHeader
+  env    : ConLeche.Env
+
+/-- Validate a real `.olean` header and kernel-check the declarations `decoded` that the
+    trusted reader (`lean_compacted_region_read`) extracted from its object region. -/
+def parseRealOlean (bytes : ByteArray) (decoded : List ConLeche.Decl) :
+    Except String RealOleanModule :=
+  match parseRealOleanHeader bytes with
+  | none => .error "parseRealOlean: invalid v4.35.0 .olean header or root pointer"
+  | some hdr =>
+    let env : ConLeche.Env := { decls := decoded }
+    if verifyDeclsPrefix [] decoded && decoded.all (verifyDecl env) then
+      .ok { header := hdr, env := env }
+    else
+      .error "parseRealOlean: CIC kernel rejected a decoded declaration"
+
+/-- Admit a new declaration `d` on top of a real `.olean` module. -/
+def checkRealOleanDecl (bytes : ByteArray) (decoded : List ConLeche.Decl)
+    (d : ConLeche.Decl) : Except String RealOleanModule :=
+  match parseRealOlean bytes decoded with
+  | .error e => .error e
+  | .ok m =>
+    match checkDecl m.env d with
+    | .error e => .error e
+    | .ok env' => .ok { m with env := env' }
+
+/-- The real `.olean` header parser accepts exactly the headers meeting the declarative
+    specification `RealOleanHeaderSpec`. -/
+theorem parseRealOleanHeader_iff (bytes : ByteArray) (h : RealOleanHeader) :
+    parseRealOleanHeader bytes = some h ↔ RealOleanHeaderSpec bytes h := by
+  rcases h with ⟨v, fl, b, r⟩
+  simp only [parseRealOleanHeader, realOleanHeaderOk, RealOleanHeaderSpec, Bool.and_eq_true,
+    decide_eq_true_eq, beq_iff_eq, Bool.or_eq_true]
+  split <;> rename_i hok
+  · simp only [Option.some.injEq, RealOleanHeader.mk.injEq]
+    constructor
+    · rintro ⟨rfl, rfl, rfl, rfl⟩
+      exact ⟨hok.1.1.1.1.1.1.1, hok.1.1.1.1.1.1.2, rfl, hok.1.1.1.1.1.2, rfl,
+        hok.1.1.1.1.2, hok.1.1.1.2, rfl, rfl, hok.1.1.2, hok.1.2, hok.2⟩
+    · rintro ⟨-, -, hv, -, hf, -, -, hb, hr, -⟩
+      exact ⟨hv.symm, hf.symm, hb.symm, hr.symm⟩
+  · simp only [reduceCtorEq, false_iff]
+    rintro ⟨hs, hm, rfl, hv, rfl, hl, hg, rfl, rfl, hb, hr, ha⟩
+    exact hok ⟨⟨⟨⟨⟨⟨⟨hs, hm⟩, hv⟩, hl⟩, hg⟩, hb⟩, hr⟩, ha⟩
+
+/-- No `"OLEN"` v1 model shard is a real `.olean`: encoded shards and every shard accepted
+    by `parseOleanShard` start with `'O'` (`0x4F`), never with the `'o'` of `"olean"`. -/
+theorem olen_shard_not_real_olean (env : ConLeche.Env) :
+    parseRealOleanHeader (encodeOleanShard env) = none ∧
+    ∀ bytes env', parseOleanShard bytes = .ok env' → parseRealOleanHeader bytes = none := by
+  have key : ∀ bytes : ByteArray, bytes.get! 0 = 0x4F → parseRealOleanHeader bytes = none := by
+    intro bytes h0
+    cases hp : parseRealOleanHeader bytes with
+    | none => rfl
+    | some h =>
+      have hm := congrArg List.head? ((parseRealOleanHeader_iff bytes h).mp hp).2.1
+      simp [bytesSlice, realOleanMagic, List.range_succ, h0] at hm
+  refine ⟨key _ ?_, fun bytes env' hp => key bytes ?_⟩
+  · simp [_root_.ConLeche.encodeOleanShard, ByteArray.get!]
+  · unfold parseOleanShard _root_.ConLeche.parseOleanShard at hp
+    split at hp
+    · contradiction
+    · split at hp
+      · contradiction
+      · rename_i hmag
+        simp only [Bool.not_eq_true', Bool.and_eq_false_iff, beq_eq_false_iff_ne, ne_eq,
+          not_or, Classical.not_not] at hmag
+        exact hmag.1.1.1
+
+/-- A successful real `.olean` parse yields a header meeting `RealOleanHeaderSpec`, keeps
+    exactly the trusted reader's declarations, and every one of them is CIC-valid. -/
+theorem real_olean_bridge_sound (bytes : ByteArray) (decoded : List ConLeche.Decl)
+    (m : RealOleanModule) (h_parse : parseRealOlean bytes decoded = .ok m) :
+    RealOleanHeaderSpec bytes m.header ∧ m.env.decls = decoded ∧ EnvWellFormed m.env := by
+  unfold parseRealOlean at h_parse
+  split at h_parse
+  · contradiction
+  · rename_i hdr hhdr
+    dsimp only at h_parse
+    split at h_parse
+    · rename_i hok
+      injection h_parse with hm
+      subst hm
+      rcases Bool.and_eq_true_iff.mp hok with ⟨hpref, hall⟩
+      refine ⟨(parseRealOleanHeader_iff bytes hdr).mp hhdr, rfl, rfl, hpref, fun d hd => ?_⟩
+      exact _root_.ConLeche.con_leche_verify_decl_sound _ d (List.all_eq_true.mp hall d hd)
+    · contradiction
+
+/-- Admitting `d` on top of a real `.olean` module preserves header validity and
+    environment well-formedness, and `d` itself is CIC-valid. -/
+theorem real_olean_checkDecl_sound (bytes : ByteArray) (decoded : List ConLeche.Decl)
+    (d : ConLeche.Decl) (m' : RealOleanModule)
+    (h_ok : checkRealOleanDecl bytes decoded d = .ok m') :
+    RealOleanHeaderSpec bytes m'.header ∧ EnvWellFormed m'.env ∧
+    CICValid { decls := decoded } d := by
+  unfold checkRealOleanDecl at h_ok
+  split at h_ok
+  · contradiction
+  · rename_i m hm
+    have ⟨hspec, hdecls, hwf⟩ := real_olean_bridge_sound bytes decoded m hm
+    split at h_ok
+    · contradiction
+    · rename_i env' henv'
+      injection h_ok with h_eq
+      subst h_eq
+      have ⟨hwf', hcic⟩ := con_leche_verify_decl_sound m.env env' d hwf henv'
+      have h_env : m.env = { decls := decoded } := by
+        rcases hwf with ⟨hmag, -⟩
+        cases hme : m.env
+        simp_all
+      exact ⟨hspec, hwf', h_env ▸ hcic⟩
+
+/-! ### Real `.olean` header mutant-kill guards -/
+
+/-- Little-endian `u64` encoding of `n`. -/
+def u64LEBytes (n : Nat) : List UInt8 :=
+  (List.range 8).map (fun i => (n / 256 ^ i % 256).toUInt8)
+
+/-- Assemble a synthetic real `.olean` image: 96-byte header plus `objLen` zero object bytes. -/
+def mkRealOleanBytes (magic : List UInt8) (version : UInt8) (leanVer githash : List UInt8)
+    (base root objLen : Nat) : ByteArray :=
+  let header := magic ++ [version, 1] ++ leanVer ++ githash ++ u64LEBytes base ++ u64LEBytes root
+  ByteArray.mk (header ++ List.replicate objLen 0).toArray
+
+/-- `base_addr` taken from the v4.35.0 `Init/Prelude.olean` header. -/
+def sampleRealOleanBase : Nat := 0x31FC9D500000
+
+/-- Valid baseline: version `2`, root at the first object (`base_addr + 96`). -/
+def validRealOleanBytes : ByteArray :=
+  mkRealOleanBytes realOleanMagic 2 realOleanLeanVersion realOleanGithash
+    sampleRealOleanBase (sampleRealOleanBase + 96) 16
+
+/-- Build a variant of the baseline with one field changed. -/
+def realOleanVariant (magic : List UInt8 := realOleanMagic) (version : UInt8 := 2)
+    (leanVer : List UInt8 := realOleanLeanVersion) (githash : List UInt8 := realOleanGithash)
+    (rootOff : Nat := 96) : ByteArray :=
+  mkRealOleanBytes magic version leanVer githash
+    sampleRealOleanBase (sampleRealOleanBase + rootOff) 16
+
+-- Positive guards: the baseline and the `allowClosures` (version 3) variant are accepted.
+#guard (parseRealOleanHeader validRealOleanBytes).isSome
+#guard (parseRealOleanHeader (realOleanVariant (version := 3))).isSome
+#guard (parseRealOleanHeader validRealOleanBytes).map (·.baseAddr) == some sampleRealOleanBase
+#guard (parseRealOleanHeader validRealOleanBytes).map (fun h => h.rootPtr - h.baseAddr) == some 96
+#guard (parseRealOleanHeader (realOleanVariant (rootOff := 104))).isSome
+#guard u64LEBytes sampleRealOleanBase == [0x00, 0x00, 0x50, 0x9D, 0xFC, 0x31, 0x00, 0x00]
+
+-- Mutant R1: `"OLEN"` model shards and a capitalised magic are not real `.olean` files.
+#guard (parseRealOleanHeader (encodeOleanShard validKernelEnv)).isNone
+#guard (parseRealOleanHeader (realOleanVariant (magic := asciiBytes "OLEAN"))).isNone
+-- Mutant R2: unknown format version.
+#guard (parseRealOleanHeader (realOleanVariant (version := 4))).isNone
+#guard (parseRealOleanHeader (realOleanVariant (version := 1))).isNone
+-- Mutant R3: different Lean version or toolchain githash.
+#guard (parseRealOleanHeader
+  (realOleanVariant (leanVer := asciiBytes "4.34.1" ++ List.replicate 27 0))).isNone
+#guard (parseRealOleanHeader
+  (realOleanVariant (githash := asciiBytes "0b6cafb7290e8bd5f2937522d8d804f58f02bafc"))).isNone
+-- Mutant R4: header truncated below 96 bytes.
+#guard (parseRealOleanHeader (validRealOleanBytes.extract 0 95)).isNone
+-- Mutant R5: root pointer inside the header, past the region end, or misaligned.
+#guard (parseRealOleanHeader (realOleanVariant (rootOff := 88))).isNone
+#guard (parseRealOleanHeader (realOleanVariant (rootOff := 112))).isNone
+#guard (parseRealOleanHeader (realOleanVariant (rootOff := 100))).isNone
+
+-- Mutant R6: the CIC kernel still gates declarations read from a valid real header.
+#guard (parseRealOlean validRealOleanBytes [validKernelDecl]).isOk
+#guard (parseRealOlean validRealOleanBytes [mutant2IllTypedDecl]).isOk == false
+#guard (parseRealOlean (realOleanVariant (version := 4)) [validKernelDecl]).isOk == false
+#guard (checkRealOleanDecl validRealOleanBytes [] validKernelDecl).isOk
+#guard (checkRealOleanDecl validRealOleanBytes [validKernelDecl] validKernelDecl).isOk == false
 
 end TurboLean.Kernel.ConLeche

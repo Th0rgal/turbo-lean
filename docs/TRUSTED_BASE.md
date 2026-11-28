@@ -92,9 +92,21 @@
 2. The H1 theorem statement is not frozen or hash-pinned yet (`H1.F` is an open leaf).
 3. No generated coverage matrix exists yet (`H1.0` is an open leaf; no JSON is committed).
 4. The `Contract V4 M2`/`M3` theorems are stated over the in-repo `"OLEN"` v1 model — `ConLeche.lean`
-   says so in-file (`lean/TurboLean/ConLeche.lean:7,12`: "binary `"OLEN"` v1 … shard model format,
-   NOT raw Lean 4 `.olean`"), as does the root `README.md:42`; the proof against real `.olean`
-   files is open (leaf `G1b` caveat, PR `#460`). The kernel-backed witness of leaf `A2`
+   says so in-file (module docstring: "binary `"OLEN"` v1 … shard model format, NOT raw Lean 4
+   `.olean`"), as does the root `README.md:42`. Leaf `G1b` adds a real-`.olean` layer in the same
+   file (section "Real Lean 4 v4.35.0 `.olean` Header & Root-Bounds Validator"):
+   `parseRealOleanHeader` checks the 96-byte v4.35.0 header (magic `"olean"`, version `2`/`3`,
+   NUL-padded `"4.35.0"`, githash `eb6cafb7…`, little-endian `base_addr` and root pointer) and that
+   the root lands 8-aligned inside the object region; `parseRealOleanHeader_iff`,
+   `olen_shard_not_real_olean`, `real_olean_bridge_sound` and `real_olean_checkDecl_sound` are
+   kernel-checked with `0 sorryAx` and only `propext`, `Quot.sound`, `Classical.choice`.
+   **Trusted, not proved:** the compacted object region is decoded into declarations by Lean's C
+   runtime (`lean_compacted_region_read`, called from `readModuleData`). The Lean model takes that
+   reader's output as the `decoded` argument of `parseRealOlean`; the theorems say those
+   declarations are CIC-valid in the `ConLeche` model once the header passes, not that the reader
+   decodes the region faithfully, nor that the `ConLeche` model is Lean's kernel. The header layout
+   was checked against all 2,546 `.olean` files of the v4.35.0 toolchain, not proved from Lean's C
+   sources. The kernel-backed witness of leaf `A2`
    (`audit-spec --kernel`) reads real `.olean` files through Lean's own kernel replay, but it
    trusts Lake's trace and `.hash` sidecars to bind the `.olean` to its source: an attacker who
    rewrites the `.olean`, its sidecar and its trace consistently is caught only by the kernel
