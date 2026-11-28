@@ -1396,8 +1396,19 @@ pub(crate) fn lake_trace_uses_nested_mod_deps(toolchain: &str) -> bool {
     matches!(parse_toolchain_major_minor(toolchain), Some((4, minor)) if minor < 33)
 }
 
+/// A Lake `.trace`'s recorded `inputs`, or `None` when it records none to check: absent, or a
+/// trace Lake restored from its artifact cache (`"synthetic": true`, `"inputs": []`). Such a
+/// trace is judged like one without `inputs`: its `depHash` must equal the hash recomputed from
+/// source, options and imports (`compute_expected_lake_module_dep_hash`).
+pub(crate) fn lake_trace_inputs(tv: &serde_json::Value) -> Option<&serde_json::Value> {
+    let inputs = tv.get("inputs")?;
+    let synthetic_empty = tv.get("synthetic").and_then(|v| v.as_bool()) == Some(true)
+        && inputs.as_array().is_some_and(|a| a.is_empty());
+    (!synthetic_empty).then_some(inputs)
+}
+
 pub(super) fn trace_recorded_src_hash(tv: &serde_json::Value) -> Option<&str> {
-    let inputs = tv.get("inputs")?.as_array()?;
+    let inputs = lake_trace_inputs(tv)?.as_array()?;
     let first_tag = inputs.first()?.as_array()?.first()?.as_str()?;
     if first_tag.ends_with(":deps") {
         tv.pointer("/inputs/2/1")?.as_str()
@@ -1409,7 +1420,7 @@ pub(super) fn trace_recorded_src_hash(tv: &serde_json::Value) -> Option<&str> {
 }
 
 pub(super) fn trace_recorded_imports_array(tv: &serde_json::Value) -> Option<&serde_json::Value> {
-    let inputs = tv.get("inputs")?.as_array()?;
+    let inputs = lake_trace_inputs(tv)?.as_array()?;
     let first_tag = inputs.first()?.as_array()?.first()?.as_str()?;
     let imports_pair = if first_tag == "deps" {
         tv.pointer("/inputs/0/1/1")?
@@ -8833,7 +8844,7 @@ pub(super) fn collect_prebuilt_dep_pkg_closure_for_statement(
                     ) else {
                         return Ok(None);
                     };
-                    if tv.get("inputs").is_some() {
+                    if lake_trace_inputs(&tv).is_some() {
                         let expected_src_h = format!("{:016x}", lake_hash_text(&src));
                         let src_matched = trace_recorded_src_hash(&tv)
                             == Some(expected_src_h.as_str())

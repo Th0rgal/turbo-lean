@@ -486,6 +486,65 @@ use super::*;
         Ok(())
     }
 
+    /// Lake's artifact cache (`LAKE_ARTIFACT_CACHE` + `LAKE_RESTORE_ARTIFACTS`) restores modules
+    /// with synthetic traces (`"synthetic": true`, `"inputs": []`, the real `depHash`) and
+    /// hardlinked artifacts older than their sources. The post-`lake build` gate accepts them
+    /// exactly when `depHash` matches the one recomputed from source, options and imports.
+    #[test]
+    fn test_lake_artifact_cache_synthetic_traces_verify_by_dep_hash() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sources = [
+            ("P/A.lean", "def a : Nat := 1\n"),
+            ("P/M.lean", "import P.A\ntheorem m : a = 1 := rfl\n"),
+            ("P/B.lean", "import P.M\ntheorem b : a = 1 := rfl\n"),
+        ];
+        let tree = crate::worktree_test_support::LakeTree::new("synthetic_traces", &sources)?;
+        let lake_cache = tree.root.join("lake-cache");
+        // The first build fills Lake's cache, the second restores every module from it.
+        for _ in 0..2 {
+            fs::remove_dir_all(tree.project.join(".lake/build"))?;
+            let out = Command::new("lake")
+                .args(["build", "P"])
+                .current_dir(&tree.project)
+                .env("LAKE_ARTIFACT_CACHE", "true")
+                .env("LAKE_RESTORE_ARTIFACTS", "true")
+                .env("LAKE_CACHE_DIR", &lake_cache)
+                .output()?;
+            anyhow::ensure!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let trace = |m: &str| tree.project.join(format!(".lake/build/lib/lean/P/{m}.trace"));
+        for m in ["A", "M"] {
+            let tv: serde_json::Value = serde_json::from_slice(&fs::read(trace(m))?)?;
+            assert_eq!(tv["synthetic"], true, "{m}: fixture must be cache-restored");
+            assert_eq!(tv["inputs"], serde_json::json!([]), "{m}");
+        }
+        // Rewritten sources are newer than the cache's hardlinked artifacts.
+        for (rel, src) in sources {
+            fs::write(tree.project.join(rel), src)?;
+        }
+        let targets = [tree.project.join("P/B.lean")];
+        let gate = || ensure_project_imports_fresh_inner(&tree.project, &targets, None, true, true);
+        assert_eq!(gate()?, 0, "matching synthetic traces are fresh");
+
+        let original = fs::read(trace("A"))?;
+        let mut forged: serde_json::Value = serde_json::from_slice(&original)?;
+        forged["depHash"] = serde_json::json!("0123456789abcdef");
+        fs::write(trace("A"), serde_json::to_vec(&forged)?)?;
+        assert!(gate().is_err(), "a synthetic trace with a foreign depHash");
+        fs::write(trace("A"), &original)?;
+        assert_eq!(gate()?, 0);
+
+        fs::write(tree.project.join("P/A.lean"), "def a : Nat := 1\ndef a2 := 2\n")?;
+        assert!(gate().is_err(), "a source edit after the restore");
+        Ok(())
+    }
+
     #[test]
     fn test_local_host_reads_remain_ineligible_for_stamp_reuse() -> Result<()> {
         let _guard = crate::pack::tests::env_test_lock()

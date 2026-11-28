@@ -1043,7 +1043,7 @@ pub(super) fn verify_lake_trace_options_and_args(
     tv: &serde_json::Value,
     opt_idx: usize,
 ) -> bool {
-    let Some(inputs_arr) = tv.get("inputs").and_then(|v| v.as_array()) else {
+    let Some(inputs_arr) = lake_trace_inputs(tv).and_then(|v| v.as_array()) else {
         return false;
     };
     let Some(opt_pair) = inputs_arr.get(opt_idx).and_then(|v| v.as_array()) else {
@@ -1783,7 +1783,7 @@ pub(super) fn prebuilt_closure_export_info(
             }
         }
         let (mut info, is_mod, tv) = prebuilt_artifact_traces(olean_path)?;
-        if tv.get("inputs").is_none() {
+        if lake_trace_inputs(&tv).is_none() {
             let mapped_spec = mapped_spec_opt?;
             return lake_closure_export_info_inner(
                 cfg,
@@ -2314,7 +2314,7 @@ pub(super) fn lake_closure_export_info_inner(
             let tv: serde_json::Value =
                 serde_json::from_slice(&fs::read(olean_path.with_extension("trace")).ok()?).ok()?;
             let src_h = lake_hash_text(&src_raw);
-            if tv.get("inputs").is_none() {
+            if lake_trace_inputs(&tv).is_none() {
                 let actual_dep_h = tv
                     .get("depHash")
                     .and_then(|v| v.as_str())
@@ -2473,7 +2473,7 @@ pub(super) fn lake_closure_export_info_inner(
                     }
                 }
                 let expected_len = base_idx + 7;
-                let inputs_arr = tv.get("inputs").and_then(|v| v.as_array())?;
+                let inputs_arr = lake_trace_inputs(&tv).and_then(|v| v.as_array())?;
                 let expected_opts_and_args_ok =
                     verify_lake_trace_options_and_args(spec, &tv, base_idx + 2);
                 let extra_dep_ok = if !spec.custom_target_needs.is_empty() {
@@ -2894,7 +2894,7 @@ pub(super) fn verify_trace_outputs_against_artifacts_ext(
     })?;
     let expected_o = format!("{:016x}.olean", olean_h);
     let expected_i = format!("{:016x}.ilean", ilean_h);
-    let dep_hash_ok = if let Some(inputs_val) = tv.get("inputs") {
+    let dep_hash_ok = if let Some(inputs_val) = lake_trace_inputs(&tv) {
         let expected_dep_h = format!("{:016x}", lake_input_hash(inputs_val)?);
         tv.get("depHash").and_then(|v| v.as_str()) == Some(expected_dep_h.as_str())
     } else {
@@ -3268,13 +3268,13 @@ pub(crate) fn verify_module_lake_sidecars_inner_opts_ext(
         c_path.as_deref().map(|p| (p, needs_c)),
         allow_stock_missing_c_outputs,
     )?;
-    if require_inputs && tv.get("inputs").is_none() {
+    if require_inputs && lake_trace_inputs(&tv).is_none() {
         anyhow::bail!(
             "Lake module trace `{}` lacks full `inputs` array",
             olean_path.with_extension("trace").display()
         );
     }
-    if check_src_hash && tv.get("inputs").is_some() {
+    if check_src_hash && lake_trace_inputs(&tv).is_some() {
         let expected_src_h = format!("{:016x}", lake_hash_text(src_raw));
         let src_matched = trace_recorded_src_hash(&tv) == Some(expected_src_h.as_str())
             || tv
@@ -3434,7 +3434,7 @@ pub(crate) fn find_dirty_modules_in_otherwise_fresh_dag(
                 continue;
             }
             let src_h = lake_hash_text(&src_raw);
-            if tv.get("inputs").is_none() {
+            if lake_trace_inputs(&tv).is_none() {
                 let raw_imp_dynlibs = compute_module_raw_import_dynlibs(dag, node);
                 let actual_dep_h = tv
                     .get("depHash")
@@ -6941,7 +6941,7 @@ pub(super) fn probe_warm_on_disk_module_candidate(
         import_entries.extend(lake_import_trace_entries(node.is_module, imp, &exp_info));
     }
 
-    if tv.get("inputs").is_none() {
+    if lake_trace_inputs(&tv).is_none() {
         let actual_dep_h = tv
             .get("depHash")
             .and_then(|v| v.as_str())
@@ -7091,7 +7091,7 @@ pub(super) fn probe_warm_on_disk_module_candidate(
         }
     }
 
-    let inputs_arr = tv.get("inputs").and_then(|v| v.as_array())?;
+    let inputs_arr = lake_trace_inputs(&tv).and_then(|v| v.as_array())?;
     let expected_len = base_idx + 7;
     if inputs_arr.len() != expected_len {
         return None;
