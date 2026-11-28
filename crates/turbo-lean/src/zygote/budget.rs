@@ -462,6 +462,134 @@ pub(crate) fn export_replay_worker_budget(export_jobs: Option<usize>, budget_job
     }
 }
 
+/// Default resident estimate (MiB) of one warm `ZygoteWorker` running a parallel declaration-replay
+/// shard; `TURBO_LEAN_REPLAY_WORKER_RSS_MB` overrides it as for kernel replay.
+pub(crate) const DEFAULT_ZYGOTE_SHARD_WORKER_RSS_MB: u64 = 1024;
+
+/// H2.3 unified replay width `min(requested, ⌊max_total_rss / per_worker⌋, ⌊available / per_worker⌋)`;
+/// `None` when not one worker fits, so the caller fails closed instead of risking an OOM.
+pub(crate) fn effective_replay_jobs(
+    requested: usize,
+    max_total_rss_mb: u64,
+    per_worker_rss_mb: u64,
+    available_mb: u64,
+) -> Option<usize> {
+    let fit = |mb: u64| usize::try_from(mb / per_worker_rss_mb.max(1)).unwrap_or(usize::MAX);
+    Some(requested.min(fit(max_total_rss_mb)).min(fit(available_mb))).filter(|&n| n > 0)
+}
+
+/// Live plan for replaying `blocks` declaration shards in parallel, `resident` of them on already
+/// warm pooled workers (whose RSS is resident, so they need no fresh RAM): `(jobs, slots)`, where
+/// `slots = ⌊TURBO_LEAN_MAX_TOTAL_ZYGOTE_RSS_MB / per_worker⌋` bounds live workers process-wide.
+pub(crate) fn parallel_replay_plan(blocks: usize, resident: usize) -> Result<(usize, usize)> {
+    let per = positive_env("TURBO_LEAN_REPLAY_WORKER_RSS_MB")
+        .unwrap_or(DEFAULT_ZYGOTE_SHARD_WORKER_RSS_MB);
+    let total = max_total_zygote_rss_mb();
+    let available = crate::shm_cache::MemoryBudgetGovernor::detect()
+        .budget_mb
+        .saturating_add(per.saturating_mul(resident as u64));
+    let requested = replay_jobs_env().unwrap_or(blocks).min(blocks);
+    let jobs = effective_replay_jobs(requested, total, per, available).ok_or_else(|| {
+        anyhow::anyhow!("parallel replay budget exhausted: one {per} MiB worker (`TURBO_LEAN_REPLAY_WORKER_RSS_MB`) does not fit `TURBO_LEAN_MAX_TOTAL_ZYGOTE_RSS_MB` = {total} MiB / {available} MiB available: fail-closed")
+    })?;
+    Ok((
+        jobs,
+        effective_replay_jobs(usize::MAX, total, per, u64::MAX).unwrap_or(1),
+    ))
+}
+
+/// Process-wide count of live parallel-replay workers.
+#[derive(Default)]
+pub(crate) struct ReplayPermits {
+    in_use: std::sync::Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+/// One live replay worker slot, released on drop (error, timeout and panic paths included).
+pub(crate) struct ReplayPermit<'a>(&'a ReplayPermits);
+
+impl ReplayPermits {
+    pub(crate) const fn new() -> Self {
+        Self {
+            in_use: std::sync::Mutex::new(0),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_use(&self) -> usize {
+        *self.in_use.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Up to `want` permits while fewer than `cap` are live. Only the first is waited for (until
+    /// `deadline`, then fail-closed); the rest are taken only if free, so a holder never waits for
+    /// more and concurrent requests cannot deadlock on partial grants.
+    pub(crate) fn acquire(
+        &self,
+        want: usize,
+        cap: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<ReplayPermit<'_>>> {
+        let mut n = self.in_use.lock().unwrap_or_else(|e| e.into_inner());
+        while want > 0 && *n >= cap.max(1) {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            anyhow::ensure!(!left.is_zero(), "parallel replay budget exhausted: {cap} replay workers stay live until the request deadline: fail-closed");
+            n = self
+                .freed
+                .wait_timeout(n, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        let k = want.min(cap.max(1).saturating_sub(*n));
+        *n += k;
+        Ok((0..k).map(|_| ReplayPermit(self)).collect())
+    }
+}
+
+impl Drop for ReplayPermit<'_> {
+    fn drop(&mut self) {
+        *self.0.in_use.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        self.0.freed.notify_all();
+    }
+}
+
+/// Run `items` in waves of one thread per worker, so at most `workers.len()` run at once. After
+/// each wave `settle` (on the calling thread, which may hold non-`Sync` state such as the store)
+/// sees every `(worker, item index, result)` and returns `false` to stop before the next wave.
+pub(crate) fn run_bounded<W: Send, T: Sync, R: Send, S>(
+    mut workers: Vec<W>,
+    items: &[T],
+    run: impl Fn(&mut W, &T) -> R + Sync,
+    mut settle: impl FnMut(&mut W, usize, R) -> (S, bool),
+) -> (Vec<W>, Vec<S>) {
+    let width = workers.len().max(1);
+    let mut settled = Vec::with_capacity(items.len());
+    for (wave, chunk) in items.chunks(width).enumerate() {
+        let run = &run;
+        let raw: Vec<R> = std::thread::scope(|s| {
+            let handles: Vec<_> = workers
+                .iter_mut()
+                .zip(chunk)
+                .map(|(w, item)| s.spawn(move || run(w, item)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("parallel replay thread panicked"))
+                .collect()
+        });
+        let mut go_on = true;
+        for (k, (w, r)) in workers.iter_mut().zip(raw).enumerate() {
+            let (out, ok) = settle(w, wave * width + k, r);
+            settled.push(out);
+            go_on &= ok;
+        }
+        if !go_on {
+            break;
+        }
+    }
+    (workers, settled)
+}
+
 pub(crate) fn run_lean_command(
     cmd: &mut Command,
     timeout_ms: Option<u64>,
@@ -669,5 +797,186 @@ mod tests {
         // Non-timeout errors are untouched.
         let plain = format!("{:#}", with_timeout_knob_hint(anyhow::anyhow!("boom")));
         assert_eq!(plain, "boom");
+    }
+
+    #[test]
+    fn test_effective_replay_jobs_unified_budget() {
+        // RAM allows: scales up to the requested width.
+        assert_eq!(effective_replay_jobs(4, 12_288, 1024, 64_000), Some(4));
+        // `⌊max_total / per_worker⌋` and `⌊available / per_worker⌋` each cap it.
+        assert_eq!(effective_replay_jobs(8, 4096, 1024, 64_000), Some(4));
+        assert_eq!(effective_replay_jobs(8, 12_288, 1024, 2_500), Some(2));
+        assert_eq!(effective_replay_jobs(4, 3_000, 1024, 64_000), Some(2));
+        // Exhausted budget fails closed instead of spawning a worker that would OOM.
+        assert_eq!(effective_replay_jobs(4, 512, 1024, 64_000), None);
+        assert_eq!(effective_replay_jobs(4, 12_288, 1024, 1_000), None);
+        assert_eq!(effective_replay_jobs(0, 12_288, 1024, 64_000), None);
+        // Degenerate per-worker estimate never divides by zero.
+        assert_eq!(effective_replay_jobs(3, 10, 0, 10), Some(3));
+    }
+
+    #[test]
+    fn test_parallel_replay_plan_honors_env_budget() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const KEYS: [&str; 4] = [
+            "TURBO_LEAN_MAX_TOTAL_ZYGOTE_RSS_MB",
+            "TURBO_LEAN_REPLAY_WORKER_RSS_MB",
+            "TURBO_LEAN_REPLAY_JOBS",
+            "TURBO_LEAN_JOBS",
+        ];
+        let prev: Vec<_> = KEYS.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in KEYS {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("TURBO_LEAN_MAX_TOTAL_ZYGOTE_RSS_MB", "2048");
+        std::env::set_var("TURBO_LEAN_REPLAY_WORKER_RSS_MB", "1024");
+        // Four resident workers guarantee RAM slots; the 2048 MiB total caps the width at 2.
+        assert_eq!(parallel_replay_plan(4, 4).unwrap(), (2, 2));
+        assert_eq!(parallel_replay_plan(1, 4).unwrap(), (1, 2));
+        std::env::set_var("TURBO_LEAN_REPLAY_JOBS", "1");
+        assert_eq!(parallel_replay_plan(4, 4).unwrap(), (1, 2));
+        std::env::set_var("TURBO_LEAN_REPLAY_WORKER_RSS_MB", "4096");
+        let err = parallel_replay_plan(4, 4).unwrap_err().to_string();
+        assert!(
+            err.contains("budget exhausted") && err.contains("fail-closed"),
+            "{err}"
+        );
+        for (k, v) in prev {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// `run_bounded` body that tracks the live and peak concurrency.
+    fn timed_probe(live: &std::sync::atomic::AtomicUsize, peak: &std::sync::atomic::AtomicUsize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        peak.fetch_max(live.fetch_add(1, SeqCst) + 1, SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        live.fetch_sub(1, SeqCst);
+    }
+
+    #[test]
+    fn test_run_bounded_scales_to_effective_jobs() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let items: Vec<usize> = (0..8).collect();
+        for jobs in 1..=4 {
+            let (live, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let t0 = std::time::Instant::now();
+            let (workers, out) = run_bounded(
+                vec![0usize; jobs],
+                &items,
+                |runs, &i| {
+                    timed_probe(&live, &peak);
+                    *runs += 1;
+                    i * 10
+                },
+                |_, i, r| ((i, r), true),
+            );
+            let waves = items.len().div_ceil(jobs) as u32;
+            assert_eq!(
+                peak.load(SeqCst),
+                jobs,
+                "exactly `jobs` workers run at once"
+            );
+            assert!(t0.elapsed() >= std::time::Duration::from_millis(40) * waves);
+            assert_eq!(out, items.iter().map(|&i| (i, i * 10)).collect::<Vec<_>>());
+            assert_eq!(workers.iter().sum::<usize>(), items.len());
+        }
+    }
+
+    #[test]
+    fn test_tight_total_rss_caps_concurrency_across_requests() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        // `TURBO_LEAN_MAX_TOTAL_ZYGOTE_RSS_MB = 2048` with 1024 MiB workers: two live slots.
+        let slots = effective_replay_jobs(usize::MAX, 2048, 1024, u64::MAX).unwrap();
+        assert_eq!(slots, 2);
+        let permits = ReplayPermits::new();
+        let (live, peak, done) = (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        std::thread::scope(|s| {
+            for _ in 0..6 {
+                s.spawn(|| {
+                    let jobs = effective_replay_jobs(4, 12_288, 1024, 64_000).unwrap();
+                    let held = permits.acquire(jobs, slots, deadline).unwrap();
+                    assert!((1..=slots).contains(&held.len()));
+                    let (_, out) = run_bounded(
+                        vec![(); held.len()],
+                        &[0u8; 4],
+                        |_, _| timed_probe(&live, &peak),
+                        |_, _, r| (r, true),
+                    );
+                    assert_eq!(out.len(), 4);
+                    done.fetch_add(1, SeqCst);
+                });
+            }
+        });
+        assert_eq!(done.load(SeqCst), 6, "every request completes: no deadlock");
+        assert_eq!(
+            peak.load(SeqCst),
+            slots,
+            "live replay workers never exceed the RSS slots"
+        );
+        assert_eq!(permits.in_use(), 0, "no leaked permits");
+    }
+
+    #[test]
+    fn test_replay_permits_no_deadlock_or_leak_on_error_or_timeout() {
+        let permits = ReplayPermits::new();
+        let soon = || std::time::Instant::now() + std::time::Duration::from_millis(50);
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // Budget exhausted until the deadline: fail-closed error, promptly, nothing leaked.
+        let held = permits.acquire(5, 2, far).unwrap();
+        assert_eq!(held.len(), 2);
+        let t0 = std::time::Instant::now();
+        let err = permits.acquire(1, 2, soon()).err().unwrap().to_string();
+        assert!(err.contains("fail-closed"), "{err}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(permits.in_use(), 2);
+        // A waiter wakes as soon as a holder releases, and partial grants never wait.
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| permits.acquire(3, 2, far).map(|p| p.len()));
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            drop(held);
+            assert!((1..=2).contains(&waiter.join().unwrap().unwrap()));
+        });
+        assert_eq!(permits.in_use(), 0);
+        // Worker error: `settle` stops before the next wave; permits drop on the error return.
+        let failing = || -> Result<usize> {
+            let held = permits.acquire(2, 2, far)?;
+            let (_, out) = run_bounded(
+                vec![(); held.len()],
+                &[0, 1, 2, 3, 4],
+                |_, &i| i,
+                |_, _, i| (i, i != 1),
+            );
+            anyhow::ensure!(out.len() == 5, "worker error after {} replies", out.len());
+            Ok(out.len())
+        };
+        assert_eq!(
+            failing().unwrap_err().to_string(),
+            "worker error after 2 replies"
+        );
+        assert_eq!(permits.in_use(), 0);
+        // A panicking replay thread unwinds through the permit guard as well.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = permits.acquire(2, 2, far).unwrap();
+            run_bounded(
+                vec![(); 2],
+                &[0, 1],
+                |_, &i| assert_ne!(i, 1),
+                |_, _, r| (r, true),
+            );
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(permits.in_use(), 0);
+        assert!(permits.acquire(0, 2, soon()).unwrap().is_empty());
     }
 }

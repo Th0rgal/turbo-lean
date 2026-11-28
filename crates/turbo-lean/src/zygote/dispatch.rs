@@ -864,6 +864,20 @@ pub(super) fn eval_with_zygote_pool_attempt(
     #[cfg(target_os = "linux")]
     let expected_pinned_dir = closure.materialized.as_ref().map(|m| m.dir_dev_ino);
 
+    // Per-worker RSS ceiling: recycles pooled workers and caps every parallel replay worker (H2.3).
+    let governor = crate::shm_cache::MemoryBudgetGovernor::detect();
+    let worker_rss_limit_mb = std::env::var("TURBO_LEAN_WORKER_RSS_LIMIT_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&mb| mb > 0)
+        .unwrap_or_else(|| governor.worker_rss_limit_mb());
+    let effective_rss_limit_mb = if std::env::var("TURBO_LEAN_WORKER_RSS_LIMIT_MB").is_ok()
+        || std::env::var("TURBO_LEAN_MAX_MEMORY_MB").is_ok()
+    {
+        worker_rss_limit_mb
+    } else {
+        worker_rss_limit_mb.max(2048)
+    };
     let spawn_zygote_worker = || -> Result<ZygoteChild> {
         let tools = crate::module_builder::ToolchainExecutables::from_lean(lean_bin)?;
         let lean_bin = tools.lean.as_path();
@@ -905,6 +919,7 @@ pub(super) fn eval_with_zygote_pool_attempt(
         cmd.envs(&worker_env)
             .env("LEAN_STACK_SIZE_KB", default_stack_kb)
             .env("LEAN_PATH", &child_lean_path)
+            .env("TURBO_LEAN_WORKER_RSS_LIMIT_MB", effective_rss_limit_mb.to_string())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -1020,19 +1035,6 @@ pub(super) fn eval_with_zygote_pool_attempt(
         })
     };
 
-    let governor = crate::shm_cache::MemoryBudgetGovernor::detect();
-    let worker_rss_limit_mb = std::env::var("TURBO_LEAN_WORKER_RSS_LIMIT_MB")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&mb| mb > 0)
-        .unwrap_or_else(|| governor.worker_rss_limit_mb());
-    let effective_rss_limit_mb = if std::env::var("TURBO_LEAN_WORKER_RSS_LIMIT_MB").is_ok()
-        || std::env::var("TURBO_LEAN_MAX_MEMORY_MB").is_ok()
-    {
-        worker_rss_limit_mb
-    } else {
-        worker_rss_limit_mb.max(2048)
-    };
     let max_global_idle = std::env::var("TURBO_LEAN_MAX_IDLE_ZYGOTES")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -1425,10 +1427,16 @@ pub(super) fn eval_with_zygote_pool_attempt(
                     }
                 }
             }
+            // H2.3: fan out to `min(jobs, ⌊total RSS / worker RSS⌋, RAM slots)` live workers.
+            let (jobs, slots) = parallel_replay_plan(needed, workers.len())?;
+            let permits = REPLAY_PERMITS.acquire(jobs, slots, deadline)?;
+            for w in workers.split_off(permits.len().min(workers.len())) {
+                return_worker_to_pool(pool_mutex, pool_key.clone(), w);
+            }
             if !workers.is_empty() {
                 mark_closure_snapshot_used(host_closure_digest);
             }
-            while workers.len() < needed {
+            while workers.len() < permits.len() {
                 workers.push(acquire_worker()?);
             }
 
@@ -1450,66 +1458,84 @@ pub(super) fn eval_with_zygote_pool_attempt(
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            let results: Vec<(ZygoteChild, WorkerReqOutcome)> = std::thread::scope(|s| {
-                let req_id_ref = request_identity.as_str();
-                let handles: Vec<_> = workers
-                    .into_iter()
-                    .zip(req_lines)
-                    .map(|(mut w, rl)| {
-                        s.spawn(move || {
-                            let res = run_worker_req(&mut w, &rl, req_id_ref);
-                            (w, res, rl)
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        let (mut w, mut res, rl) =
-                            h.join().expect("Zygote parallel eval thread panicked");
-                        if let WorkerReqOutcome::Crashed(ref first_diag) = res {
-                            if std::time::Instant::now() < deadline {
-                                if let Ok(retry) = spawn_zygote_worker() {
-                                    let first_diag = first_diag.clone();
-                                    w = retry;
-                                    res = run_worker_req(&mut w, &rl, req_id_ref);
-                                    if !matches!(res, WorkerReqOutcome::Crashed(_)) {
-                                        first_diag.forgive();
-                                    }
+            let req_id_ref = request_identity.as_str();
+            let ceiling_mb = effective_rss_limit_mb;
+            let run_capped = |w: &mut ZygoteChild, rl: &str| -> (WorkerReqOutcome, bool) {
+                let (stop, watch_rx) = std::sync::mpsc::channel::<()>();
+                let pid = w.pid();
+                let (res, tripped) = std::thread::scope(|s| {
+                    let watch = s.spawn(move || rss_watchdog(pid, ceiling_mb, &watch_rx));
+                    let res = run_worker_req(w, rl, req_id_ref);
+                    drop(stop);
+                    (res, watch.join().unwrap_or(true))
+                });
+                if !tripped {
+                    return (res, false);
+                }
+                let msg = format!("Zygote replay worker exceeded its {ceiling_mb} MiB RSS ceiling (`TURBO_LEAN_WORKER_RSS_LIMIT_MB`) and was killed: fail-closed");
+                let diag = build_worker_crash_diagnostics(w, &msg, ceiling_mb, req_id_ref);
+                (WorkerReqOutcome::Crashed(diag), true)
+            };
+            // Worker state: `None` unused, `Some(reusable)` after a request. Retries and
+            // replacements run between waves on this thread (`spawn_zygote_worker` holds the store).
+            let width = permits.len();
+            let (finished, outcomes) = run_bounded(
+                workers.into_iter().map(|w| (w, None)).collect(),
+                &req_lines,
+                |(w, _): &mut (ZygoteChild, Option<bool>), rl: &String| run_capped(w, rl),
+                |(w, state), i, (mut res, tripped)| {
+                    if let WorkerReqOutcome::Crashed(ref first_diag) = res {
+                        if !tripped && std::time::Instant::now() < deadline {
+                            if let Ok(retry) = spawn_zygote_worker() {
+                                let first_diag = first_diag.clone();
+                                *w = retry;
+                                res = run_capped(w, &req_lines[i]).0;
+                                if !matches!(res, WorkerReqOutcome::Crashed(_)) {
+                                    first_diag.forgive();
                                 }
                             }
                         }
-                        (w, res)
-                    })
-                    .collect()
-            });
+                    }
+                    *state = Some(matches!(&res, WorkerReqOutcome::Reply(r)
+                        if r.import_ok && !r.errors.iter().any(|e| e == RUNTIME_PANIC_ERR)));
+                    let go_on = matches!(res, WorkerReqOutcome::Reply(_));
+                    if go_on && *state == Some(false) && i + width < req_lines.len() {
+                        match spawn_zygote_worker() {
+                            Ok(fresh) => (*w, *state) = (fresh, None),
+                            Err(e) => return (Err(e), false),
+                        }
+                    }
+                    (Ok(res), go_on)
+                },
+            );
 
             run_digest_test_hook("after_worker_reply");
             let binding = closure.binding();
+            for (mut w, state) in finished {
+                // A worker whose env is not proven to hold the hashed bytes is killed: its
+                // in-process env cache is labelled with this digest.
+                match state {
+                    Some(true) if binding == ClosureBinding::Bound => {
+                        w.warm_imports
+                            .insert(imports_csv.clone(), closure_pool_digest.clone());
+                        return_worker_to_pool(pool_mutex, pool_key.clone(), w);
+                    }
+                    None => return_worker_to_pool(pool_mutex, pool_key.clone(), w),
+                    _ => drop(w),
+                }
+            }
+            drop(permits);
             let mut replies = Vec::with_capacity(needed);
             let mut first_err: Option<anyhow::Error> = None;
-            for (mut w, res) in results {
+            for res in outcomes {
                 match res {
-                    WorkerReqOutcome::Reply(r) => {
-                        // A worker whose env is not proven to hold the hashed bytes is killed:
-                        // its in-process env cache is labelled with this digest.
-                        if binding == ClosureBinding::Bound
-                            && r.import_ok
-                            && !r.errors.iter().any(|e| e == RUNTIME_PANIC_ERR)
-                        {
-                            w.warm_imports
-                                .insert(imports_csv.clone(), closure_pool_digest.clone());
-                            return_worker_to_pool(pool_mutex, pool_key.clone(), w);
-                        }
-                        replies.push(r);
-                    }
-                    WorkerReqOutcome::TimedOut {
+                    Ok(WorkerReqOutcome::Reply(r)) => replies.push(r),
+                    Ok(WorkerReqOutcome::TimedOut {
                         elapsed_us,
                         peak_rss_mb,
                         stderr_tail,
                         last_request,
-                    } => {
-                        drop(w);
+                    }) => {
                         return Ok((
                             ZygoteEvalReply::timed_out_reply(
                                 eval_mode,
@@ -1523,17 +1549,22 @@ pub(super) fn eval_with_zygote_pool_attempt(
                             executed_identity,
                         ));
                     }
-                    WorkerReqOutcome::Crashed(diag) => {
-                        drop(w);
-                        if first_err.is_none() {
-                            first_err = Some(anyhow::anyhow!("{}", diag.message));
-                        }
+                    Ok(WorkerReqOutcome::Crashed(diag)) => {
+                        first_err.get_or_insert_with(|| anyhow::anyhow!("{}", diag.message));
+                    }
+                    Err(e) => {
+                        first_err.get_or_insert(e);
                     }
                 }
             }
             if let Some(e) = first_err {
                 return Err(e);
             }
+            anyhow::ensure!(
+                replies.len() == needed,
+                "parallel replay checked {} of {needed} shards: fail-closed",
+                replies.len()
+            );
             let import_ok = replies.iter().all(|r| r.import_ok);
             let ok = replies.iter().all(|r| r.ok);
             let kernel_gate_active = replies.iter().all(|r| r.kernel_gate_active);

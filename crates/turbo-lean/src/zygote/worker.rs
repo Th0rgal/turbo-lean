@@ -678,6 +678,43 @@ pub(super) static ZYGOTE_POOL: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<(String, String, String), Vec<ZygoteWorkerProcess>>>,
 > = std::sync::OnceLock::new();
 
+/// Live parallel declaration-replay workers across concurrent requests (H2.3 unified RAM budget).
+pub(super) static REPLAY_PERMITS: ReplayPermits = ReplayPermits::new();
+
+/// Private (anonymous) resident MiB of `pid`: `statm` resident minus file-backed/shared pages, so
+/// mmapped `.olean` imports shared through the page cache do not count. Falls back to total RSS.
+pub(super) fn measure_private_rss_mb(pid: u32) -> u64 {
+    #[cfg(target_os = "linux")]
+    if let Ok(statm) = fs::read_to_string(format!("/proc/{pid}/statm")) {
+        let pages: Vec<u64> = statm.split_whitespace().take(3).filter_map(|f| f.parse().ok()).collect();
+        if let [_, resident, shared] = pages[..] {
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+            return resident.saturating_sub(shared).saturating_mul(page) >> 20;
+        }
+    }
+    measure_process_rss_mb(pid)
+}
+
+/// Enforce a per-worker private-RSS ceiling while one replay request is in flight: polls `pid`
+/// until `stop` fires (sender dropped or sent) and `SIGKILL`s it above `ceiling_mb`; `true` if so.
+pub(super) fn rss_watchdog(pid: u32, ceiling_mb: u64, stop: &std::sync::mpsc::Receiver<()>) -> bool {
+    loop {
+        if measure_private_rss_mb(pid) > ceiling_mb {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+            return true;
+        }
+        if !matches!(
+            stop.recv_timeout(std::time::Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            return false;
+        }
+    }
+}
+
 #[allow(clippy::type_complexity)]
 pub(super) static ZYGOTE_MASTERS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<(String, String, String), std::sync::Arc<ZygoteMasterEntry>>>,
@@ -2053,5 +2090,36 @@ mod worker_embed_tests {
         let _ = fs::remove_dir_all(&root);
         Ok(())
     }
-}
 
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_rss_watchdog_enforces_per_worker_ceiling() {
+        // Over the ceiling: killed while the request is in flight.
+        let mut hog = Command::new("/bin/sh")
+            .args(["-c", "x=$(head -c 33554432 /dev/zero | tr '\\0' a); sleep 60"])
+            .spawn()
+            .unwrap();
+        let (stop, rx) = std::sync::mpsc::channel::<()>();
+        let bound = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            drop(stop);
+        });
+        assert!(rss_watchdog(hog.id(), 8, &rx), "a 32 MiB worker exceeds an 8 MiB ceiling");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(hog.wait().unwrap().signal(), Some(libc::SIGKILL));
+        drop(bound);
+        // Under the ceiling: the watchdog returns as soon as the request finishes.
+        let mut idle = Command::new("/bin/sh").args(["-c", "sleep 60"]).spawn().unwrap();
+        let (stop, rx) = std::sync::mpsc::channel::<()>();
+        let t0 = std::time::Instant::now();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(stop);
+        });
+        assert!(!rss_watchdog(idle.id(), u64::MAX, &rx));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+        assert!(idle.try_wait().unwrap().is_none(), "an in-budget worker is left alive");
+        let _ = idle.kill();
+        let _ = idle.wait();
+    }
+}
