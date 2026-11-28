@@ -17,6 +17,8 @@ required = [
     'LeanNative.Proofs.H1.negWitnessWrongReturn_killed',
     'LeanNative.Proofs.H1.negWitnessDroppedParam_killed',
     'LeanNative.Proofs.H1.negWitnessWrongScrutinee_killed',
+    'LeanNative.Proofs.H1.letWitness',
+    'LeanNative.Proofs.H1.negWitnessSwappedArith_killed',
     'LeanNative.Transform.optimizeEqSatCode_sound',
     'LeanNative.Transform.scheduleStructuredLoop_sound',
     'LeanNative.Transform.elideAndMutateRC_sound',

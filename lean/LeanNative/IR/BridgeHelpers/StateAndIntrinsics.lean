@@ -61,22 +61,6 @@ def freshBridgeVar (ty : LNIRType) : BridgeM VarId := do
 def getVarType (vid : VarId) : BridgeM LNIRType := do
   return (← get).varTypes.getD vid .objPtr
 
-def lowerArg (arg : Lean.Compiler.LCNF.Arg pu) (allowInternalObj : Bool := false) : BridgeM VarId := do
-  match arg with
-  | .fvar fvarId =>
-    if ((← get).localFunMap.contains fvarId) then
-      Lean.throwError "[lean-native] Unsupported higher-order / escaping local function value"
-    let vid ← internFVar fvarId
-    let vTy ← getVarType vid
-    if !(isSupportedParamOrRetType vTy (← get).arch true || (allowInternalObj && (vTy == .objPtr || vTy == .taggedPtr))) then
-      Lean.throwError s!"[lean-native] Unsupported non-scalar argument of type `{reprStr vTy}`"
-    return vid
-  | .erased => freshBridgeVar .unit
-  | .type .. => freshBridgeVar .unit
-
-def toImpureParams (params : Array (Lean.Compiler.LCNF.Param pu)) : Array (Lean.Compiler.LCNF.Param .impure) :=
-  params.map fun p => { fvarId := p.fvarId, binderName := p.binderName, type := p.type, borrow := p.borrow }
-
 partial def codeHasRecursiveJmp (targetFVar : Lean.FVarId) (code : Lean.Compiler.LCNF.Code pu) : Bool :=
   match code with
   | .let _ k | .fun _ k _ | .inc _ _ _ _ k _ | .dec _ _ _ _ _ k _
@@ -235,39 +219,6 @@ partial def freshenJoinPointCode (subst : Std.HashMap VarId VarId) (code : LNIRC
   | .ret v => return .ret (subst.getD v v)
   | .unreachable => return .unreachable
 
-def spliceJoinPointJmp {pu} (jpParams : Array (Lean.Compiler.LCNF.Param .impure)) (jpBody : LNIRCode)
-    (args : Array (Lean.Compiler.LCNF.Arg pu)) : BridgeM LNIRCode := do
-  if jpParams.size != args.size then
-    Lean.throwError s!"[lean-native] join point arity mismatch: expected {jpParams.size}, got {args.size}"
-  let mut preBinds : List (VarId × LNIRType × LNIRExpr) := []
-  let mut subst : Std.HashMap VarId VarId := {}
-  for (p, arg) in jpParams.toList.zip args.toList do
-    let pTy ← lowerBridgeType p.type
-    let origParamVid ← internFVar p.fvarId pTy
-    let argVar ← match arg with
-      | .erased | .type .. =>
-        let zTy := if pTy == .unit then .i64 else pTy
-        let zv ← freshBridgeVar zTy
-        preBinds := preBinds ++ [(zv, zTy, .scalar (.constU64 0))]
-        pure zv
-      | _ => lowerArg arg true
-    subst := subst.insert origParamVid argVar
-  let body' ← freshenJoinPointCode subst jpBody
-  return preBinds.foldr (fun (dst, ty, val) acc => .letBind dst ty val acc) body'
-
-def orderAlts (alts : List (Lean.Compiler.LCNF.Alt pu)) : List (Lean.Compiler.LCNF.Alt pu) :=
-  RealLCNFBridge.orderAltsPure alts
-
-def lowerLitValueM (lit : Lean.Compiler.LCNF.LitValue) (retTy : LNIRType := .i64)
-    (allowInternalObj : Bool := false) : BridgeM LNIRExpr := do
-  let arch := (← get).arch
-  match RealLCNFBridge.lowerLitValuePure lit retTy arch allowInternalObj with
-  | .ok expr => return expr
-  | .error msg => Lean.throwError msg
-
-def lowerLitValue (lit : Lean.Compiler.LCNF.LitValue) : BridgeM LNIRExpr :=
-  lowerLitValueM lit .i64
-
 partial def eraseBinderNamesAndPrefix (fnName : Lean.Name) : Lean.Expr → Lean.Expr
   | .const n ls => if fnName.isPrefixOf n then .const (n.replacePrefix fnName `canonical_intrinsic) ls else .const n ls
   | .app f a => .app (eraseBinderNamesAndPrefix fnName f) (eraseBinderNamesAndPrefix fnName a)
@@ -325,39 +276,5 @@ def internParams {pu} (params : Array (Lean.Compiler.LCNF.Param pu)) (allowInter
     let pTy ← lowerBridgeType p.type
     checkBridgeType "parameter" p.type pTy allowInternalObj
     let _ ← internFVar p.fvarId pTy true
-
-def lowerRefOp (isInc : Bool) (fvarId : Lean.FVarId) (n : Nat) (kCode : LNIRCode) : BridgeM LNIRCode := do
-  let v ← internFVar fvarId
-  let vt ← getVarType v
-  match RealLCNFBridge.lowerRefOpPure isInc v vt n kCode with
-  | .ok code => return code
-  | .error msg => Lean.throwError msg
-
-def inferImpureRhsType (rhs : LNIRExpr) (declTy : LNIRType) (isBox : Bool) : BridgeM LNIRType := do
-  if isBox then
-    match rhs with
-    | .scalar (.var sv) =>
-      let sty ← getVarType sv
-      return if isUnboxedScalarOrTuple sty then sty else .i64
-    | _ => return .i64
-  match rhs with
-  | .allocCtor .. => return .objPtr
-  | .isExclusive .. => return .i1
-  | .scalar (.var sv) =>
-    let sty ← getVarType sv
-    return if isUnboxedScalarOrTuple declTy then declTy
-      else if isUnboxedScalarOrTuple sty then sty else declTy
-  | .scalar _ => return if isUnboxedScalarOrTuple declTy then declTy else .i64
-  | .mkTuple argVars => return .tuple (← argVars.mapM getVarType)
-  | .projTuple tv idx =>
-    match (← getVarType tv) with
-    | .tuple fs => return if isUnboxedScalarOrTuple declTy then declTy else fs[idx]?.getD .i64
-    | _ => return declTy
-  | _ => return declTy
-
-def lookupCtorIdx (ctorName : Lean.Name) (fallbackIdx : Nat) : BridgeM Nat := do
-  match (← getEnv).find? ctorName with
-  | some (.ctorInfo cval) => return cval.cidx
-  | _ => return fallbackIdx
 
 end LeanNative.IR

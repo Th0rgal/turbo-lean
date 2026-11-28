@@ -364,72 +364,6 @@ def buildRealBridgeCtxM (typeExprs : List Lean.Expr) (ctorSeeds calleeSeeds : Li
     knownFVarCtors := knownFVarCtors
   }
 
-/-- Convert current `BridgeState` to `RealBridgeState`, pre-interning any free `FVarId`s in `freeFVars`. -/
-def bridgeStateToRealM (freeFVars : List Lean.FVarId) : BridgeM RealLCNFBridge.RealBridgeState := do
-  for fv in freeFVars do
-    if !(← get).localFunMap.contains fv then
-      let _ ← internFVar fv
-  let st ← get
-  return {
-    fvarMap := st.fvarToVar.toList
-    varTypes := st.varTypes.toList
-    activeCtor := st.activeCtor.toList
-    jpDecls := []
-    nextVarId := st.nextVarId
-  }
-
-/-- Synchronize allocated `VarId` counter and bindings back from `RealBridgeState` into `BridgeState`. -/
-def syncRealToBridgeStateM (rst : RealLCNFBridge.RealBridgeState) : BridgeM Unit := do
-  modify fun st => {
-    st with
-    fvarToVar := rst.fvarMap.foldl (fun m (f, v) => m.insert f v) st.fvarToVar
-    varTypes := rst.varTypes.foldl (fun m (v, t) => m.insert v t) st.varTypes
-    activeCtor := rst.activeCtor.foldl (fun m (v, c) => m.insert v c) {}
-    nextVarId := max st.nextVarId rst.nextVarId
-  }
-
-/-- Delegate `LetValue .impure` lowering directly to `RealLCNFBridge.lowerImpureLetValuePure`. -/
-def lowerImpureLetValueViaRealM (lv : Lean.Compiler.LCNF.LetValue .impure) (retTy : LNIRType) : BridgeM LNIRExpr := do
-  if let .fvar fvarId args := lv then
-    if args.isEmpty && (← get).localFunMap.contains fvarId then
-      Lean.throwError "[lean-native] Unsupported escaping local function value"
-  let freeFVars := collectLetValueFVarsImpure [] lv
-  let (ctors, callees) := collectLetValueCtorAndCalleeNames [] [] lv
-  let st ← get
-  let ctx ← buildRealBridgeCtxM [] (ctors ++ st.fvarCtor.toList.map Prod.snd ++ st.activeCtor.toList.map Prod.snd)
-    callees [] st.fvarCtor.toList
-  let rst ← bridgeStateToRealM freeFVars
-  match RealLCNFBridge.lowerImpureLetValuePure ctx rst lv retTy with
-  | .ok (expr, rst') =>
-    syncRealToBridgeStateM rst'
-    return expr
-  | .error msg => Lean.throwError msg
-
-/-- Delegate `Code .impure` lowering directly to `RealLCNFBridge.lowerRealLCNFCode`. -/
-def lowerImpureCodeViaRealM (rawCode : Lean.Compiler.LCNF.Code .impure) : BridgeM LNIRCode := do
-  let code ← if (← get).arch.isFreestandingEmbedded then
-    normalizeEmbeddedSliceGetBang {} {} rawCode
-  else pure rawCode
-  checkImpureLetTypesM code
-  let freeFVars := collectFreeCodeFVarsImpure {} [] code
-  for fv in freeFVars do
-    if (← get).localFunMap.contains fv then
-      Lean.throwError "[lean-native] Unsupported higher-order / escaping local function value"
-  let typeExprs := collectCodeTypeExprs [] code
-  let (ctors, callees) := collectCodeCtorAndCalleeNames [] [] code
-  let st ← get
-  let knownCtors := (collectFVarCtors code).fold (fun m k v => m.insert k v) st.fvarCtor
-  let ctx ← buildRealBridgeCtxM typeExprs
-    (ctors ++ knownCtors.toList.map Prod.snd ++ st.activeCtor.toList.map Prod.snd)
-    callees [] knownCtors.toList
-  let rst ← bridgeStateToRealM freeFVars
-  let fuel := codeAstFuel code + 64
-  match RealLCNFBridge.lowerRealLCNFCode fuel ctx rst code with
-  | .ok (lnir, rst') =>
-    syncRealToBridgeStateM rst'
-    return lnir
-  | .error msg => Lean.throwError msg
-
 partial def pureCodeAstFuel : Lean.Compiler.LCNF.Code .pure → Nat
   | .let _ k => 1 + pureCodeAstFuel k
   | .fun d k _ | .jp d k => 1 + pureCodeAstFuel d.value + pureCodeAstFuel k
@@ -506,17 +440,6 @@ def attachBaseDeclFactsM (declName : Lean.Name) (d : LNIRDecl) : Lean.CoreM LNIR
         pure (rawFacts.filter (factVarsInScope paramTys))
   let merged := (sigFacts ++ baseFacts).foldl LeanNative.IR.consFact d.retainedFacts
   return { d with retainedFacts := merged }
-
-def extractPureDeclFactsWithBridgeState (decl : Lean.Compiler.LCNF.Decl .pure)
-    (st : BridgeState) (d : LNIRDecl) : LNIRDecl :=
-  let seedMap := st.fvarToVar.toList
-  let fuel := decl.params.size +
-    (match decl.value with | .code c => pureCodeAstFuel c | .extern _ => 0) + 128
-  let liveVarTys := collectDeclVarTys (d.params.map fun p => (p.id, p.ty)) d.body
-  let facts := (LeanNative.Frontend.ProofRetention.retainedPureDeclFactsWithSeed
-    fuel seedMap st.nextVarId decl).filter (factVarsInScope liveVarTys)
-  let merged := facts.foldl LeanNative.IR.consFact d.retainedFacts
-  { d with retainedFacts := merged }
 
 /-- Delegate `Decl .impure` lowering directly to `RealLCNFBridge.lowerRealLCNFDecl` (backed by `lowerRealLCNFDecl_sound`). -/
 def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)

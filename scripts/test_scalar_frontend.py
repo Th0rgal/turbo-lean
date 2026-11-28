@@ -963,33 +963,24 @@ open Lean LeanNative.IR Lean.Compiler.LCNF
 run_meta do
   let j : FVarId := ⟨`join⟩
   let x : FVarId := ⟨`value⟩
-  let r : FVarId := ⟨`res⟩
   let ty := mkConst ``UInt64
   let recursive : FunDecl .impure := .mk j `join #[] ty (.jmp j #[])
-  let recLocalFn : FunDecl .pure := .mk j `recFn #[.mk x `p0 ty false] ty (.let ⟨r, `r, ty, .fvar j #[.fvar x]⟩ (.return r))
-  let p0 : Param .pure := .mk x `p0 ty false
-  let actions : List (String × BridgeM LNIRCode) :=
-    [("recursive join point", lowerImpureCode (.jp recursive (.jmp j #[]))),
-     ("unmapped join point", lowerImpureCode (.jmp j #[.fvar x])),
-     ("arity mismatch", lowerImpureCode (.jp (.mk j `join #[] ty (.return x)) (.jmp j #[.fvar x]))),
-     ("constructor tag mutation", lowerImpureCode (.setTag x 1 (.return x))),
-     ("recursive local function", lowerPureCode (.fun recLocalFn (.return x))),
-             ("higher-order fvar call", lowerPureLetValue (.fvar x #[.fvar x]) .i64 >>= fun _ => pure (.ret 0)),
-             ("constructor payload pattern", lowerPureAlts 0 false 0 [.alt `Boxed.mk #[p0] (.return x)]),
-             ("unsupported string literal", lowerLitValue (.str "abc") >>= fun _ => pure (.ret 0)),
-             ("Unsupported heap reset", lowerImpureLetValue (.reset 2 x rfl) .objPtr >>= fun _ => pure (.ret 0))]
-  for (expected, action) in actions do
-    let rejected ← try
-      let _ ← action.run' {}
-      pure false
-    catch error =>
-      let message ← error.toMessageData.toString
+  let st : RealLCNFBridge.RealBridgeState := { fvarMap := [(x, 0)], varTypes := [(0, .i64)], nextVarId := 1 }
+  let lower (c : Code .impure) := RealLCNFBridge.lowerRealLCNFCode 64 {} st c
+  let cases : List (String × Code .impure) :=
+    [("recursive join point", .jp recursive (.jmp j #[])),
+     ("unmapped join point", .jmp j #[.fvar x]),
+     ("arity mismatch", .jp (.mk j `join #[] ty (.return x)) (.jmp j #[.fvar x])),
+     ("constructor tag mutation", .setTag x 1 (.return x) rfl),
+     ("unsupported string literal", .let ⟨⟨`r⟩, `r, ty, .lit (.str "abc")⟩ (.return x))]
+  for (expected, code) in cases do
+    match lower code with
+    | .ok _ => throwError "accepted unsupported {expected}"
+    | .error message =>
       unless (message.splitOn expected).length > 1 do
         throwError "wrong rejection for {expected}: {message}"
-      pure true
-    unless rejected do throwError "accepted unsupported {expected}"
   let ordinary : FunDecl .impure := .mk j `join #[] ty (.return x)
-  let _ ← (lowerImpureCode (.jp ordinary (.jmp j #[]))).run' { varTypes := ({} : Std.HashMap VarId LNIRType).insert 0 .i64, fvarToVar := ({} : Std.HashMap FVarId VarId).insert x 0, nextVarId := 1 }
+  if let .error e := lower (.jp ordinary (.jmp j #[])) then throwError e
 '''
         with tempfile.TemporaryDirectory(prefix="unsupported_lcnf_") as directory:
             path = Path(directory) / "Boundary.lean"

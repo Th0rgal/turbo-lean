@@ -396,18 +396,50 @@ def lowerTagBranchPure (condVar : VarId) (condTy : LNIRType) (cidx : Nat) (isBoo
 def orderAltsPure {pu} (alts : List (Lean.Compiler.LCNF.Alt pu)) : List (Lean.Compiler.LCNF.Alt pu) :=
   alts.filter (fun | .default _ => false | _ => true) ++ alts.filter (fun | .default _ => true | _ => false)
 
+/-- Structural `Lean.Level` equality. `Level.beq` is `opaque`, so `==` on levels has no kernel value. -/
+def levelStructEq : Lean.Level → Lean.Level → Bool
+  | .zero, .zero => true
+  | .succ u, .succ v => levelStructEq u v
+  | .max u₁ u₂, .max v₁ v₂ | .imax u₁ u₂, .imax v₁ v₂ => levelStructEq u₁ v₁ && levelStructEq u₂ v₂
+  | .param a, .param b => a == b
+  | .mvar a, .mvar b => a == b
+  | _, _ => false
+
+def levelsStructEq : List Lean.Level → List Lean.Level → Bool
+  | [], [] => true
+  | u :: us, v :: vs => levelStructEq u v && levelsStructEq us vs
+  | _, _ => false
+
+/-- Computable structural `Lean.Expr` equality, used for every type comparison in the lowerer and in
+    `RealLCNFSemantics`. `Expr.eqv` (`==`) is `opaque`, so a type decided by it has no kernel value.
+    Like `Expr.eqv`, binder names and annotations are ignored; `mdata` payloads are ignored too. -/
+def exprStructEq : Lean.Expr → Lean.Expr → Bool
+  | .bvar i, .bvar j => i == j
+  | .fvar a, .fvar b => a == b
+  | .mvar a, .mvar b => a == b
+  | .sort u, .sort v => levelStructEq u v
+  | .const n us, .const m vs => n == m && levelsStructEq us vs
+  | .app f a, .app g b => exprStructEq f g && exprStructEq a b
+  | .lam _ t b _, .lam _ t' b' _ | .forallE _ t b _, .forallE _ t' b' _ =>
+    exprStructEq t t' && exprStructEq b b'
+  | .letE _ t v b _, .letE _ t' v' b' _ => exprStructEq t t' && exprStructEq v v' && exprStructEq b b'
+  | .lit l, .lit l' => l == l'
+  | .mdata _ e, .mdata _ e' => exprStructEq e e'
+  | .proj s i e, .proj s' i' e' => s == s' && i == i' && exprStructEq e e'
+  | _, _ => false
+
 /-- Pure lowering of non-tuple atomic `Lean.Compiler.LCNF.ImpureType` and ground scalar `Lean.Expr` types. -/
 def lowerAtomicImpureType (e : Lean.Expr) : LNIRType :=
-  if e == Lean.Compiler.LCNF.ImpureType.uint8 then .i8
-  else if e == Lean.Compiler.LCNF.ImpureType.uint16 then .i16
-  else if e == Lean.Compiler.LCNF.ImpureType.uint32 then .i32
-  else if e == Lean.Compiler.LCNF.ImpureType.uint64 then .i64
-  else if e == Lean.Compiler.LCNF.ImpureType.usize then .usize
-  else if e == Lean.Compiler.LCNF.ImpureType.float32 then .f32
-  else if e == Lean.Compiler.LCNF.ImpureType.float then .f64
-  else if e == Lean.Compiler.LCNF.ImpureType.object then .objPtr
-  else if e == Lean.Compiler.LCNF.ImpureType.tagged || e == Lean.Compiler.LCNF.ImpureType.tobject then .taggedPtr
-  else if e == Lean.Compiler.LCNF.ImpureType.erased || e == Lean.Compiler.LCNF.ImpureType.void then .unit
+  if exprStructEq e Lean.Compiler.LCNF.ImpureType.uint8 then .i8
+  else if exprStructEq e Lean.Compiler.LCNF.ImpureType.uint16 then .i16
+  else if exprStructEq e Lean.Compiler.LCNF.ImpureType.uint32 then .i32
+  else if exprStructEq e Lean.Compiler.LCNF.ImpureType.uint64 then .i64
+  else if exprStructEq e Lean.Compiler.LCNF.ImpureType.usize then .usize
+  else if exprStructEq e Lean.Compiler.LCNF.ImpureType.float32 then .f32
+  else if exprStructEq e Lean.Compiler.LCNF.ImpureType.float then .f64
+  else if exprStructEq e Lean.Compiler.LCNF.ImpureType.object then .objPtr
+  else if exprStructEq e Lean.Compiler.LCNF.ImpureType.tagged || exprStructEq e Lean.Compiler.LCNF.ImpureType.tobject then .taggedPtr
+  else if exprStructEq e Lean.Compiler.LCNF.ImpureType.erased || exprStructEq e Lean.Compiler.LCNF.ImpureType.void then .unit
   else match e.getAppFn with
     | .const declName _ =>
       if declName == ``UInt8 then .i8
@@ -423,7 +455,7 @@ def lowerAtomicImpureType (e : Lean.Expr) : LNIRType :=
 /-- Pure lowering of standard `Lean.Compiler.LCNF.ImpureType` and ground scalar/pair `Lean.Expr` types. -/
 def lowerGroundImpureType (e : Lean.Expr) : LNIRType :=
   let t0 := lowerAtomicImpureType e
-  if !lnirTypeEq t0 .objPtr || e == Lean.Compiler.LCNF.ImpureType.object then t0
+  if !lnirTypeEq t0 .objPtr || exprStructEq e Lean.Compiler.LCNF.ImpureType.object then t0
   else match e.getAppFn with
     | .const declName _ =>
       if declName == ``Prod || declName == ``MProd || declName == ``PProd then
@@ -495,7 +527,7 @@ def RealBridgeCtx.findKnownFVarCtor? (ctx : RealBridgeCtx) (fvarId : Lean.FVarId
   (ctx.knownFVarCtors.find? (fun (f, _) => f == fvarId)).map Prod.snd
 
 def lowerGroundImpureTypeWith (ctx : RealBridgeCtx) (e : Lean.Expr) : LNIRType :=
-  match ctx.typeOverrides.find? (fun (ex, _) => ex == e) with
+  match ctx.typeOverrides.find? (fun (ex, _) => exprStructEq ex e) with
   | some (_, ty) => ty
   | none => lowerGroundImpureType e
 
@@ -760,7 +792,7 @@ def lowerImpureLetValuePure (ctx : RealBridgeCtx) (st : RealBridgeState)
     if isUnboxedScalarOrTuple (st.getVarType v) then return (.scalar (.var v), st)
     throw "[lean-native] Unsupported heap reset instruction in Stage 1B"
 
-/-- Pure type inference for a lowered impure right-hand side (`BridgeHelpers.inferImpureRhsType`). -/
+/-- Pure type inference for a lowered impure right-hand side. -/
 def inferImpureRhsTypePure (st : RealBridgeState) (rhs : LNIRExpr) (declTy : LNIRType) (isBox : Bool) : LNIRType :=
   if isBox then
     match rhs with
@@ -783,7 +815,7 @@ def inferImpureRhsTypePure (st : RealBridgeState) (rhs : LNIRExpr) (declTy : LNI
       | _ => declTy
     | _ => declTy
 
-/-- Pure reference-counting instruction lowering (`Code.inc` / `Code.dec`, shared with `BridgeHelpers.lowerRefOp`). -/
+/-- Pure reference-counting instruction lowering (`Code.inc` / `Code.dec`). -/
 def lowerRefOpPure (isInc : Bool) (vid : VarId) (vt : LNIRType) (n : Nat) (kCode : LNIRCode) :
     Except String LNIRCode :=
   if isUnboxedScalarOrTuple vt then .ok kCode

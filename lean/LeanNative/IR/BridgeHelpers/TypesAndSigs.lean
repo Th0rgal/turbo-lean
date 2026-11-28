@@ -155,9 +155,6 @@ export LeanNative.IR.RealLCNFBridge (
 def isSupportedScalarOrFloat (ty : LNIRType) (arch : TargetArch) : Bool :=
   isSupportedStage1BScalarType ty arch || ty == .f64
 
-def isSupportedParamOrRetType (ty : LNIRType) (arch : TargetArch) (allowSlice : Bool := false) : Bool :=
-  isSupportedStage1BScalarOrTuple ty arch || ty == .f64 || (allowSlice && isSupportedSliceType ty)
-
 def exprCodomainIsProp (env? : Option Lean.Environment) (e : Lean.Expr) : Bool :=
   let e := e.consumeMData
   let fn := e.getAppFn
