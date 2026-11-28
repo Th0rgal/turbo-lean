@@ -73,9 +73,9 @@ EXPECTED_FRAGMENT_NAMES = [
 # changes a fragment updates its hash here in the same commit.
 EXPECTED_FRAGMENT_HASHES = {
     "10_docs_pinning_ratchet.sh": "ac187453635c45e67abc47e65127f25aeb67c00a8318e6768dd236b2ceddb9ac",
-    "20_audit_spec_v2.sh": "e0e9df7c3c15bc028155d847c77c6f142f47ac73806f5fc0c4d0c5304ef9b951",
+    "20_audit_spec_v2.sh": "06a0df0b9383e18eadcb33dba661e5e9794072fb863c08f123f36612d9ceb637",
     "21_audit_spec_strict_proofs.sh": "d0c073cae6410d0092a388ff404b2cacaea2e112f1639fe93796af0c066fd15f",
-    "30_axiom_gate.sh": "49e36170e63217edc80887b8d26cb6b199b079596de0abdc54bd6e4104a8f60a",
+    "30_axiom_gate.sh": "d82c6602e0f45dc2907f66d9d500dd9d979f6e9053f5f4a8e5ead3f1f205d296",
     "35_h1_mutant_matrix.sh": "9d22f8f021379c5631df454d847a8f616feaebf7a1d3efa08162daca4ddee279",
     "40_verified_pass_hygiene.sh": "7cbb8ca4782a952d9a2e31466de6d6677273a9f7a49e9386cb3be086d1d997e0",
     "50_plugin_mutant_gate.sh": "d7463ec4943426b4e235e6706eac9e49f4def2e2eec02437c8b510948763ea43",

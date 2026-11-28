@@ -11421,7 +11421,10 @@ mod pr_verify_tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         let proj = dir.join("proj");
-        let dep = dir.join("dep_pkg");
+        // Keep the mutable fixture dependency inside the project. External path
+        // dependencies are intentionally read-only and cannot receive the
+        // verified-sources manifest this regression exercises.
+        let dep = proj.join("deps/dep_pkg");
         fs::create_dir_all(dep.join("DepPkg"))?;
         fs::create_dir_all(proj.join("custom_src/P"))?;
         for d in [&proj, &dep] {
@@ -11438,10 +11441,7 @@ mod pr_verify_tests {
         )?;
         fs::write(
             proj.join("lakefile.toml"),
-            format!(
-                "name = \"p\"\nsrcDir = \"custom_src\"\n[[require]]\nname = \"dep_pkg\"\npath = \"{}\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n",
-                dep.display()
-            ),
+            "name = \"p\"\nsrcDir = \"custom_src\"\n[[require]]\nname = \"dep_pkg\"\npath = \"deps/dep_pkg\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n",
         )?;
         let marker = dir.join("build_cmd_ran");
         fs::write(
@@ -11585,10 +11585,7 @@ mod pr_verify_tests {
         let stale_root_manifest = fs::read(&root_manifest)?;
         fs::write(
             proj.join("lakefile.toml"),
-            format!(
-                "name = \"p\"\nsrcDir = \"custom_src\"\nleanOptions = {{ autoImplicit = false }}\n[[require]]\nname = \"dep_pkg\"\npath = \"{}\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n",
-                dep.display()
-            ),
+            "name = \"p\"\nsrcDir = \"custom_src\"\nleanOptions = { autoImplicit = false }\n[[require]]\nname = \"dep_pkg\"\npath = \"deps/dep_pkg\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n",
         )?;
         git_init_and_commit(&proj, "shift root leanOptions")?;
         fs::write(&root_manifest, &stale_root_manifest)?;
