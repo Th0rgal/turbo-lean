@@ -2473,8 +2473,8 @@ def findUnsupportedLLVMCallInCodeAux (localSigs : List (String × List LNIRType 
   | .ret _ | .unreachable => none
 
 /-- P-cert C5 (fail closed): the LLVM backend accepts no RC-ADT (Stage 1D heap) code — any heap-typed binder,
-    ctor op, heap box, `isExclusive`, or heap runtime call is `some`. The heap lowering above is guarded
-    (C2.3); only the H3.1 opt-in leaf (`findUnsupportedLLVMCallWith? true`) lets it through. -/
+    ctor op, heap box, `isExclusive`, or heap runtime call is `some`. The heap lowering above is
+    guarded (C2.3); only the H3.1 opt-in leaf (`findUnsupportedLLVMCallWith? true`) admits it. -/
 def findUnsupportedLLVMCallInCode (localSigs : List (String × List LNIRType × LNIRType)) (c : LNIRCode) : Option String :=
   findUnsupportedLLVMCallInCodeAux localSigs c <|> (if c.containsRcAdt [] then some "rc_adt" else none)
 
@@ -2495,7 +2495,8 @@ def findUnsupportedLLVMCall? (m : LNIRModule) (target : TargetArch := .x86_64) :
     8-byte-slot `ctorGetScalar`; every other RC-ADT expression keeps its fail-closed name. -/
 def rcAdtLLVMLeafExpr? (ty : LNIRType) : LNIRExpr → Option String
   | .allocCtor tag objs scalars =>
-    if tag ≤ 244 && objs.length ≤ 255 && 8 * scalars.length ≤ 1024 then none else some "allocCtor"
+    let fits := tag ≤ 244 && objs.length ≤ 255 && 8 * scalars.length ≤ 1024
+    if fits && slotLLVMType ty == "ptr" then none else some "allocCtor"
   | .ctorGetObj _ _ => if slotLLVMType ty == "ptr" then none else some "ctorGetObj"
   | .ctorGetScalar _ _ sty =>
     if slotLLVMType sty == "i64" && slotLLVMType ty == "i64" then none else some "ctorGetScalar"
@@ -2505,24 +2506,33 @@ def rcAdtLLVMLeafExpr? (ty : LNIRType) : LNIRExpr → Option String
   | _ => if ty.containsHeapObject && slotLLVMType ty != "ptr" then some "rc_adt" else none
 
 /-- H3.1 opt-in body gate: RC-ADT leaf expressions plus `incRef`/`decRef`; calls keep the default
-    allowlist, and heap-typed stores and loop carriers stay rejected. -/
-def findUnsupportedRcAdtLLVMInCode (localSigs : List (String × List LNIRType × LNIRType)) :
-    LNIRCode → Option String
+    allowlist minus the heap-box helpers (`box`/`unbox_u64`) and `ensure_exclusive` on a
+    non-`sarray` (`vars`: decl slot types); heap-typed stores and loop carriers stay rejected. -/
+def findUnsupportedRcAdtLLVMInCode (sigs : List (String × List LNIRType × LNIRType))
+    (vars : List (VarId × LNIRType)) : LNIRCode → Option String
   | .letBind dst ty e k =>
+    let isSarray (v : VarId) : Bool :=
+      match vars.lookup v with
+      | some (.sarray _) => true
+      | _ => false
     let here := match e with
-      | .call .. => findUnsupportedLLVMCallInCodeAux localSigs (.letBind dst ty e .unreachable)
+      | .call fn args _ _ =>
+        if fn == "lean_native_box_u64" || fn == "lean_native_unbox_u64" then some fn
+        else if fn == "lean_native_ensure_exclusive" && !args.all isSarray then some fn
+        else findUnsupportedLLVMCallInCodeAux sigs (.letBind dst ty e .unreachable)
       | _ => rcAdtLLVMLeafExpr? ty e
-    here <|> findUnsupportedRcAdtLLVMInCode localSigs k
+    here <|> findUnsupportedRcAdtLLVMInCode sigs vars k
   | .rawStore _ _ _ ety k =>
-    if ety.containsHeapObject then some "rc_adt" else findUnsupportedRcAdtLLVMInCode localSigs k
-  | .incRef _ _ k | .decRef _ _ k => findUnsupportedRcAdtLLVMInCode localSigs k
+    if ety.containsHeapObject then some "rc_adt" else findUnsupportedRcAdtLLVMInCode sigs vars k
+  | .incRef _ _ k | .decRef _ _ k => findUnsupportedRcAdtLLVMInCode sigs vars k
   | .ite _ t e =>
-    findUnsupportedRcAdtLLVMInCode localSigs t <|> findUnsupportedRcAdtLLVMInCode localSigs e
+    findUnsupportedRcAdtLLVMInCode sigs vars t <|> findUnsupportedRcAdtLLVMInCode sigs vars e
   | .seqFor _ _ _ _ _ aty body k =>
     if aty.containsHeapObject then some "rc_adt" else
-      findUnsupportedRcAdtLLVMInCode localSigs body <|> findUnsupportedRcAdtLLVMInCode localSigs k
+      findUnsupportedRcAdtLLVMInCode sigs vars body <|>
+        findUnsupportedRcAdtLLVMInCode sigs vars k
   | .parFor _ _ _ ety _ k =>
-    if ety.containsHeapObject then some "rc_adt" else findUnsupportedRcAdtLLVMInCode localSigs k
+    if ety.containsHeapObject then some "rc_adt" else findUnsupportedRcAdtLLVMInCode sigs vars k
   | .ret _ | .unreachable => none
 
 /-- H3.1 opt-in decl gate. A non-RC-ADT decl takes the default gate unchanged. An RC-ADT decl must
@@ -2534,7 +2544,19 @@ def findUnsupportedRcAdtLLVMInDecl (localSigs : List (String × List LNIRType ×
   else if target.isILP32 || target == .nvptx64 || target == .hybridCpuGpu then some "rc_adt_target"
   else if d.params.any (·.ty.containsHeapObject) || d.retTy.containsHeapObject then
     some "rc_adt_signature"
-  else findUnsupportedRcAdtLLVMInCode localSigs d.body <|> d.checkElemTypes localSigs
+  else
+    findUnsupportedRcAdtLLVMInCode localSigs (declSlotVars d) d.body <|> d.checkElemTypes localSigs
+
+/-- H3.1 CLI opt-in flag (`--allow-rc-adt-llvm`); without it LLVM paths refuse RC-ADT (C5). -/
+def rcAdtLLVMOptIn (args : List String) : Bool := args.contains "--allow-rc-adt-llvm"
+
+/-- Fail-closed misuse of the opt-in: only LLVM-emitting commands, never C-ABI/PTX/Metal modes. -/
+def rcAdtLLVMMisuse? (args : List String) : Option String :=
+  let cmds := ["compile", "compile-llvm", "emit-llvm", "build-exe"]
+  let nonLLVM := ["--c-abi", "--emit-c-abi", "--emit-ptx", "--ptx", "--emit-metal", "--metal"]
+  let llvmOnly := cmds.contains (args.headD "") && !nonLLVM.any args.contains
+  if !rcAdtLLVMOptIn args || llvmOnly then none
+  else some s!"[lean-native] --allow-rc-adt-llvm is only supported by LLVM emission via {cmds}"
 
 /-- LLVM emission gate: the default C5 refusal, or the H3.1 RC-ADT leaf when `allowRcAdt`. -/
 def findUnsupportedLLVMCallWith? (allowRcAdt : Bool) (m : LNIRModule)

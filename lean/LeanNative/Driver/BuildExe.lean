@@ -133,7 +133,7 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
   let sysroot ← resolveLeanSysroot
   let hostArch : TargetArch :=
     if System.Platform.target.startsWith "aarch64" || System.Platform.target.startsWith "arm64" then .arm64 else .x86_64
-  let allowRcAdt := cliArgs.contains "--allow-rc-adt-llvm"
+  let allowRcAdt := LeanNative.Backend.LLVM.rcAdtLLVMOptIn cliArgs
   let (cCode, rawMod) ← emitLeanCFromSourceFile filePath `Main hostArch allowRcAdt
   let (optMod, _) := LeanNative.Transform.runDefaultPipeline rawMod
   if let some err := buildExeLLVMGate? rawMod optMod hostArch allowRcAdt then

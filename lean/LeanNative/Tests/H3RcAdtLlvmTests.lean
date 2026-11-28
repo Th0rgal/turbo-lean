@@ -145,6 +145,27 @@ def bigTag : LNIRDecl :=
 #guard optInRejects bigTag == some "allocCtor"
 #guard optInRejects ctorScalar .wasm32 == some "rc_adt_target"
 #guard optInRejects ctorScalar .nvptx64 == some "rc_adt_target"
+
+/-- One-binder RC-ADT probe: `let 3 : ty := e` after a live heap object `2`, then `ret 0`. -/
+def probe (nm : String) (ty : LNIRType) (e : LNIRExpr) : LNIRDecl :=
+  { ctorScalar with
+    name := nm
+    body := .letBind 2 .objPtr (.allocCtor 0 [] [0]) (.letBind 3 ty e (.decRef 2 1 (.ret 0))) }
+
+#guard optInRejects (probe "h3_box" .objPtr (.boxScalar 0 .i64)) == some "boxScalar"
+#guard optInRejects (probe "h3_unbox" .i64 (.unboxScalar 2 .i64)) == some "unboxScalar"
+-- `allocCtor` must bind a `ptr` slot: a tuple / scalar binder would silently drop the object.
+#guard optInRejects (probe "h3_tup" (.tuple [.objPtr, .i64]) (.allocCtor 1 [] [0])) ==
+  some "allocCtor"
+#guard optInRejects (probe "h3_i64" .i64 (.allocCtor 1 [] [0])) == some "allocCtor"
+-- The heap-box helpers and `ensure_exclusive` on a ctor object stay outside the leaf.
+#guard optInRejects (probe "h3_bx" .objPtr (.call "lean_native_box_u64" [0] .objPtr false)) ==
+  some "lean_native_box_u64"
+#guard optInRejects (probe "h3_ux" .i64 (.call "lean_native_unbox_u64" [2] .i64 false)) ==
+  some "lean_native_unbox_u64"
+#guard optInRejects
+    (probe "h3_ex" .objPtr (.call "lean_native_ensure_exclusive" [2] .objPtr false)) ==
+  some "lean_native_ensure_exclusive"
 -- A scalar module takes the unchanged default gate under the opt-in.
 #guard findUnsupportedLLVMCallWith? true (modOf scalarIdDecl) == none
 #guard (checkFreestandingModule fixtureModule).isSome
@@ -244,6 +265,27 @@ def cliSuite : IO Unit := do
     throw <| IO.userError "[H3] --allow-rc-adt-llvm compile-llvm did not emit the RC-ADT leaf"
 
 #guard rcAdtLLVMOptIn ["compile-llvm", "--allow-rc-adt-llvm"] && !rcAdtLLVMOptIn ["--allow-rc-adt"]
+
+-- The opt-in is refused outside LLVM emission, including the `superopt-evolve` early return.
+#guard ["compile", "compile-llvm", "emit-llvm", "build-exe"].all fun c =>
+  (rcAdtLLVMMisuse? [c, "--allow-rc-adt-llvm"]).isNone
+#guard ["superopt-evolve", "superopt", "eval-lnir", "compile-ptx", "emit-lnir"].all fun c =>
+  (rcAdtLLVMMisuse? [c, "--allow-rc-adt-llvm"]).isSome
+#guard ["--c-abi", "--emit-ptx", "--metal"].all fun f =>
+  (rcAdtLLVMMisuse? ["compile", f, "--allow-rc-adt-llvm"]).isSome
+
+def dispatchRefuses (args : List String) : IO Bool := do
+  try
+    discard <| dispatchSharedCommand "h3" none args
+    pure false
+  catch e => pure ((toString e).startsWith "[lean-native] --allow-rc-adt-llvm")
+
+/-- info: true -/
+#guard_msgs in
+#eval do
+  let a ← dispatchRefuses ["superopt-evolve", "--allow-rc-adt-llvm", "--lnir", "/nonexistent"]
+  let b ← dispatchRefuses ["compile", "--c-abi", "--allow-rc-adt-llvm", "--lnir", "/nonexistent"]
+  IO.println (a && b)
 
 #guard buildExeLLVMGate? fixtureModule fixtureModule == some
   "[lean-native] build-exe: RC-ADT declaration 'h3_ctor_scalar' is unsupported by the LLVM backend"

@@ -43,8 +43,6 @@ def findFlagValue (args : List String) (flag : String) (defaultVal : String) : S
   ((args.zip (args.drop 1)).find? (fun (f, _) => f == flag)).map Prod.snd |>.getD defaultVal
 
 def hasFlag (args : List String) (flag : String) : Bool := args.contains flag
-/-- H3.1 opt-in: admit non-recursive RC-ADT decls through LLVM emission (default refuses, C5). -/
-def rcAdtLLVMOptIn (args : List String) : Bool := hasFlag args "--allow-rc-adt-llvm"
 def hasTelemetryOptIn (args : List String) : Bool :=
   ["--telemetry", "--telemetry=metrics", "--telemetry=local", "--telemetry=full"].any args.contains &&
   !(args.contains "--no-telemetry" || args.contains "--telemetry=off" || args.contains "--telemetry=0")
@@ -229,10 +227,7 @@ def runCompileMode (tag : String) (elaborateHook? : Option (String → TargetArc
   if opts.emitCABI then rejectLeanSourceWithoutFrontend tag "compile" elaborateHook? args
   let wasmSimd128 := hasFlag args "--wasm-simd128"
   let rcLLVM := rcAdtLLVMOptIn args
-  if rcLLVM && (opts.emitCABI || opts.emitPTX || opts.emitMetal) then
-    throw <| IO.userError s!"[{tag}] --allow-rc-adt-llvm requires LLVM emission"
-  let baseMod ← loadInputModule elaborateHook? args opts.emitCABI (allowRcAdt := rcLLVM)
-    (sel? := some sel)
+  let baseMod ← loadInputModule elaborateHook? args opts.emitCABI false rcLLVM (some sel)
   if hasTelemetryOptIn args then
     let telCfg ← TelemetryConfig.probe args
     let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
@@ -264,9 +259,8 @@ def runCompileLLVM (tag : String) (elaborateHook? : Option (String → TargetArc
   let wasmSimd128 := hasFlag args "--wasm-simd128"
   let freestanding := hasFlag args "--freestanding" || arch.isFreestandingEmbedded
   let outPath := findFlagValue args "-o" ""
-  let rcLLVM := rcAdtLLVMOptIn args
   let baseMod ← if hasFlag args "--slot-regression" then pure slotTypeRegressionModule
-    else loadInputModule elaborateHook? args (allowRcAdt := rcLLVM)
+    else loadInputModule elaborateHook? args (allowRcAdt := rcAdtLLVMOptIn args)
   if hasTelemetryOptIn args then
     let telCfg ← TelemetryConfig.probe args
     let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
@@ -282,9 +276,8 @@ def runCompileLLVM (tag : String) (elaborateHook? : Option (String → TargetArc
       return (← writeOrPrint outPath irText
         (some s!"[{tag}] Wrote freestanding LLVM 18 IR ({arch.triple}, baseline={isBaseline}, decls={modToEmit.decls.length}) to {outPath}"))
   -- `--slot-regression` is the fixed in-tree slot-typing fixture (its `ptr` slots are the point of the test)
-  let gate? := if hasFlag args "--slot-regression" then none
-    else findUnsupportedLLVMCallWith? rcLLVM modToEmit arch
-  if let some (dName, callee) := gate? then
+  if let some (dName, callee) := if hasFlag args "--slot-regression" then none
+      else findUnsupportedLLVMCallWith? (rcAdtLLVMOptIn args) modToEmit arch then
     throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"
   let irText := if isBaseline then emitLLVMBaseline modToEmit arch none wasmSimd128 false else emitLLVMOptimized modToEmit arch none wasmSimd128 false
   writeOrPrint outPath irText (some s!"[{tag}] Wrote LLVM 18 IR ({arch.triple}, baseline={isBaseline}, decls={modToEmit.decls.length}) to {outPath}")
@@ -951,20 +944,16 @@ def runEvalLNIR (elaborateHook? : Option (String → TargetArch → IO LNIRModul
   IO.println jsonRow; return if ok then 0 else 1
 
 def rcAdtSupportedCommands : List String := ["emit-lnir", "eval-lnir", "validate-tv", "verify-certs"]
-/-- Commands that honor the H3.1 `--allow-rc-adt-llvm` opt-in (LLVM emission paths only). -/
-def rcAdtLLVMCommands : List String := ["compile", "compile-llvm", "emit-llvm", "build-exe"]
 
 /-- Shared CLI dispatcher for both `lean-native-core` (`elaborateHook? = none`) and `lean-native` (`elaborateHook? = some ...`). -/
 def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule))
     (args : List String) : IO (Option UInt32) := do
+  if let some err := rcAdtLLVMMisuse? args then throw <| IO.userError err
   if let "superopt-evolve" :: rest := args then return some (← runSuperoptEvolve elaborateHook? rest)
   validateValueTakingFlags args
   let isCabiFallback := !(args.headD "").startsWith "compile" && (hasFlag args "--c-abi" || hasFlag args "--emit-c-abi")
   if hasFlag args "--allow-rc-adt" && (!(rcAdtSupportedCommands.contains (args.headD "")) || isCabiFallback) then
     throw <| IO.userError "[lean-native] --allow-rc-adt is only supported by emit-lnir, eval-lnir, validate-tv, and verify-certs"
-  if rcAdtLLVMOptIn args && !rcAdtLLVMCommands.contains (args.headD "") then
-    throw <| IO.userError
-      s!"[lean-native] --allow-rc-adt-llvm is only supported by {rcAdtLLVMCommands}"
   if hasFlag args "--signatures-only" && ((args.head? != some "emit-cabi-bindings" && args.head? != some "emit-c-abi") || elaborateHook?.isSome) then
     throw <| IO.userError "[lean-native] --signatures-only is only supported by lean-native-core emit-cabi-bindings (the full frontend applies the Stage 1D gate)"
   if args.head? != some "eval-lnir" && (args.contains "--args" || args.contains "--cases-file") then
