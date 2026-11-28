@@ -63,7 +63,27 @@ end
 theorem beq_self (v : Val) : (v == v) = true :=
   beq_refl v
 
+mutual
+  theorem eq_of_beq {a b : Val} (h : Val.beq a b = true) : a = b := by
+    cases a <;> cases b
+    all_goals simp_all [Val.beq]
+    exact eqList_of_beqList h
+
+  theorem eqList_of_beqList : ∀ {xs ys : List Val}, Val.beqList xs ys = true → xs = ys
+    | [], [], _ => rfl
+    | _ :: _, _ :: _, h => by
+      simp only [Val.beqList, Bool.and_eq_true] at h; rw [eq_of_beq h.1, eqList_of_beqList h.2]
+    | [], _ :: _, h | _ :: _, [], h => by simp [Val.beqList] at h
+end
+
+/-- `DecidableEq Val` is decided by `Val.beq`, so `==` and `=` agree by construction. -/
+instance : LawfulBEq Val where
+  eq_of_beq := eq_of_beq
+  rfl := beq_refl _
+
 end Val
+
+instance : DecidableEq Val := instDecidableEqOfLawfulBEq
 
 /-- Explicit undefined behavior / runtime trap conditions in LNIR semantics. -/
 inductive UBError where
@@ -171,46 +191,6 @@ structure HeapObj where
   scalarFields : List Val
   deriving Repr, Inhabited, BEq
 
-namespace HeapObj
-
-mutual
-  def decEqVal : (a b : Val) → Decidable (a = b)
-    | .u64 x, .u64 y => if h : x = y then isTrue (h ▸ rfl) else isFalse (by intro heq; injection heq; contradiction)
-    | .u256 x, .u256 y => if h : x = y then isTrue (h ▸ rfl) else isFalse (by intro heq; injection heq; contradiction)
-    | .bool x, .bool y => if h : x = y then isTrue (h ▸ rfl) else isFalse (by intro heq; injection heq; contradiction)
-    | .tuple xs, .tuple ys =>
-      match decEqValList xs ys with
-      | isTrue h => isTrue (h ▸ rfl)
-      | isFalse h => isFalse (by intro heq; injection heq with hxy; exact h hxy)
-    | .objPtr x, .objPtr y => if h : x = y then isTrue (h ▸ rfl) else isFalse (by intro heq; injection heq; contradiction)
-    | .sarrayId x, .sarrayId y => if h : x = y then isTrue (h ▸ rfl) else isFalse (by intro heq; injection heq; contradiction)
-    | .rawPtrId x, .rawPtrId y => if h : x = y then isTrue (h ▸ rfl) else isFalse (by intro heq; injection heq; contradiction)
-    | .storageMapId x, .storageMapId y => if h : x = y then isTrue (h ▸ rfl) else isFalse (by intro heq; injection heq; contradiction)
-    | .unit, .unit => isTrue rfl
-    | .u64 _, .u256 _ | .u64 _, .bool _ | .u64 _, .tuple _ | .u64 _, .objPtr _ | .u64 _, .sarrayId _ | .u64 _, .rawPtrId _ | .u64 _, .storageMapId _ | .u64 _, .unit
-    | .u256 _, .u64 _ | .u256 _, .bool _ | .u256 _, .tuple _ | .u256 _, .objPtr _ | .u256 _, .sarrayId _ | .u256 _, .rawPtrId _ | .u256 _, .storageMapId _ | .u256 _, .unit
-    | .bool _, .u64 _ | .bool _, .u256 _ | .bool _, .tuple _ | .bool _, .objPtr _ | .bool _, .sarrayId _ | .bool _, .rawPtrId _ | .bool _, .storageMapId _ | .bool _, .unit
-    | .tuple _, .u64 _ | .tuple _, .u256 _ | .tuple _, .bool _ | .tuple _, .objPtr _ | .tuple _, .sarrayId _ | .tuple _, .rawPtrId _ | .tuple _, .storageMapId _ | .tuple _, .unit
-    | .objPtr _, .u64 _ | .objPtr _, .u256 _ | .objPtr _, .bool _ | .objPtr _, .tuple _ | .objPtr _, .sarrayId _ | .objPtr _, .rawPtrId _ | .objPtr _, .storageMapId _ | .objPtr _, .unit
-    | .sarrayId _, .u64 _ | .sarrayId _, .u256 _ | .sarrayId _, .bool _ | .sarrayId _, .tuple _ | .sarrayId _, .objPtr _ | .sarrayId _, .rawPtrId _ | .sarrayId _, .storageMapId _ | .sarrayId _, .unit
-    | .rawPtrId _, .u64 _ | .rawPtrId _, .u256 _ | .rawPtrId _, .bool _ | .rawPtrId _, .tuple _ | .rawPtrId _, .objPtr _ | .rawPtrId _, .sarrayId _ | .rawPtrId _, .storageMapId _ | .rawPtrId _, .unit
-    | .storageMapId _, .u64 _ | .storageMapId _, .u256 _ | .storageMapId _, .bool _ | .storageMapId _, .tuple _ | .storageMapId _, .objPtr _ | .storageMapId _, .sarrayId _ | .storageMapId _, .rawPtrId _ | .storageMapId _, .unit
-    | .unit, .u64 _ | .unit, .u256 _ | .unit, .bool _ | .unit, .tuple _ | .unit, .objPtr _ | .unit, .sarrayId _ | .unit, .rawPtrId _ | .unit, .storageMapId _ =>
-      isFalse (by intro h; cases h)
-
-  def decEqValList : (xs ys : List Val) → Decidable (xs = ys)
-    | [], [] => isTrue rfl
-    | [], _ :: _ | _ :: _, [] => isFalse (by intro h; cases h)
-    | x :: xs, y :: ys =>
-      match decEqVal x y, decEqValList xs ys with
-      | isTrue h1, isTrue h2 => isTrue (by rw [h1, h2])
-      | isFalse h1, _ => isFalse (by intro h; injection h with hx _; exact h1 hx)
-      | _, isFalse h2 => isFalse (by intro h; injection h with _ hxs; exact h2 hxs)
-end
-
-end HeapObj
-
-instance : DecidableEq Val := HeapObj.decEqVal
 deriving instance DecidableEq for HeapObj
 
 /-- `true` iff `v` is or contains (at any tuple depth) an owning edge (`.objPtr` / `.sarrayId`). -/
