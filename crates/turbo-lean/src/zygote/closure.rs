@@ -227,7 +227,9 @@ pub(super) fn probe_ctime_in(dir: &Path) -> Option<i128> {
 #[derive(Clone)]
 pub(super) struct CachedFileDigest {
     pub(super) sig: OleanFileStatSig,
-    pub(super) hash: String,
+    /// Keep the binary BLAKE3 output in the memo: hexadecimal encoding is only needed by
+    /// callers that incorporate the digest into a closure label.
+    pub(super) hash: blake3::Hash,
     pub(super) deps: Option<Vec<String>>,
 }
 
@@ -290,7 +292,7 @@ pub(super) fn read_file_digest_opts(path: &Path, need_olean_deps: bool) -> Resul
                 return Ok(Some(FileRead {
                     canon,
                     sig: pre,
-                    hash: hit.hash,
+                    hash: hit.hash.to_hex().to_string(),
                     deps: hit.deps,
                     stable: true,
                 }));
@@ -303,7 +305,7 @@ pub(super) fn read_file_digest_opts(path: &Path, need_olean_deps: bool) -> Resul
     file.read_to_end(&mut bytes).map_err(drop)?;
     run_digest_test_hook("file_digest_after_read");
     let post = OleanFileStatSig::from_meta(&file.metadata().map_err(drop)?);
-    let hash = blake3::hash(&bytes).to_hex().to_string();
+    let hash = blake3::hash(&bytes);
     let deps = parse_deps
         .then(|| crate::module_builder::parse_olean_binary_imports(&bytes))
         .flatten()
@@ -323,7 +325,7 @@ pub(super) fn read_file_digest_opts(path: &Path, need_olean_deps: bool) -> Resul
                 key,
                 CachedFileDigest {
                     sig: pre,
-                    hash: hash.clone(),
+                    hash,
                     deps: deps.clone(),
                 },
             );
@@ -332,7 +334,7 @@ pub(super) fn read_file_digest_opts(path: &Path, need_olean_deps: bool) -> Resul
     Ok(Some(FileRead {
         canon,
         sig: pre,
-        hash,
+        hash: hash.to_hex().to_string(),
         deps,
         stable,
     }))
@@ -2100,6 +2102,96 @@ pub(super) fn hex_encode_bytes(bytes: &[u8]) -> String {
 #[cfg(all(test, unix))]
 mod snapshot_tests {
     use super::*;
+
+    /// The stat-keyed memo must avoid the byte read on an unchanged file, then fail closed as
+    /// soon as its timestamps (same-size, same-inode overwrite), length, or inode change.
+    #[test]
+    fn file_digest_memo_hits_and_invalidates_on_stat_change() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_digest_memo_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memo.bin");
+        fs::write(&path, b"first").unwrap();
+        // Entries are only trusted after the conservative ctime window has elapsed.
+        std::thread::sleep(std::time::Duration::from_millis(2_100));
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reads_for_hook = Arc::clone(&reads);
+        digest_test_hooks::set("file_digest_after_stat", move || {
+            reads_for_hook.fetch_add(1, Ordering::SeqCst);
+        });
+        let first = read_file_digest_opts(&path, false).unwrap().unwrap();
+        let hit = read_file_digest_opts(&path, false).unwrap().unwrap();
+        assert_eq!(first.hash, hit.hash);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "unchanged stat tuple must return from the memo before reading bytes"
+        );
+
+        // Same-size, same-inode overwrite of the memoized entry: only `mtime`/`ctime` change,
+        // so this isolates timestamp invalidation from the size and inode checks below.
+        fs::write(&path, b"FIRST").unwrap();
+        let rewritten = read_file_digest_opts(&path, false).unwrap().unwrap();
+        assert_eq!(rewritten.sig.ino, first.sig.ino, "overwrite must keep the inode");
+        assert_eq!(rewritten.sig.size, first.sig.size, "overwrite must keep the size");
+        assert_ne!(first.hash, rewritten.hash);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            2,
+            "same-size same-inode overwrite must re-read via mtime/ctime"
+        );
+
+        fs::write(&path, b"first-but-larger").unwrap();
+        // Let the new ctime age past the trust window so the next read memoizes.
+        std::thread::sleep(std::time::Duration::from_millis(2_100));
+        let resized = read_file_digest_opts(&path, false).unwrap().unwrap();
+        assert_ne!(rewritten.hash, resized.hash);
+        assert_eq!(reads.load(Ordering::SeqCst), 3, "size change must re-read");
+        let resized_hit = read_file_digest_opts(&path, false).unwrap().unwrap();
+        assert_eq!(resized.hash, resized_hit.hash);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            3,
+            "aged entry must return from the memo before the inode swap"
+        );
+
+        // Same-length replacement renamed over `path`: only the inode (and its timestamps) differ
+        // from the memoized entry, never the size.
+        let replacement = dir.join("replacement.bin");
+        fs::write(&replacement, b"FIRST-BUT-LARGER").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let replaced = read_file_digest_opts(&path, false).unwrap().unwrap();
+        assert_ne!(replaced.sig.ino, resized.sig.ino, "rename must swap the inode");
+        assert_eq!(replaced.sig.size, resized.sig.size, "replacement must keep the size");
+        assert_ne!(resized.hash, replaced.hash);
+        assert_eq!(reads.load(Ordering::SeqCst), 4, "inode change must re-read");
+        digest_test_hooks::clear();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_digest_memo_fails_closed_for_missing_or_non_regular_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_digest_missing_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(read_file_digest_opts(&dir.join("missing.olean"), false)
+            .unwrap()
+            .is_none());
+        assert!(read_file_digest_opts(&dir, false).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// The unresolved-tag fallback must be deterministic: the daemon pre-resolves its execution
     /// identity and compares it against the identity executed a moment later, so a per-call
