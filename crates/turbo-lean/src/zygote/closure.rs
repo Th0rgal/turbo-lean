@@ -2104,7 +2104,7 @@ mod snapshot_tests {
     use super::*;
 
     /// The stat-keyed memo must avoid the byte read on an unchanged file, then fail closed as
-    /// soon as either the file length or its inode changes.
+    /// soon as its timestamps (same-size, same-inode overwrite), length, or inode change.
     #[test]
     fn file_digest_memo_hits_and_invalidates_on_stat_change() {
         use std::sync::{
@@ -2137,17 +2137,43 @@ mod snapshot_tests {
             "unchanged stat tuple must return from the memo before reading bytes"
         );
 
-        fs::write(&path, b"first-but-larger").unwrap();
-        let resized = read_file_digest_opts(&path, false).unwrap().unwrap();
-        assert_ne!(first.hash, resized.hash);
-        assert_eq!(reads.load(Ordering::SeqCst), 2, "size change must re-read");
+        // Same-size, same-inode overwrite of the memoized entry: only `mtime`/`ctime` change,
+        // so this isolates timestamp invalidation from the size and inode checks below.
+        fs::write(&path, b"FIRST").unwrap();
+        let rewritten = read_file_digest_opts(&path, false).unwrap().unwrap();
+        assert_eq!(rewritten.sig.ino, first.sig.ino, "overwrite must keep the inode");
+        assert_eq!(rewritten.sig.size, first.sig.size, "overwrite must keep the size");
+        assert_ne!(first.hash, rewritten.hash);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            2,
+            "same-size same-inode overwrite must re-read via mtime/ctime"
+        );
 
+        fs::write(&path, b"first-but-larger").unwrap();
+        // Let the new ctime age past the trust window so the next read memoizes.
+        std::thread::sleep(std::time::Duration::from_millis(2_100));
+        let resized = read_file_digest_opts(&path, false).unwrap().unwrap();
+        assert_ne!(rewritten.hash, resized.hash);
+        assert_eq!(reads.load(Ordering::SeqCst), 3, "size change must re-read");
+        let resized_hit = read_file_digest_opts(&path, false).unwrap().unwrap();
+        assert_eq!(resized.hash, resized_hit.hash);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            3,
+            "aged entry must return from the memo before the inode swap"
+        );
+
+        // Same-length replacement renamed over `path`: only the inode (and its timestamps) differ
+        // from the memoized entry, never the size.
         let replacement = dir.join("replacement.bin");
-        fs::write(&replacement, b"different-but-same").unwrap();
+        fs::write(&replacement, b"FIRST-BUT-LARGER").unwrap();
         fs::rename(&replacement, &path).unwrap();
         let replaced = read_file_digest_opts(&path, false).unwrap().unwrap();
+        assert_ne!(replaced.sig.ino, resized.sig.ino, "rename must swap the inode");
+        assert_eq!(replaced.sig.size, resized.sig.size, "replacement must keep the size");
         assert_ne!(resized.hash, replaced.hash);
-        assert_eq!(reads.load(Ordering::SeqCst), 3, "inode change must re-read");
+        assert_eq!(reads.load(Ordering::SeqCst), 4, "inode change must re-read");
         digest_test_hooks::clear();
         let _ = fs::remove_dir_all(&dir);
     }
