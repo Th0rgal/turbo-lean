@@ -815,7 +815,7 @@ private partial def collectReferenceProbes (nsPrefix : String) (dom : GroundDomT
   | .bool => some (mk keyRoot s!"(if {appText} then 1 else 0)")
   | .uint8 | .uint16 | .uint32 | .usize => some (mk keyRoot s!"({appText}.toUInt64)")
   | .uint64 => some (mk keyRoot s!"({appText})")
-  | .unit => some (mk keyRoot "0")
+  | .unit => some (mk keyRoot s!"(let _res := {appText}; 0)")
   | .enumInduct _ ctors =>
     -- `GroundDomType.enumInduct` only models nullary-ctor enums (fielded ADTs use `.rcAdt`).
     some (mk keyRoot ("(match (" ++ appText ++ ") with " ++
@@ -872,7 +872,7 @@ private partial def reassembleCanonicalFromE (ctx : RealBridgeCtx) (dom : Ground
     let n ← atKey keyRoot
     let masked := if ctx.arch.isILP32 then (UInt64.ofNat n) &&& 0xFFFFFFFF else UInt64.ofNat n
     .ok (.usize masked)
-  | .unit => .ok .unit
+  | .unit => do let _ ← atKey keyRoot; .ok .unit
   | .enumInduct indName ctors =>
     do
       let n ← atKey keyRoot
@@ -968,21 +968,23 @@ private def runReferenceProbesIO (baseText : String) (refDefs : List RefProbeDef
   -- second time in one process deadlocks, so in-process probing would hang every run after the first.
   let snippetPath := s!"{tmpBase}/.eval-lcnf-refprobes-{ms}-{salt}.lean"
   IO.FS.writeFile snippetPath snippet
-  let sysroot ← LeanNative.IR.resolveLeanSysroot
-  let searchPath := (sysroot / "lib" / "lean") :: (← snippetExtraSearchPaths)
-  let leanPath := System.SearchPath.separator.toString.intercalate
-    (← searchPath.mapM fun p => return (← IO.FS.realPath p).toString)
-  let out ← IO.Process.output {
-    cmd := (sysroot / "bin" / "lean").toString
-    args := #[snippetPath]
-    env := #[("LEAN_PATH", some leanPath)]
-  }
-  try IO.FS.removeFile snippetPath catch _ => pure ()
-  if out.exitCode != 0 || !(← System.FilePath.pathExists pathStr) then
-    throw <| IO.userError s!"compiled-reference probe snippet failed (exit {out.exitCode}):\n{out.stdout}{out.stderr}"
-  let text ← IO.FS.readFile pathStr
-  try IO.FS.removeFile pathStr catch _ => pure ()
-  return parseReferenceProbeResults text
+  tryFinally (do
+    let sysroot ← LeanNative.IR.resolveLeanSysroot
+    let searchPath := (sysroot / "lib" / "lean") :: (← snippetExtraSearchPaths)
+    let leanPath := System.SearchPath.separator.toString.intercalate
+      (← searchPath.mapM fun p => return (← IO.FS.realPath p).toString)
+    let out ← IO.Process.output {
+      cmd := (sysroot / "bin" / "lean").toString
+      args := #[snippetPath]
+      env := #[("LEAN_PATH", some leanPath)]
+    }
+    if out.exitCode != 0 || !(← System.FilePath.pathExists pathStr) then
+      throw <| IO.userError s!"compiled-reference probe snippet failed (exit {out.exitCode}):\n{out.stdout}{out.stderr}"
+    let text ← IO.FS.readFile pathStr
+    return parseReferenceProbeResults text)
+    (do
+      try IO.FS.removeFile snippetPath catch _ => pure ()
+      try IO.FS.removeFile pathStr catch _ => pure ())
 
 
 /-- Secondary reference evaluator: evaluates an expression using Lean kernel reduction
@@ -1407,7 +1409,7 @@ private partial def renderClosedProbeArgText (ty : Expr) (depth : Nat := 3) : Me
         if let some firstCtor := ival.ctors.head? then
           if let some (.ctorInfo cv) := env.find? firstCtor then
             if cv.numFields == 0 && ival.numParams == 0 && ival.numIndices == 0 then
-              return some nm.toString
+              return some firstCtor.toString
   return none
 
 /-- Build a skip-probe spec for a declaration the project interpreter refused. Returns `none`
